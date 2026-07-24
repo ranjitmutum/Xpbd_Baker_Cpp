@@ -1,0 +1,2 @@
+Vulkan-Headers and Vulkan-Loader (Khronos Group)
+Apache License 2.0. https://github.com/KhronosGroup

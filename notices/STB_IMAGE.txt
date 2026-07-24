@@ -1,0 +1,2 @@
+stb_image.h — Sean Barrett / stb
+MIT License / public domain dedication (see header in third_party/stb/stb_image.h).

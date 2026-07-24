@@ -1,0 +1,2 @@
+spdlog (https://github.com/gabime/spdlog) and {fmt} (https://github.com/fmtlib/fmt)
+Both MIT License.

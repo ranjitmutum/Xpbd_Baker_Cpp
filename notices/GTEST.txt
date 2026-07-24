@@ -1,0 +1,2 @@
+Google Test / GoogleMock
+BSD 3-Clause. Used for unit tests only; not required at runtime for the GUI.

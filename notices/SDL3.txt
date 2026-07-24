@@ -1,0 +1,2 @@
+SDL 3 — Simple DirectMedia Layer
+zlib License. https://www.libsdl.org/

@@ -1,0 +1,12 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "local-msvc-debug",
+      "inherits": "windows-msvc-debug",
+      "environment": {
+        "VCPKG_ROOT": "D:/App/vcpkg"
+      }
+    }
+  ]
+}

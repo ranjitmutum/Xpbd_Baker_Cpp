@@ -1,0 +1,119 @@
+# ===== Java / Maven =====
+/target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+release.properties
+dependency-reduced-pom.xml
+.buildNumber
+
+# ===== IDE / editors =====
+/.idea/
+/.vscode/
+*.iml
+.classpath
+.project
+.settings/
+*.swp
+*~
+
+# ===== Logs / crashes =====
+*.log
+hs_err_pid*
+replay_pid*
+xpbd_gfx_log.txt
+
+# ===== OS junk =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== Local agent / planning =====
+/analysis/
+/.agents/
+/.planning/
+/.tmp/
+/findings.md
+/progress.md
+/task_plan.md
+
+# ===== Backups / archives =====
+*.bak
+*.tmp
+*.orig
+*.rej
+/xpbd-baker-*.zip
+
+# ===== Env secrets =====
+.env
+.env.*
+!.env.example
+
+# ===== C++ / CMake / vcpkg =====
+/build-mingw-release/
+/.toolchain/
+/vcpkg_installed_mingw/
+/dist/
+/real_fixture_regression_compact/
+/real_model_tests/
+/.tmp_transition_audit/
+/cpp/build/
+/cpp/build-app/
+/cpp/out/
+/cpp/cmake-build-*/
+/cpp/vcpkg_installed/
+/cpp/third_party/EUI-NEO/
+/cpp/.idea/
+
+# tools/: keep scripts tracked; ignore large/third-party binaries (re-fetch via tools/setup_tools.*)
+/tools/__pycache__/
+/tools/glslang/
+/tools/glslang.zip
+/tools/**/*.exe
+/tools/**/*.lib
+/tools/**/*.dll
+/tools/**/*.pdb
+!/tools/*.py
+!/tools/*.ps1
+!/tools/*.bat
+!/tools/*.md
+/cpp/tools/glslang/
+/cpp/tools/glslang.zip
+/cpp/tools/**/*.exe
+/cpp/tools/**/*.lib
+/cpp/tools/**/*.dll
+/cpp/tools/**/*.pdb
+!/cpp/tools/*.py
+!/cpp/tools/*.ps1
+!/cpp/tools/*.bat
+!/cpp/tools/*.md
+CMakeUserPresets.json
+compile_commands.json
+vcpkg_installed/
+.vs/
+*.user
+*.VC.db
+*.suo
+*.sdf
+*.opensdf
+*.aps
+*.ipch
+ipch/
+
+# Keep tracked third-party headers (Nuklear, SPIR-V includes)
+!/cpp/third_party/nuklear/
+!/cpp/src/gfx/spirv/
+
+# ===== Generated / local =====
+*.bmp
+xpbd_gfx_log.txt
+
+!*.cpp
+!*.cxx
+!*.cc
+!*.c
+!*.h
+!*.hpp
+!*.py
+![Mm]akefile
+!*.mk

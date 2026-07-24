@@ -1,0 +1,3 @@
+Nuklear (Immediate-Mode-UI/Nuklear)
+See third_party/nuklear/nuklear.h header for the project license notice
+(MIT / public-domain dual style as published by the upstream project).

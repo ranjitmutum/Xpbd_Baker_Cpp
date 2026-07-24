@@ -1,0 +1,18 @@
+{
+  "name": "xpbd-baker",
+  "version-string": "1.0.0",
+  "description": "C++ port of XPBD Bone Baker for Minecraft Bedrock physics animation baking",
+  "homepage": "https://github.com/ranjitmutum/xpbd_baker",
+  "dependencies": [
+    "nlohmann-json",
+    "bullet3",
+    "gtest",
+    {
+      "name": "sdl3",
+      "features": ["vulkan"]
+    },
+    "vulkan-headers",
+    "vulkan-loader",
+    "spdlog"
+  ]
+}
