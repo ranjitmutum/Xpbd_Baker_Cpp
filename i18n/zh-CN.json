@@ -3,6 +3,7 @@
   "open_anim": "打开动画",
   "import_tex": "导入贴图",
   "export_anim": "导出动画",
+  "export_all_anim": "全量导出",
   "export_vel": "导出速度",
   "clear_tex": "清除贴图",
   "about": "关于",

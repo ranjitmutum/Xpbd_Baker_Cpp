@@ -52,7 +52,26 @@ public:
                   const TransitionReferenceExport *transition_reference,
                   bool exact_baked_length);
 
+  // 导出全部已导入动画，并用当前烘焙结果替换同名动画。
+  static void
+  exportAllAnimations(const loader::AnimationRoot &source_root,
+                      const std::string &baked_animation_id,
+                      const loader::Animation *reference_animation,
+                      const std::vector<baker::BakedFrame> &frames,
+                      loader::Animation::LoopBehavior loop_behavior,
+                      const std::filesystem::path &file_path,
+                      const TransitionReferenceExport *transition_reference,
+                      bool exact_baked_length);
+
 private:
+  static nlohmann::json
+  bakedAnimationToJson(const loader::Animation *reference_animation,
+                       const std::vector<baker::BakedFrame> &frames,
+                       loader::Animation::LoopBehavior loop_behavior,
+                       const TransitionReferenceExport *transition_reference,
+                       bool exact_baked_length);
+  static nlohmann::json
+  sourceAnimationToJson(const loader::Animation &animation);
   static nlohmann::json keyframesToJson(const loader::Keyframes &kf);
   static nlohmann::json toArray(const double v[3]);
   static nlohmann::json toArray(const std::array<double, 3> &v);

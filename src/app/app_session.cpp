@@ -59,6 +59,19 @@ bool hasTextureResourceState(const gfx::TextureImage &texture) noexcept {
   return texture.width != 0 || texture.height != 0 || !texture.rgba.empty();
 }
 
+// 动画导出始终使用 JSON 后缀，避免名称中的 .bake/.baked 被误认为最终扩展名。
+std::filesystem::path ensureJsonExtension(std::filesystem::path path) {
+  std::string extension = path.extension().string();
+  std::transform(extension.begin(), extension.end(), extension.begin(),
+                 [](unsigned char c) {
+                   return static_cast<char>(std::tolower(c));
+                 });
+  if (extension != ".json") {
+    path += ".json";
+  }
+  return path;
+}
+
 
 std::vector<std::uint8_t> decodeBase64(std::string_view in) {
   static int kDec[256];
@@ -3002,6 +3015,7 @@ void AppSession::clearCommittedPhysicsArtifacts(bool reset_to_source_start) {
   empty_export_preflight_ = {};
   force_export_confirmation_pending = false;
   pending_export_animation_path_.reset();
+  pending_export_all_ = false;
   presentation_mode = PresentationMode::SourcePreview;
   playback_state = PlaybackState::Paused;
   preview_frame_index = 0;
@@ -3312,7 +3326,11 @@ bool AppSession::hasCompleteBake() const {
 }
 
 bool AppSession::exportAnimation(const std::filesystem::path &path) {
-  return exportAnimationInternal(path, false);
+  return exportAnimationInternal(path, false, false);
+}
+
+bool AppSession::exportAllAnimations(const std::filesystem::path &path) {
+  return exportAnimationInternal(path, false, true);
 }
 
 void AppSession::requestAnimationExport(const std::filesystem::path &path) {
@@ -3325,8 +3343,25 @@ void AppSession::requestAnimationExport(const std::filesystem::path &path) {
     return;
   }
   pending_export_animation_path_ = path;
+  pending_export_all_ = false;
   force_export_confirmation_pending = true;
   status = "Animation export requires safety confirmation";
+}
+
+void AppSession::requestAllAnimationsExport(
+    const std::filesystem::path &path) {
+  if (canExportAnimation()) {
+    exportAllAnimations(path);
+    return;
+  }
+  if (!canForceExportAnimation()) {
+    exportAllAnimations(path);
+    return;
+  }
+  pending_export_animation_path_ = path;
+  pending_export_all_ = true;
+  force_export_confirmation_pending = true;
+  status = "Full animation export requires safety confirmation";
 }
 
 void AppSession::confirmAnimationExport(bool proceed) {
@@ -3335,17 +3370,20 @@ void AppSession::confirmAnimationExport(bool proceed) {
     return;
   }
   const auto path = std::move(*pending_export_animation_path_);
+  const bool export_all = pending_export_all_;
   pending_export_animation_path_.reset();
+  pending_export_all_ = false;
   force_export_confirmation_pending = false;
   if (!proceed) {
     status = "Force animation export cancelled";
     return;
   }
-  exportAnimationInternal(path, true);
+  exportAnimationInternal(path, true, export_all);
 }
 
 bool AppSession::exportAnimationInternal(const std::filesystem::path &path,
-                                         bool force_unsafe) {
+                                         bool force_unsafe,
+                                         bool export_all) {
   if (!canExportAnimation() &&
       (!force_unsafe || !canForceExportAnimation())) {
     status = exportPreflight().block_reasons.empty()
@@ -3365,10 +3403,18 @@ bool AppSession::exportAnimationInternal(const std::filesystem::path &path,
       status = "No reference animation for export";
       return false;
     }
-    const std::string id = execution.input.source_animation_name.empty()
-                               ? "animation.xpbd.baked"
-                               : execution.input.source_animation_name +
-                                     ".baked";
+    if (export_all && execution.input.source_animation_name.empty()) {
+      status = "No source animation name for full export";
+      return false;
+    }
+
+    const std::filesystem::path output_path = ensureJsonExtension(path);
+    const std::string id = export_all
+                               ? execution.input.source_animation_name
+                               : execution.input.source_animation_name.empty()
+                                     ? "animation.xpbd.baked"
+                                     : execution.input.source_animation_name +
+                                           ".baked";
     std::optional<export_::TransitionReferenceExport> transition_reference;
     if (execution.baker->isTransitionBake()) {
       execution.baker->requireTransitionReferenceExportable();
@@ -3380,15 +3426,28 @@ bool AppSession::exportAnimationInternal(const std::filesystem::path &path,
           execution.baker->getOutputReferenceDependencyBones();
       transition_reference->model_bones = &execution.input.mapper.allBones();
     }
-    export_::AnimationExporter::exportAnimation(
-        id, reference, *final_result_->frames,
-        execution.baker->getOutputLoopBehavior(), path,
-        transition_reference ? &*transition_reference : nullptr,
-        execution.baker->isTransitionBake());
+
+    if (export_all) {
+      // 全量模式保留全部导入动画，并以原名称覆盖当前烘焙动画。
+      export_::AnimationExporter::exportAllAnimations(
+          animation_root, id, reference, *final_result_->frames,
+          execution.baker->getOutputLoopBehavior(), output_path,
+          transition_reference ? &*transition_reference : nullptr,
+          execution.baker->isTransitionBake());
+    } else {
+      export_::AnimationExporter::exportAnimation(
+          id, reference, *final_result_->frames,
+          execution.baker->getOutputLoopBehavior(), output_path,
+          transition_reference ? &*transition_reference : nullptr,
+          execution.baker->isTransitionBake());
+    }
     status = force_unsafe
-                 ? "Warning: force-exported " + path.filename().string() +
+                 ? "Warning: force-exported " +
+                       output_path.filename().string() +
                        " despite safety preflight"
-                 : "Exported " + path.filename().string();
+                 : (export_all ? "Exported all animations to "
+                               : "Exported ") +
+                       output_path.filename().string();
     return true;
   } catch (const std::exception &e) {
     last_error = e.what();
@@ -4532,9 +4591,10 @@ saveFileDialog(const wchar_t *title, const wchar_t *filter,
   ofn.lpstrFilter = filter;
   ofn.nFilterIndex = 1;
   ofn.lpstrTitle = title;
+  ofn.lpstrDefExt = L"json";
   ofn.Flags = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
   if (GetSaveFileNameW(&ofn) == TRUE) {
-    return std::filesystem::path(file);
+    return ensureJsonExtension(std::filesystem::path(file));
   }
   return std::nullopt;
 }

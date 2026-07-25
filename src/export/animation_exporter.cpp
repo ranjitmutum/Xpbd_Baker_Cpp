@@ -40,15 +40,79 @@ void AnimationExporter::exportAnimation(
   if (anim_id.empty()) {
     throw std::invalid_argument("animation ID must not be blank");
   }
+
+  nlohmann::json root = nlohmann::json::object();
+  root["format_version"] = "1.8.0";
+  root["animations"] = nlohmann::json::object();
+  root["animations"][anim_id] = bakedAnimationToJson(
+      reference_animation, frames, loop_behavior, transition_reference,
+      exact_baked_length);
+  AtomicFileWriter::writeUtf8(file_path, root.dump(2));
+}
+
+void AnimationExporter::exportAllAnimations(
+    const loader::AnimationRoot &source_root,
+    const std::string &baked_animation_id,
+    const loader::Animation *reference_animation,
+    const std::vector<baker::BakedFrame> &frames,
+    loader::Animation::LoopBehavior loop_behavior,
+    const std::filesystem::path &file_path,
+    const TransitionReferenceExport *transition_reference,
+    bool exact_baked_length) {
+  if (baked_animation_id.empty()) {
+    throw std::invalid_argument("baked animation ID must not be blank");
+  }
+  if (!source_root.animations.contains(baked_animation_id)) {
+    throw std::invalid_argument("baked animation is missing from animation root");
+  }
+
+  // 全量导出必须保留导入文件中的动画名称和顺序，仅替换当前烘焙动画的内容。
+  nlohmann::ordered_json root = nlohmann::ordered_json::object();
+  root["format_version"] = source_root.format_version.empty()
+                               ? "1.8.0"
+                               : source_root.format_version;
+  nlohmann::ordered_json animations = nlohmann::ordered_json::object();
+  std::unordered_set<std::string> written_names;
+
+  const auto write_animation = [&](const std::string &name) {
+    const auto found = source_root.animations.find(name);
+    if (found == source_root.animations.end() ||
+        !written_names.insert(name).second) {
+      return;
+    }
+    if (name == baked_animation_id) {
+      animations[name] = bakedAnimationToJson(
+          reference_animation, frames, loop_behavior, transition_reference,
+          exact_baked_length);
+    } else {
+      animations[name] = sourceAnimationToJson(found->second);
+    }
+  };
+
+  for (const auto &name : source_root.animation_order) {
+    write_animation(name);
+  }
+  for (const auto &[name, animation] : source_root.animations) {
+    (void)animation;
+    write_animation(name);
+  }
+
+  root["animations"] = std::move(animations);
+  AtomicFileWriter::writeUtf8(file_path, root.dump(2));
+}
+
+nlohmann::json AnimationExporter::bakedAnimationToJson(
+    const loader::Animation *reference_animation,
+    const std::vector<baker::BakedFrame> &frames,
+    loader::Animation::LoopBehavior loop_behavior,
+    const TransitionReferenceExport *transition_reference,
+    bool exact_baked_length) {
   if (transition_reference != nullptr &&
       (!transition_reference->sample_pose ||
        transition_reference->model_bones == nullptr)) {
     throw std::invalid_argument(
         "transition reference export requires a pose sampler and model bones");
   }
-
-  nlohmann::json root = nlohmann::json::object();
-  root["format_version"] = "1.8.0";
 
   nlohmann::json anim = nlohmann::json::object();
   if (loop_behavior == loader::Animation::LoopBehavior::HoldLast) {
@@ -267,11 +331,40 @@ void AnimationExporter::exportAnimation(
   }
 
   anim["bones"] = bones;
-  nlohmann::json animations = nlohmann::json::object();
-  animations[anim_id] = anim;
-  root["animations"] = animations;
+  return anim;
+}
 
-  AtomicFileWriter::writeUtf8(file_path, root.dump(2));
+nlohmann::json AnimationExporter::sourceAnimationToJson(
+    const loader::Animation &animation) {
+  nlohmann::json result = nlohmann::json::object();
+  if (animation.loop_behavior == loader::Animation::LoopBehavior::HoldLast) {
+    result["loop"] = "hold_on_last_frame";
+  } else {
+    result["loop"] =
+        animation.loop_behavior == loader::Animation::LoopBehavior::Loop;
+  }
+  result["animation_length"] = animation.animation_length;
+  if (animation.override_previous_animation.has_value()) {
+    result["override_previous_animation"] =
+        *animation.override_previous_animation;
+  }
+
+  nlohmann::json bones = nlohmann::json::object();
+  for (const auto &[bone_name, bone] : animation.bones) {
+    nlohmann::json bone_json = nlohmann::json::object();
+    if (bone.has_position) {
+      bone_json["position"] = keyframesToJson(bone.position);
+    }
+    if (bone.has_rotation) {
+      bone_json["rotation"] = keyframesToJson(bone.rotation);
+    }
+    if (bone.has_scale) {
+      bone_json["scale"] = keyframesToJson(bone.scale);
+    }
+    bones[bone_name] = std::move(bone_json);
+  }
+  result["bones"] = std::move(bones);
+  return result;
 }
 
 nlohmann::json AnimationExporter::keyframesToJson(const loader::Keyframes &kf) {

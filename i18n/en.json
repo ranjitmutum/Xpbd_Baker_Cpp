@@ -3,6 +3,7 @@
   "open_anim": "Open Anim",
   "import_tex": "Import Tex",
   "export_anim": "Export Anim",
+  "export_all_anim": "Export All",
   "export_vel": "Export Vel",
   "clear_tex": "Clear Tex",
   "about": "About",

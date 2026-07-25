@@ -713,7 +713,9 @@ public:
   void resetBake();
   void shutdownBakeWorker();
   bool exportAnimation(const std::filesystem::path &path);
+  bool exportAllAnimations(const std::filesystem::path &path);
   void requestAnimationExport(const std::filesystem::path &path);
+  void requestAllAnimationsExport(const std::filesystem::path &path);
   void confirmAnimationExport(bool proceed);
   bool exportVelocity(const std::filesystem::path &path);
   bool exportDiagnostics(const std::filesystem::path &path);
@@ -755,7 +757,7 @@ private:
   [[nodiscard]] std::vector<loader::MolangBakeWarning>
   collectPendingMolangWarnings() const;
   bool exportAnimationInternal(const std::filesystem::path &path,
-                               bool force_unsafe);
+                               bool force_unsafe, bool export_all);
   bool molang_approved_once_ = false;
   std::uint64_t model_generation_ = 0;
   std::uint64_t animation_generation_ = 0;
@@ -771,6 +773,7 @@ private:
   mutable baker::BakedPreviewScratch preview_sample_scratch_;
   ExportPreflight empty_export_preflight_{};
   std::optional<std::filesystem::path> pending_export_animation_path_;
+  bool pending_export_all_ = false;
   bool explicit_cancel_requested_ = false;
 };
 

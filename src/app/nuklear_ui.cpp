@@ -874,20 +874,23 @@ UiFrameResult composeNuklearUi(nk_context *ctx, int win_w, int win_h,
     float w_oa = 88.0f * g.s;
     float w_tex = 88.0f * g.s;
     float w_ea = 88.0f * g.s;
+    float w_all = 88.0f * g.s;
     float w_ev = 80.0f * g.s;
     float w_about = 72.0f * g.s;
-    float need = w_om + w_oa + w_tex + w_ea + w_ev + w_about + gap * 5.0f;
+    float need = w_om + w_oa + w_tex + w_ea + w_all + w_ev + w_about +
+                 gap * 6.0f;
     if (need > inner_w) {
       const float k = inner_w / need;
       w_om *= k;
       w_oa *= k;
       w_tex *= k;
       w_ea *= k;
+      w_all *= k;
       w_ev *= k;
       w_about *= k;
     }
 
-    nk_layout_row_begin(ctx, NK_STATIC, menu_row_h, 6);
+    nk_layout_row_begin(ctx, NK_STATIC, menu_row_h, 7);
     file_btn(tr("open_model"), w_om, true, [&] {
       if (auto p = openFileDialog(
               L"Open Bedrock/Blockbench Model",
@@ -925,6 +928,18 @@ UiFrameResult composeNuklearUi(nk_context *ctx, int win_w, int win_h,
                              L"Animation JSON (*.json)\0*.json\0All\0*.*\0",
                              L"animation.baked.json")) {
         session.requestAnimationExport(*p);
+      }
+    });
+    file_btn(tr("export_all_anim"), w_all,
+             !session.force_export_confirmation_pending &&
+                 (session.canExportAnimation() ||
+                  session.canForceExportAnimation()),
+             [&] {
+      if (auto p =
+              saveFileDialog(L"Export All Animations",
+                             L"Animation JSON (*.json)\0*.json\0All\0*.*\0",
+                             L"animations.full.json")) {
+        session.requestAllAnimationsExport(*p);
       }
     });
     file_btn(tr("export_vel"), w_ev, session.canExportVelocity(), [&] {

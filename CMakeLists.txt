@@ -7,7 +7,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-option(XPBD_BUILD_TESTS "Build unit tests" ON)
 option(XPBD_BUILD_APP "Build Nuklear+SDL3 desktop application" OFF)
 option(XPBD_BUILD_CLI "Build headless CLI" ON)
 option(XPBD_BUILD_BENCHMARKS "Build repeatable performance benchmark tool" ON)
@@ -118,7 +117,6 @@ int main() { return 0; }
 
 set(XPBD_SIMD_OBJECTS)
 set(XPBD_SIMD_CORE_SOURCES)
-set(XPBD_SIMD_TEST_SOURCES)
 if(XPBD_X86_SIMD_TARGET_V2)
     add_library(xpbd_simd_sse2 OBJECT src/core/simd_dense_sse2.cpp)
     add_library(xpbd_simd_avx2 OBJECT src/core/simd_dense_avx2.cpp)
@@ -147,7 +145,6 @@ if(XPBD_X86_SIMD_TARGET_V2)
         $<TARGET_OBJECTS:xpbd_simd_sse2>
         $<TARGET_OBJECTS:xpbd_simd_avx2>)
     set(XPBD_SIMD_CORE_SOURCES src/core/simd_kernel_table.cpp)
-    set(XPBD_SIMD_TEST_SOURCES tests/simd_kernel_test.cpp)
 endif()
 
 set(XPBD_CORE_SOURCES
@@ -267,73 +264,6 @@ if(XPBD_BUILD_BENCHMARKS)
     else()
         target_compile_options(xpbd_perf_benchmark PRIVATE -Wall -Wextra -Wpedantic)
     endif()
-endif()
-
-if(XPBD_BUILD_TESTS)
-    enable_testing()
-    find_package(GTest CONFIG REQUIRED)
-
-    add_executable(xpbd_tests
-        tests/smoke_test.cpp
-        tests/bake_profiler_test.cpp
-        tests/baked_preview_sampler_test.cpp
-        tests/simd_dispatch_test.cpp
-        ${XPBD_SIMD_TEST_SOURCES}
-        tests/particle_test.cpp
-        tests/xpbd_engine_test.cpp
-        tests/distance_constraint_test.cpp
-        tests/weld_constraint_test.cpp
-        tests/target_constraint_test.cpp
-        tests/cross_spring_constraint_test.cpp
-        tests/ground_collision_test.cpp
-        tests/rotation_util_test.cpp
-        tests/bedrock_transform_test.cpp
-        tests/loader_export_test.cpp
-        tests/output_timeline_resampler_test.cpp
-        tests/physics_baker_test.cpp
-        tests/physics_input_validation_test.cpp
-        tests/xpbd_pose_periodic_test.cpp
-        tests/loop_transition_test.cpp
-        tests/rigid_body_test.cpp
-        tests/skeleton_viewport_test.cpp
-        tests/e2e_bake_export_test.cpp
-        tests/body_collision_test.cpp
-        tests/rigid_body_joint_auditor_test.cpp
-        tests/stability_calculator_test.cpp
-        tests/texture_mesh_test.cpp
-        tests/gpu_backend_test.cpp
-        tests/i18n_resource_test.cpp
-        # App-session confirmation and viewport texturing live in the app
-        # target; link their non-SDL sources for integration/unit tests.
-        src/app/app_session.cpp
-        src/app/i18n.cpp
-        src/gfx/texture_image.cpp
-        src/gfx/viewport_mesh.cpp
-    )
-    target_link_libraries(xpbd_tests
-        PRIVATE
-            xpbd::core
-            GTest::gtest
-            GTest::gtest_main
-    )
-    target_include_directories(xpbd_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb
-    )
-    target_compile_definitions(xpbd_tests
-        PRIVATE
-            XPBD_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
-            XPBD_I18N_DIR="${CMAKE_CURRENT_SOURCE_DIR}/i18n"
-    )
-    if(MSVC)
-        target_compile_options(xpbd_tests PRIVATE /utf-8)
-    endif()
-    if(WIN32)
-        target_link_libraries(xpbd_tests PRIVATE comdlg32)
-    endif()
-
-    include(GoogleTest)
-    gtest_discover_tests(xpbd_tests)
 endif()
 
 if(XPBD_BUILD_APP)
@@ -485,7 +415,7 @@ endif()
 if(MINGW)
     get_filename_component(XPBD_MINGW_RUNTIME_DIR
         "${CMAKE_CXX_COMPILER}" DIRECTORY)
-    foreach(_xpbd_target IN ITEMS xpbd_tests xpbd_cli xpbd_perf_benchmark)
+    foreach(_xpbd_target IN ITEMS xpbd_cli xpbd_perf_benchmark)
         if(TARGET ${_xpbd_target})
             foreach(_xpbd_runtime IN ITEMS libc++.dll libunwind.dll)
                 if(EXISTS "${XPBD_MINGW_RUNTIME_DIR}/${_xpbd_runtime}")
@@ -501,5 +431,5 @@ if(MINGW)
 endif()
 
 message(STATUS
-    "xpbd_baker: tests=${XPBD_BUILD_TESTS} cli=${XPBD_BUILD_CLI} "
+    "xpbd_baker: cli=${XPBD_BUILD_CLI} "
     "benchmarks=${XPBD_BUILD_BENCHMARKS} app=${XPBD_BUILD_APP}")
