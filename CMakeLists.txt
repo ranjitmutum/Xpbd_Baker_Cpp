@@ -183,6 +183,7 @@ set(XPBD_CORE_SOURCES
     src/baker/output_timeline_resampler.cpp
     src/baker/rigid_body_collision_auditor.cpp
     src/baker/rigid_body_joint_auditor.cpp
+    src/baker/rigid_body_input_compat.cpp
     src/baker/physics_baker.cpp
     src/baker/body_collider_cache.cpp
     src/loader/bedrock_animation_data.cpp

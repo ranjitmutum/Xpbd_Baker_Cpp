@@ -1,6 +1,7 @@
 #include "xpbd/baker/bone_mapper.hpp"
 #include "xpbd/baker/physics_baker.hpp"
 #include "xpbd/baker/rigid_body_joint_auditor.hpp"
+#include "xpbd/baker/rigid_body_input_compat.hpp"
 #include "xpbd/export/animation_exporter.hpp"
 #include "xpbd/export/velocity_cache_exporter.hpp"
 #include "xpbd/loader/animation_loader.hpp"
@@ -311,6 +312,29 @@ int cmdBake(int argc, char **argv) {
     cfg.loop_mode = xpbd::baker::BoneMapper::LoopMode::Auto;
   }
 
+  xpbd::loader::Animation physics_source_animation = *source_anim;
+  const auto compatibility =
+      xpbd::baker::prepareRigidBodyInputCompatibility(
+          mapper, physics_source_animation);
+  if (mapper.physicsBones().empty()) {
+    throw std::runtime_error(
+        "rigid-body compatibility preflight removed every selected physics "
+        "bone; select at least one bone that owns a usable cube");
+  }
+  for (const auto &bone : compatibility.skipped_blocked_dynamic_bones) {
+    std::cerr << "warning: auto-skipped blocked empty rigid body: " << bone
+              << "\n";
+  }
+  for (const auto &bone : compatibility.promoted_animated_compound_bones) {
+    std::cerr << "warning: promoted animated compound descendant to rigid "
+                 "body in physics copy: "
+              << bone << "\n";
+  }
+  for (const auto &bone : compatibility.repaired_source_scale_bones) {
+    std::cerr << "warning: repaired degenerate scale in physics copy: "
+              << bone << "\n";
+  }
+
   std::cerr << "model:  " << model_path << " (" << geometry.bones.size()
             << " bones)\n";
   std::cerr << "anim:   " << source_name
@@ -319,7 +343,7 @@ int cmdBake(int argc, char **argv) {
             << "  physics_bones=" << mapper.physicsBones().size() << "\n";
 
   xpbd::baker::PhysicsBaker baker(mapper);
-  baker.setSourceAnimation(source_anim);
+  baker.setSourceAnimation(&physics_source_animation);
   baker.setDt(dt);
   baker.initialize();
 

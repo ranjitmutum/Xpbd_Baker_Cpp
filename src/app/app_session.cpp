@@ -1,6 +1,7 @@
 #include "xpbd/app/app_session.hpp"
 
 #include "xpbd/baker/bone_pose_calculator.hpp"
+#include "xpbd/baker/rigid_body_input_compat.hpp"
 #include "xpbd/export/animation_exporter.hpp"
 #include "xpbd/export/velocity_cache_exporter.hpp"
 
@@ -539,7 +540,13 @@ bool loadTextureFromBbEntry(const nlohmann::json &tex,
 struct BakeExecutionState {
   explicit BakeExecutionState(BakeJobInput job);
 
+  [[nodiscard]] const loader::Animation *outputReferenceAnimation() const;
+  [[nodiscard]] std::string compatibilityStatusSuffix() const;
+
   BakeJobInput input;
+  loader::Animation physics_source_animation;
+  std::optional<loader::Animation> physics_target_animation;
+  baker::RigidBodyInputCompatibilityReport compatibility;
   std::optional<baker::TransitionBakeRequest> transition_request;
   std::unique_ptr<baker::PhysicsBaker> baker;
   bool initialized = false;
@@ -2075,18 +2082,28 @@ void runBakeWorker(std::stop_token stop,
 }
 
 BakeExecutionState::BakeExecutionState(BakeJobInput job)
-    : input(std::move(job)),
-      baker(std::make_unique<baker::PhysicsBaker>(input.mapper)) {
+    : input(std::move(job)), physics_source_animation(input.source_animation),
+      physics_target_animation(input.transition_target_animation) {
   auto &config = input.mapper.config();
   config.allow_input_only_molang_zero_fallback =
       input.allow_input_molang_zero;
   config.allow_selected_molang_zero_fallback =
       input.allow_selected_molang_zero;
-  baker->setSourceAnimation(&input.source_animation);
+
+  compatibility = baker::prepareRigidBodyInputCompatibility(
+      input.mapper, physics_source_animation,
+      physics_target_animation ? &*physics_target_animation : nullptr);
+  if (input.mapper.physicsBones().empty()) {
+    throw std::invalid_argument(
+        "rigid-body compatibility preflight removed every selected physics "
+        "bone; select at least one bone that owns a usable cube");
+  }
+
+  baker = std::make_unique<baker::PhysicsBaker>(input.mapper);
+  baker->setSourceAnimation(&physics_source_animation);
   const loader::Animation *target =
-      input.transition_target_animation
-          ? &*input.transition_target_animation
-          : &input.source_animation;
+      physics_target_animation ? &*physics_target_animation
+                               : &physics_source_animation;
   if (input.transition_mode == 0) {
     baker->setTransitionRequest(nullptr);
     baker->setTransitionAnimation(nullptr);
@@ -2095,7 +2112,7 @@ BakeExecutionState::BakeExecutionState(BakeJobInput job)
     baker->setTransitionAnimation(target);
   } else {
     transition_request.emplace(
-        input.source_animation, *target,
+        physics_source_animation, *target,
         std::max(0.0, input.transition_source_exit),
         std::max(0.0, input.transition_target_entry),
         std::max(0.0, input.transition_duration),
@@ -2104,6 +2121,63 @@ BakeExecutionState::BakeExecutionState(BakeJobInput job)
     baker->setTransitionRequest(&*transition_request);
   }
   baker->setDt(input.timing.nominalOutputDt());
+}
+
+const loader::Animation *
+BakeExecutionState::outputReferenceAnimation() const {
+  if (!baker) {
+    return nullptr;
+  }
+  const loader::Animation *reference = baker->getOutputReferenceAnimation();
+  if (reference == &physics_source_animation) {
+    return &input.source_animation;
+  }
+  if (physics_target_animation && reference == &*physics_target_animation) {
+    return input.transition_target_animation
+               ? &*input.transition_target_animation
+               : &input.source_animation;
+  }
+  return reference;
+}
+
+std::string BakeExecutionState::compatibilityStatusSuffix() const {
+  const std::size_t skipped =
+      compatibility.skipped_blocked_dynamic_bones.size();
+  const std::size_t promoted =
+      compatibility.promoted_animated_compound_bones.size();
+  const std::size_t repaired =
+      compatibility.repaired_source_scale_bones.size() +
+      compatibility.repaired_target_scale_bones.size();
+  if (skipped == 0 && promoted == 0 && repaired == 0) {
+    return {};
+  }
+
+  std::ostringstream message;
+  message << " — compatibility: ";
+  bool needs_separator = false;
+  if (skipped != 0) {
+    message << "skipped " << skipped << " blocked empty rigid "
+            << (skipped == 1 ? "body" : "bodies");
+    needs_separator = true;
+  }
+  if (promoted != 0) {
+    if (needs_separator) {
+      message << ", ";
+    }
+    message << "promoted " << promoted << " animated compound "
+            << (promoted == 1 ? "bone" : "bones");
+    needs_separator = true;
+  }
+  if (repaired != 0) {
+    if (needs_separator) {
+      message << ", ";
+    }
+    message << "repaired " << repaired << " degenerate scale channel";
+    if (repaired != 1) {
+      message << "s";
+    }
+  }
+  return message.str();
 }
 
 std::string SessionFingerprint::hex() const {
@@ -3187,7 +3261,7 @@ void AppSession::stepBake() {
     live.output_frame_interval = execution.baker->outputFrameInterval();
     live.frame = execution.baker->captureCurrentFrameForPreview();
     if (const auto *reference =
-            execution.baker->getOutputReferenceAnimation()) {
+            execution.outputReferenceAnimation()) {
       live.reference_animation =
           std::make_shared<const loader::Animation>(*reference);
     }
@@ -3214,7 +3288,8 @@ void AppSession::stepBake() {
                "export audit";
     } else {
       status = "Stepped " + std::to_string(bake_current.load()) + " / " +
-               std::to_string(bake_total.load());
+               std::to_string(bake_total.load()) +
+               execution.compatibilityStatusSuffix();
     }
   } catch (const std::exception &e) {
     last_error = e.what();
@@ -3285,7 +3360,7 @@ bool AppSession::exportAnimationInternal(const std::filesystem::path &path,
       execution.baker->requireSafeForExport();
     }
     const loader::Animation *reference =
-        execution.baker->getOutputReferenceAnimation();
+        execution.outputReferenceAnimation();
     if (reference == nullptr) {
       status = "No reference animation for export";
       return false;
@@ -4127,9 +4202,10 @@ void AppSession::pollBakeProgress() {
     playback_state = PlaybackState::Playing;
     preview_time = 0.0;
     preview_frame_index = 0;
-    status = exportPreflight().animation_allowed
-                 ? "Bake complete"
-                 : "Bake complete — export blocked";
+    status = (exportPreflight().animation_allowed
+                  ? "Bake complete"
+                  : "Bake complete — export blocked") +
+             final_execution_->compatibilityStatusSuffix();
     bake_message = status;
     return;
   }
@@ -4223,7 +4299,7 @@ AppSession::currentPreviewReferenceAnimation() const {
   if (presentation_mode == PresentationMode::FinalBakedPreview &&
       hasCompleteBake()) {
     if (const auto *reference =
-            final_execution_->baker->getOutputReferenceAnimation()) {
+            final_execution_->outputReferenceAnimation()) {
       return reference;
     }
   }

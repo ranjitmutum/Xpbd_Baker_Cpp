@@ -3,6 +3,7 @@
 #include "xpbd/baker/cube_geometry.hpp"
 #include "xpbd/baker/rotation_util.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <sstream>
@@ -188,9 +189,29 @@ Compilation BedrockRigidBodyCompiler::compileCompound(
                 "cube on bone '" + source.bone->name + "' owned by rigid body '" +
                 body_bone.name + "'";
             std::array<double, 3> edgeLengths{};
-            std::array<Vec3, 3> axes{};
             for (std::size_t axis = 0; axis < 3; ++axis) {
                 edgeLengths[axis] = length(edges[axis]);
+            }
+
+            const std::array<double, 3> halfExtents{
+                edgeLengths[0] * unit_scale * 0.5,
+                edgeLengths[1] * unit_scale * 0.5,
+                edgeLengths[2] * unit_scale * 0.5};
+            const bool hasSafeExtents = std::all_of(
+                halfExtents.begin(), halfExtents.end(), [](double halfExtent) {
+                    return std::isfinite(halfExtent) &&
+                           halfExtent >
+                               kBulletSafetyThresholds.minimum_half_extent_error;
+                });
+            if (!hasSafeExtents) {
+                ++result.skipped_degenerate_cube_count;
+                continue;
+            }
+            const double minimumHalfExtent = *std::min_element(
+                halfExtents.begin(), halfExtents.end());
+
+            std::array<Vec3, 3> axes{};
+            for (std::size_t axis = 0; axis < 3; ++axis) {
                 axes[axis] = normalized(edges[axis], geometryContext);
             }
             constexpr double kOrthogonalityTolerance = 1e-8;
@@ -216,17 +237,6 @@ Compilation BedrockRigidBodyCompiler::compileCompound(
                 for (double& component : axes[2]) {
                     component = -component;
                 }
-            }
-
-            std::array<double, 3> halfExtents{
-                edgeLengths[0] * unit_scale * 0.5,
-                edgeLengths[1] * unit_scale * 0.5,
-                edgeLengths[2] * unit_scale * 0.5};
-            if (halfExtents[0] <= kBulletSafetyThresholds.degenerate_minimum_half_extent ||
-                halfExtents[1] <= kBulletSafetyThresholds.degenerate_minimum_half_extent ||
-                halfExtents[2] <= kBulletSafetyThresholds.degenerate_minimum_half_extent) {
-                result.skipped_degenerate_cube_count++;
-                continue;
             }
 
             const std::array<double, 3> centerDelta{
@@ -278,8 +288,9 @@ Compilation BedrockRigidBodyCompiler::compileCompound(
         definition.ccd = CcdSettings{true, smallestHalfExtent * 0.5, smallestHalfExtent * 0.8};
     }
     if (result.skipped_degenerate_cube_count > 0) {
-        result.diagnostic = "skipped " + std::to_string(result.skipped_degenerate_cube_count) +
-                            " degenerate cube(s) owned by " + body_bone.name;
+        result.diagnostic =
+            "skipped " + std::to_string(result.skipped_degenerate_cube_count) +
+            " unsafe or degenerate cube(s) owned by " + body_bone.name;
     }
     result.body = std::move(definition);
     result.collider_diagnostics = diagnose(*result.body, unit_scale);
