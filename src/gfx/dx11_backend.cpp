@@ -337,15 +337,18 @@ public:
 
 
     if (frame.ui) {
-      draws += drawUi(*frame.ui);
+      draws += drawUi(*frame.ui, false);
     }
 
-
+    bool drew_viewport = false;
     if (frame.viewport.w > 1 && frame.viewport.h > 1 && frame.view_matrix &&
         frame.proj_matrix && frame.scene) {
+      drew_viewport = true;
       draws += drawMesh(frame);
     }
-
+    if (drew_viewport && frame.ui && frame.ui->overlay_visible) {
+      draws += drawUi(*frame.ui, true);
+    }
 
 
     stats_.backend_cpu_ms =
@@ -549,7 +552,7 @@ private:
     }
   }
 
-  int drawUi(const UiDrawData &ui) {
+  int drawUi(const UiDrawData &ui, bool overlay_only) {
     if (!ui.ctx || !ui.cmds || !ui.vertices || !ui.indices || !font_srv_) {
       return 0;
     }
@@ -563,18 +566,22 @@ private:
       return 0;
     }
 
-    ensureVb(ui_vb_, ui_vb_cap_, static_cast<UINT>(vsize),
-             nk_buffer_memory_const(ui.vertices));
-    ensureIb(static_cast<UINT>(esize), nk_buffer_memory_const(ui.indices));
+    if (!overlay_only) {
+      ensureVb(ui_vb_, ui_vb_cap_, static_cast<UINT>(vsize),
+               nk_buffer_memory_const(ui.vertices));
+      ensureIb(static_cast<UINT>(esize), nk_buffer_memory_const(ui.indices));
+    }
 
-    float proj[16];
-    makeUiProj(static_cast<float>((std::max)(1, ui.logical_w)),
-               static_cast<float>((std::max)(1, ui.logical_h)), proj);
-    D3D11_MAPPED_SUBRESOURCE map{};
-    if (SUCCEEDED(
-            ctx_->Map(ui_cb_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) {
-      std::memcpy(map.pData, proj, sizeof(proj));
-      ctx_->Unmap(ui_cb_.Get(), 0);
+    if (!overlay_only) {
+      float proj[16];
+      makeUiProj(static_cast<float>((std::max)(1, ui.logical_w)),
+                 static_cast<float>((std::max)(1, ui.logical_h)), proj);
+      D3D11_MAPPED_SUBRESOURCE map{};
+      if (SUCCEEDED(
+              ctx_->Map(ui_cb_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) {
+        std::memcpy(map.pData, proj, sizeof(proj));
+        ctx_->Unmap(ui_cb_.Get(), 0);
+      }
     }
 
     const int fbw = (std::max)(1, ui.fb_w);
@@ -618,6 +625,18 @@ private:
       rc.top = static_cast<LONG>(cmd->clip_rect.y * sy);
       rc.right = static_cast<LONG>((cmd->clip_rect.x + cmd->clip_rect.w) * sx);
       rc.bottom = static_cast<LONG>((cmd->clip_rect.y + cmd->clip_rect.h) * sy);
+      if (overlay_only) {
+        rc.left = (std::max)(
+            rc.left, static_cast<LONG>(ui.overlay_x * sx));
+        rc.top = (std::max)(
+            rc.top, static_cast<LONG>(ui.overlay_y * sy));
+        rc.right = (std::min)(
+            rc.right,
+            static_cast<LONG>((ui.overlay_x + ui.overlay_w) * sx));
+        rc.bottom = (std::min)(
+            rc.bottom,
+            static_cast<LONG>((ui.overlay_y + ui.overlay_h) * sy));
+      }
       if (rc.right <= rc.left || rc.bottom <= rc.top) {
         idx_off += cmd->elem_count;
         continue;

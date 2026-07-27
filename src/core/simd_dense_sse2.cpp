@@ -68,4 +68,56 @@ double boxProjectionOverlapSse2(const double *first_xyz_soa,
                   maximum_second - minimum_first);
 }
 
+void targetPositionSse2(double *position, double *lambda, const double *target,
+                        double alpha, double weight,
+                        double denominator) noexcept {
+  const __m128d position_xy = _mm_loadu_pd(position);
+  const __m128d target_xy = _mm_loadu_pd(target);
+  const __m128d lambda_xy = _mm_loadu_pd(lambda);
+  const __m128d numerator_xy =
+      _mm_add_pd(_mm_sub_pd(position_xy, target_xy),
+                 _mm_mul_pd(_mm_set1_pd(alpha), lambda_xy));
+  const __m128d delta_xy =
+      _mm_div_pd(_mm_sub_pd(_mm_setzero_pd(), numerator_xy),
+                 _mm_set1_pd(denominator));
+  _mm_storeu_pd(lambda, _mm_add_pd(lambda_xy, delta_xy));
+  _mm_storeu_pd(
+      position,
+      _mm_add_pd(position_xy, _mm_mul_pd(_mm_set1_pd(weight), delta_xy)));
+
+  const double delta_z =
+      -(position[2] - target[2] + alpha * lambda[2]) / denominator;
+  lambda[2] += delta_z;
+  position[2] += weight * delta_z;
+}
+
+void affineTransform8Sse2(double *output_xyz_aos,
+                          const double *input_xyz_aos,
+                          const double *linear_3x3,
+                          const double *translation) noexcept {
+  const __m128d column_x_xy =
+      _mm_set_pd(linear_3x3[3], linear_3x3[0]);
+  const __m128d column_y_xy =
+      _mm_set_pd(linear_3x3[4], linear_3x3[1]);
+  const __m128d column_z_xy =
+      _mm_set_pd(linear_3x3[5], linear_3x3[2]);
+  const __m128d translation_xy =
+      _mm_set_pd(translation[1], translation[0]);
+  for (std::size_t vertex = 0; vertex < 8; ++vertex) {
+    const std::size_t offset = vertex * 3;
+    const double x = input_xyz_aos[offset];
+    const double y = input_xyz_aos[offset + 1];
+    const double z = input_xyz_aos[offset + 2];
+    const __m128d xy = _mm_add_pd(
+        _mm_add_pd(_mm_mul_pd(_mm_set1_pd(x), column_x_xy),
+                   _mm_mul_pd(_mm_set1_pd(y), column_y_xy)),
+        _mm_add_pd(_mm_mul_pd(_mm_set1_pd(z), column_z_xy),
+                   translation_xy));
+    _mm_storeu_pd(output_xyz_aos + offset, xy);
+    output_xyz_aos[offset + 2] =
+        linear_3x3[6] * x + linear_3x3[7] * y + linear_3x3[8] * z +
+        translation[2];
+  }
+}
+
 }

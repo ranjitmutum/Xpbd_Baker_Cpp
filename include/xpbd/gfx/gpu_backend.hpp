@@ -33,6 +33,11 @@ struct UiDrawData {
   int logical_h = 0;
   int fb_w = 0;
   int fb_h = 0;
+  bool overlay_visible = false;
+  float overlay_x = 0.0f;
+  float overlay_y = 0.0f;
+  float overlay_w = 0.0f;
+  float overlay_h = 0.0f;
 };
 
 struct ViewportRect {

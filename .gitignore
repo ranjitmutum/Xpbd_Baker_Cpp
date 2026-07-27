@@ -117,3 +117,5 @@ xpbd_gfx_log.txt
 !*.py
 ![Mm]akefile
 !*.mk
+
+out/

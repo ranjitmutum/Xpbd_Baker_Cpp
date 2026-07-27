@@ -800,7 +800,7 @@ public:
 
     int draws = 0;
     if (draw_ui) {
-      stats_.ui_commands = drawUi(fs, *frame.ui);
+      stats_.ui_commands = drawUi(fs, *frame.ui, false);
       draws += stats_.ui_commands;
     }
     write_timestamp(GpuTimestampQuery::UiEnd,
@@ -934,6 +934,11 @@ public:
                       VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
       write_timestamp(GpuTimestampQuery::LinesEnd,
                       VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    }
+    if (draw_ui && draw_viewport && frame.ui->overlay_visible) {
+      const int overlay_commands = drawUi(fs, *frame.ui, true);
+      stats_.ui_commands += overlay_commands;
+      draws += overlay_commands;
     }
 
     stats_.draw_calls = draws;
@@ -2421,7 +2426,7 @@ private:
     }
   }
 
-  int drawUi(FrameSync &frame, const UiDrawData &ui);
+  int drawUi(FrameSync &frame, const UiDrawData &ui, bool overlay_only);
 };
 
 
@@ -2648,7 +2653,8 @@ bool VulkanBackend::createPipelines() {
   return true;
 }
 
-int VulkanBackend::drawUi(FrameSync &frame, const UiDrawData &ui) {
+int VulkanBackend::drawUi(FrameSync &frame, const UiDrawData &ui,
+                          bool overlay_only) {
   if (!ui.ctx || !ui.cmds || !ui.vertices || !ui.indices) {
     return 0;
   }
@@ -2703,20 +2709,33 @@ int VulkanBackend::drawUi(FrameSync &frame, const UiDrawData &ui) {
     if (!dcmd || dcmd->elem_count == 0) {
       continue;
     }
+    int32_t x1 = static_cast<int32_t>(dcmd->clip_rect.x * sx);
+    int32_t y1 = static_cast<int32_t>(dcmd->clip_rect.y * sy);
+    int32_t x2 = static_cast<int32_t>(
+        (dcmd->clip_rect.x + dcmd->clip_rect.w) * sx);
+    int32_t y2 = static_cast<int32_t>(
+        (dcmd->clip_rect.y + dcmd->clip_rect.h) * sy);
+    if (overlay_only) {
+      x1 = (std::max)(x1, static_cast<int32_t>(ui.overlay_x * sx));
+      y1 = (std::max)(y1, static_cast<int32_t>(ui.overlay_y * sy));
+      x2 = (std::min)(
+          x2, static_cast<int32_t>((ui.overlay_x + ui.overlay_w) * sx));
+      y2 = (std::min)(
+          y2, static_cast<int32_t>((ui.overlay_y + ui.overlay_h) * sy));
+    }
+    x1 = (std::max)(x1, 0);
+    y1 = (std::max)(y1, 0);
+    x2 = (std::min)(x2, static_cast<int32_t>(swap_extent_.width));
+    y2 = (std::min)(y2, static_cast<int32_t>(swap_extent_.height));
+    if (x2 <= x1 || y2 <= y1) {
+      index_offset += dcmd->elem_count;
+      continue;
+    }
     VkRect2D sc{};
-    sc.offset.x = static_cast<int32_t>(dcmd->clip_rect.x * sx);
-    sc.offset.y = static_cast<int32_t>(dcmd->clip_rect.y * sy);
-    sc.extent.width =
-        static_cast<uint32_t>((std::max)(dcmd->clip_rect.w * sx, 0.0f));
-    sc.extent.height =
-        static_cast<uint32_t>((std::max)(dcmd->clip_rect.h * sy, 0.0f));
-
-    if (sc.offset.x < 0) {
-      sc.offset.x = 0;
-    }
-    if (sc.offset.y < 0) {
-      sc.offset.y = 0;
-    }
+    sc.offset.x = x1;
+    sc.offset.y = y1;
+    sc.extent.width = static_cast<uint32_t>(x2 - x1);
+    sc.extent.height = static_cast<uint32_t>(y2 - y1);
     vkCmdSetScissor(cmd, 0, 1, &sc);
     vkCmdDrawIndexed(cmd, dcmd->elem_count, 1, index_offset, 0, 0);
     index_offset += dcmd->elem_count;

@@ -1,9 +1,11 @@
 #pragma once
 
 #include "xpbd/baker/bone_pose_calculator.hpp"
+#include "xpbd/core/simd_dispatch.hpp"
 #include "xpbd/loader/bedrock_model_data.hpp"
 
 #include <array>
+#include <cstddef>
 
 namespace xpbd::baker {
 
@@ -16,6 +18,17 @@ public:
 
 
     [[nodiscard]] static std::array<double, 24> bindVertices(const loader::Cube& cube);
+
+    [[nodiscard]] static std::array<double, 24>
+    transformPoints8(const BonePoseCalculator::Pose& pose,
+                     const std::array<double, 24>& points);
+    [[nodiscard]] static std::array<double, 24>
+    transformPoints8(const BonePoseCalculator::Pose& pose,
+                     const std::array<double, 24>& points,
+                     core::SimdMode mode);
+
+    [[nodiscard]] static core::SimdMode
+    recommendedTransformSimdMode(std::size_t cube_count) noexcept;
 
     static void transformPoint(const BonePoseCalculator::Pose& pose, double x, double y,
                                double z, double result[3]);

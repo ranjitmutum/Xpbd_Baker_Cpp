@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #if defined(_WIN32)
@@ -364,6 +365,14 @@ void lineToQuad(float x0, float y0, float x1, float y1, float thickness,
 
 void SkeletonViewport::setGeometry(const loader::Geometry *geometry) {
   geometry_ = geometry;
+  std::size_t cube_count = 0;
+  if (geometry_ != nullptr) {
+    for (const auto &bone : geometry_->bones) {
+      cube_count += bone.cubes.size();
+    }
+  }
+  transform_simd_mode_ =
+      baker::CubeGeometry::recommendedTransformSimdMode(cube_count);
 }
 
 void SkeletonViewport::setBoneMapper(const baker::BoneMapper *mapper) {
@@ -412,17 +421,16 @@ bool SkeletonViewport::computeBounds(std::array<float, 3> &center,
     }
     for (const auto &cube : bone.cubes) {
       const auto bind = baker::CubeGeometry::bindVertices(cube);
+      auto transformed = baker::CubeGeometry::transformPoints8(
+          pose_it->second, bind, transform_simd_mode_);
       for (int v = 0; v < 8; ++v) {
-        double world[3];
-        baker::CubeGeometry::transformPoint(
-            pose_it->second, bind[static_cast<std::size_t>(v * 3)],
-            bind[static_cast<std::size_t>(v * 3 + 1)],
-            bind[static_cast<std::size_t>(v * 3 + 2)], world);
+        const auto offset = static_cast<std::size_t>(v * 3);
         if (mcbe_coords_) {
-          applyMcbeBasis(world[0], world[2]);
+          applyMcbeBasis(transformed[offset], transformed[offset + 2]);
         }
-        expandBounds(min_x, min_y, min_z, max_x, max_y, max_z, world[0],
-                     world[1], world[2]);
+        expandBounds(min_x, min_y, min_z, max_x, max_y, max_z,
+                     transformed[offset], transformed[offset + 1],
+                     transformed[offset + 2]);
         any = true;
       }
     }
@@ -547,15 +555,14 @@ void SkeletonViewport::appendCubes(
       double wx[8], wy[8], wz[8];
       bool ok[8];
       int visible = 0;
+      const auto transformed =
+          baker::CubeGeometry::transformPoints8(
+              pose_it->second, bind, transform_simd_mode_);
       for (int v = 0; v < 8; ++v) {
-        double world[3];
-        baker::CubeGeometry::transformPoint(
-            pose_it->second, bind[static_cast<std::size_t>(v * 3)],
-            bind[static_cast<std::size_t>(v * 3 + 1)],
-            bind[static_cast<std::size_t>(v * 3 + 2)], world);
-        wx[v] = world[0];
-        wy[v] = world[1];
-        wz[v] = world[2];
+        const auto offset = static_cast<std::size_t>(v * 3);
+        wx[v] = transformed[offset];
+        wy[v] = transformed[offset + 1];
+        wz[v] = transformed[offset + 2];
         if (mcbe_coords_) {
           applyMcbeBasis(wx[v], wz[v]);
         }
@@ -615,7 +622,7 @@ void SkeletonViewport::appendCubes(
 SkeletonDrawList SkeletonViewport::projectPoses(
     const std::map<std::string, baker::BonePoseCalculator::Pose> &poses,
     const ViewportCamera &camera, float view_w, float view_h,
-    bool baked_style) const {
+    bool baked_style, bool sort_by_depth) const {
   SkeletonDrawList list;
   if (geometry_ == nullptr || poses.empty() || view_w < 2.0f || view_h < 2.0f) {
     return list;
@@ -711,23 +718,29 @@ SkeletonDrawList SkeletonViewport::projectPoses(
   }
 
 
-  std::sort(list.faces.begin(), list.faces.end(),
-            [](const ProjectedFace &a, const ProjectedFace &b) {
-              return a.depth > b.depth;
-            });
-  std::sort(list.segments.begin(), list.segments.end(),
-            [](const ProjectedSegment &a, const ProjectedSegment &b) {
-              return a.depth > b.depth;
-            });
-  std::sort(list.joints.begin(), list.joints.end(),
-            [](const ProjectedJoint &a, const ProjectedJoint &b) {
-              return a.depth > b.depth;
-            });
+  if (sort_by_depth) {
+    std::sort(list.faces.begin(), list.faces.end(),
+              [](const ProjectedFace &a, const ProjectedFace &b) {
+                return a.depth > b.depth;
+              });
+    std::sort(list.segments.begin(), list.segments.end(),
+              [](const ProjectedSegment &a, const ProjectedSegment &b) {
+                return a.depth > b.depth;
+              });
+    std::sort(list.joints.begin(), list.joints.end(),
+              [](const ProjectedJoint &a, const ProjectedJoint &b) {
+                return a.depth > b.depth;
+              });
+  }
   return list;
 }
 
-std::string pickBone(const SkeletonDrawList &list, float x, float y,
-                     float tolerance) {
+namespace {
+
+std::string pickBoneCandidates(const SkeletonDrawList &list, float x, float y,
+                               float tolerance,
+                               const std::uint32_t *face_indices,
+                               std::size_t face_count) {
   std::string best_name;
   float best_depth = (std::numeric_limits<float>::max)();
   float best_distance_squared = (std::numeric_limits<float>::max)();
@@ -746,10 +759,22 @@ std::string pickBone(const SkeletonDrawList &list, float x, float y,
     }
   };
 
-  for (const auto &face : list.faces) {
+  const auto testFace = [&](const ProjectedFace &face) {
     if (!face.is_ground && !face.bone_name.empty() &&
         pointInQuad(x, y, face.xy)) {
       consider(face.bone_name, faceDepthAt(face, x, y), 0.0f);
+    }
+  };
+  if (face_indices != nullptr || face_count == 0) {
+    for (std::size_t i = 0; i < face_count; ++i) {
+      const std::uint32_t face_index = face_indices[i];
+      if (face_index < list.faces.size()) {
+        testFace(list.faces[face_index]);
+      }
+    }
+  } else {
+    for (const auto &face : list.faces) {
+      testFace(face);
     }
   }
 
@@ -776,34 +801,167 @@ std::string pickBone(const SkeletonDrawList &list, float x, float y,
   return best_name;
 }
 
+} // namespace
+
+std::string pickBone(const SkeletonDrawList &list, float x, float y,
+                     float tolerance) {
+  return pickBoneCandidates(list, x, y, tolerance, nullptr, list.faces.size());
+}
+
+BonePickIndex buildBonePickIndex(SkeletonDrawList draw_list, float view_w,
+                                 float view_h, float cell_size) {
+  BonePickIndex index;
+  index.draw_list = std::move(draw_list);
+  if (!std::isfinite(view_w) || !std::isfinite(view_h) || view_w < 1.0f ||
+      view_h < 1.0f) {
+    return index;
+  }
+
+  index.cell_size =
+      std::clamp(std::isfinite(cell_size) ? cell_size : 64.0f, 16.0f, 256.0f);
+  index.columns = static_cast<std::uint32_t>(
+      std::max(1.0, std::ceil(static_cast<double>(view_w) / index.cell_size)));
+  index.rows = static_cast<std::uint32_t>(
+      std::max(1.0, std::ceil(static_cast<double>(view_h) / index.cell_size)));
+  const std::size_t cell_count =
+      static_cast<std::size_t>(index.columns) * index.rows;
+  std::vector<std::uint32_t> counts(cell_count, 0);
+
+  const auto visitFaceCells = [&](const ProjectedFace &face,
+                                  const auto &visitor) {
+    if (face.is_ground || face.bone_name.empty()) {
+      return;
+    }
+    float min_x = face.xy[0];
+    float max_x = face.xy[0];
+    float min_y = face.xy[1];
+    float max_y = face.xy[1];
+    for (std::size_t i = 2; i < face.xy.size(); i += 2) {
+      min_x = std::min(min_x, face.xy[i]);
+      max_x = std::max(max_x, face.xy[i]);
+      min_y = std::min(min_y, face.xy[i + 1]);
+      max_y = std::max(max_y, face.xy[i + 1]);
+    }
+    if (max_x < 0.0f || max_y < 0.0f || min_x > view_w ||
+        min_y > view_h) {
+      return;
+    }
+    const int first_x = std::clamp(
+        static_cast<int>(std::floor(std::max(0.0f, min_x) / index.cell_size)),
+        0, static_cast<int>(index.columns) - 1);
+    const int last_x = std::clamp(
+        static_cast<int>(std::floor(std::min(view_w, max_x) /
+                                    index.cell_size)),
+        0, static_cast<int>(index.columns) - 1);
+    const int first_y = std::clamp(
+        static_cast<int>(std::floor(std::max(0.0f, min_y) / index.cell_size)),
+        0, static_cast<int>(index.rows) - 1);
+    const int last_y = std::clamp(
+        static_cast<int>(std::floor(std::min(view_h, max_y) /
+                                    index.cell_size)),
+        0, static_cast<int>(index.rows) - 1);
+    for (int cell_y = first_y; cell_y <= last_y; ++cell_y) {
+      for (int cell_x = first_x; cell_x <= last_x; ++cell_x) {
+        visitor(static_cast<std::size_t>(cell_y) * index.columns +
+                static_cast<std::size_t>(cell_x));
+      }
+    }
+  };
+
+  for (const auto &face : index.draw_list.faces) {
+    visitFaceCells(face, [&](std::size_t cell) { ++counts[cell]; });
+  }
+
+  index.cell_offsets.resize(cell_count + 1, 0);
+  for (std::size_t cell = 0; cell < cell_count; ++cell) {
+    index.cell_offsets[cell + 1] = index.cell_offsets[cell] + counts[cell];
+  }
+  index.face_indices.resize(index.cell_offsets.back());
+  std::vector<std::uint32_t> cursors(index.cell_offsets.begin(),
+                                     index.cell_offsets.end() - 1);
+  for (std::uint32_t face_index = 0;
+       face_index < index.draw_list.faces.size(); ++face_index) {
+    visitFaceCells(index.draw_list.faces[face_index], [&](std::size_t cell) {
+      index.face_indices[cursors[cell]++] = face_index;
+    });
+  }
+  return index;
+}
+
+std::string pickBone(const BonePickIndex &index, float x, float y,
+                     float tolerance, BonePickDiagnostics *diagnostics) {
+  const std::uint32_t total_faces =
+      static_cast<std::uint32_t>(std::min<std::size_t>(
+          index.draw_list.faces.size(),
+          (std::numeric_limits<std::uint32_t>::max)()));
+  if (diagnostics != nullptr) {
+    diagnostics->candidate_face_count = total_faces;
+    diagnostics->total_face_count = total_faces;
+  }
+  if (index.columns == 0 || index.rows == 0 || index.cell_offsets.empty() ||
+      x < 0.0f || y < 0.0f) {
+    return pickBone(index.draw_list, x, y, tolerance);
+  }
+
+  const int cell_x = static_cast<int>(std::floor(x / index.cell_size));
+  const int cell_y = static_cast<int>(std::floor(y / index.cell_size));
+  if (cell_x < 0 || cell_y < 0 ||
+      cell_x >= static_cast<int>(index.columns) ||
+      cell_y >= static_cast<int>(index.rows)) {
+    if (diagnostics != nullptr) {
+      diagnostics->candidate_face_count = 0;
+    }
+    return pickBoneCandidates(index.draw_list, x, y, tolerance, nullptr, 0);
+  }
+
+  const std::size_t cell =
+      static_cast<std::size_t>(cell_y) * index.columns +
+      static_cast<std::size_t>(cell_x);
+  const std::uint32_t begin = index.cell_offsets[cell];
+  const std::uint32_t end = index.cell_offsets[cell + 1];
+  if (diagnostics != nullptr) {
+    diagnostics->candidate_face_count = end - begin;
+  }
+  const std::uint32_t *candidates =
+      begin < end ? index.face_indices.data() + begin : nullptr;
+  return pickBoneCandidates(index.draw_list, x, y, tolerance, candidates,
+                            end - begin);
+}
+
 SkeletonDrawList SkeletonViewport::buildRest(const ViewportCamera &camera,
-                                             float view_w, float view_h) const {
-  return projectPoses(restPoses(), camera, view_w, view_h, false);
+                                             float view_w, float view_h,
+                                             bool sort_by_depth) const {
+  return projectPoses(restPoses(), camera, view_w, view_h, false,
+                      sort_by_depth);
 }
 
 SkeletonDrawList
 SkeletonViewport::buildAnimation(const loader::Animation *animation,
                                  double time, const ViewportCamera &camera,
-                                 float view_w, float view_h) const {
+                                 float view_w, float view_h,
+                                 bool sort_by_depth) const {
   if (geometry_ == nullptr) {
     return {};
   }
   const auto poses =
       baker::BonePoseCalculator::calculate(geometry_->bones, animation, time);
-  return projectPoses(poses, camera, view_w, view_h, false);
+  return projectPoses(poses, camera, view_w, view_h, false, sort_by_depth);
 }
 
 SkeletonDrawList SkeletonViewport::buildBaked(const baker::BakedFrame &frame,
                                               const ViewportCamera &camera,
                                               float view_w,
-                                              float view_h) const {
-  return buildBaked(frame, nullptr, 0.0, camera, view_w, view_h);
+                                              float view_h,
+                                              bool sort_by_depth) const {
+  return buildBaked(frame, nullptr, 0.0, camera, view_w, view_h,
+                    sort_by_depth);
 }
 
 SkeletonDrawList SkeletonViewport::buildBaked(
     const baker::BakedFrame &frame,
     const loader::Animation *reference_animation, double reference_time,
-    const ViewportCamera &camera, float view_w, float view_h) const {
+    const ViewportCamera &camera, float view_w, float view_h,
+    bool sort_by_depth) const {
   if (geometry_ == nullptr) {
     return {};
   }
@@ -837,7 +995,7 @@ SkeletonDrawList SkeletonViewport::buildBaked(
       }
     }
   }
-  return projectPoses(poses, camera, view_w, view_h, true);
+  return projectPoses(poses, camera, view_w, view_h, true, sort_by_depth);
 }
 
 SoftRasterImage softRasterize(const SkeletonDrawList &list, int width,

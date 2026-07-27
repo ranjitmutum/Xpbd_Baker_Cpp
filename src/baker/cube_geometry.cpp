@@ -1,6 +1,11 @@
 #include "xpbd/baker/cube_geometry.hpp"
 
 #include "xpbd/baker/bedrock_transform_resolver.hpp"
+#if defined(XPBD_HAS_X86_SIMD)
+#include "../core/simd_kernels.hpp"
+#endif
+
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
@@ -47,6 +52,69 @@ std::array<double, 24> CubeGeometry::bindVertices(const loader::Cube& cube) {
         }
     }
     return result;
+}
+
+std::array<double, 24> CubeGeometry::transformPoints8(
+    const BonePoseCalculator::Pose& pose,
+    const std::array<double, 24>& points) {
+    return transformPoints8(pose, points, core::SimdMode::Auto);
+}
+
+std::array<double, 24> CubeGeometry::transformPoints8(
+    const BonePoseCalculator::Pose& pose,
+    const std::array<double, 24>& points,
+    core::SimdMode mode) {
+    std::array<double, 24> result{};
+#if defined(XPBD_HAS_X86_SIMD)
+    static const auto sse2_kernel =
+        core::detail::selectedSimdKernelTable(core::SimdMode::SSE2)
+            .affine_transform_8;
+    static const auto avx2_kernel =
+        core::detail::selectedSimdKernelTable(core::SimdMode::AVX2)
+            .affine_transform_8;
+    static const auto auto_kernel =
+        core::detail::selectedSimdKernelTable(core::SimdMode::Auto)
+            .affine_transform_8;
+    const auto kernel = mode == core::SimdMode::SSE2
+                            ? sse2_kernel
+                            : (mode == core::SimdMode::AVX2 ? avx2_kernel
+                                                           : auto_kernel);
+    kernel(result.data(), points.data(), pose.world_linear.data(),
+           pose.world_translation.data());
+#else
+    for (std::size_t vertex = 0; vertex < 8; ++vertex) {
+        const std::size_t offset = vertex * 3;
+        const double x = points[offset];
+        const double y = points[offset + 1];
+        const double z = points[offset + 2];
+        result[offset] = pose.world_linear[0] * x + pose.world_linear[1] * y +
+                         pose.world_linear[2] * z + pose.world_translation[0];
+        result[offset + 1] =
+            pose.world_linear[3] * x + pose.world_linear[4] * y +
+            pose.world_linear[5] * z + pose.world_translation[1];
+        result[offset + 2] =
+            pose.world_linear[6] * x + pose.world_linear[7] * y +
+            pose.world_linear[8] * z + pose.world_translation[2];
+    }
+#endif
+    if (!std::all_of(result.begin(), result.end(),
+                     [](double value) { return std::isfinite(value); })) {
+        throw std::invalid_argument("transformed model point must be finite");
+    }
+    return result;
+}
+
+core::SimdMode
+CubeGeometry::recommendedTransformSimdMode(std::size_t cube_count) noexcept {
+    if (!core::detectSimdCapabilities().avx2Usable()) {
+        return core::SimdMode::SSE2;
+    }
+    // On the supported 8-point AoS kernel, AVX2 wins while the per-frame
+    // working set is moderate. Around ten thousand cubes the wider masked
+    // stores and AVX frequency cost lose to SSE2, so large models switch back.
+    constexpr std::size_t kAvx2MaximumCubeCount = 6144;
+    return cube_count <= kAvx2MaximumCubeCount ? core::SimdMode::AVX2
+                                               : core::SimdMode::SSE2;
 }
 
 void CubeGeometry::transformPoint(const BonePoseCalculator::Pose& pose, double x, double y,

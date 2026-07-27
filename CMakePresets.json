@@ -10,71 +10,36 @@
       "name": "base",
       "hidden": true,
       "binaryDir": "${sourceDir}/out/build/${presetName}",
+      "environment": {
+      "VCPKG_ROOT": "C:/vcpkg",
+      "HTTP_PROXY": "http://127.0.0.1:7892",
+      "HTTPS_PROXY": "http://127.0.0.1:7892",
+      "NO_PROXY": "127.0.0.1,localhost"
+      },
       "cacheVariables": {
         "CMAKE_TOOLCHAIN_FILE": {
           "type": "FILEPATH",
-          "value": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+          "value": "C:/vcpkg/scripts/buildsystems/vcpkg.cmake"
         },
         "VCPKG_TARGET_TRIPLET": "x64-windows",
         "VCPKG_INSTALLED_DIR": {
           "type": "PATH",
           "value": "${sourceDir}/vcpkg_installed"
         },
-        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "XPBD_BUILD_TESTS": "ON",
+        "XPBD_BUILD_TESTS": "OFF",
         "XPBD_BUILD_CLI": "ON",
-        "XPBD_BUILD_APP": "OFF"
+        "XPBD_BUILD_APP": "ON",
+        "XPBD_BUILD_BENCHMARKS": "OFF"
       }
     },
     {
-      "name": "windows-msvc-debug",
-      "displayName": "Windows MSVC Debug (CLion)",
-      "description": "MSVC + shared vcpkg_installed. Select this preset in CLion Settings → CMake.",
-      "inherits": "base",
-      "generator": "Ninja",
-      "architecture": {
-        "value": "x64",
-        "strategy": "external"
-      },
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug"
-      },
-      "condition": {
-        "type": "equals",
-        "lhs": "${hostSystemName}",
-        "rhs": "Windows"
-      },
-      "vendor": {
-        "jetbrains.com/clion": {
-          "toolchain": "Visual Studio"
-        }
-      }
-    },
-    {
-      "name": "windows-msvc-release",
-      "displayName": "Windows MSVC Release",
-      "inherits": "base",
-      "generator": "Ninja",
-      "architecture": {
-        "value": "x64",
-        "strategy": "external"
-      },
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release"
-      },
-      "condition": {
-        "type": "equals",
-        "lhs": "${hostSystemName}",
-        "rhs": "Windows"
-      }
-    },
-    {
-      "name": "windows-vs",
-      "displayName": "Windows Visual Studio (build.bat default layout)",
+      "name": "vscode-windows-app",
+      "displayName": "VS Code Windows App",
+      "description": "使用 Visual Studio Build Tools 2022 编译桌面程序",
       "inherits": "base",
       "generator": "Visual Studio 17 2022",
       "architecture": "x64",
-      "binaryDir": "${sourceDir}/build",
+      "binaryDir": "${sourceDir}/out/build/vscode-windows-app",
       "condition": {
         "type": "equals",
         "lhs": "${hostSystemName}",
@@ -84,35 +49,13 @@
   ],
   "buildPresets": [
     {
-      "name": "windows-msvc-debug",
-      "configurePreset": "windows-msvc-debug"
-    },
-    {
-      "name": "windows-msvc-release",
-      "configurePreset": "windows-msvc-release",
-      "configuration": "Release"
-    },
-    {
-      "name": "windows-vs-release",
-      "configurePreset": "windows-vs",
-      "configuration": "Release"
-    }
-  ],
-  "testPresets": [
-    {
-      "name": "windows-msvc-debug",
-      "configurePreset": "windows-msvc-debug",
-      "output": {
-        "outputOnFailure": true
-      }
-    },
-    {
-      "name": "windows-vs-release",
-      "configurePreset": "windows-vs",
+      "name": "vscode-windows-app-release",
+      "displayName": "VS Code Windows App Release",
+      "configurePreset": "vscode-windows-app",
       "configuration": "Release",
-      "output": {
-        "outputOnFailure": true
-      }
+      "targets": [
+        "xpbd_baker_app"
+      ]
     }
   ]
 }

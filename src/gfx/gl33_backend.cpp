@@ -338,13 +338,13 @@ public:
 
 
     if (frame.ui) {
-      drawUi(*frame.ui, draws);
+      drawUi(*frame.ui, draws, false);
     }
 
-
-
+    bool drew_viewport = false;
     if (frame.viewport.w > 1 && frame.viewport.h > 1 && frame.view_matrix &&
         frame.proj_matrix && frame.scene) {
+      drew_viewport = true;
       const int vx = frame.viewport.x;
       const int vy = fbh - (frame.viewport.y + frame.viewport.h);
       const int vw = frame.viewport.w;
@@ -408,6 +408,9 @@ public:
       gl::Disable(GL_SCISSOR_TEST);
       gl::Viewport(0, 0, fbw, fbh);
     }
+    if (drew_viewport && frame.ui && frame.ui->overlay_visible) {
+      drawUi(*frame.ui, draws, true);
+    }
 
     stats_.backend_cpu_ms =
         std::chrono::duration<float, std::milli>(Clock::now() - t0).count();
@@ -420,7 +423,7 @@ public:
     SDL_GL_SwapWindow(window_);
   }
 
-  void drawUi(const UiDrawData &ui, int &draws) {
+  void drawUi(const UiDrawData &ui, int &draws, bool overlay_only) {
     if (!ui.ctx || !ui.cmds || !ui.vertices || !ui.indices) {
       return;
     }
@@ -474,11 +477,13 @@ public:
     gl::Uniform1i(loc_ui_tex_, 0);
 
     gl::BindVertexArray(vao_ui_);
-    upload(vbo_ui_, GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vsize),
-           nk_buffer_memory_const(ui.vertices), ui_v_cap_);
-    gl::BindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo_ui_);
-    upload(ebo_ui_, GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(esize),
-           nk_buffer_memory_const(ui.indices), ui_e_cap_);
+    if (!overlay_only) {
+      upload(vbo_ui_, GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vsize),
+             nk_buffer_memory_const(ui.vertices), ui_v_cap_);
+      gl::BindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo_ui_);
+      upload(ebo_ui_, GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(esize),
+             nk_buffer_memory_const(ui.indices), ui_e_cap_);
+    }
 
     const nk_draw_command *cmd = nullptr;
     nk_size off = 0;
@@ -495,12 +500,22 @@ public:
       gl::ActiveTexture(GL_TEXTURE0);
       gl::BindTexture(GL_TEXTURE_2D, tex);
 
-      const float x = cmd->clip_rect.x * scale_x;
-      const float y = cmd->clip_rect.y * scale_y;
-      const float w = cmd->clip_rect.w * scale_x;
-      const float h = cmd->clip_rect.h * scale_y;
-      gl::Scissor((GLint)x, (GLint)((float)fbh - (y + h)),
-                  (GLsizei)(std::max)(w, 0.0f), (GLsizei)(std::max)(h, 0.0f));
+      float x1 = cmd->clip_rect.x * scale_x;
+      float y1 = cmd->clip_rect.y * scale_y;
+      float x2 = (cmd->clip_rect.x + cmd->clip_rect.w) * scale_x;
+      float y2 = (cmd->clip_rect.y + cmd->clip_rect.h) * scale_y;
+      if (overlay_only) {
+        x1 = (std::max)(x1, ui.overlay_x * scale_x);
+        y1 = (std::max)(y1, ui.overlay_y * scale_y);
+        x2 = (std::min)(x2, (ui.overlay_x + ui.overlay_w) * scale_x);
+        y2 = (std::min)(y2, (ui.overlay_y + ui.overlay_h) * scale_y);
+      }
+      if (x2 <= x1 || y2 <= y1) {
+        off += (nk_size)cmd->elem_count * sizeof(nk_draw_index);
+        continue;
+      }
+      gl::Scissor((GLint)x1, (GLint)((float)fbh - y2),
+                  (GLsizei)(x2 - x1), (GLsizei)(y2 - y1));
 
       gl::DrawElements(GL_TRIANGLES, (GLsizei)cmd->elem_count,
                        GL_UNSIGNED_SHORT, (const void *)(uintptr_t)off);

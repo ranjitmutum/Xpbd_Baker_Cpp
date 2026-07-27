@@ -347,6 +347,12 @@ void VertexFaceCollisionConstraint::recordContact(
     models::Particle &particle, int particle_index,
     const baker::BodyColliderCache::Collider &collider, int face,
     double before_x, double before_y, double before_z, double dt) {
+  const auto idx = static_cast<std::size_t>(particle_index);
+  // 与地面约束一致的首次接触锁存：后续求解迭代中的再接触是被前一次
+  // 投影削减过的位移，用它重算入射速度会把恢复系数系统性冲淡为 0。
+  if (touched_[idx]) {
+    return;
+  }
   const double nx = collider.getCurrentNormal(face, 0);
   const double ny = collider.getCurrentNormal(face, 1);
   const double nz = collider.getCurrentNormal(face, 2);
@@ -374,7 +380,6 @@ void VertexFaceCollisionConstraint::recordContact(
     invalid_value_count_++;
     return;
   }
-  const auto idx = static_cast<std::size_t>(particle_index);
   touched_[idx] = true;
   normal_x_[idx] = nx;
   normal_y_[idx] = ny;

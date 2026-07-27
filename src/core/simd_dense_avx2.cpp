@@ -72,4 +72,52 @@ double boxProjectionOverlapAvx2(const double *first_xyz_soa,
                   maximum_second - minimum_first);
 }
 
+void targetPositionAvx2(double *position, double *lambda, const double *target,
+                        double alpha, double weight,
+                        double denominator) noexcept {
+  const __m256i mask = _mm256_set_epi64x(0, -1, -1, -1);
+  const __m256d position_xyz = _mm256_maskload_pd(position, mask);
+  const __m256d target_xyz = _mm256_maskload_pd(target, mask);
+  const __m256d lambda_xyz = _mm256_maskload_pd(lambda, mask);
+  const __m256d numerator_xyz =
+      _mm256_add_pd(_mm256_sub_pd(position_xyz, target_xyz),
+                    _mm256_mul_pd(_mm256_set1_pd(alpha), lambda_xyz));
+  const __m256d delta_xyz =
+      _mm256_div_pd(_mm256_sub_pd(_mm256_setzero_pd(), numerator_xyz),
+                    _mm256_set1_pd(denominator));
+  _mm256_maskstore_pd(lambda, mask, _mm256_add_pd(lambda_xyz, delta_xyz));
+  _mm256_maskstore_pd(
+      position, mask,
+      _mm256_add_pd(position_xyz,
+                    _mm256_mul_pd(_mm256_set1_pd(weight), delta_xyz)));
+}
+
+void affineTransform8Avx2(double *output_xyz_aos,
+                          const double *input_xyz_aos,
+                          const double *linear_3x3,
+                          const double *translation) noexcept {
+  const __m256i mask = _mm256_set_epi64x(0, -1, -1, -1);
+  const __m256d column_x = _mm256_set_pd(
+      0.0, linear_3x3[6], linear_3x3[3], linear_3x3[0]);
+  const __m256d column_y = _mm256_set_pd(
+      0.0, linear_3x3[7], linear_3x3[4], linear_3x3[1]);
+  const __m256d column_z = _mm256_set_pd(
+      0.0, linear_3x3[8], linear_3x3[5], linear_3x3[2]);
+  const __m256d translation_xyz =
+      _mm256_set_pd(0.0, translation[2], translation[1], translation[0]);
+  for (std::size_t vertex = 0; vertex < 8; ++vertex) {
+    const std::size_t offset = vertex * 3;
+    const __m256d xyz = _mm256_add_pd(
+        _mm256_add_pd(
+            _mm256_mul_pd(_mm256_set1_pd(input_xyz_aos[offset]), column_x),
+            _mm256_mul_pd(_mm256_set1_pd(input_xyz_aos[offset + 1]),
+                          column_y)),
+        _mm256_add_pd(
+            _mm256_mul_pd(_mm256_set1_pd(input_xyz_aos[offset + 2]),
+                          column_z),
+            translation_xyz));
+    _mm256_maskstore_pd(output_xyz_aos + offset, mask, xyz);
+  }
+}
+
 }

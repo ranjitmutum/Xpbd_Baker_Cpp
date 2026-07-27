@@ -2,6 +2,7 @@
 
 #include "xpbd/baker/baked_frame.hpp"
 #include "xpbd/baker/bone_mapper.hpp"
+#include "xpbd/core/simd_dispatch.hpp"
 #include "xpbd/gfx/texture_image.hpp"
 #include "xpbd/loader/bedrock_animation_data.hpp"
 #include "xpbd/loader/bedrock_model_data.hpp"
@@ -134,6 +135,7 @@ public:
   void setGeometry(const loader::Geometry *geometry);
   void setBoneMapper(const baker::BoneMapper *mapper) { mapper_ = mapper; }
   void setSelectedBone(std::string name) { selected_bone_ = std::move(name); }
+  void setHoveredBone(std::string name) { hovered_bone_ = std::move(name); }
   void setHiddenBones(const std::set<std::string> *hidden_bones) {
     hidden_bones_ = hidden_bones;
   }
@@ -141,6 +143,10 @@ public:
   void setShowBones(bool v) { show_bones_ = v; }
   void setShowGround(bool v) { show_ground_ = v; }
   void setMcbeCoords(bool v) { mcbe_coords_ = v; }
+  void setTransformSimdMode(core::SimdMode mode);
+  [[nodiscard]] core::SimdMode transformSimdMode() const {
+    return transform_simd_mode_;
+  }
 
   void buildRest(ViewportGpuScene &out) const;
   void buildAnimation(const loader::Animation *animation, double time,
@@ -170,9 +176,11 @@ private:
   const std::set<std::string> *hidden_bones_ = nullptr;
   const TextureImage *texture_ = nullptr;
   std::string selected_bone_;
+  std::string hovered_bone_;
   bool show_bones_ = true;
   bool show_ground_ = true;
   bool mcbe_coords_ = false;
+  core::SimdMode transform_simd_mode_ = core::SimdMode::SSE2;
   std::optional<baker::BonePoseCalculator::Evaluator> pose_evaluator_;
   std::map<std::string, baker::BonePoseCalculator::Pose> rest_poses_;
   ViewportGpuScene ground_cache_;
@@ -203,7 +211,8 @@ void buildSessionViewportScene(const loader::Geometry &geometry,
                                bool mcbe_coords, ViewportGpuScene &out,
                                bool show_ground = true,
                                const std::set<std::string> *hidden_bones =
-                                   nullptr);
+                                   nullptr,
+                               const std::string &hovered_bone = {});
 
 
 

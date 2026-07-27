@@ -819,6 +819,11 @@ void PhysicsBaker::initialize() {
                           cfg.turbulence);
 
   const auto &physicsBones = bone_mapper_.physicsBones();
+  owned_particles_.reserve(physicsBones.size());
+  owned_constraints_.reserve(physicsBones.size() * 3U + 2U);
+  if (!hasPeriodicLoop()) {
+    frames_.reserve(static_cast<std::size_t>(total_steps_) + 1U);
+  }
   collision_particles_.assign(physicsBones.size(), nullptr);
   animation_targets_.assign(physicsBones.size(), nullptr);
 
@@ -1518,6 +1523,14 @@ void PhysicsBaker::finalizeFrames() {
   profiler_.addCounter(BakeProfiler::Counter::UnsafeFinalCollisions,
                        static_cast<long>(unsafe_final_collision_count_));
   total_bake_scope_.reset();
+}
+
+std::vector<BakedFrame> PhysicsBaker::takeFinalizedFrames() {
+  if (!frames_finalized_ || current_step_ < total_steps_) {
+    throw std::logic_error(
+        "bake frames can only be transferred after finalization");
+  }
+  return std::move(frames_);
 }
 
 void PhysicsBaker::resampleOutputTimeline() {
@@ -2529,10 +2542,15 @@ void PhysicsBaker::rebuildFinalWorldPositionsAndAudit() {
       }
       state.world_position = pose->second.world_position;
       state.has_world_position = true;
+      // 审计基于 1e-4 量化后的导出通道重建世界位姿：静止接触恰好停在
+      // 约束表面上，量化噪声（经父链放大）可达 ~1e-3 模型单位，必须给
+      // 判定留出该量级的容差，否则约一半的静止接触帧会被误标为不安全。
+      constexpr double kQuantizedAuditTolerance = 1e-3;
       if (ground_collision_constraint_ != nullptr &&
           !bone_mapper_.isFixedBone(state.bone_name) &&
           pose->second.world_position[1] <
-              ground_collision_constraint_->minimumY() - 1e-9) {
+              ground_collision_constraint_->minimumY() -
+                  kQuantizedAuditTolerance) {
         unsafe_final_collision_count_++;
       }
       if (body_collision_constraint_ != nullptr &&
@@ -2542,7 +2560,8 @@ void PhysicsBaker::rebuildFinalWorldPositionsAndAudit() {
               pose->second.world_position[0],
               pose->second.world_position[1],
               pose->second.world_position[2],
-              body_collision_constraint_->skin())) {
+              body_collision_constraint_->skin() -
+                  kQuantizedAuditTolerance)) {
         unsafe_final_collision_count_++;
       }
     }

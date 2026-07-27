@@ -258,7 +258,10 @@ std::vector<BakedFrame> OutputTimelineResampler::resample(
   std::size_t lower_index = 0;
   for (std::size_t step = 0; step <= whole_steps; ++step) {
     const double time = static_cast<double>(step) * target_interval;
-    if (time >= clip_length) {
+    // step*interval 与 clip_length 网格对齐时约有一半概率向下舍入 1 ulp，
+    // 不加 epsilon 会在半开区间末尾多发出一帧 t≈L 的重复帧（等于第 0 帧），
+    // Closed 模式下则产生相距 1 ulp 的两帧，毒化接缝速度测量。
+    if (time >= clip_length - kTimeEpsilon) {
       break;
     }
     while (lower_index + 1 < source.size() &&

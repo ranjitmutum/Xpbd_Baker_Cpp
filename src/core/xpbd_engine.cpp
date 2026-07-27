@@ -59,6 +59,9 @@ void XpbdEngine::setSimdMode(SimdMode mode) noexcept {
 #else
   dense_scaled_add_kernel_ = denseScaledAddScalar;
 #endif
+  for (constraints::Constraint *constraint : constraints_) {
+    constraint->setSimdMode(simd_diagnostics_.selected);
+  }
 }
 
 void XpbdEngine::addParticle(models::Particle *particle) {
@@ -79,6 +82,7 @@ void XpbdEngine::addConstraint(constraints::Constraint *constraint) {
     throw std::invalid_argument("constraint");
   }
   constraints_.push_back(constraint);
+  constraint->setSimdMode(simd_diagnostics_.selected);
 }
 
 void XpbdEngine::setGravity(const models::Vector3 &g) {
@@ -171,8 +175,9 @@ void XpbdEngine::step(double dt, double forcingTime, double forcingPeriod) {
 
 
 
-  if (dense_prediction_eligible_ &&
-      simd_diagnostics_.requested != SimdMode::Auto) {
+  // Auto 模式同样走 dense 预测路径：内核已在 setSimdMode 中按 CPU 能力
+  // 选定（AVX2 优先，回退 SSE2），与显式指定模式共用同一条代码路径。
+  if (dense_prediction_eligible_) {
     for (std::size_t dense_index = 0;
          dense_index < dynamic_particle_indices_.size(); ++dense_index) {
       const std::size_t particle_index = dynamic_particle_indices_[dense_index];

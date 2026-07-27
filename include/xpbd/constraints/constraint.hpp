@@ -2,7 +2,12 @@
 
 #include "xpbd/models/particle.hpp"
 
+#include <cstdint>
 #include <span>
+
+namespace xpbd::core {
+enum class SimdMode : std::uint8_t;
+}
 
 namespace xpbd::constraints {
 
@@ -16,6 +21,7 @@ public:
     virtual ~Constraint() = default;
     virtual void solve(std::span<models::Particle* const> particles, double dt) = 0;
     virtual void resetLambda() = 0;
+    virtual void setSimdMode(core::SimdMode) noexcept {}
 };
 
 }

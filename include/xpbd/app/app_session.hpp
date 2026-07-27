@@ -41,6 +41,13 @@ enum class BakeState {
   Failed
 };
 enum class PlaybackState { Paused, Playing };
+
+struct ViewportPickDiagnostics {
+  bool cache_rebuilt = false;
+  std::uint32_t candidate_face_count = 0;
+  std::uint32_t total_face_count = 0;
+};
+
 enum class WorkerPhase {
   Preparing,
   Simulating,
@@ -579,11 +586,16 @@ public:
   bool viewport_right_drag = false;
   bool show_bones = true;
 
+  // 视口中鼠标当前悬停的组（每帧由主循环拾取更新，仅用于高亮显示）。
+  std::string hovered_bone_name;
+
 
   std::set<std::string> hidden_bone_names;
 
   bool bone_context_open = false;
   std::string bone_context_bone_name;
+  float bone_context_anchor_x = 0.0f;
+  float bone_context_anchor_y = 0.0f;
 
   bool show_ground = true;
 
@@ -594,7 +606,7 @@ public:
   bool camera_follow_preview = false;
 
 
-  bool use_mcbe_coords = false;
+  bool use_mcbe_coords = true;
   gfx::TextureImage model_texture;
   std::string texture_path;
 
@@ -625,6 +637,11 @@ public:
   float debug_ema_frame_ms = 16.0f;
   float debug_mesh_ms = 0.0f;
   float debug_upload_ms = 0.0f;
+  float debug_pick_ms = 0.0f;
+  float debug_pick_queries = 0.0f;
+  float debug_pick_cache_rebuilds = 0.0f;
+  std::uint32_t debug_pick_candidate_faces = 0;
+  std::uint32_t debug_pick_total_faces = 0;
 
   double debug_upload_bytes = 0.0;
   double debug_static_bone_upload_bytes = 0.0;
@@ -693,7 +710,14 @@ public:
   void setBoneVisible(const std::string &name, bool visible);
   [[nodiscard]] std::string pickBoneAt(float viewport_x, float viewport_y,
                                        float view_w, float view_h);
-  bool openBoneContext(const std::string &name);
+  [[nodiscard]] std::uint64_t viewportPickStateToken(float view_w,
+                                                     float view_h) const;
+  [[nodiscard]] const ViewportPickDiagnostics &
+  lastViewportPickDiagnostics() const noexcept {
+    return last_viewport_pick_diagnostics_;
+  }
+  bool openBoneContext(const std::string &name, float anchor_x = -1.0f,
+                       float anchor_y = -1.0f);
   void closeBoneContext();
   void loadSelectedBoneEditors();
   bool applySelectedBoneConfig();
@@ -740,7 +764,8 @@ public:
   [[nodiscard]] bool canPreview() const;
   [[nodiscard]] double previewLength() const;
   [[nodiscard]] render::SkeletonDrawList buildViewportDrawList(float view_w,
-                                                               float view_h);
+                                                               float view_h,
+                                                               bool sort_by_depth = true);
   [[nodiscard]] const baker::BakedFrame *currentPreviewFrame() const;
   void setPreviewFrameIndex(int index);
 
@@ -763,6 +788,10 @@ private:
   std::uint64_t animation_generation_ = 0;
   std::uint64_t texture_generation_ = 0;
   std::uint64_t physics_generation_ = 0;
+  bool viewport_pick_cache_valid_ = false;
+  std::uint64_t viewport_pick_cache_token_ = 0;
+  render::BonePickIndex viewport_pick_cache_;
+  ViewportPickDiagnostics last_viewport_pick_diagnostics_{};
   SessionFingerprint active_job_fingerprint_{};
   std::optional<std::jthread> bake_thread;
   std::shared_ptr<BakeWorkerMailbox> worker_mailbox_;

@@ -112,6 +112,7 @@ public:
   [[nodiscard]] const std::vector<BakedFrame> &frames() const {
     return frames_;
   }
+  [[nodiscard]] std::vector<BakedFrame> takeFinalizedFrames();
 
   [[nodiscard]] BakedFrame captureCurrentFrameForPreview();
   [[nodiscard]] int currentStep() const { return current_step_; }

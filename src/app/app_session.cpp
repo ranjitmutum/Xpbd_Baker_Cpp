@@ -2049,24 +2049,21 @@ void runBakeWorker(std::stop_token stop,
     }
     mailbox->current = execution->baker->currentStep();
     mailbox->phase = WorkerPhase::Committing;
-    auto frame_copy = std::make_shared<std::vector<baker::BakedFrame>>();
-    frame_copy->reserve(execution->baker->frames().size());
-    for (const auto &frame : execution->baker->frames()) {
-      if (stop.stop_requested()) {
-        throw baker::BakeCancelled{};
-      }
-      frame_copy->push_back(frame);
-    }
-    result.frames = std::move(frame_copy);
-    if (stop.stop_requested()) {
-      throw baker::BakeCancelled{};
-    }
     result.export_preflight = preflightFor(*execution);
     if (stop.stop_requested()) {
       throw baker::BakeCancelled{};
     }
     result.diagnostics =
         diagnosticsFor(*execution, WorkerPhase::Finished, resumed_from_step);
+    if (stop.stop_requested()) {
+      throw baker::BakeCancelled{};
+    }
+    // Diagnostics and preflight consume the baker-owned view first. The final
+    // immutable result can then take the vector allocation in O(1), avoiding a
+    // deep copy of every frame and bone state without touching their contents.
+    result.frames =
+        std::make_shared<const std::vector<baker::BakedFrame>>(
+            execution->baker->takeFinalizedFrames());
     result.terminal_state = BakeState::Completed;
     {
       std::lock_guard lock(mailbox->mutex);
@@ -2707,15 +2704,72 @@ void AppSession::setBoneVisible(const std::string &name, bool visible) {
 
 std::string AppSession::pickBoneAt(float viewport_x, float viewport_y,
                                    float view_w, float view_h) {
+  last_viewport_pick_diagnostics_ = {};
   if (geometry.bones.empty() || viewport_x < 0.0f || viewport_y < 0.0f ||
       viewport_x > view_w || viewport_y > view_h) {
     return {};
   }
-  return render::pickBone(buildViewportDrawList(view_w, view_h), viewport_x,
-                          viewport_y);
+  if (camera_needs_fit) {
+    fitCameraToModel();
+  }
+
+  const std::uint64_t state_token = viewportPickStateToken(view_w, view_h);
+  if (!viewport_pick_cache_valid_ ||
+      viewport_pick_cache_token_ != state_token) {
+    viewport_pick_cache_ = render::buildBonePickIndex(
+        buildViewportDrawList(view_w, view_h, false), view_w, view_h);
+    viewport_pick_cache_token_ = state_token;
+    viewport_pick_cache_valid_ = true;
+    last_viewport_pick_diagnostics_.cache_rebuilt = true;
+  }
+
+  render::BonePickDiagnostics diagnostics;
+  std::string result =
+      render::pickBone(viewport_pick_cache_, viewport_x, viewport_y, 6.0f,
+                       &diagnostics);
+  last_viewport_pick_diagnostics_.candidate_face_count =
+      diagnostics.candidate_face_count;
+  last_viewport_pick_diagnostics_.total_face_count =
+      diagnostics.total_face_count;
+  return result;
 }
 
-bool AppSession::openBoneContext(const std::string &name) {
+std::uint64_t AppSession::viewportPickStateToken(float view_w,
+                                                 float view_h) const {
+  FingerprintBuilder hash;
+  hash.addInteger(model_generation_);
+  hash.addInteger(animation_generation_);
+  hash.addInteger(physics_generation_);
+  hash.addInteger(static_cast<int>(presentation_mode));
+  hash.addString(selected_animation_name);
+  hash.addDouble(preview_time);
+  hash.addInteger(preview_frame_index);
+  hash.addDouble(view_w);
+  hash.addDouble(view_h);
+  hash.addDouble(camera.yaw_deg);
+  hash.addDouble(camera.pitch_deg);
+  hash.addDouble(camera.distance);
+  hash.addDouble(camera.pan_x);
+  hash.addDouble(camera.pan_y);
+  hash.addDouble(camera.pan_z);
+  hash.addDouble(camera.fov_y_deg);
+  hash.addDouble(camera.near_z);
+  hash.addBool(camera_needs_fit);
+  hash.addBool(show_bones);
+  hash.addBool(use_mcbe_coords);
+  hash.addInteger(hidden_bone_names.size());
+  for (const auto &name : hidden_bone_names) {
+    hash.addString(name);
+  }
+  if (live_frame_) {
+    hash.addDouble(live_frame_->frame.time);
+    hash.addInteger(live_frame_->frame.bone_states.size());
+  }
+  return hash.finish().value;
+}
+
+bool AppSession::openBoneContext(const std::string &name, float anchor_x,
+                                 float anchor_y) {
   const bool known = std::any_of(
       geometry.bones.begin(), geometry.bones.end(),
       [&](const loader::Bone &bone) { return bone.name == name; });
@@ -2727,6 +2781,10 @@ bool AppSession::openBoneContext(const std::string &name) {
     return false;
   }
   bone_context_bone_name = name;
+  if (anchor_x >= 0.0f && anchor_y >= 0.0f) {
+    bone_context_anchor_x = anchor_x;
+    bone_context_anchor_y = anchor_y;
+  }
   bone_context_open = true;
   return true;
 }
@@ -4531,7 +4589,8 @@ void AppSession::advancePreview(float dt_seconds) {
 }
 
 render::SkeletonDrawList AppSession::buildViewportDrawList(float view_w,
-                                                           float view_h) {
+                                                           float view_h,
+                                                           bool sort_by_depth) {
   skeleton_view.setGeometry(geometry.bones.empty() ? nullptr : &geometry);
   skeleton_view.setBoneMapper(&bone_mapper);
   skeleton_view.setSelectedBone(selected_bone_name);
@@ -4547,16 +4606,18 @@ render::SkeletonDrawList AppSession::buildViewportDrawList(float view_w,
     if (const auto *frame = currentPreviewFrame()) {
       return skeleton_view.buildBaked(
           *frame, currentPreviewReferenceAnimation(),
-          currentPreviewReferenceTime(), camera, view_w, view_h);
+          currentPreviewReferenceTime(), camera, view_w, view_h,
+          sort_by_depth);
     }
   }
 
   if (selected_animation != nullptr) {
     return skeleton_view.buildAnimation(selected_animation, preview_time,
-                                        camera, view_w, view_h);
+                                        camera, view_w, view_h,
+                                        sort_by_depth);
   }
 
-  return skeleton_view.buildRest(camera, view_w, view_h);
+  return skeleton_view.buildRest(camera, view_w, view_h, sort_by_depth);
 }
 
 #if defined(_WIN32)

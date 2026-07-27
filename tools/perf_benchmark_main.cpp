@@ -10,6 +10,7 @@
 #include "xpbd/core/simd_dispatch.hpp"
 #include "xpbd/core/xpbd_engine.hpp"
 #include "xpbd/gfx/viewport_mesh.hpp"
+#include "xpbd/loader/model_loader.hpp"
 #include "xpbd/models/particle.hpp"
 #include "xpbd/rigidbody/rigid_body_bake_session.hpp"
 
@@ -51,6 +52,8 @@ struct Options {
   int trace_capacity = 256;
   std::string diagnostics = "contacts";
   std::string mode = "all";
+  xpbd::core::SimdMode transform_simd_mode = xpbd::core::SimdMode::Auto;
+  std::filesystem::path model;
   std::filesystem::path output;
 };
 
@@ -65,6 +68,8 @@ struct Options {
       "[--xpbd-steps N] [--values N] [--kernel-iterations N] "
       "[--rigid-substeps N] [--diagnostics none|contacts|full] "
       "[--trace-capacity N] "
+      "[--model model.geo.json|model.bbmodel] "
+      "[--simd-mode auto|sse2|avx2] "
       "[--output result.json]");
 }
 
@@ -120,6 +125,19 @@ Options parseOptions(int argc, char **argv) {
       options.rigid_substeps = parsePositive<int>(next(), flag);
     } else if (flag == "--trace-capacity") {
       options.trace_capacity = parsePositive<int>(next(), flag);
+    } else if (flag == "--model") {
+      options.model = std::filesystem::path(next());
+    } else if (flag == "--simd-mode") {
+      const std::string_view value = next();
+      if (value == "auto") {
+        options.transform_simd_mode = xpbd::core::SimdMode::Auto;
+      } else if (value == "sse2") {
+        options.transform_simd_mode = xpbd::core::SimdMode::SSE2;
+      } else if (value == "avx2") {
+        options.transform_simd_mode = xpbd::core::SimdMode::AVX2;
+      } else {
+        usageError("--simd-mode must be auto, sse2, or avx2");
+      }
     } else if (flag == "--diagnostics") {
       options.diagnostics = std::string(next());
       if (options.diagnostics != "none" &&
@@ -138,6 +156,8 @@ Options parseOptions(int argc, char **argv) {
              "[--xpbd-steps N] [--values N] [--kernel-iterations N] "
              "[--rigid-substeps N] [--diagnostics none|contacts|full] "
              "[--trace-capacity N] "
+             "[--model model.geo.json|model.bbmodel] "
+             "[--simd-mode auto|sse2|avx2] "
              "[--output result.json]\n";
       std::exit(0);
     } else {
@@ -265,11 +285,18 @@ xpbd::gfx::TextureImage makeBenchmarkTexture() {
 }
 
 nlohmann::json benchmarkUv(const Options &options) {
-  auto geometry = makeUvGeometry(options.cube_count);
+  auto geometry = options.model.empty()
+                      ? makeUvGeometry(options.cube_count)
+                      : xpbd::loader::ModelLoader::load(options.model);
+  std::size_t cubeCount = 0;
+  for (const auto &bone : geometry.bones) {
+    cubeCount += bone.cubes.size();
+  }
   auto texture = makeBenchmarkTexture();
   xpbd::gfx::ViewportMeshBuilder builder;
   builder.setGeometry(&geometry);
-  builder.setTexture(&texture);
+  builder.setTransformSimdMode(options.transform_simd_mode);
+  builder.setTexture(options.model.empty() ? &texture : nullptr);
   builder.setShowBones(false);
   builder.setShowGround(false);
 
@@ -316,8 +343,11 @@ nlohmann::json benchmarkUv(const Options &options) {
   const std::size_t staticGroundFrameBytes =
       staticGroundFrame.bones.size() * sizeof(xpbd::gfx::StaticModelBoneState) +
       staticGroundOverlayVertices * sizeof(xpbd::gfx::MeshVertex);
-  return {{"cube_count", options.cube_count},
-          {"texture", {{"width", texture.width}, {"height", texture.height}}},
+  nlohmann::json result = {{"cube_count", cubeCount},
+          {"texture",
+           {{"enabled", options.model.empty()},
+            {"width", options.model.empty() ? texture.width : 0},
+            {"height", options.model.empty() ? texture.height : 0}}},
           {"legacy_per_frame",
            {{"timing", toJson(legacyTiming)},
             {"solid_vertices", legacy.solid.size()},
@@ -356,6 +386,13 @@ nlohmann::json benchmarkUv(const Options &options) {
            staticFrameBytes == 0 ? 0.0
                                  : static_cast<double>(legacyBytes) /
                                        static_cast<double>(staticFrameBytes)}};
+  if (!options.model.empty()) {
+    result["model"] = options.model.u8string();
+    result["bone_count"] = geometry.bones.size();
+  }
+  result["transform_simd_mode"] =
+      xpbd::core::simdModeName(builder.transformSimdMode());
+  return result;
 }
 
 nlohmann::json benchmarkXpbd(const Options &options) {
@@ -410,6 +447,7 @@ struct ProfiledBakeRun {
   xpbd::baker::BakeProfiler::Snapshot snapshot;
   std::size_t frame_count = 0;
   int simulation_steps = 0;
+  double checksum = 0.0;
 };
 
 ProfiledBakeRun runProfiledBake(const Options &options) {
@@ -448,7 +486,7 @@ ProfiledBakeRun runProfiledBake(const Options &options) {
   config.transition_duration = 0.0;
   config.solver_iterations = 8;
   config.enable_ground_collision = false;
-  config.simd_mode = xpbd::core::SimdMode::Auto;
+  config.simd_mode = options.transform_simd_mode;
 
   constexpr double dt = 1.0 / 60.0;
   Animation animation;
@@ -464,7 +502,16 @@ ProfiledBakeRun runProfiledBake(const Options &options) {
   baker.setProfiler(profiler);
   baker.initialize();
   baker.runToEnd();
-  return {profiler.snapshot(), baker.frames().size(), baker.totalSteps()};
+  auto finalizedFrames = baker.takeFinalizedFrames();
+  double checksum = 0.0;
+  if (!finalizedFrames.empty()) {
+    for (const auto &state : finalizedFrames.back().bone_states) {
+      checksum += state.position[0] + state.position[1] + state.position[2];
+      checksum += state.rotation[0] + state.rotation[1] + state.rotation[2];
+    }
+  }
+  return {profiler.snapshot(), finalizedFrames.size(), baker.totalSteps(),
+          checksum};
 }
 
 nlohmann::json benchmarkBakeProfile(const Options &options) {
@@ -519,6 +566,8 @@ nlohmann::json benchmarkBakeProfile(const Options &options) {
       {"requested_steps", options.xpbd_steps_per_sample},
       {"simulation_steps", last.simulation_steps},
       {"output_frames", last.frame_count},
+      {"simd_mode", xpbd::core::simdModeName(options.transform_simd_mode)},
+      {"checksum", last.checksum},
       {"profiled_bake_timing", toJson(profiledBakeTiming)},
       {"construction_plus_bake_timing", toJson(constructionInclusiveTiming)},
       {"stages", std::move(stages)},
@@ -814,6 +863,17 @@ double frameLayoutChecksum(
 
 nlohmann::json benchmarkFrameLayout(const Options &options) {
   const auto fixture = makeFrameLayoutBenchmarkFixture(options);
+  std::shared_ptr<const std::vector<xpbd::baker::BakedFrame>>
+      deepCopiedFrames;
+  const auto deepCopyTiming = measure(options.warmup, options.samples, [&] {
+    auto copy =
+        std::make_shared<std::vector<xpbd::baker::BakedFrame>>();
+    copy->reserve(fixture.frames.size());
+    for (const auto &frame : fixture.frames) {
+      copy->push_back(frame);
+    }
+    deepCopiedFrames = std::move(copy);
+  });
   std::vector<xpbd::baker::BakedFrame> resampled;
   const auto resampleTiming = measure(options.warmup, options.samples, [&] {
     resampled = xpbd::baker::OutputTimelineResampler::resample(
@@ -831,6 +891,9 @@ nlohmann::json benchmarkFrameLayout(const Options &options) {
   return {
       {"bone_count", options.bone_count},
       {"source_frame_count", fixture.frames.size()},
+      {"deep_copy_commit_timing", toJson(deepCopyTiming)},
+      {"deep_copy_commit_checksum",
+       deepCopiedFrames ? frameLayoutChecksum(*deepCopiedFrames) : 0.0},
       {"resampled_frame_count", resampled.size()},
       {"resample_timing", toJson(resampleTiming)},
       {"loop_seam_timing", toJson(seamTiming)},
@@ -1119,6 +1182,229 @@ nlohmann::json benchmarkSimd(const Options &options) {
   }
   projection["checksum"] = projectionChecksum;
   result["box_projection_overlap"] = std::move(projection);
+
+  struct TargetCase {
+    std::array<double, 3> position{};
+    std::array<double, 3> lambda{};
+    std::array<double, 3> target{};
+    double alpha = 0.0;
+    double weight = 1.0;
+    double denominator = 1.0;
+  };
+  const std::size_t targetCaseCount =
+      std::clamp(options.value_count / 9u, std::size_t{1},
+                 std::size_t{65536});
+  std::vector<TargetCase> targetCases(targetCaseCount);
+  for (std::size_t index = 0; index < targetCases.size(); ++index) {
+    auto &entry = targetCases[index];
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+      const double phase =
+          static_cast<double>((index * 19u + axis * 23u) % 32749u);
+      entry.position[axis] = std::sin(phase * 0.017) * 3.0;
+      entry.lambda[axis] = std::cos(phase * 0.013) * 0.05;
+      entry.target[axis] = std::cos(phase * 0.011 + 0.3) * 2.0;
+    }
+    entry.alpha = 0.001 + static_cast<double>(index % 17u) * 0.0001;
+    entry.weight = 0.25 + static_cast<double>(index % 7u) * 0.125;
+    entry.denominator = entry.alpha + entry.weight;
+  }
+  const auto verifyTargetKernel =
+      [&](xpbd::core::detail::TargetPositionKernel kernel) {
+        TargetCase value = targetCases.front();
+        kernel(value.position.data(), value.lambda.data(), value.target.data(),
+               value.alpha, value.weight, value.denominator);
+        return value;
+      };
+  const TargetCase targetReference =
+      verifyTargetKernel(xpbd::core::detail::targetPositionScalar);
+  const auto targetMaximumError = [&](const TargetCase &value) {
+    double error = 0.0;
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+      error = std::max(error, std::abs(value.position[axis] -
+                                       targetReference.position[axis]));
+      error = std::max(
+          error, std::abs(value.lambda[axis] - targetReference.lambda[axis]));
+    }
+    return error;
+  };
+  const double targetSse2MaximumError = targetMaximumError(
+      verifyTargetKernel(xpbd::core::detail::targetPositionSse2));
+  double targetChecksum = 0.0;
+  const auto runTarget =
+      [&](xpbd::core::detail::TargetPositionKernel kernel) {
+        return measure(options.warmup, options.samples, [&] {
+          for (int iteration = 0; iteration < options.kernel_iterations;
+               ++iteration) {
+            for (auto &entry : targetCases) {
+              kernel(entry.position.data(), entry.lambda.data(),
+                     entry.target.data(), entry.alpha, entry.weight,
+                     entry.denominator);
+            }
+          }
+          targetChecksum = targetCases.back().position[0] +
+                           targetCases.back().position[1] +
+                           targetCases.back().position[2];
+        });
+      };
+  const auto targetScalar =
+      runTarget(xpbd::core::detail::targetPositionScalar);
+  const auto targetSse2 = runTarget(xpbd::core::detail::targetPositionSse2);
+  nlohmann::json targetResult = {
+      {"case_count", targetCases.size()},
+      {"iterations_per_sample", options.kernel_iterations},
+      {"scalar", {{"timing", toJson(targetScalar)}}},
+      {"sse2", {{"timing", toJson(targetSse2)}}},
+      {"sse2_vs_scalar_speedup",
+       targetSse2.median_ms <= 0.0
+           ? 0.0
+           : targetScalar.median_ms / targetSse2.median_ms},
+      {"sse2_maximum_absolute_error", targetSse2MaximumError},
+  };
+  if (capabilities.avx2Usable()) {
+    const auto targetAvx2 =
+        runTarget(xpbd::core::detail::targetPositionAvx2);
+    targetResult["avx2"] = {{"timing", toJson(targetAvx2)}};
+    targetResult["avx2_vs_scalar_speedup"] =
+        targetAvx2.median_ms <= 0.0
+            ? 0.0
+            : targetScalar.median_ms / targetAvx2.median_ms;
+    targetResult["avx2_vs_sse2_speedup"] =
+        targetAvx2.median_ms <= 0.0
+            ? 0.0
+            : targetSse2.median_ms / targetAvx2.median_ms;
+    targetResult["avx2_maximum_absolute_error"] = targetMaximumError(
+        verifyTargetKernel(xpbd::core::detail::targetPositionAvx2));
+  }
+  targetResult["checksum"] = targetChecksum;
+  result["target_constraint_position"] = std::move(targetResult);
+
+  struct AffineCase {
+    std::array<double, 24> input{};
+    std::array<double, 9> linear{};
+    std::array<double, 3> translation{};
+    std::array<double, 24> output{};
+  };
+  const std::size_t affineCaseCapacity =
+      std::clamp(options.value_count / 24u, std::size_t{1},
+                 std::size_t{65536});
+  std::vector<AffineCase> affineCases(affineCaseCapacity);
+  for (std::size_t index = 0; index < affineCases.size(); ++index) {
+    auto &entry = affineCases[index];
+    for (std::size_t value = 0; value < entry.input.size(); ++value) {
+      const double phase =
+          static_cast<double>((index * 29u + value * 31u) % 65521u);
+      entry.input[value] = std::sin(phase * 0.009) * 8.0;
+    }
+    const double angle = static_cast<double>(index % 360u) *
+                         3.14159265358979323846 / 180.0;
+    const double c = std::cos(angle);
+    const double s = std::sin(angle);
+    entry.linear = {c, -s, 0.05, s, c, -0.025, 0.01, 0.02, 1.0};
+    entry.translation = {
+        static_cast<double>(index % 97u) * 0.01,
+        static_cast<double>(index % 53u) * -0.02,
+        static_cast<double>(index % 31u) * 0.03,
+    };
+  }
+  const auto verifyAffineKernel =
+      [&](xpbd::core::detail::AffineTransform8Kernel kernel) {
+        AffineCase value = affineCases.front();
+        kernel(value.output.data(), value.input.data(), value.linear.data(),
+               value.translation.data());
+        return value.output;
+      };
+  const auto affineReference =
+      verifyAffineKernel(xpbd::core::detail::affineTransform8Scalar);
+  const auto affineMaximumError =
+      [&](const std::array<double, 24> &value) {
+        double error = 0.0;
+        for (std::size_t index = 0; index < value.size(); ++index) {
+          error =
+              std::max(error, std::abs(value[index] - affineReference[index]));
+        }
+        return error;
+      };
+  const double affineSse2MaximumError = affineMaximumError(
+      verifyAffineKernel(xpbd::core::detail::affineTransform8Sse2));
+  const double affineAvx2MaximumError =
+      capabilities.avx2Usable()
+          ? affineMaximumError(
+                verifyAffineKernel(xpbd::core::detail::affineTransform8Avx2))
+          : 0.0;
+
+  std::vector<std::size_t> affineCaseCounts{
+      1, 8, 32, 128, 512, 2048, 4096, 6144,
+      8192, 10368, affineCaseCapacity};
+  for (std::size_t &count : affineCaseCounts) {
+    count = std::min(count, affineCaseCapacity);
+  }
+  std::sort(affineCaseCounts.begin(), affineCaseCounts.end());
+  affineCaseCounts.erase(
+      std::unique(affineCaseCounts.begin(), affineCaseCounts.end()),
+      affineCaseCounts.end());
+
+  nlohmann::json affineResults = nlohmann::json::array();
+  double affineChecksum = 0.0;
+  for (const std::size_t caseCount : affineCaseCounts) {
+    const int repeats = std::max(
+        options.kernel_iterations,
+        static_cast<int>((65536u + caseCount - 1u) / caseCount));
+    const auto runAffine =
+        [&](xpbd::core::detail::AffineTransform8Kernel kernel) {
+          return measure(options.warmup, options.samples, [&] {
+            for (int iteration = 0; iteration < repeats; ++iteration) {
+              for (std::size_t index = 0; index < caseCount; ++index) {
+                auto &entry = affineCases[index];
+                kernel(entry.output.data(), entry.input.data(),
+                       entry.linear.data(), entry.translation.data());
+              }
+            }
+            const auto &last = affineCases[caseCount - 1].output;
+            affineChecksum = last[0] + last[7] + last[14] + last[21];
+          });
+        };
+    const auto affineScalar =
+        runAffine(xpbd::core::detail::affineTransform8Scalar);
+    const auto affineSse2 =
+        runAffine(xpbd::core::detail::affineTransform8Sse2);
+    const double calls =
+        static_cast<double>(caseCount) * static_cast<double>(repeats);
+    nlohmann::json entry = {
+        {"cube_count", caseCount},
+        {"repeats_per_sample", repeats},
+        {"scalar",
+         {{"timing", toJson(affineScalar)},
+          {"nanoseconds_per_cube", affineScalar.median_ms * 1.0e6 / calls}}},
+        {"sse2",
+         {{"timing", toJson(affineSse2)},
+          {"nanoseconds_per_cube", affineSse2.median_ms * 1.0e6 / calls}}},
+        {"sse2_vs_scalar_speedup",
+         affineSse2.median_ms <= 0.0
+             ? 0.0
+             : affineScalar.median_ms / affineSse2.median_ms},
+    };
+    if (capabilities.avx2Usable()) {
+      const auto affineAvx2 =
+          runAffine(xpbd::core::detail::affineTransform8Avx2);
+      entry["avx2"] = {
+          {"timing", toJson(affineAvx2)},
+          {"nanoseconds_per_cube", affineAvx2.median_ms * 1.0e6 / calls}};
+      entry["avx2_vs_scalar_speedup"] =
+          affineAvx2.median_ms <= 0.0
+              ? 0.0
+              : affineScalar.median_ms / affineAvx2.median_ms;
+      entry["avx2_vs_sse2_speedup"] =
+          affineAvx2.median_ms <= 0.0
+              ? 0.0
+              : affineSse2.median_ms / affineAvx2.median_ms;
+    }
+    affineResults.push_back(std::move(entry));
+  }
+  result["affine_transform_8"] = {
+      {"cases", std::move(affineResults)},
+      {"checksum", affineChecksum},
+      {"sse2_maximum_absolute_error", affineSse2MaximumError},
+      {"avx2_maximum_absolute_error", affineAvx2MaximumError}};
   return result;
 #else
   (void)options;

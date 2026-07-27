@@ -85,6 +85,9 @@ double normalizedTime(const std::vector<BakedFrame>& frames, int start, int inde
 }
 
 std::array<double, 3> solve3(double matrix[3][4]) {
+    // 退化回退：消元会改写 matrix[0][3]，必须在开始前捕获 u=1 处的端点值。
+    // {0,0,endpoint} 使 evaluate(coeff,1)=endpoint，保住 C0 接缝并放弃高阶约束。
+    const double endpoint_value = matrix[0][3];
     for (int column = 0; column < 3; ++column) {
         int pivot = column;
         for (int row = column + 1; row < 3; ++row) {
@@ -93,7 +96,7 @@ std::array<double, 3> solve3(double matrix[3][4]) {
             }
         }
         if (std::abs(matrix[pivot][column]) < 1e-12) {
-            return {0.0, 0.0, matrix[0][3]};
+            return {0.0, 0.0, endpoint_value};
         }
         if (pivot != column) {
             for (int j = 0; j < 4; ++j) {
@@ -480,6 +483,8 @@ LoopSeamCorrector::Result LoopSeamCorrector::correctCopy(
     const std::map<std::string, loader::Bone>& bones_by_name,
     const std::set<std::string>& corrected_bones,
     double window_ratio, bool match_acceleration) {
+    // 3 帧窗口下 previousU==0，三行约束系统奇异，solve3 退化为仅 C0 端点修正；
+    // 完整的 C1/C2 需要窗口内至少 3 个间隔（≥4 帧）。
     const std::size_t minimum_samples = match_acceleration ? 4 : 3;
     if (source.size() < minimum_samples) {
         throw std::invalid_argument(match_acceleration

@@ -17,6 +17,12 @@ struct UiLayout {
   float vp_x = 0, vp_y = 0, vp_w = 0, vp_h = 0;
   bool viewport_hovered = false;
 
+  bool overlay_visible = false;
+  float overlay_x = 0.0f;
+  float overlay_y = 0.0f;
+  float overlay_w = 0.0f;
+  float overlay_h = 0.0f;
+
   bool horizontal_resize_cursor = false;
 };
 

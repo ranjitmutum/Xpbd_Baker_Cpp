@@ -73,6 +73,15 @@ Rgba roleCubeColor(render::JointRole role) {
   }
 }
 
+Rgba brighten(Rgba c, float k) {
+  return {std::clamp(c.r * k, 0.0f, 1.0f), std::clamp(c.g * k, 0.0f, 1.0f),
+          std::clamp(c.b * k, 0.0f, 1.0f), c.a};
+}
+
+// 贴图模式下选中 / 悬停组的染色（着色器中与纹理颜色相乘，>1 表示提亮）。
+constexpr Rgba kSelectedTexturedTint{1.42f, 1.28f, 0.72f, 1.0f};
+constexpr Rgba kHoveredTexturedTint{1.20f, 1.23f, 1.32f, 1.0f};
+
 Rgba roleBoneColor(render::JointRole role) {
   switch (role) {
   case render::JointRole::Physics:
@@ -269,6 +278,12 @@ GroundLayout computeGroundLayout(
   float min_y = 1e9f, max_y = -1e9f;
   float min_z = 1e9f, max_z = -1e9f;
   bool any = false;
+  std::size_t cube_count = 0;
+  for (const auto &bone : geometry->bones) {
+    cube_count += bone.cubes.size();
+  }
+  const auto transform_mode =
+      baker::CubeGeometry::recommendedTransformSimdMode(cube_count);
   for (const auto &bone : geometry->bones) {
     auto pit = poses.find(bone.name);
     if (pit == poses.end()) {
@@ -289,15 +304,13 @@ GroundLayout computeGroundLayout(
     }
     for (const auto &cube : bone.cubes) {
       const auto bind = baker::CubeGeometry::bindVertices(cube);
+      const auto transformed = baker::CubeGeometry::transformPoints8(
+          pit->second, bind, transform_mode);
       for (int v = 0; v < 8; ++v) {
-        double world[3];
-        baker::CubeGeometry::transformPoint(
-            pit->second, bind[static_cast<std::size_t>(v * 3)],
-            bind[static_cast<std::size_t>(v * 3 + 1)],
-            bind[static_cast<std::size_t>(v * 3 + 2)], world);
-        const float wx = static_cast<float>(world[0]);
-        const float wy = static_cast<float>(world[1]);
-        const float wz = static_cast<float>(world[2]);
+        const auto offset = static_cast<std::size_t>(v * 3);
+        const float wx = static_cast<float>(transformed[offset]);
+        const float wy = static_cast<float>(transformed[offset + 1]);
+        const float wz = static_cast<float>(transformed[offset + 2]);
         min_x = std::min(min_x, wx);
         max_x = std::max(max_x, wx);
         min_y = std::min(min_y, wy);
@@ -398,25 +411,27 @@ void applyMcbe(float &x, float &y, float &z) {
   z = -z;
 }
 
-void appendSelectedCubeOutline(
-    ViewportGpuScene &out, const loader::Cube &cube,
-    const baker::BonePoseCalculator::Pose &pose, bool mcbe_coords) {
+constexpr Rgba kSelectedOutline{1.0f, 0.82f, 0.12f, 1.0f};
+constexpr Rgba kHoverOutline{0.92f, 0.95f, 1.0f, 0.95f};
+
+// 选中 / 悬停组的立方体描边（Blockbench 风格的组高亮）。
+void appendCubeOutline(ViewportGpuScene &out, const loader::Cube &cube,
+                       const baker::BonePoseCalculator::Pose &pose,
+                       bool mcbe_coords, const Rgba &outline_color) {
   constexpr int kCubeEdges[12][2] = {
       {0, 1}, {1, 3}, {3, 2}, {2, 0}, {4, 5}, {5, 7},
       {7, 6}, {6, 4}, {0, 4}, {1, 5}, {2, 6}, {3, 7},
   };
-  constexpr Rgba kOutline{1.0f, 0.82f, 0.12f, 1.0f};
+  const Rgba kOutline = outline_color;
   const auto bind = baker::CubeGeometry::bindVertices(cube);
+  const auto transformed = baker::CubeGeometry::transformPoints8(
+      pose, bind, core::SimdMode::Auto);
   float world[8][3]{};
   for (int vertex = 0; vertex < 8; ++vertex) {
-    double transformed[3]{};
-    baker::CubeGeometry::transformPoint(
-        pose, bind[static_cast<std::size_t>(vertex * 3)],
-        bind[static_cast<std::size_t>(vertex * 3 + 1)],
-        bind[static_cast<std::size_t>(vertex * 3 + 2)], transformed);
-    world[vertex][0] = static_cast<float>(transformed[0]);
-    world[vertex][1] = static_cast<float>(transformed[1]);
-    world[vertex][2] = static_cast<float>(transformed[2]);
+    const auto offset = static_cast<std::size_t>(vertex * 3);
+    world[vertex][0] = static_cast<float>(transformed[offset]);
+    world[vertex][1] = static_cast<float>(transformed[offset + 1]);
+    world[vertex][2] = static_cast<float>(transformed[offset + 2]);
     if (mcbe_coords) {
       applyMcbe(world[vertex][0], world[vertex][1], world[vertex][2]);
     }
@@ -696,6 +711,10 @@ void pushTexturedFace(std::vector<MeshVertex> &solid,
         float tu = 0, tv = 0;
         sampleUV(suc, svc, tu, tv);
         cell = sampleAlbedo(tex, tu, tv, base);
+        // 与 base tint 相乘，让选中 / 悬停高亮在贴图模式下也生效。
+        cell.r = std::clamp(cell.r * base.r, 0.0f, 1.0f);
+        cell.g = std::clamp(cell.g * base.g, 0.0f, 1.0f);
+        cell.b = std::clamp(cell.b * base.b, 0.0f, 1.0f);
       }
 
       if (cell.a < 0.02f) {
@@ -713,6 +732,7 @@ void pushTexturedFace(std::vector<MeshVertex> &solid,
 
 void ViewportMeshBuilder::setGeometry(const loader::Geometry *geometry) {
   geometry_ = geometry;
+  setTransformSimdMode(core::SimdMode::Auto);
   pose_evaluator_.reset();
   rest_poses_.clear();
   if (geometry_ != nullptr) {
@@ -725,6 +745,21 @@ void ViewportMeshBuilder::setGeometry(const loader::Geometry *geometry) {
     appendGround(ground_cache_, ground);
     appendGrid(ground_cache_, ground);
   }
+}
+
+void ViewportMeshBuilder::setTransformSimdMode(core::SimdMode mode) {
+  if (mode != core::SimdMode::Auto) {
+    transform_simd_mode_ = core::selectedSimdMode(mode);
+    return;
+  }
+  std::size_t cube_count = 0;
+  if (geometry_ != nullptr) {
+    for (const auto &bone : geometry_->bones) {
+      cube_count += bone.cubes.size();
+    }
+  }
+  transform_simd_mode_ =
+      baker::CubeGeometry::recommendedTransformSimdMode(cube_count);
 }
 
 render::JointRole ViewportMeshBuilder::roleFor(const std::string &bone_name,
@@ -929,31 +964,41 @@ void ViewportMeshBuilder::buildFromPoses(
       continue;
     }
     const render::JointRole role = roleFor(bone.name, baked_style);
+    const bool is_selected = role == render::JointRole::Selected;
+    const bool is_hovered = !is_selected && !hovered_bone_.empty() &&
+                            bone.name == hovered_bone_;
 
     const bool textured = texture_ != nullptr && texture_->valid();
-    const Rgba cube_base = textured
-                               ? Rgba{1.0f, 1.0f, 1.0f, 1.0f}
-                               : boneAccent(bone.name, roleCubeColor(role));
+    Rgba cube_base = textured ? Rgba{1.0f, 1.0f, 1.0f, 1.0f}
+                              : boneAccent(bone.name, roleCubeColor(role));
+    if (textured) {
+      if (is_selected) {
+        cube_base = kSelectedTexturedTint;
+      } else if (is_hovered) {
+        cube_base = kHoveredTexturedTint;
+      }
+    } else if (is_hovered) {
+      cube_base = brighten(cube_base, 1.22f);
+    }
 
-    if (role == render::JointRole::Selected) {
+    if (is_selected || is_hovered) {
+      const Rgba outline = is_selected ? kSelectedOutline : kHoverOutline;
       for (const auto &cube : bone.cubes) {
-        appendSelectedCubeOutline(out, cube, pose_it->second, mcbe_coords_);
+        appendCubeOutline(out, cube, pose_it->second, mcbe_coords_, outline);
       }
     }
 
     if (include_model) {
       for (const auto &cube : bone.cubes) {
         const auto bind = baker::CubeGeometry::bindVertices(cube);
+        const auto transformed = baker::CubeGeometry::transformPoints8(
+            pose_it->second, bind, transform_simd_mode_);
         float wx[8], wy[8], wz[8];
         for (int v = 0; v < 8; ++v) {
-          double world[3];
-          baker::CubeGeometry::transformPoint(
-              pose_it->second, bind[static_cast<std::size_t>(v * 3)],
-              bind[static_cast<std::size_t>(v * 3 + 1)],
-              bind[static_cast<std::size_t>(v * 3 + 2)], world);
-          wx[v] = static_cast<float>(world[0]);
-          wy[v] = static_cast<float>(world[1]);
-          wz[v] = static_cast<float>(world[2]);
+          const auto offset = static_cast<std::size_t>(v * 3);
+          wx[v] = static_cast<float>(transformed[offset]);
+          wy[v] = static_cast<float>(transformed[offset + 1]);
+          wz[v] = static_cast<float>(transformed[offset + 2]);
           if (mcbe_coords_) {
             applyMcbe(wx[v], wy[v], wz[v]);
           }
@@ -990,7 +1035,7 @@ void ViewportMeshBuilder::buildFromPoses(
           ny /= nlen;
           nz /= nlen;
           const Rgba face_base = face_textured
-                                     ? Rgba{1.0f, 1.0f, 1.0f, 1.0f}
+                                     ? cube_base
                                      : tintByNormal(cube_base, nx, ny, nz);
           pushTexturedFace(out.solid, out.transparent, p, nx, ny, nz, face_base,
                            face_textured ? texture_ : nullptr, face_uv, tex_w,
@@ -1156,8 +1201,20 @@ void ViewportMeshBuilder::buildStaticFrameFromPoses(
       state.transform = staticBoneTransform(pose->second, mcbe_coords_);
     }
     const render::JointRole role = roleFor(bone.name, baked_style);
+    const bool is_selected = role == render::JointRole::Selected;
+    const bool is_hovered = !is_selected && !hovered_bone_.empty() &&
+                            bone.name == hovered_bone_;
     Rgba tint = has_texture ? Rgba{1.0f, 1.0f, 1.0f, 1.0f}
                             : boneAccent(bone.name, roleCubeColor(role));
+    if (has_texture) {
+      if (is_selected) {
+        tint = kSelectedTexturedTint;
+      } else if (is_hovered) {
+        tint = kHoveredTexturedTint;
+      }
+    } else if (is_hovered) {
+      tint = brighten(tint, 1.22f);
+    }
     if (isHidden(bone.name)) {
       tint.a = 0.0f;
     }
@@ -1206,11 +1263,13 @@ void buildSessionViewportScene(const loader::Geometry &geometry,
                                const TextureImage *texture, bool show_bones,
                                bool mcbe_coords, ViewportGpuScene &out,
                                bool show_ground,
-                               const std::set<std::string> *hidden_bones) {
+                               const std::set<std::string> *hidden_bones,
+                               const std::string &hovered_bone) {
   ViewportMeshBuilder builder;
   builder.setGeometry(geometry.bones.empty() ? nullptr : &geometry);
   builder.setBoneMapper(&bone_mapper);
   builder.setSelectedBone(selected_bone);
+  builder.setHoveredBone(hovered_bone);
   builder.setHiddenBones(hidden_bones);
   builder.setTexture(texture);
   builder.setShowBones(show_bones);

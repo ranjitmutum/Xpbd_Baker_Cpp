@@ -10,6 +10,11 @@ struct FrameStats {
   float fps = 0.0f;
   float ui_ms = 0.0f;
   float mesh_ms = 0.0f;
+  float pick_ms = 0.0f;
+  std::uint32_t pick_queries = 0;
+  std::uint32_t pick_cache_rebuilds = 0;
+  std::uint32_t pick_candidate_faces = 0;
+  std::uint32_t pick_total_faces = 0;
 
 
   float gpu_ms = 0.0f;

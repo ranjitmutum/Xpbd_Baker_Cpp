@@ -200,7 +200,12 @@ struct PendingViewportClick {
 
 bool pointInsideViewport(const xpbd::app::UiLayout &layout, float x,
                          float y) {
-  return layout.vp_w > 1.0f && layout.vp_h > 1.0f &&
+  const bool inside_overlay =
+      layout.overlay_visible && layout.overlay_w > 0.0f &&
+      layout.overlay_h > 0.0f && x >= layout.overlay_x &&
+      y >= layout.overlay_y && x <= layout.overlay_x + layout.overlay_w &&
+      y <= layout.overlay_y + layout.overlay_h;
+  return !inside_overlay && layout.vp_w > 1.0f && layout.vp_h > 1.0f &&
          x >= layout.vp_x && y >= layout.vp_y &&
          x <= layout.vp_x + layout.vp_w &&
          y <= layout.vp_y + layout.vp_h;
@@ -378,6 +383,11 @@ int app_main(int argc, char **argv) {
   float disp_ema_ms = 16.0f;
   float disp_mesh_ms = 0.0f;
   float disp_upload_ms = 0.0f;
+  float disp_pick_ms = 0.0f;
+  float disp_pick_queries = 0.0f;
+  float disp_pick_cache_rebuilds = 0.0f;
+  std::uint32_t disp_pick_candidate_faces = 0;
+  std::uint32_t disp_pick_total_faces = 0;
   double disp_upload_bytes = 0.0;
   double disp_static_bone_upload_bytes = 0.0;
   double disp_static_resource_upload_bytes = 0.0;
@@ -400,6 +410,11 @@ int app_main(int argc, char **argv) {
   double accum_frame_ms = 0.0;
   double accum_mesh_ms = 0.0;
   double accum_upload_ms = 0.0;
+  double accum_pick_ms = 0.0;
+  std::uint64_t accum_pick_queries = 0;
+  std::uint64_t accum_pick_cache_rebuilds = 0;
+  std::uint64_t accum_pick_candidate_faces = 0;
+  std::uint32_t accum_pick_total_faces = 0;
   double accum_upload_bytes = 0.0;
   double accum_static_bone_upload_bytes = 0.0;
   double accum_static_resource_upload_bytes = 0.0;
@@ -417,6 +432,15 @@ int app_main(int argc, char **argv) {
   bool running = true;
   auto last = std::chrono::steady_clock::now();
   auto &session = xpbd::app::AppSession::instance();
+  bool hover_pick_snapshot_valid = false;
+  float hover_pick_mouse_x = 0.0f;
+  float hover_pick_mouse_y = 0.0f;
+  float hover_pick_viewport_x = 0.0f;
+  float hover_pick_viewport_y = 0.0f;
+  float hover_pick_viewport_w = 0.0f;
+  float hover_pick_viewport_h = 0.0f;
+  std::uint64_t hover_pick_scene_token = 0;
+  auto hover_pick_last_query = std::chrono::steady_clock::time_point{};
 
   while (running) {
     const auto now = std::chrono::steady_clock::now();
@@ -443,6 +467,11 @@ int app_main(int argc, char **argv) {
     session.debug_ema_frame_ms = disp_ema_ms;
     session.debug_mesh_ms = disp_mesh_ms;
     session.debug_upload_ms = disp_upload_ms;
+    session.debug_pick_ms = disp_pick_ms;
+    session.debug_pick_queries = disp_pick_queries;
+    session.debug_pick_cache_rebuilds = disp_pick_cache_rebuilds;
+    session.debug_pick_candidate_faces = disp_pick_candidate_faces;
+    session.debug_pick_total_faces = disp_pick_total_faces;
     session.debug_upload_bytes = disp_upload_bytes;
     session.debug_static_bone_upload_bytes = disp_static_bone_upload_bytes;
     session.debug_static_resource_upload_bytes =
@@ -472,6 +501,13 @@ int app_main(int argc, char **argv) {
     frame_stats.fps = disp_fps;
     frame_stats.mesh_ms = disp_mesh_ms;
     frame_stats.upload_ms = disp_upload_ms;
+    frame_stats.pick_ms = disp_pick_ms;
+    frame_stats.pick_queries =
+        static_cast<std::uint32_t>(std::max(0.0f, disp_pick_queries));
+    frame_stats.pick_cache_rebuilds = static_cast<std::uint32_t>(
+        std::max(0.0f, disp_pick_cache_rebuilds));
+    frame_stats.pick_candidate_faces = disp_pick_candidate_faces;
+    frame_stats.pick_total_faces = disp_pick_total_faces;
     frame_stats.backend_cpu_ms = disp_backend_cpu_ms;
     frame_stats.gpu_timestamp_valid = disp_gpu_timestamp_valid;
     frame_stats.gpu_timestamp_total_ms = disp_gpu_timestamp_total_ms;
@@ -489,12 +525,16 @@ int app_main(int argc, char **argv) {
     static ViewportPointerGesture right_viewport_gesture{};
     PendingViewportClick pending_viewport_click{};
     float wheel_y = 0.0f;
+    bool hover_pick_force_refresh = false;
 
     SDL_Event ev;
     nk_input_begin(&ctx);
     while (SDL_PollEvent(&ev)) {
       if (ev.type == SDL_EVENT_QUIT) {
         running = false;
+      }
+      if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_ESCAPE) {
+        session.closeBoneContext();
       }
       if (ev.type == SDL_EVENT_WINDOW_RESIZED ||
           ev.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) {
@@ -504,6 +544,7 @@ int app_main(int argc, char **argv) {
       }
       if (ev.type == SDL_EVENT_MOUSE_WHEEL) {
         wheel_y += ev.wheel.y;
+        hover_pick_force_refresh = true;
       }
       if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
           (ev.button.button == SDL_BUTTON_LEFT ||
@@ -535,6 +576,7 @@ int app_main(int argc, char **argv) {
       if (ev.type == SDL_EVENT_MOUSE_BUTTON_UP &&
           (ev.button.button == SDL_BUTTON_LEFT ||
            ev.button.button == SDL_BUTTON_RIGHT)) {
+        hover_pick_force_refresh = true;
         auto &gesture = ev.button.button == SDL_BUTTON_LEFT
                             ? left_viewport_gesture
                             : right_viewport_gesture;
@@ -560,7 +602,8 @@ int app_main(int argc, char **argv) {
 
 
 
-    if (prev_layout.viewport_hovered) {
+    if (prev_layout.viewport_hovered &&
+        pointInsideViewport(prev_layout, mx, my)) {
       const bool shift = (SDL_GetModState() & SDL_KMOD_SHIFT) != 0;
       const bool pan_btn =
           (buttons & SDL_BUTTON_RMASK) != 0 ||
@@ -590,19 +633,96 @@ int app_main(int argc, char **argv) {
     }
     nk_input_end(&ctx);
 
+    frame_stats.pick_ms = 0.0f;
+    frame_stats.pick_queries = 0;
+    frame_stats.pick_cache_rebuilds = 0;
+    frame_stats.pick_candidate_faces = 0;
+    frame_stats.pick_total_faces = 0;
+    const auto timedPickBone = [&](float local_x, float local_y, float view_w,
+                                   float view_h) {
+      const auto pick_start = std::chrono::steady_clock::now();
+      std::string bone =
+          session.pickBoneAt(local_x, local_y, view_w, view_h);
+      const auto pick_end = std::chrono::steady_clock::now();
+      frame_stats.pick_ms +=
+          std::chrono::duration<float, std::milli>(pick_end - pick_start)
+              .count();
+      ++frame_stats.pick_queries;
+      const auto &diagnostics = session.lastViewportPickDiagnostics();
+      if (diagnostics.cache_rebuilt) {
+        ++frame_stats.pick_cache_rebuilds;
+      }
+      frame_stats.pick_candidate_faces += diagnostics.candidate_face_count;
+      frame_stats.pick_total_faces =
+          std::max(frame_stats.pick_total_faces,
+                   diagnostics.total_face_count);
+      return bone;
+    };
+
+    // Blockbench 风格的悬停拾取：光标下的组实时高亮，点击所见即所得。
+    {
+      const bool any_button_down =
+          (buttons & (SDL_BUTTON_LMASK | SDL_BUTTON_RMASK |
+                      SDL_BUTTON_MMASK)) != 0;
+      if (prev_layout.viewport_hovered && !any_button_down &&
+          pointInsideViewport(prev_layout, mx, my)) {
+        const std::uint64_t scene_token = session.viewportPickStateToken(
+            prev_layout.vp_w, prev_layout.vp_h);
+        const bool pointer_or_layout_changed =
+            !hover_pick_snapshot_valid || mx != hover_pick_mouse_x ||
+            my != hover_pick_mouse_y ||
+            prev_layout.vp_x != hover_pick_viewport_x ||
+            prev_layout.vp_y != hover_pick_viewport_y ||
+            prev_layout.vp_w != hover_pick_viewport_w ||
+            prev_layout.vp_h != hover_pick_viewport_h;
+        const bool scene_changed =
+            !hover_pick_snapshot_valid ||
+            scene_token != hover_pick_scene_token;
+        constexpr auto kSceneOnlyPickInterval =
+            std::chrono::milliseconds(50);
+        const bool scene_refresh_due =
+            scene_changed &&
+            now - hover_pick_last_query >= kSceneOnlyPickInterval;
+        if (pointer_or_layout_changed || hover_pick_force_refresh ||
+            scene_refresh_due) {
+          session.hovered_bone_name =
+              timedPickBone(mx - prev_layout.vp_x, my - prev_layout.vp_y,
+                            prev_layout.vp_w, prev_layout.vp_h);
+          hover_pick_last_query = now;
+          hover_pick_snapshot_valid = true;
+          hover_pick_mouse_x = mx;
+          hover_pick_mouse_y = my;
+          hover_pick_viewport_x = prev_layout.vp_x;
+          hover_pick_viewport_y = prev_layout.vp_y;
+          hover_pick_viewport_w = prev_layout.vp_w;
+          hover_pick_viewport_h = prev_layout.vp_h;
+          hover_pick_scene_token = session.viewportPickStateToken(
+              prev_layout.vp_w, prev_layout.vp_h);
+        }
+      } else if (!prev_layout.viewport_hovered ||
+                 !pointInsideViewport(prev_layout, mx, my)) {
+        session.hovered_bone_name.clear();
+        hover_pick_snapshot_valid = false;
+      }
+    }
+
     if (pending_viewport_click.ready) {
       const float local_x = pending_viewport_click.x - prev_layout.vp_x;
       const float local_y = pending_viewport_click.y - prev_layout.vp_y;
-      const std::string bone = session.pickBoneAt(
+      const std::string bone = timedPickBone(
           local_x, local_y, prev_layout.vp_w, prev_layout.vp_h);
       if (!bone.empty()) {
         if (pending_viewport_click.button == SDL_BUTTON_RIGHT) {
-          session.openBoneContext(bone);
+          session.openBoneContext(bone, pending_viewport_click.x,
+                                  pending_viewport_click.y);
         } else {
           session.selectBone(bone);
         }
       } else if (pending_viewport_click.button == SDL_BUTTON_RIGHT) {
         session.closeBoneContext();
+      } else {
+        // 左键点击空白处取消当前选择（与 Blockbench 一致）。
+        session.selectBone(std::string{});
       }
     }
 
@@ -653,6 +773,7 @@ int app_main(int argc, char **argv) {
     if (use_static_model) {
       static_mesh_builder.setBoneMapper(&session.bone_mapper);
       static_mesh_builder.setSelectedBone(session.selected_bone_name);
+      static_mesh_builder.setHoveredBone(session.hovered_bone_name);
       static_mesh_builder.setHiddenBones(&session.hidden_bone_names);
       static_mesh_builder.setTexture(model_texture);
       static_mesh_builder.setShowBones(session.show_bones);
@@ -688,7 +809,7 @@ int app_main(int argc, char **argv) {
           preview_animation, preview_reference_time, preview_frame != nullptr,
           preview_frame, model_texture, session.show_bones,
           session.use_mcbe_coords, scene, session.show_ground,
-          &session.hidden_bone_names);
+          &session.hidden_bone_names, session.hovered_bone_name);
     }
     const auto t_mesh1 = std::chrono::steady_clock::now();
     frame_stats.mesh_ms =
@@ -743,6 +864,11 @@ int app_main(int argc, char **argv) {
     ui_draw.logical_h = win_h;
     ui_draw.fb_w = fb_w;
     ui_draw.fb_h = fb_h;
+    ui_draw.overlay_visible = ui_result.layout.overlay_visible;
+    ui_draw.overlay_x = ui_result.layout.overlay_x;
+    ui_draw.overlay_y = ui_result.layout.overlay_y;
+    ui_draw.overlay_w = ui_result.layout.overlay_w;
+    ui_draw.overlay_h = ui_result.layout.overlay_h;
 
     xpbd::gfx::FrameInput frame{};
     frame.fb_width = fb_w;
@@ -773,9 +899,9 @@ int app_main(int argc, char **argv) {
       frame.static_texture_generation = session.textureGeneration();
     }
     frame.ui = &ui_draw;
-    frame.clear_r = 45.0f / 255.0f;
-    frame.clear_g = 45.0f / 255.0f;
-    frame.clear_b = 45.0f / 255.0f;
+    frame.clear_r = 26.0f / 255.0f;
+    frame.clear_g = 28.0f / 255.0f;
+    frame.clear_b = 34.0f / 255.0f;
 
     backend->render(frame);
     const auto backend_stats = backend->stats();
@@ -825,6 +951,12 @@ int app_main(int argc, char **argv) {
       accum_frame_ms += raw_frame;
       accum_mesh_ms += frame_stats.mesh_ms;
       accum_upload_ms += frame_stats.upload_ms;
+      accum_pick_ms += frame_stats.pick_ms;
+      accum_pick_queries += frame_stats.pick_queries;
+      accum_pick_cache_rebuilds += frame_stats.pick_cache_rebuilds;
+      accum_pick_candidate_faces += frame_stats.pick_candidate_faces;
+      accum_pick_total_faces =
+          std::max(accum_pick_total_faces, frame_stats.pick_total_faces);
       accum_upload_bytes += static_cast<double>(frame_stats.upload_bytes);
       accum_static_bone_upload_bytes +=
           static_cast<double>(frame_stats.static_bone_upload_bytes);
@@ -852,6 +984,16 @@ int app_main(int argc, char **argv) {
           disp_fps = ema_ms > 0.01f ? 1000.0f / ema_ms : 0.0f;
           disp_mesh_ms = frame_stats.mesh_ms;
           disp_upload_ms = frame_stats.upload_ms;
+          disp_pick_ms = frame_stats.pick_ms;
+          disp_pick_queries = static_cast<float>(frame_stats.pick_queries);
+          disp_pick_cache_rebuilds =
+              static_cast<float>(frame_stats.pick_cache_rebuilds);
+          disp_pick_candidate_faces =
+              frame_stats.pick_queries > 0
+                  ? frame_stats.pick_candidate_faces /
+                        frame_stats.pick_queries
+                  : 0;
+          disp_pick_total_faces = frame_stats.pick_total_faces;
           disp_upload_bytes = static_cast<double>(frame_stats.upload_bytes);
           disp_static_bone_upload_bytes =
               static_cast<double>(frame_stats.static_bone_upload_bytes);
@@ -873,6 +1015,18 @@ int app_main(int argc, char **argv) {
           disp_fps = disp_frame_ms > 0.01f ? 1000.0f / disp_frame_ms : 0.0f;
           disp_mesh_ms = static_cast<float>(accum_mesh_ms / accum_frames);
           disp_upload_ms = static_cast<float>(accum_upload_ms / accum_frames);
+          disp_pick_ms =
+              static_cast<float>(accum_pick_ms / accum_frames);
+          disp_pick_queries = static_cast<float>(
+              static_cast<double>(accum_pick_queries) / accum_frames);
+          disp_pick_cache_rebuilds = static_cast<float>(
+              static_cast<double>(accum_pick_cache_rebuilds) / accum_frames);
+          disp_pick_candidate_faces =
+              accum_pick_queries > 0
+                  ? static_cast<std::uint32_t>(
+                        accum_pick_candidate_faces / accum_pick_queries)
+                  : 0;
+          disp_pick_total_faces = accum_pick_total_faces;
           disp_upload_bytes = accum_upload_bytes / accum_frames;
           disp_static_bone_upload_bytes =
               accum_static_bone_upload_bytes / accum_frames;
@@ -916,6 +1070,11 @@ int app_main(int argc, char **argv) {
         accum_frame_ms = 0.0;
         accum_mesh_ms = 0.0;
         accum_upload_ms = 0.0;
+        accum_pick_ms = 0.0;
+        accum_pick_queries = 0;
+        accum_pick_cache_rebuilds = 0;
+        accum_pick_candidate_faces = 0;
+        accum_pick_total_faces = 0;
         accum_upload_bytes = 0.0;
         accum_static_bone_upload_bytes = 0.0;
         accum_static_resource_upload_bytes = 0.0;

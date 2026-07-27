@@ -62,6 +62,10 @@ struct UiPersistentState {
   float drag_anchor_other_width = 0.0f;
   std::set<std::string> expanded_bones;
   std::string bone_hierarchy_signature;
+
+  // 视口点选联动：选中变化时展开祖先并滚动到该行。
+  std::string last_selected_bone;
+  bool scroll_tree_to_selection = false;
 };
 
 UiPersistentState &uiState() {
@@ -318,21 +322,72 @@ bool check(nk_context *ctx, const Geom &g, const char *label, bool &value,
   return false;
 }
 
+// 分组标题：左侧强调色竖条 + 亮色文字，视觉上切分各设置区块。
 void heading(nk_context *ctx, const Geom &g, const char *t) {
-  nk_layout_row_dynamic(ctx, g.row + 2.0f, 1);
-  nk_label_colored(ctx, t, NK_TEXT_LEFT, nk_rgb(210, 210, 220));
+  nk_layout_row_dynamic(ctx, 3.0f, 1);
+  nk_spacing(ctx, 1);
+  nk_layout_row_begin(ctx, NK_STATIC, g.row + 2.0f, 2);
+  nk_layout_row_push(ctx, 8.0f);
+  struct nk_rect bar{};
+  if (nk_widget(&bar, ctx) != NK_WIDGET_INVALID) {
+    nk_fill_rect(nk_window_get_canvas(ctx),
+                 nk_rect(bar.x + 2.0f, bar.y + 3.0f, 3.0f, bar.h - 6.0f), 1.5f,
+                 nk_rgb(49, 192, 200));
+  }
+  const float rest = (std::max)(
+      40.0f, nk_window_get_content_region_size(ctx).x - 8.0f -
+                 ctx->style.window.spacing.x * 3.0f);
+  nk_layout_row_push(ctx, rest);
+  nk_label_colored(ctx, t, NK_TEXT_LEFT, nk_rgb(231, 235, 244));
+  nk_layout_row_end(ctx);
 }
 
 void muted(nk_context *ctx, const Geom &g, const char *t) {
   nk_layout_row_dynamic(ctx, g.label, 1);
-  nk_label_colored(ctx, t, NK_TEXT_LEFT, nk_rgb(170, 170, 170));
+  nk_label_colored(ctx, t, NK_TEXT_LEFT, nk_rgb(170, 177, 194));
 }
 
 void mutedWrap(nk_context *ctx, const Geom &g, const char *t) {
   nk_layout_row_dynamic(ctx, g.label * 2.0f, 1);
-  nk_style_push_color(ctx, &ctx->style.text.color, nk_rgb(170, 170, 170));
+  nk_style_push_color(ctx, &ctx->style.text.color, nk_rgb(170, 177, 194));
   nk_label_wrap(ctx, t);
   nk_style_pop_color(ctx);
+}
+
+// 大纲树 / 列表行：扁平样式，选中行用强调色填充，悬停行浅色提示。
+bool treeRowButton(nk_context *ctx, const char *label, bool selected,
+                   bool hover_hint) {
+  nk_style_push_style_item(
+      ctx, &ctx->style.button.normal,
+      selected     ? nk_style_item_color(nk_rgba(27, 140, 148, 255))
+      : hover_hint ? nk_style_item_color(nk_rgba(61, 67, 83, 255))
+                   : nk_style_item_color(nk_rgba(0, 0, 0, 0)));
+  nk_style_push_style_item(
+      ctx, &ctx->style.button.hover,
+      selected ? nk_style_item_color(nk_rgba(33, 158, 166, 255))
+               : nk_style_item_color(nk_rgba(61, 67, 83, 255)));
+  nk_style_push_style_item(ctx, &ctx->style.button.active,
+                           nk_style_item_color(nk_rgba(41, 182, 190, 255)));
+  nk_style_push_color(ctx, &ctx->style.button.text_normal,
+                      selected ? nk_rgb(255, 255, 255)
+                               : nk_rgb(224, 228, 238));
+  nk_style_push_flags(ctx, &ctx->style.button.text_alignment, NK_TEXT_LEFT);
+  const bool clicked = nk_button_label(ctx, label) != 0;
+  nk_style_pop_flags(ctx);
+  nk_style_pop_color(ctx);
+  nk_style_pop_style_item(ctx);
+  nk_style_pop_style_item(ctx);
+  nk_style_pop_style_item(ctx);
+  return clicked;
+}
+
+// 树展开箭头：无底色的扁平符号按钮。
+bool flatSymbolButton(nk_context *ctx, enum nk_symbol_type symbol) {
+  nk_style_push_style_item(ctx, &ctx->style.button.normal,
+                           nk_style_item_color(nk_rgba(0, 0, 0, 0)));
+  const bool clicked = nk_button_symbol(ctx, symbol) != 0;
+  nk_style_pop_style_item(ctx);
+  return clicked;
 }
 
 bool eyeButton(nk_context *ctx, bool visible) {
@@ -379,11 +434,35 @@ void drawBoneHierarchy(nk_context *ctx, const Geom &g, AppSession &session,
   if (signature != state.bone_hierarchy_signature) {
     state.bone_hierarchy_signature = signature;
     state.expanded_bones.clear();
+    state.last_selected_bone.clear();
   }
 
   std::set<std::string> known_names;
   for (const auto &bone : bones) {
     known_names.insert(bone.name);
+  }
+
+  // 选中骨骼变化（例如在视口中点选）时：展开全部祖先节点并请求滚动定位。
+  if (session.selected_bone_name != state.last_selected_bone) {
+    state.last_selected_bone = session.selected_bone_name;
+    if (!session.selected_bone_name.empty()) {
+      std::map<std::string, const loader::Bone *> by_name;
+      for (const auto &bone : bones) {
+        by_name[bone.name] = &bone;
+      }
+      std::set<std::string> walk_guard;
+      auto it = by_name.find(session.selected_bone_name);
+      const loader::Bone *cursor =
+          it == by_name.end() ? nullptr : it->second;
+      while (cursor != nullptr && cursor->has_parent &&
+             !cursor->parent.empty() && cursor->parent != cursor->name &&
+             walk_guard.insert(cursor->name).second) {
+        state.expanded_bones.insert(cursor->parent);
+        const auto parent_it = by_name.find(cursor->parent);
+        cursor = parent_it == by_name.end() ? nullptr : parent_it->second;
+      }
+      state.scroll_tree_to_selection = true;
+    }
   }
 
   std::map<std::string, std::vector<const loader::Bone *>> children;
@@ -412,6 +491,9 @@ void drawBoneHierarchy(nk_context *ctx, const Geom &g, AppSession &session,
     }
   };
 
+  int row_index = 0;
+  int selected_row = -1;
+
   std::function<void(const loader::Bone &, int)> draw_bone;
   draw_bone = [&](const loader::Bone &bone, int depth) {
     if (!visited.insert(bone.name).second) {
@@ -426,6 +508,10 @@ void drawBoneHierarchy(nk_context *ctx, const Geom &g, AppSession &session,
     const bool collision = session.bone_mapper.isCollisionRoot(bone.name);
     const bool visible = session.isBoneVisible(bone.name);
     const bool selected = session.selected_bone_name == bone.name;
+    if (selected) {
+      selected_row = row_index;
+    }
+    ++row_index;
 
     const float content_width =
         (std::max)(80.0f, nk_window_get_content_region_size(ctx).x);
@@ -448,7 +534,7 @@ void drawBoneHierarchy(nk_context *ctx, const Geom &g, AppSession &session,
     nk_label(ctx, "", NK_TEXT_LEFT);
     nk_layout_row_push(ctx, tree_button);
     if (has_children) {
-      if (nk_button_symbol(ctx, expanded ? NK_SYMBOL_TRIANGLE_DOWN
+      if (flatSymbolButton(ctx, expanded ? NK_SYMBOL_TRIANGLE_DOWN
                                          : NK_SYMBOL_TRIANGLE_RIGHT)) {
         if (expanded) {
           state.expanded_bones.erase(bone.name);
@@ -494,9 +580,13 @@ void drawBoneHierarchy(nk_context *ctx, const Geom &g, AppSession &session,
     }
 
     nk_layout_row_push(ctx, name_width);
-    const std::string label = selected ? "> " + bone.name : bone.name;
-    if (nk_button_label(ctx, label.c_str())) {
+    const bool viewport_hovered_row =
+        !selected && session.hovered_bone_name == bone.name;
+    if (treeRowButton(ctx, bone.name.c_str(), selected,
+                      viewport_hovered_row)) {
       session.selectBone(bone.name);
+      // 树内点击的行本来就可见，跳过下一帧的自动展开与滚动。
+      state.last_selected_bone = session.selected_bone_name;
     }
     nk_layout_row_end(ctx);
 
@@ -521,10 +611,177 @@ void drawBoneHierarchy(nk_context *ctx, const Geom &g, AppSession &session,
       draw_bone(bone, 0);
     }
   }
+
+  // 把选中行滚动到列表可视区域中间（下一帧生效）。
+  if (state.scroll_tree_to_selection) {
+    state.scroll_tree_to_selection = false;
+    if (selected_row >= 0) {
+      const float row_step = g.row + ctx->style.window.spacing.y;
+      const float group_h = nk_window_get_content_region_size(ctx).y;
+      const float target = (std::max)(
+          0.0f, static_cast<float>(selected_row) * row_step -
+                    (std::max)(0.0f, group_h * 0.5f - row_step));
+      nk_group_set_scroll(ctx, "bones", 0, static_cast<nk_uint>(target));
+    }
+  }
 }
 
-void drawBoneContextCard(nk_context *ctx, const Geom &g, AppSession &session,
-                         bool busy) {
+bool contextMenuNavButton(nk_context *ctx, const char *label) {
+  nk_style_push_style_item(ctx, &ctx->style.button.normal,
+                           nk_style_item_color(nk_rgba(48, 52, 64, 255)));
+  nk_style_push_style_item(ctx, &ctx->style.button.hover,
+                           nk_style_item_color(nk_rgba(64, 70, 86, 255)));
+  nk_style_push_style_item(ctx, &ctx->style.button.active,
+                           nk_style_item_color(nk_rgba(34, 150, 158, 255)));
+  nk_style_push_flags(ctx, &ctx->style.button.text_alignment, NK_TEXT_LEFT);
+  const bool clicked = nk_button_label(ctx, label) != 0;
+  nk_style_pop_flags(ctx);
+  nk_style_pop_style_item(ctx);
+  nk_style_pop_style_item(ctx);
+  nk_style_pop_style_item(ctx);
+  return clicked;
+}
+
+void drawSelectedBoneOverrideEditor(nk_context *ctx, const Geom &g,
+                                    AppSession &session, bool busy) {
+  heading(ctx, g, tr("bone_override"));
+  if (session.selected_bone_name.empty()) {
+    muted(ctx, g, tr("no_bone_selected"));
+    return;
+  }
+
+  const std::string selected_label =
+      std::string(tr("bone_prefix")) + session.selected_bone_name;
+  muted(ctx, g, selected_label.c_str());
+  const auto override_toggle = [&](const char *label, bool &enabled,
+                                   bool disabled = false) {
+    nk_layout_row_dynamic(ctx, g.row, 1);
+    nk_bool value = enabled ? nk_true : nk_false;
+    if (busy || disabled) {
+      nk_widget_disable_begin(ctx);
+    }
+    if (!busy && !disabled && nk_checkbox_label(ctx, label, &value)) {
+      enabled = value != 0;
+      session.markSelectedBoneDraftDirty();
+    }
+    if (busy || disabled) {
+      nk_widget_disable_end(ctx);
+    }
+  };
+  const auto override_slider = [&](const char *label, float &value, float lo,
+                                   float hi, float step = 0.0f,
+                                   bool disabled = false) {
+    if (slider(ctx, g, label, value, lo, hi, busy || disabled, step)) {
+      session.markSelectedBoneDraftDirty();
+    }
+  };
+
+  override_toggle(tr("ov_mass"), session.bone_ov_mass);
+  if (session.bone_ov_mass) {
+    override_slider(tr("mass"), session.bone_mass, 0.01f, 100.0f, 0.1f);
+  }
+  override_toggle(tr("ov_compliance"), session.bone_ov_compliance,
+                  session.solver_mode != 0);
+  if (session.bone_ov_compliance) {
+    override_slider(tr("compliance"), session.bone_compliance, 0.0f, 10.0f,
+                    0.000001f, session.solver_mode != 0);
+  }
+  override_toggle(tr("ov_damping"), session.bone_ov_damping,
+                  session.solver_mode != 0);
+  if (session.bone_ov_damping) {
+    override_slider(tr("damping"), session.bone_damping, 0.0f, 10.0f,
+                    0.00001f, session.solver_mode != 0);
+  }
+  override_toggle(tr("ov_max_bend"), session.bone_ov_max_bend,
+                  session.solver_mode != 0 || !session.enable_angle);
+  if (session.bone_ov_max_bend) {
+    override_slider(tr("max_bend"), session.bone_max_bend, 0.0f, 180.0f,
+                    1.0f,
+                    session.solver_mode != 0 || !session.enable_angle);
+  }
+  override_toggle(tr("ov_rb_bend_x"), session.bone_ov_rb_bend_x,
+                  session.solver_mode != 1 || !session.enable_angle);
+  if (session.bone_ov_rb_bend_x) {
+    override_slider(tr("rb_max_bend_x"), session.bone_rb_bend_x, 0.0f,
+                    180.0f, 1.0f,
+                    session.solver_mode != 1 || !session.enable_angle);
+  }
+  override_toggle(tr("ov_rb_bend_y"), session.bone_ov_rb_bend_y,
+                  session.solver_mode != 1 || !session.enable_angle);
+  if (session.bone_ov_rb_bend_y) {
+    override_slider(tr("rb_max_bend_y"), session.bone_rb_bend_y, 0.0f,
+                    180.0f, 1.0f,
+                    session.solver_mode != 1 || !session.enable_angle);
+  }
+  override_toggle(tr("ov_rb_bend_z"), session.bone_ov_rb_bend_z,
+                  session.solver_mode != 1 || !session.enable_angle);
+  if (session.bone_ov_rb_bend_z) {
+    override_slider(tr("rb_max_bend_z"), session.bone_rb_bend_z, 0.0f,
+                    180.0f, 1.0f,
+                    session.solver_mode != 1 || !session.enable_angle);
+  }
+  override_toggle(tr("ov_bend_compliance"),
+                  session.bone_ov_bend_compliance,
+                  session.solver_mode != 0 || !session.enable_angle);
+  if (session.bone_ov_bend_compliance) {
+    override_slider(tr("bend_compliance"), session.bone_bend_compliance, 0.0f,
+                    10.0f, 0.00001f,
+                    session.solver_mode != 0 || !session.enable_angle);
+  }
+  override_toggle(tr("ov_pull"), session.bone_ov_pull,
+                  session.enable_real_gravity);
+  if (session.bone_ov_pull) {
+    override_slider(tr("anim_follow"), session.bone_pull, 0.0f, 1.0f, 0.01f,
+                    session.enable_real_gravity);
+  }
+  if (session.transition_mode == 2) {
+    override_toggle(tr("ov_transition_follow"),
+                    session.bone_ov_transition_follow);
+    if (session.bone_ov_transition_follow) {
+      override_slider(tr("transition_follow"),
+                      session.bone_transition_follow, 0.0f, 1.0f, 0.05f);
+    }
+  }
+  override_toggle(tr("ov_gravity"), session.bone_ov_gravity);
+  if (session.bone_ov_gravity) {
+    override_slider(tr("gravity_scale"), session.bone_gravity_scale, 0.0f,
+                    5.0f, 0.1f);
+  }
+  override_toggle(tr("ov_wind"), session.bone_ov_wind);
+  if (session.bone_ov_wind) {
+    override_slider(tr("wind_scale"), session.bone_wind, 0.0f, 5.0f, 0.1f);
+  }
+  override_toggle(tr("ov_turbulence"), session.bone_ov_turbulence);
+  if (session.bone_ov_turbulence) {
+    override_slider(tr("turbulence_scale"), session.bone_turbulence, 0.0f,
+                    5.0f, 0.1f);
+  }
+  override_toggle(tr("ov_fixed"), session.bone_ov_fixed);
+  if (session.bone_ov_fixed &&
+      check(ctx, g, tr("fixed_kinematic"), session.bone_fixed, busy)) {
+    session.markSelectedBoneDraftDirty();
+  }
+
+  muted(ctx, g, session.hasUnappliedPerBoneDraft() ? tr("draft_unapplied")
+                                                   : tr("draft_applied"));
+  nk_layout_row_dynamic(ctx, g.btn, 1);
+  if (nk_button_label(ctx, tr("apply_bone")) && !busy) {
+    session.applySelectedBoneConfig();
+  }
+  nk_layout_row_dynamic(ctx, g.btn, 1);
+  if (nk_button_label(ctx, tr("discard_draft")) && !busy &&
+      session.hasUnappliedPerBoneDraft()) {
+    session.discardSelectedBoneDraft();
+  }
+  nk_layout_row_dynamic(ctx, g.btn, 1);
+  if (nk_button_label(ctx, tr("clear_override")) && !busy) {
+    session.clearSelectedBoneConfig();
+  }
+}
+
+void drawBoneContextMenuContent(nk_context *ctx, const Geom &g,
+                                AppSession &session, bool busy,
+                                float child_list_h) {
   const std::string bone_name = session.bone_context_bone_name;
   const auto selected_it = std::find_if(
       session.geometry.bones.begin(), session.geometry.bones.end(),
@@ -535,9 +792,30 @@ void drawBoneContextCard(nk_context *ctx, const Geom &g, AppSession &session,
     return;
   }
 
-  heading(ctx, g, tr("bone_context_title"));
-  const std::string bone_label = std::string(tr("bone_prefix")) + bone_name;
-  muted(ctx, g, bone_label.c_str());
+  const float content_w = nk_window_get_content_region_size(ctx).x;
+  nk_layout_row_begin(ctx, NK_STATIC, g.btn + 5.0f, 2);
+  nk_layout_row_push(ctx, (std::max)(80.0f, content_w - g.btn - 8.0f));
+  nk_label_colored(ctx, tr("bone_context_title"), NK_TEXT_LEFT,
+                   nk_rgb(112, 224, 230));
+  nk_layout_row_push(ctx, g.btn);
+  if (flatSymbolButton(ctx, NK_SYMBOL_X)) {
+    session.closeBoneContext();
+  }
+  nk_layout_row_end(ctx);
+  if (!session.bone_context_open) {
+    return;
+  }
+
+  nk_layout_row_dynamic(ctx, g.row + 3.0f, 1);
+  nk_label_colored(ctx, bone_name.c_str(), NK_TEXT_LEFT,
+                   nk_rgb(238, 241, 248));
+  nk_layout_row_dynamic(ctx, 5.0f, 1);
+  struct nk_rect separator{};
+  if (nk_widget(&separator, ctx) != NK_WIDGET_INVALID) {
+    nk_fill_rect(nk_window_get_canvas(ctx),
+                 nk_rect(separator.x, separator.y + 2.0f, separator.w, 1.0f),
+                 0.0f, nk_rgb(76, 82, 100));
+  }
 
   bool physics = session.bone_mapper.isPhysicsBone(bone_name);
   if (check(ctx, g, tr("bone_context_physics_group"), physics, busy)) {
@@ -553,6 +831,8 @@ void drawBoneContextCard(nk_context *ctx, const Geom &g, AppSession &session,
   if (check(ctx, g, tr("bone_context_visible"), visible, false)) {
     session.setBoneVisible(bone_name, visible);
   }
+
+  drawSelectedBoneOverrideEditor(ctx, g, session, busy);
 
   const loader::Bone *parent = nullptr;
   if (selected_it->has_parent && !selected_it->parent.empty() &&
@@ -570,7 +850,7 @@ void drawBoneContextCard(nk_context *ctx, const Geom &g, AppSession &session,
   heading(ctx, g, tr("bone_context_parent"));
   if (parent != nullptr) {
     nk_layout_row_dynamic(ctx, g.btn, 1);
-    if (nk_button_label(ctx, parent->name.c_str())) {
+    if (contextMenuNavButton(ctx, parent->name.c_str())) {
       session.openBoneContext(parent->name);
       return;
     }
@@ -579,26 +859,116 @@ void drawBoneContextCard(nk_context *ctx, const Geom &g, AppSession &session,
   }
 
   heading(ctx, g, tr("bone_context_children"));
-  bool has_children = false;
-  for (const auto &bone : session.geometry.bones) {
-    if (!bone.has_parent || bone.parent != bone_name || bone.name == bone_name) {
-      continue;
+  nk_layout_row_dynamic(ctx, child_list_h, 1);
+  if (nk_group_begin(ctx, "bone_context_popup_children", NK_WINDOW_BORDER)) {
+    bool has_children = false;
+    for (const auto &bone : session.geometry.bones) {
+      if (!bone.has_parent || bone.parent != bone_name ||
+          bone.name == bone_name) {
+        continue;
+      }
+      has_children = true;
+      nk_layout_row_dynamic(ctx, g.btn, 1);
+      if (contextMenuNavButton(ctx, bone.name.c_str())) {
+        session.openBoneContext(bone.name);
+        break;
+      }
     }
-    has_children = true;
-    nk_layout_row_dynamic(ctx, g.btn, 1);
-    if (nk_button_label(ctx, bone.name.c_str())) {
-      session.openBoneContext(bone.name);
-      return;
+    if (!has_children) {
+      muted(ctx, g, tr("bone_context_no_children"));
     }
-  }
-  if (!has_children) {
-    muted(ctx, g, tr("bone_context_no_children"));
+    nk_group_end(ctx);
   }
 
   nk_layout_row_dynamic(ctx, g.btn, 1);
-  if (nk_button_label(ctx, tr("close"))) {
+  if (contextMenuNavButton(ctx, tr("close"))) {
     session.closeBoneContext();
   }
+}
+
+void drawBoneContextPopup(nk_context *ctx, const Geom &g, AppSession &session,
+                          bool busy, float window_w, float window_h,
+                          UiFrameResult &result) {
+  if (!session.bone_context_open) {
+    return;
+  }
+
+  std::size_t child_count = 0;
+  for (const auto &bone : session.geometry.bones) {
+    if (bone.has_parent && bone.parent == session.bone_context_bone_name &&
+        bone.name != session.bone_context_bone_name) {
+      ++child_count;
+    }
+  }
+
+  const float margin = 12.0f * g.s;
+  const float gap = 14.0f * g.s;
+  const float popup_w = std::clamp(310.0f * g.s, 250.0f, 390.0f);
+  const float visible_child_rows =
+      static_cast<float>((std::min<std::size_t>)(child_count, 4));
+  const float child_list_h =
+      child_count == 0
+          ? g.label + 14.0f
+          : visible_child_rows * (g.btn + ctx->style.window.spacing.y) +
+                10.0f;
+  const float desired_h = 330.0f * g.s + child_list_h;
+  const float popup_h =
+      std::clamp(desired_h, 280.0f, (std::max)(280.0f, window_h - margin * 2.0f));
+
+  float popup_x = session.bone_context_anchor_x + gap;
+  if (popup_x + popup_w > window_w - margin) {
+    popup_x = session.bone_context_anchor_x - popup_w - gap;
+  }
+  popup_x = std::clamp(popup_x, margin,
+                       (std::max)(margin, window_w - popup_w - margin));
+  float popup_y = session.bone_context_anchor_y - 10.0f * g.s;
+  if (popup_y + popup_h > window_h - margin) {
+    popup_y = window_h - popup_h - margin;
+  }
+  popup_y = std::clamp(popup_y, margin,
+                       (std::max)(margin, window_h - popup_h - margin));
+  const struct nk_rect popup_bounds =
+      nk_rect(popup_x, popup_y, popup_w, popup_h);
+
+  if (nk_input_is_mouse_pressed(&ctx->input, NK_BUTTON_LEFT) &&
+      !nk_input_is_mouse_hovering_rect(&ctx->input, popup_bounds)) {
+    session.closeBoneContext();
+    return;
+  }
+  result.layout.overlay_visible = true;
+  result.layout.overlay_x = popup_bounds.x;
+  result.layout.overlay_y = popup_bounds.y;
+  result.layout.overlay_w = popup_bounds.w;
+  result.layout.overlay_h = popup_bounds.h;
+
+  const nk_color popup_bg = nk_rgba(37, 40, 49, 252);
+  const nk_color popup_border = nk_rgba(78, 85, 104, 235);
+  nk_style_push_style_item(ctx, &ctx->style.window.fixed_background,
+                           nk_style_item_color(popup_bg));
+  nk_style_push_color(ctx, &ctx->style.window.background, popup_bg);
+  nk_style_push_color(ctx, &ctx->style.window.border_color, popup_border);
+  nk_style_push_color(ctx, &ctx->style.window.group_border_color,
+                      nk_rgba(70, 77, 94, 220));
+  nk_style_push_float(ctx, &ctx->style.window.border, 1.0f);
+  nk_style_push_float(ctx, &ctx->style.window.rounding, 9.0f * g.s);
+  nk_style_push_vec2(ctx, &ctx->style.window.padding,
+                     nk_vec2(12.0f * g.s, 10.0f * g.s));
+
+  constexpr const char *kPopupName = "##bone_context_popup";
+  nk_window_set_bounds(ctx, kPopupName, popup_bounds);
+  if (nk_begin(ctx, kPopupName, popup_bounds, NK_WINDOW_BORDER)) {
+    nk_window_set_bounds(ctx, kPopupName, popup_bounds);
+    drawBoneContextMenuContent(ctx, g, session, busy, child_list_h);
+  }
+  nk_end(ctx);
+
+  nk_style_pop_vec2(ctx);
+  nk_style_pop_float(ctx);
+  nk_style_pop_float(ctx);
+  nk_style_pop_color(ctx);
+  nk_style_pop_color(ctx);
+  nk_style_pop_color(ctx);
+  nk_style_pop_style_item(ctx);
 }
 
 struct PanelWidths {
@@ -681,10 +1051,10 @@ bool drawSplitter(nk_context *ctx, SplitterDrag side, float current_width,
       bar.x += (bar.w - 2.0f) * 0.5f;
       bar.w = 2.0f;
     }
-    nk_fill_rect(nk_window_get_canvas(ctx), bar, 0.0f,
-                 active    ? nk_rgb(100, 165, 255)
-                 : hovered ? nk_rgb(80, 130, 205)
-                           : nk_rgb(90, 95, 110));
+    nk_fill_rect(nk_window_get_canvas(ctx), bar, 1.0f,
+                 active    ? nk_rgb(106, 222, 228)
+                 : hovered ? nk_rgb(49, 192, 200)
+                           : nk_rgb(63, 68, 84));
   }
   return hovered || active;
 }
@@ -694,95 +1064,184 @@ bool drawSplitter(nk_context *ctx, SplitterDrag side, float current_width,
 void applyDarkStyle(nk_context *ctx, float ) {
 
   auto &st = ctx->style;
-  const nk_color bg = nk_rgba(40, 42, 48, 255);
-  const nk_color panel = nk_rgba(50, 52, 60, 255);
-  const nk_color border = nk_rgba(90, 95, 110, 255);
-  const nk_color text = nk_rgba(235, 238, 245, 255);
-  const nk_color accent = nk_rgba(70, 130, 220, 255);
-  const nk_color btn = nk_rgba(62, 66, 78, 255);
-  const nk_color btn_h = nk_rgba(80, 100, 150, 255);
+
+  // 现代深色配色：深底、低对比描边、Blockbench 风格的青色强调色。
+  const nk_color bg = nk_rgba(26, 28, 34, 255);
+  const nk_color panel = nk_rgba(34, 37, 45, 255);
+  const nk_color inset = nk_rgba(22, 24, 30, 255);
+  const nk_color raised = nk_rgba(53, 57, 69, 255);
+  const nk_color raised_h = nk_rgba(66, 72, 88, 255);
+  const nk_color border = nk_rgba(70, 76, 93, 210);
+  const nk_color text = nk_rgba(235, 238, 246, 255);
+  const nk_color text_dim = nk_rgba(170, 177, 194, 255);
+  const nk_color accent = nk_rgba(49, 192, 200, 255);
+  const nk_color accent_hi = nk_rgba(106, 222, 228, 255);
+  const nk_color accent_dn = nk_rgba(32, 148, 156, 255);
 
   st.window.background = bg;
   st.window.fixed_background = nk_style_item_color(bg);
   st.window.border_color = border;
-  st.window.border = 1.0f;
+  st.window.border = 0.0f;
   st.window.rounding = 0.0f;
-  st.window.padding = nk_vec2(6, 6);
-  st.window.spacing = nk_vec2(4, 4);
-  st.window.scrollbar_size = nk_vec2(14, 14);
+  st.window.padding = nk_vec2(8, 8);
+  st.window.group_padding = nk_vec2(8, 6);
+  st.window.spacing = nk_vec2(6, 5);
+  st.window.scrollbar_size = nk_vec2(10, 10);
+  st.window.group_border = 1.0f;
+  st.window.group_border_color = border;
+  st.window.combo_border = 1.0f;
+  st.window.combo_border_color = border;
+  st.window.popup_border_color = border;
+  st.window.tooltip_border_color = border;
 
-  st.button.normal = nk_style_item_color(btn);
-  st.button.hover = nk_style_item_color(btn_h);
-  st.button.active = nk_style_item_color(accent);
-  st.button.border_color = border;
+  st.button.normal = nk_style_item_color(raised);
+  st.button.hover = nk_style_item_color(raised_h);
+  st.button.active = nk_style_item_color(accent_dn);
+  st.button.border_color = nk_rgba(0, 0, 0, 0);
   st.button.text_normal = text;
   st.button.text_hover = nk_rgb(255, 255, 255);
   st.button.text_active = nk_rgb(255, 255, 255);
-  st.button.rounding = 4.0f;
+  st.button.rounding = 6.0f;
+  st.button.padding = nk_vec2(8, 4);
+  st.button.border = 0.0f;
 
-  st.button.padding = nk_vec2(6, 3);
-  st.button.border = 1.0f;
-
-  st.checkbox.normal = nk_style_item_color(panel);
-  st.checkbox.hover = nk_style_item_color(btn_h);
+  st.checkbox.normal = nk_style_item_color(raised);
+  st.checkbox.hover = nk_style_item_color(raised_h);
+  st.checkbox.active = nk_style_item_color(raised_h);
   st.checkbox.cursor_normal = nk_style_item_color(accent);
-  st.checkbox.cursor_hover = nk_style_item_color(nk_rgb(120, 170, 255));
+  st.checkbox.cursor_hover = nk_style_item_color(accent_hi);
+  st.checkbox.border_color = border;
+  st.checkbox.border = 1.0f;
+  st.checkbox.padding = nk_vec2(2, 2);
   st.checkbox.text_normal = text;
   st.checkbox.text_hover = text;
   st.checkbox.text_active = text;
+  st.option = st.checkbox;
 
-  st.slider.bar_normal = nk_rgba(45, 48, 58, 255);
-  st.slider.bar_hover = nk_rgba(55, 60, 75, 255);
-  st.slider.bar_active = nk_rgba(60, 80, 120, 255);
+  st.slider.bar_normal = inset;
+  st.slider.bar_hover = nk_rgba(38, 41, 50, 255);
+  st.slider.bar_active = nk_rgba(43, 47, 59, 255);
   st.slider.bar_filled = accent;
-  st.slider.cursor_normal = nk_style_item_color(accent);
-  st.slider.cursor_hover = nk_style_item_color(nk_rgb(130, 180, 255));
-  st.slider.cursor_active = nk_style_item_color(nk_rgb(150, 200, 255));
-  st.slider.cursor_size = nk_vec2(16, 16);
+  st.slider.cursor_normal = nk_style_item_color(nk_rgb(226, 231, 242));
+  st.slider.cursor_hover = nk_style_item_color(nk_rgb(255, 255, 255));
+  st.slider.cursor_active = nk_style_item_color(accent_hi);
+  st.slider.cursor_size = nk_vec2(13, 13);
+  st.slider.rounding = 4.0f;
+  st.slider.bar_height = 6.0f;
 
-  st.progress.normal = nk_style_item_color(panel);
+  st.progress.normal = nk_style_item_color(inset);
+  st.progress.hover = nk_style_item_color(inset);
+  st.progress.active = nk_style_item_color(inset);
   st.progress.cursor_normal = nk_style_item_color(accent);
-  st.progress.cursor_hover = nk_style_item_color(accent);
-  st.progress.cursor_active = nk_style_item_color(accent);
+  st.progress.cursor_hover = nk_style_item_color(accent_hi);
+  st.progress.cursor_active = nk_style_item_color(accent_hi);
+  st.progress.rounding = 5.0f;
+  st.progress.cursor_rounding = 5.0f;
+  st.progress.padding = nk_vec2(2, 2);
 
-  st.scrollv.normal = nk_style_item_color(panel);
-  st.scrollv.hover = nk_style_item_color(btn);
-  st.scrollv.active = nk_style_item_color(btn_h);
-  st.scrollv.cursor_normal = nk_style_item_color(btn_h);
-  st.scrollv.cursor_hover = nk_style_item_color(accent);
+  st.scrollv.normal = nk_style_item_color(nk_rgba(0, 0, 0, 0));
+  st.scrollv.hover = nk_style_item_color(nk_rgba(0, 0, 0, 0));
+  st.scrollv.active = nk_style_item_color(nk_rgba(0, 0, 0, 0));
+  st.scrollv.cursor_normal = nk_style_item_color(nk_rgba(84, 90, 108, 255));
+  st.scrollv.cursor_hover = nk_style_item_color(nk_rgba(108, 116, 138, 255));
   st.scrollv.cursor_active = nk_style_item_color(accent);
+  st.scrollv.rounding = 5.0f;
+  st.scrollv.rounding_cursor = 5.0f;
+  st.scrollv.border = 0.0f;
+  st.scrollv.border_cursor = 0.0f;
   st.scrollh = st.scrollv;
 
   st.text.color = text;
-  st.edit.normal = nk_style_item_color(panel);
-  st.edit.hover = nk_style_item_color(btn);
-  st.edit.active = nk_style_item_color(btn_h);
+
+  st.edit.normal = nk_style_item_color(inset);
+  st.edit.hover = nk_style_item_color(inset);
+  st.edit.active = nk_style_item_color(inset);
   st.edit.border_color = border;
+  st.edit.border = 1.0f;
+  st.edit.rounding = 5.0f;
   st.edit.text_normal = text;
   st.edit.text_hover = text;
   st.edit.text_active = text;
+  st.edit.cursor_normal = accent_hi;
+  st.edit.cursor_hover = accent_hi;
+  st.edit.cursor_text_normal = bg;
+  st.edit.cursor_text_hover = bg;
+  st.edit.selected_normal = accent_dn;
+  st.edit.selected_hover = accent_dn;
+  st.edit.selected_text_normal = nk_rgb(255, 255, 255);
+  st.edit.selected_text_hover = nk_rgb(255, 255, 255);
 
+  st.combo.normal = nk_style_item_color(raised);
+  st.combo.hover = nk_style_item_color(raised_h);
+  st.combo.active = nk_style_item_color(raised_h);
+  st.combo.border_color = nk_rgba(0, 0, 0, 0);
+  st.combo.border = 0.0f;
+  st.combo.rounding = 6.0f;
+  st.combo.label_normal = text;
+  st.combo.label_hover = text;
+  st.combo.label_active = text;
+  st.combo.symbol_normal = text_dim;
+  st.combo.symbol_hover = text;
+  st.combo.symbol_active = text;
+  st.combo.button.normal = nk_style_item_color(nk_rgba(0, 0, 0, 0));
+  st.combo.button.hover = nk_style_item_color(nk_rgba(0, 0, 0, 0));
+  st.combo.button.active = nk_style_item_color(nk_rgba(0, 0, 0, 0));
+  st.combo.button.border = 0.0f;
+  st.combo.button.text_normal = text_dim;
+  st.combo.button.text_hover = text;
+  st.combo.button.text_active = text;
 
+  st.contextual_button.normal = nk_style_item_color(panel);
+  st.contextual_button.hover = nk_style_item_color(raised_h);
+  st.contextual_button.active = nk_style_item_color(accent_dn);
+  st.contextual_button.border = 0.0f;
+  st.contextual_button.text_normal = text;
+  st.contextual_button.text_hover = nk_rgb(255, 255, 255);
+  st.contextual_button.text_active = nk_rgb(255, 255, 255);
 
-  st.property.normal = nk_style_item_color(panel);
-  st.property.hover = nk_style_item_color(btn);
-  st.property.active = nk_style_item_color(btn_h);
+  st.selectable.normal = nk_style_item_color(nk_rgba(0, 0, 0, 0));
+  st.selectable.hover = nk_style_item_color(raised);
+  st.selectable.pressed = nk_style_item_color(raised_h);
+  st.selectable.normal_active = nk_style_item_color(accent_dn);
+  st.selectable.hover_active = nk_style_item_color(accent);
+  st.selectable.pressed_active = nk_style_item_color(accent);
+  st.selectable.text_normal = text;
+  st.selectable.text_hover = text;
+  st.selectable.text_pressed = text;
+  st.selectable.text_normal_active = nk_rgb(255, 255, 255);
+  st.selectable.text_hover_active = nk_rgb(255, 255, 255);
+  st.selectable.text_pressed_active = nk_rgb(255, 255, 255);
+  st.selectable.rounding = 4.0f;
+
+  st.property.normal = nk_style_item_color(inset);
+  st.property.hover = nk_style_item_color(inset);
+  st.property.active = nk_style_item_color(inset);
   st.property.border_color = border;
   st.property.label_normal = text;
   st.property.label_hover = text;
   st.property.label_active = text;
   st.property.border = 1.0f;
-  st.property.rounding = 3.0f;
+  st.property.rounding = 5.0f;
   st.property.edit = st.edit;
   st.property.edit.padding = nk_vec2(0, 0);
   st.property.edit.border = 0.0f;
   st.property.edit.rounding = 0.0f;
   st.property.inc_button = st.button;
   st.property.dec_button = st.button;
+  st.property.inc_button.normal = nk_style_item_color(nk_rgba(0, 0, 0, 0));
+  st.property.dec_button.normal = nk_style_item_color(nk_rgba(0, 0, 0, 0));
+  st.property.inc_button.hover = nk_style_item_color(raised);
+  st.property.dec_button.hover = nk_style_item_color(raised);
+  st.property.inc_button.text_normal = text_dim;
+  st.property.dec_button.text_normal = text_dim;
   st.property.inc_button.padding = nk_vec2(0, 0);
   st.property.dec_button.padding = nk_vec2(0, 0);
   st.property.inc_button.border = 0.0f;
   st.property.dec_button.border = 0.0f;
+
+  st.tab.background = nk_style_item_color(panel);
+  st.tab.border_color = border;
+  st.tab.text = text;
 }
 
 UiFrameResult composeNuklearUi(nk_context *ctx, int win_w, int win_h,
@@ -962,7 +1421,7 @@ UiFrameResult composeNuklearUi(nk_context *ctx, int win_w, int win_h,
     const float w_status2 = (std::max)(80.0f, inner_w - w_clr - gap);
     nk_layout_row_push(ctx, w_status2);
     nk_label_colored(ctx, session.status.c_str(), NK_TEXT_LEFT,
-                     busy ? nk_rgb(144, 202, 249) : nk_rgb(160, 165, 180));
+                     busy ? nk_rgb(94, 212, 218) : nk_rgb(150, 156, 172));
     nk_layout_row_push(ctx, w_clr);
     if (nk_button_label(ctx, tr("clear_tex")) &&
         session.model_texture.valid()) {
@@ -1049,7 +1508,7 @@ UiFrameResult composeNuklearUi(nk_context *ctx, int win_w, int win_h,
         session.confirmMolangBake(false);
       }
       nk_style_push_style_item(ctx, &ctx->style.button.normal,
-                               nk_style_item_color(nk_rgba(176, 83, 66, 255)));
+                               nk_style_item_color(nk_rgba(206, 82, 70, 255)));
       if (nk_button_label(ctx, tr("molang_warning_continue"))) {
         session.confirmMolangBake(true);
       }
@@ -1085,7 +1544,7 @@ UiFrameResult composeNuklearUi(nk_context *ctx, int win_w, int win_h,
         session.confirmAnimationExport(false);
       }
       nk_style_push_style_item(ctx, &ctx->style.button.normal,
-                               nk_style_item_color(nk_rgba(176, 83, 66, 255)));
+                               nk_style_item_color(nk_rgba(206, 82, 70, 255)));
       if (nk_button_label(ctx, tr("force_export_continue"))) {
         session.confirmAnimationExport(true);
       }
@@ -1158,10 +1617,8 @@ UiFrameResult composeNuklearUi(nk_context *ctx, int win_w, int win_h,
           auto draw_animation_row = [&](const std::string &name) {
             const bool sel = session.selected_animation_name == name;
             nk_layout_row_dynamic(ctx, g.btn, 1);
-            const std::string lab = sel ? ("> " + name) : name;
-
-
-            if (nk_button_label(ctx, lab.c_str()) && !busy && !sel) {
+            if (treeRowButton(ctx, name.c_str(), sel, false) && !busy &&
+                !sel) {
               session.selectAnimation(name);
             }
           };
@@ -1195,15 +1652,9 @@ UiFrameResult composeNuklearUi(nk_context *ctx, int win_w, int win_h,
         const float tool = g.btn + 8.0f;
         const float info = g.label + 4.0f;
         const float mode_row = g.btn;
-        const float context_card_h =
-            session.bone_context_open
-                ? (std::max)(220.0f * g.s, g.btn * 8.5f)
-                : 0.0f;
-        const float context_spacing =
-            session.bone_context_open ? ctx->style.window.spacing.y : 0.0f;
         const float vp_h =
-            (std::max)(40.0f, mid_row_h - tool - info - mode_row -
-                                   context_card_h - context_spacing - 32.0f);
+            (std::max)(40.0f,
+                       mid_row_h - tool - info - mode_row - 32.0f);
         nk_layout_row_dynamic(ctx, vp_h, 1);
         struct nk_rect space{};
         nk_widget(&space, ctx);
@@ -1214,14 +1665,6 @@ UiFrameResult composeNuklearUi(nk_context *ctx, int win_w, int win_h,
         result.layout.vp_h = space.h;
         result.layout.viewport_hovered =
             nk_input_is_mouse_hovering_rect(&ctx->input, space) != 0;
-
-        if (session.bone_context_open) {
-          nk_layout_row_dynamic(ctx, context_card_h, 1);
-          if (nk_group_begin(ctx, "bone_context_card", NK_WINDOW_BORDER)) {
-            drawBoneContextCard(ctx, g, session, busy);
-            nk_group_end(ctx);
-          }
-        }
 
         char info_buf[192];
         if (session.presentation_mode ==
@@ -1252,21 +1695,36 @@ UiFrameResult composeNuklearUi(nk_context *ctx, int win_w, int win_h,
                         tr("preview_open_model"));
         }
         nk_layout_row_dynamic(ctx, info, 1);
-        nk_label_colored(ctx, info_buf, NK_TEXT_LEFT, nk_rgb(180, 185, 200));
+        nk_label_colored(ctx, info_buf, NK_TEXT_LEFT, nk_rgb(184, 191, 207));
 
         nk_layout_row_dynamic(ctx, mode_row, 3);
         const auto preview_mode_button = [&](const char *label,
                                              PresentationMode mode,
                                              bool available) {
+          const bool active_mode = session.presentation_mode == mode;
+          if (active_mode) {
+            nk_style_push_style_item(
+                ctx, &ctx->style.button.normal,
+                nk_style_item_color(nk_rgba(27, 140, 148, 255)));
+            nk_style_push_style_item(
+                ctx, &ctx->style.button.hover,
+                nk_style_item_color(nk_rgba(33, 158, 166, 255)));
+            nk_style_push_color(ctx, &ctx->style.button.text_normal,
+                                nk_rgb(255, 255, 255));
+          }
           if (!available) {
             nk_widget_disable_begin(ctx);
           }
-          if (nk_button_label(ctx, label) && available &&
-              session.presentation_mode != mode) {
+          if (nk_button_label(ctx, label) && available && !active_mode) {
             session.setPresentationMode(mode);
           }
           if (!available) {
             nk_widget_disable_end(ctx);
+          }
+          if (active_mode) {
+            nk_style_pop_color(ctx);
+            nk_style_pop_style_item(ctx);
+            nk_style_pop_style_item(ctx);
           }
         };
         preview_mode_button(tr("preview_mode_source"),
@@ -1386,12 +1844,25 @@ UiFrameResult composeNuklearUi(nk_context *ctx, int win_w, int win_h,
               session.solver_mode == 0 ? tr("solver_xpbd")
                                        : tr("solver_bullet"));
         nk_layout_row_dynamic(ctx, g.btn, 2);
-        if (nk_button_label(ctx, tr("xpbd")) && !busy) {
-          session.setSolverMode(0);
-        }
-        if (nk_button_label(ctx, tr("bullet")) && !busy) {
-          session.setSolverMode(1);
-        }
+        const auto solver_mode_button = [&](const char *label, int mode) {
+          const bool active_mode = session.solver_mode == mode;
+          if (active_mode) {
+            nk_style_push_style_item(
+                ctx, &ctx->style.button.normal,
+                nk_style_item_color(nk_rgba(27, 140, 148, 255)));
+            nk_style_push_color(ctx, &ctx->style.button.text_normal,
+                                nk_rgb(255, 255, 255));
+          }
+          if (nk_button_label(ctx, label) && !busy) {
+            session.setSolverMode(mode);
+          }
+          if (active_mode) {
+            nk_style_pop_color(ctx);
+            nk_style_pop_style_item(ctx);
+          }
+        };
+        solver_mode_button(tr("xpbd"), 0);
+        solver_mode_button(tr("bullet"), 1);
 
         auto slide = [&](const char *l, float &v, float lo, float hi,
                          float step = 0.0f, bool disabled = false) {
@@ -1683,134 +2154,7 @@ UiFrameResult composeNuklearUi(nk_context *ctx, int win_w, int win_h,
         }
         mutedWrap(ctx, g, tr("collision_root_hint"));
 
-        heading(ctx, g, tr("bone_override"));
-        if (session.selected_bone_name.empty()) {
-          muted(ctx, g, tr("no_bone_selected"));
-        } else {
-          const std::string t =
-              std::string(tr("bone_prefix")) + session.selected_bone_name;
-          muted(ctx, g, t.c_str());
-          auto ov = [&](const char *l, bool &f, bool disabled = false) {
-            nk_layout_row_dynamic(ctx, g.row, 1);
-            nk_bool v = f ? nk_true : nk_false;
-            if (busy || disabled) {
-              nk_widget_disable_begin(ctx);
-            }
-            if (!busy && !disabled && nk_checkbox_label(ctx, l, &v)) {
-              f = v != 0;
-              session.markSelectedBoneDraftDirty();
-            }
-            if (busy || disabled) {
-              nk_widget_disable_end(ctx);
-            }
-          };
-          auto bone_slide = [&](const char *l, float &v, float lo, float hi,
-                                float step = 0.0f,
-                                bool disabled = false) {
-            if (slider(ctx, g, l, v, lo, hi, busy || disabled, step)) {
-              session.markSelectedBoneDraftDirty();
-            }
-          };
-          ov(tr("ov_mass"), session.bone_ov_mass);
-          if (session.bone_ov_mass) {
-            bone_slide(tr("mass"), session.bone_mass, 0.01f, 100, 0.1f);
-          }
-          ov(tr("ov_compliance"), session.bone_ov_compliance,
-             session.solver_mode != 0);
-          if (session.bone_ov_compliance) {
-            bone_slide(tr("compliance"), session.bone_compliance, 0, 10,
-                       0.000001f, session.solver_mode != 0);
-          }
-          ov(tr("ov_damping"), session.bone_ov_damping,
-             session.solver_mode != 0);
-          if (session.bone_ov_damping) {
-            bone_slide(tr("damping"), session.bone_damping, 0, 10, 0.00001f,
-                       session.solver_mode != 0);
-          }
-          ov(tr("ov_max_bend"), session.bone_ov_max_bend,
-             session.solver_mode != 0 || !session.enable_angle);
-          if (session.bone_ov_max_bend) {
-            bone_slide(tr("max_bend"), session.bone_max_bend, 0, 180, 1.0f,
-                       session.solver_mode != 0 || !session.enable_angle);
-          }
-          ov(tr("ov_rb_bend_x"), session.bone_ov_rb_bend_x,
-             session.solver_mode != 1 || !session.enable_angle);
-          if (session.bone_ov_rb_bend_x) {
-            bone_slide(tr("rb_max_bend_x"), session.bone_rb_bend_x, 0, 180,
-                       1.0f,
-                       session.solver_mode != 1 || !session.enable_angle);
-          }
-          ov(tr("ov_rb_bend_y"), session.bone_ov_rb_bend_y,
-             session.solver_mode != 1 || !session.enable_angle);
-          if (session.bone_ov_rb_bend_y) {
-            bone_slide(tr("rb_max_bend_y"), session.bone_rb_bend_y, 0, 180,
-                       1.0f,
-                       session.solver_mode != 1 || !session.enable_angle);
-          }
-          ov(tr("ov_rb_bend_z"), session.bone_ov_rb_bend_z,
-             session.solver_mode != 1 || !session.enable_angle);
-          if (session.bone_ov_rb_bend_z) {
-            bone_slide(tr("rb_max_bend_z"), session.bone_rb_bend_z, 0, 180,
-                       1.0f,
-                       session.solver_mode != 1 || !session.enable_angle);
-          }
-          ov(tr("ov_bend_compliance"), session.bone_ov_bend_compliance,
-             session.solver_mode != 0 || !session.enable_angle);
-          if (session.bone_ov_bend_compliance) {
-            bone_slide(tr("bend_compliance"), session.bone_bend_compliance, 0,
-                       10, 0.00001f,
-                       session.solver_mode != 0 || !session.enable_angle);
-          }
-          ov(tr("ov_pull"), session.bone_ov_pull, session.enable_real_gravity);
-          if (session.bone_ov_pull) {
-            bone_slide(tr("anim_follow"), session.bone_pull, 0, 1, 0.01f,
-                       session.enable_real_gravity);
-          }
-          if (session.transition_mode == 2) {
-            ov(tr("ov_transition_follow"), session.bone_ov_transition_follow);
-            if (session.bone_ov_transition_follow) {
-              bone_slide(tr("transition_follow"),
-                         session.bone_transition_follow, 0, 1, 0.05f);
-            }
-          }
-          ov(tr("ov_gravity"), session.bone_ov_gravity);
-          if (session.bone_ov_gravity) {
-            bone_slide(tr("gravity_scale"), session.bone_gravity_scale, 0, 5,
-                       0.1f);
-          }
-          ov(tr("ov_wind"), session.bone_ov_wind);
-          if (session.bone_ov_wind) {
-            bone_slide(tr("wind_scale"), session.bone_wind, 0, 5, 0.1f);
-          }
-          ov(tr("ov_turbulence"), session.bone_ov_turbulence);
-          if (session.bone_ov_turbulence) {
-            bone_slide(tr("turbulence_scale"), session.bone_turbulence, 0, 5,
-                       0.1f);
-          }
-          ov(tr("ov_fixed"), session.bone_ov_fixed);
-          if (session.bone_ov_fixed) {
-            if (check(ctx, g, tr("fixed_kinematic"), session.bone_fixed,
-                      busy)) {
-              session.markSelectedBoneDraftDirty();
-            }
-          }
-          muted(ctx, g, session.hasUnappliedPerBoneDraft()
-                            ? tr("draft_unapplied")
-                            : tr("draft_applied"));
-          nk_layout_row_dynamic(ctx, g.btn, 1);
-          if (nk_button_label(ctx, tr("apply_bone")) && !busy) {
-            session.applySelectedBoneConfig();
-          }
-          nk_layout_row_dynamic(ctx, g.btn, 1);
-          if (nk_button_label(ctx, tr("discard_draft")) && !busy &&
-              session.hasUnappliedPerBoneDraft()) {
-            session.discardSelectedBoneDraft();
-          }
-          nk_layout_row_dynamic(ctx, g.btn, 1);
-          if (nk_button_label(ctx, tr("clear_override")) && !busy) {
-            session.clearSelectedBoneConfig();
-          }
-        }
+        drawSelectedBoneOverrideEditor(ctx, g, session, busy);
 
         heading(ctx, g, tr("bake_result"));
         {
@@ -2266,7 +2610,7 @@ UiFrameResult composeNuklearUi(nk_context *ctx, int win_w, int win_h,
           formatByteCount(static_index_bytes, sizeof(static_index_bytes),
                           session.debug_static_model_index_bytes);
 
-          char lines[12][160];
+          char lines[14][160];
           std::snprintf(lines[0], sizeof(lines[0]), "FPS %.1f [%s]",
                         session.debug_fps,
                         session.debug_instant_sample ? "live" : "1s");
@@ -2275,9 +2619,18 @@ UiFrameResult composeNuklearUi(nk_context *ctx, int win_w, int win_h,
           std::snprintf(lines[2], sizeof(lines[2]), "Mesh/Upload %.2f/%.2f ms",
                         session.debug_mesh_ms, session.debug_upload_ms);
           std::snprintf(lines[3], sizeof(lines[3]),
+                        "Pick CPU/f %.2f ms | query/rebuild %.2f/%.2f",
+                        session.debug_pick_ms, session.debug_pick_queries,
+                        session.debug_pick_cache_rebuilds);
+          std::snprintf(lines[4], sizeof(lines[4]),
+                        "Pick faces %u/%u (candidate/total)",
+                        static_cast<unsigned>(
+                            session.debug_pick_candidate_faces),
+                        static_cast<unsigned>(session.debug_pick_total_faces));
+          std::snprintf(lines[5], sizeof(lines[5]),
                         "Upload/f %s | bones %s | static %s", upload_bytes,
                         bone_bytes, resource_bytes);
-          std::snprintf(lines[4], sizeof(lines[4]),
+          std::snprintf(lines[6], sizeof(lines[6]),
                         "Realloc/f %.2f | total %llu | rebuilds %llu",
                         session.debug_buffer_reallocations,
                         static_cast<unsigned long long>(
@@ -2285,33 +2638,33 @@ UiFrameResult composeNuklearUi(nk_context *ctx, int win_w, int win_h,
                         static_cast<unsigned long long>(
                             session.debug_static_resource_rebuilds));
           std::snprintf(
-              lines[5], sizeof(lines[5]),
+              lines[7], sizeof(lines[7]),
               "Static VB %s | IB %s | O/C/B %u/%u/%u", static_vertex_bytes,
               static_index_bytes,
               static_cast<unsigned>(session.debug_static_opaque_index_count),
               static_cast<unsigned>(session.debug_static_cutout_index_count),
               static_cast<unsigned>(session.debug_static_blend_index_count));
-          std::snprintf(lines[6], sizeof(lines[6]), "Backend CPU %.2f ms",
+          std::snprintf(lines[8], sizeof(lines[8]), "Backend CPU %.2f ms",
                         session.debug_backend_cpu_ms);
           if (session.debug_gpu_timestamp_valid) {
-            std::snprintf(lines[7], sizeof(lines[7]), "GPU timestamp %.2f ms",
+            std::snprintf(lines[9], sizeof(lines[9]), "GPU timestamp %.2f ms",
                           session.debug_gpu_timestamp_total_ms);
-            std::snprintf(lines[8], sizeof(lines[8]),
+            std::snprintf(lines[10], sizeof(lines[10]),
                           "GPU U/O/T/L %.2f/%.2f/%.2f/%.2f ms",
                           session.debug_gpu_timestamp_ui_ms,
                           session.debug_gpu_timestamp_opaque_ms,
                           session.debug_gpu_timestamp_transparent_ms,
                           session.debug_gpu_timestamp_lines_ms);
           } else {
-            std::snprintf(lines[7], sizeof(lines[7]),
+            std::snprintf(lines[9], sizeof(lines[9]),
                           "GPU timestamp unavailable");
-            std::snprintf(lines[8], sizeof(lines[8]), "GPU U/O/T/L n/a");
+            std::snprintf(lines[10], sizeof(lines[10]), "GPU U/O/T/L n/a");
           }
-          std::snprintf(lines[9], sizeof(lines[9]), "Backend %s",
+          std::snprintf(lines[11], sizeof(lines[11]), "Backend %s",
                         backend_name ? backend_name : "-");
-          std::snprintf(lines[10], sizeof(lines[10]), "Device %.40s",
+          std::snprintf(lines[12], sizeof(lines[12]), "Device %.40s",
                         device_name ? device_name : "-");
-          std::snprintf(lines[11], sizeof(lines[11]), "Cubes %d | VSync %s",
+          std::snprintf(lines[13], sizeof(lines[13]), "Cubes %d | VSync %s",
                         session.debug_cube_count,
                         session.vsync_enabled ? "on" : "off");
           for (auto &line : lines) {
@@ -2397,10 +2750,10 @@ UiFrameResult composeNuklearUi(nk_context *ctx, int win_w, int win_h,
                     workerPhaseName(session.worker_phase),
                     session.status.c_str());
       nk_label_colored(ctx, compact_status, NK_TEXT_LEFT,
-                       nk_rgb(150, 155, 170));
+                       nk_rgb(170, 177, 194));
       nk_layout_row_push(ctx, b_export);
       nk_style_push_style_item(ctx, &ctx->style.button.normal,
-                               nk_style_item_color(nk_rgba(60, 160, 120, 255)));
+                               nk_style_item_color(nk_rgba(52, 158, 116, 255)));
       const bool can_export_diagnostics =
           !busy && session.finalResult() != nullptr;
       if (!can_export_diagnostics) {
@@ -2428,6 +2781,8 @@ UiFrameResult composeNuklearUi(nk_context *ctx, int win_w, int win_h,
     }
   }
   nk_end(ctx);
+
+  drawBoneContextPopup(ctx, g, session, busy, W, H, result);
 
   return result;
 }
