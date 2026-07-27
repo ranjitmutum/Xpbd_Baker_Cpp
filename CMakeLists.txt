@@ -10,6 +10,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(XPBD_BUILD_APP "Build Nuklear+SDL3 desktop application" OFF)
 option(XPBD_BUILD_CLI "Build headless CLI" ON)
 option(XPBD_BUILD_BENCHMARKS "Build repeatable performance benchmark tool" ON)
+option(XPBD_BUILD_TESTS "Build focused regression tests" OFF)
 option(XPBD_CHECK_SPIRV "Verify embedded Vulkan SPIR-V during the default build" OFF)
 option(XPBD_GFX_OPENGL "Enable OpenGL 3.3 backend in app" ON)
 option(XPBD_GFX_VULKAN "Enable Vulkan backend in app (stub until full impl)" ON)
@@ -233,6 +234,31 @@ if(MSVC)
     target_compile_options(xpbd_core PRIVATE /W4 /permissive- /utf-8)
 else()
     target_compile_options(xpbd_core PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+if(XPBD_BUILD_TESTS)
+    enable_testing()
+    add_executable(xpbd_viewport_regression_tests
+        tools/viewport_regression_tests.cpp
+        src/gfx/viewport_mesh.cpp
+        src/gfx/texture_image.cpp
+    )
+    target_include_directories(xpbd_viewport_regression_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/gfx
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb
+    )
+    target_link_libraries(xpbd_viewport_regression_tests PRIVATE xpbd::core)
+    if(MSVC)
+        target_compile_options(xpbd_viewport_regression_tests PRIVATE
+            /W4 /permissive- /utf-8)
+    else()
+        target_compile_options(xpbd_viewport_regression_tests PRIVATE
+            -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME xpbd_viewport_regression
+             COMMAND xpbd_viewport_regression_tests)
 endif()
 
 if(XPBD_BUILD_CLI)

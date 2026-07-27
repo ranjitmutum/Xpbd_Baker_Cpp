@@ -256,8 +256,8 @@ int app_main(int argc, char **argv) {
   {
     std::string log_path = "xpbd_baker.log";
     if (const char *base = SDL_GetBasePath()) {
+      // SDL3 owns and releases this cached const path during SDL_Quit().
       log_path = std::string(base) + "xpbd_baker.log";
-      SDL_free(const_cast<char *>(base));
     }
     xpbd::log::init(log_path);
     xpbd::log::infof("Active backend: %s (%s) pref=%s force=%d",

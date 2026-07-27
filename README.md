@@ -45,6 +45,10 @@ English: [README.en.md](README.en.md)
 | `-d3d` / `XPBD_GFX=dx11`  | Direct3D 11             |
 | `auto`                    | Vulkan → DX11 → OpenGL  |
 
+为避免第三方覆盖层插入 Vulkan 调用链导致驱动不稳定，程序默认只在自身进程内禁用
+GamePP 与 RTSS 的 Vulkan 隐式层；这不会修改系统设置或卸载相关软件。确需启用这些
+覆盖层时，可设置 `XPBD_VULKAN_ALLOW_THIRD_PARTY_LAYERS=1`。
+
 视口是 GPU 网格预览。工具栏可导入 PNG/JPEG 贴图。右侧「选项」含显示骨骼、MCBE 坐标系、界面语言。
 
 相机：
@@ -89,4 +93,3 @@ English: [README.en.md](README.en.md)
 | `--velocity path`         | 速度缓存             |
 | `--dt`                    | 步长（默认 1/60）    |
 | `--assume-molang-zero`    | 明确允许本次无界面烘焙将不支持的 position/rotation Molang 按 0 采样（不能绕过 scale 检查） |
-

@@ -5,6 +5,8 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 
+#include <cstdlib>
+#include <cstring>
 #include <string>
 
 namespace xpbd::gfx {
@@ -16,6 +18,38 @@ struct Attempt {
     bool gl_attrs;
     const char* label;
 };
+
+bool environmentFlagEnabled(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr &&
+           (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
+            std::strcmp(value, "TRUE") == 0 ||
+            std::strcmp(value, "yes") == 0 ||
+            std::strcmp(value, "YES") == 0);
+}
+
+void prepareVulkanEnvironment() {
+    if (environmentFlagEnabled("XPBD_VULKAN_ALLOW_THIRD_PARTY_LAYERS")) {
+        xpbd::log::warn("Vulkan: third-party implicit layers explicitly allowed");
+        return;
+    }
+
+    // These are the disable controls declared by the GamePP and RTSS implicit
+    // layer manifests. Set them before SDL creates the Vulkan window (and thus
+    // before SDL loads Vulkan) so the overlays never enter this process.
+    const bool gamepp_disabled =
+        SDL_setenv_unsafe("DISABLE_GAMEPP_LAYER", "1", 1) == 0;
+    const bool rtss_disabled =
+        SDL_setenv_unsafe("DISABLE_RTSS_LAYER", "1", 1) == 0;
+    if (gamepp_disabled && rtss_disabled) {
+        xpbd::log::info(
+            "Vulkan: isolated from GamePP and RTSS implicit overlay layers");
+    } else {
+        xpbd::log::warnf(
+            "Vulkan: failed to isolate one or more implicit overlay layers: %s",
+            SDL_GetError());
+    }
+}
 
 std::unique_ptr<IGpuBackend> makeBackend(BackendPreference p) {
     switch (p) {
@@ -53,12 +87,7 @@ bool initWithWindow(SDL_Window*& window, const char* title, int w, int h, SDL_Wi
     };
 
     if (flags & SDL_WINDOW_VULKAN) {
-
-        if (!SDL_Vulkan_LoadLibrary(nullptr)) {
-            log_fail(std::string("SDL_Vulkan_LoadLibrary: ") +
-                     (SDL_GetError() ? SDL_GetError() : "failed"));
-            return false;
-        }
+        prepareVulkanEnvironment();
     }
     window = SDL_CreateWindow(title, w, h,
                               flags | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);

@@ -275,7 +275,6 @@ GroundLayout computeGroundLayout(
     return g;
   }
   float min_x = 1e9f, max_x = -1e9f;
-  float min_y = 1e9f, max_y = -1e9f;
   float min_z = 1e9f, max_z = -1e9f;
   bool any = false;
   std::size_t cube_count = 0;
@@ -292,12 +291,9 @@ GroundLayout computeGroundLayout(
 
     {
       const float px = static_cast<float>(pit->second.world_position[0]);
-      const float py = static_cast<float>(pit->second.world_position[1]);
       const float pz = static_cast<float>(pit->second.world_position[2]);
       min_x = std::min(min_x, px);
       max_x = std::max(max_x, px);
-      min_y = std::min(min_y, py);
-      max_y = std::max(max_y, py);
       min_z = std::min(min_z, pz);
       max_z = std::max(max_z, pz);
       any = true;
@@ -309,12 +305,9 @@ GroundLayout computeGroundLayout(
       for (int v = 0; v < 8; ++v) {
         const auto offset = static_cast<std::size_t>(v * 3);
         const float wx = static_cast<float>(transformed[offset]);
-        const float wy = static_cast<float>(transformed[offset + 1]);
         const float wz = static_cast<float>(transformed[offset + 2]);
         min_x = std::min(min_x, wx);
         max_x = std::max(max_x, wx);
-        min_y = std::min(min_y, wy);
-        max_y = std::max(max_y, wy);
         min_z = std::min(min_z, wz);
         max_z = std::max(max_z, wz);
         any = true;
@@ -325,8 +318,9 @@ GroundLayout computeGroundLayout(
     return g;
   }
 
-  const float height = std::max(1.0f, max_y - min_y);
-  g.y = min_y - std::clamp(height * 0.02f, 0.05f, 0.35f);
+  // The grid is the world-coordinate reference, not a model pedestal. Keeping
+  // it at Y=0 preserves the meaning of authored negative-Y geometry.
+  g.y = 0.0f;
   const float span_xz = std::max(max_x - min_x, max_z - min_z);
   g.half = std::clamp(std::max(span_xz * 0.75f, 6.0f), 6.0f, 48.0f);
 

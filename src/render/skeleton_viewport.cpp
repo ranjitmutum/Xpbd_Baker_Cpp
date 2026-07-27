@@ -267,10 +267,13 @@ float triangleEdge(float ax, float ay, float bx, float by, float px,
 
 bool pointInTriangle(float px, float py, float ax, float ay, float bx,
                      float by, float cx, float cy) {
+  constexpr float kEpsilon = 1e-4f;
+  if (std::abs(triangleEdge(ax, ay, bx, by, cx, cy)) <= kEpsilon) {
+    return false;
+  }
   const float e0 = triangleEdge(ax, ay, bx, by, px, py);
   const float e1 = triangleEdge(bx, by, cx, cy, px, py);
   const float e2 = triangleEdge(cx, cy, ax, ay, px, py);
-  constexpr float kEpsilon = 1e-4f;
   const bool has_negative = e0 < -kEpsilon || e1 < -kEpsilon ||
                             e2 < -kEpsilon;
   const bool has_positive =
@@ -281,6 +284,22 @@ bool pointInTriangle(float px, float py, float ax, float ay, float bx,
 bool pointInQuad(float px, float py, const std::array<float, 8> &xy) {
   return pointInTriangle(px, py, xy[0], xy[1], xy[2], xy[3], xy[4], xy[5]) ||
          pointInTriangle(px, py, xy[0], xy[1], xy[4], xy[5], xy[6], xy[7]);
+}
+
+float pointQuadDistanceSquared(float px, float py,
+                               const std::array<float, 8> &xy) {
+  if (pointInQuad(px, py, xy)) {
+    return 0.0f;
+  }
+  float best = (std::numeric_limits<float>::max)();
+  for (int edge = 0; edge < 4; ++edge) {
+    const int next = (edge + 1) % 4;
+    best = std::min(best,
+                    pointSegmentHit(px, py, xy[edge * 2], xy[edge * 2 + 1],
+                                    xy[next * 2], xy[next * 2 + 1])
+                        .distance_squared);
+  }
+  return best;
 }
 
 bool triangleBarycentrics(float px, float py, float ax, float ay, float bx,
@@ -759,10 +778,15 @@ std::string pickBoneCandidates(const SkeletonDrawList &list, float x, float y,
     }
   };
 
+  const float clamped_tolerance = std::max(0.0f, tolerance);
+  const float face_tolerance_squared =
+      clamped_tolerance * clamped_tolerance;
   const auto testFace = [&](const ProjectedFace &face) {
-    if (!face.is_ground && !face.bone_name.empty() &&
-        pointInQuad(x, y, face.xy)) {
-      consider(face.bone_name, faceDepthAt(face, x, y), 0.0f);
+    if (!face.is_ground && !face.bone_name.empty()) {
+      const float distance_squared = pointQuadDistanceSquared(x, y, face.xy);
+      if (distance_squared <= face_tolerance_squared) {
+        consider(face.bone_name, faceDepthAt(face, x, y), distance_squared);
+      }
     }
   };
   if (face_indices != nullptr || face_count == 0) {
@@ -778,7 +802,6 @@ std::string pickBoneCandidates(const SkeletonDrawList &list, float x, float y,
     }
   }
 
-  const float clamped_tolerance = std::max(0.0f, tolerance);
   for (const auto &segment : list.segments) {
     const float radius = clamped_tolerance + segment.thickness * 0.5f;
     const SegmentHit hit = pointSegmentHit(x, y, segment.x0, segment.y0,
@@ -809,7 +832,8 @@ std::string pickBone(const SkeletonDrawList &list, float x, float y,
 }
 
 BonePickIndex buildBonePickIndex(SkeletonDrawList draw_list, float view_w,
-                                 float view_h, float cell_size) {
+                                 float view_h, float cell_size,
+                                 float face_padding) {
   BonePickIndex index;
   index.draw_list = std::move(draw_list);
   if (!std::isfinite(view_w) || !std::isfinite(view_h) || view_w < 1.0f ||
@@ -819,6 +843,9 @@ BonePickIndex buildBonePickIndex(SkeletonDrawList draw_list, float view_w,
 
   index.cell_size =
       std::clamp(std::isfinite(cell_size) ? cell_size : 64.0f, 16.0f, 256.0f);
+  index.face_padding =
+      std::clamp(std::isfinite(face_padding) ? face_padding : 6.0f, 0.0f,
+                 32.0f);
   index.columns = static_cast<std::uint32_t>(
       std::max(1.0, std::ceil(static_cast<double>(view_w) / index.cell_size)));
   index.rows = static_cast<std::uint32_t>(
@@ -842,6 +869,10 @@ BonePickIndex buildBonePickIndex(SkeletonDrawList draw_list, float view_w,
       min_y = std::min(min_y, face.xy[i + 1]);
       max_y = std::max(max_y, face.xy[i + 1]);
     }
+    min_x -= index.face_padding;
+    max_x += index.face_padding;
+    min_y -= index.face_padding;
+    max_y += index.face_padding;
     if (max_x < 0.0f || max_y < 0.0f || min_x > view_w ||
         min_y > view_h) {
       return;
@@ -900,6 +931,9 @@ std::string pickBone(const BonePickIndex &index, float x, float y,
   }
   if (index.columns == 0 || index.rows == 0 || index.cell_offsets.empty() ||
       x < 0.0f || y < 0.0f) {
+    return pickBone(index.draw_list, x, y, tolerance);
+  }
+  if (std::max(0.0f, tolerance) > index.face_padding) {
     return pickBone(index.draw_list, x, y, tolerance);
   }
 

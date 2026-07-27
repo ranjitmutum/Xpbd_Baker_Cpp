@@ -52,6 +52,11 @@ Headless bake:
 | `-d3d` / `XPBD_GFX=dx11`  | Direct3D 11            |
 | `auto`                    | Vulkan → DX11 → OpenGL |
 
+To avoid driver instability from third-party overlays inserted into the Vulkan
+call chain, the app disables the GamePP and RTSS implicit Vulkan layers for its
+own process by default. This does not change system settings or uninstall
+anything. Set `XPBD_VULKAN_ALLOW_THIRD_PARTY_LAYERS=1` to opt back in.
+
 The viewport is a GPU mesh preview. Use the toolbar to import a PNG/JPEG texture. Right-hand **Options**: show bones,
 MCBE coordinates, UI language.
 

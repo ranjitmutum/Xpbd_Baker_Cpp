@@ -36,6 +36,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -151,11 +152,6 @@ public:
   bool init(SDL_Window *window) override {
     window_ = window;
     writeLog("VulkanBackend::init");
-
-    if (!SDL_Vulkan_LoadLibrary(nullptr)) {
-      writeLog(SDL_GetError());
-      return false;
-    }
 
     uint32_t ext_count = 0;
     const char *const *exts = SDL_Vulkan_GetInstanceExtensions(&ext_count);
@@ -548,8 +544,34 @@ public:
     stats_.static_cutout_index_count = static_draw_plan_.cutout.index_count;
     stats_.static_blend_index_count = static_draw_plan_.blend.index_count;
 
-    const bool valid_viewport = frame.viewport.w > 1 && frame.viewport.h > 1 &&
-                                frame.view_matrix && frame.proj_matrix;
+    const int framebuffer_width = static_cast<int>(std::min<std::uint32_t>(
+        swap_extent_.width,
+        static_cast<std::uint32_t>((std::numeric_limits<int>::max)())));
+    const int framebuffer_height = static_cast<int>(std::min<std::uint32_t>(
+        swap_extent_.height,
+        static_cast<std::uint32_t>((std::numeric_limits<int>::max)())));
+    const auto clamped_edge = [](int origin, int size, int limit) {
+      const std::int64_t edge = static_cast<std::int64_t>(origin) +
+                                static_cast<std::int64_t>((std::max)(size, 0));
+      return static_cast<int>((std::clamp)(
+          edge, std::int64_t{0}, static_cast<std::int64_t>(limit)));
+    };
+    ViewportRect safe_viewport{};
+    safe_viewport.x =
+        (std::clamp)(frame.viewport.x, 0, framebuffer_width);
+    safe_viewport.y =
+        (std::clamp)(frame.viewport.y, 0, framebuffer_height);
+    safe_viewport.w =
+        (std::max)(0, clamped_edge(frame.viewport.x, frame.viewport.w,
+                                   framebuffer_width) -
+                          safe_viewport.x);
+    safe_viewport.h =
+        (std::max)(0, clamped_edge(frame.viewport.y, frame.viewport.h,
+                                   framebuffer_height) -
+                          safe_viewport.y);
+    const bool valid_viewport =
+        safe_viewport.w > 1 && safe_viewport.h > 1 && frame.view_matrix &&
+        frame.proj_matrix;
     const bool draw_mesh =
         valid_viewport && frame.scene &&
         (!frame.scene->solid.empty() || !frame.scene->transparent.empty() ||
@@ -809,15 +831,15 @@ public:
 
     if (draw_viewport) {
       VkViewport vp{};
-      vp.x = static_cast<float>(frame.viewport.x);
-      vp.y = static_cast<float>(frame.viewport.y);
-      vp.width = static_cast<float>(frame.viewport.w);
-      vp.height = static_cast<float>(frame.viewport.h);
+      vp.x = static_cast<float>(safe_viewport.x);
+      vp.y = static_cast<float>(safe_viewport.y);
+      vp.width = static_cast<float>(safe_viewport.w);
+      vp.height = static_cast<float>(safe_viewport.h);
       vp.minDepth = 0.0f;
       vp.maxDepth = 1.0f;
-      VkRect2D sc{{frame.viewport.x, frame.viewport.y},
-                  {static_cast<uint32_t>(frame.viewport.w),
-                   static_cast<uint32_t>(frame.viewport.h)}};
+      VkRect2D sc{{safe_viewport.x, safe_viewport.y},
+                  {static_cast<uint32_t>(safe_viewport.w),
+                   static_cast<uint32_t>(safe_viewport.h)}};
       vkCmdSetViewport(fs.cmd, 0, 1, &vp);
       vkCmdSetScissor(fs.cmd, 0, 1, &sc);
 

@@ -77,6 +77,7 @@ struct BonePickDiagnostics {
 struct BonePickIndex {
   SkeletonDrawList draw_list;
   float cell_size = 64.0f;
+  float face_padding = 6.0f;
   std::uint32_t columns = 0;
   std::uint32_t rows = 0;
   std::vector<std::uint32_t> cell_offsets;
@@ -169,7 +170,8 @@ private:
 
 [[nodiscard]] BonePickIndex buildBonePickIndex(SkeletonDrawList draw_list,
                                                float view_w, float view_h,
-                                               float cell_size = 64.0f);
+                                               float cell_size = 64.0f,
+                                               float face_padding = 6.0f);
 
 [[nodiscard]] std::string
 pickBone(const BonePickIndex &index, float x, float y, float tolerance = 6.0f,
