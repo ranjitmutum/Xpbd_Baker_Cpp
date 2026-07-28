@@ -530,6 +530,7 @@ double Animation::maximumKeyframeTime(const Animation &animation) {
 Animation Animation::fromJson(const nlohmann::json &json,
                               const std::string &animation_name) {
   Animation a;
+  a.original_json = json;
   if (json.contains("loop")) {
     const auto &loopElem = json.at("loop");
     if (loopElem.is_boolean()) {

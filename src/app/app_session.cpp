@@ -4,13 +4,16 @@
 #include "xpbd/baker/rigid_body_input_compat.hpp"
 #include "xpbd/export/animation_exporter.hpp"
 #include "xpbd/export/velocity_cache_exporter.hpp"
+#include "xpbd/log.hpp"
 
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -49,6 +52,55 @@ void advanceGeneration(std::uint64_t &generation) noexcept {
   }
 }
 
+bool vulkanDiagnosticsEnabled() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("XPBD_VULKAN_DIAGNOSTICS");
+    return value != nullptr && value[0] != '\0' &&
+           std::string_view(value) != "0" &&
+           std::string_view(value) != "false" &&
+           std::string_view(value) != "FALSE";
+  }();
+  return enabled;
+}
+
+std::uint64_t diagnosticTimestampUs() {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+std::uint64_t diagnosticThreadId() {
+  return static_cast<std::uint64_t>(
+      std::hash<std::thread::id>{}(std::this_thread::get_id()));
+}
+
+std::uint64_t modelCubeCount(const baker::BoneMapper &mapper) {
+  std::uint64_t count = 0;
+  for (const auto &bone : mapper.allBones()) {
+    count += static_cast<std::uint64_t>(bone.cubes.size());
+  }
+  return count;
+}
+
+void logBakeDiagnostic(const char *event, WorkerPhase phase, int current,
+                       int total, std::size_t frame_count,
+                       std::size_t bone_count, std::uint64_t cube_count,
+                       std::uint64_t generation) {
+  if (!vulkanDiagnosticsEnabled()) {
+    return;
+  }
+  xpbd::log::infof(
+      "VKDIAG bake ts_us=%llu thread=%llu event=%s worker_phase=%d "
+      "progress=%d/%d frames=%zu bones=%zu cubes=%llu physics_generation=%llu",
+      static_cast<unsigned long long>(diagnosticTimestampUs()),
+      static_cast<unsigned long long>(diagnosticThreadId()), event,
+      static_cast<int>(phase), current, total, frame_count, bone_count,
+      static_cast<unsigned long long>(cube_count),
+      static_cast<unsigned long long>(generation));
+  xpbd::log::flush();
+}
+
 bool sameTextureResource(const gfx::TextureImage &lhs,
                          const gfx::TextureImage &rhs) noexcept {
   return lhs.width == rhs.width && lhs.height == rhs.height &&
@@ -72,481 +124,6 @@ std::filesystem::path ensureJsonExtension(std::filesystem::path path) {
   return path;
 }
 
-
-std::vector<std::uint8_t> decodeBase64(std::string_view in) {
-  static int kDec[256];
-  static bool ready = false;
-  if (!ready) {
-    for (int &d : kDec) {
-      d = -1;
-    }
-    const char *alphabet =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    for (int i = 0; alphabet[i]; ++i) {
-      kDec[static_cast<unsigned char>(alphabet[i])] = i;
-    }
-    ready = true;
-  }
-  std::vector<std::uint8_t> out;
-  out.reserve(in.size() * 3 / 4);
-  int val = 0, valb = -8;
-  for (unsigned char c : in) {
-    if (c == '=' || c == '\n' || c == '\r' || c == ' ' || c == '\t') {
-      continue;
-    }
-    const int d = kDec[c];
-    if (d < 0) {
-      return {};
-    }
-    val = (val << 6) + d;
-    valb += 6;
-    if (valb >= 0) {
-      out.push_back(static_cast<std::uint8_t>((val >> valb) & 0xFF));
-      valb -= 8;
-    }
-  }
-  return out;
-}
-
-
-
-std::optional<double> parseBbNumberStrict(const nlohmann::json &v) {
-  if (v.is_number()) {
-    return v.get<double>();
-  }
-  if (v.is_string()) {
-    const std::string s = v.get<std::string>();
-
-    try {
-      std::size_t idx = 0;
-      const double d = std::stod(s, &idx);
-
-      while (idx < s.size() &&
-             std::isspace(static_cast<unsigned char>(s[idx]))) {
-        ++idx;
-      }
-      if (idx == s.size()) {
-        return d;
-      }
-    } catch (...) {
-    }
-    return std::nullopt;
-  }
-  return 0.0;
-}
-
-
-
-
-
-double evalSimpleMolang(std::string_view expr, double anim_time) {
-  struct Parser {
-    std::string_view s;
-    std::size_t i = 0;
-    double anim_time = 0.0;
-
-    void skip() {
-      while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) {
-        ++i;
-      }
-    }
-    bool match(std::string_view lit) {
-      skip();
-      if (s.substr(i, lit.size()) == lit) {
-        i += lit.size();
-        return true;
-      }
-      return false;
-    }
-    double parseExpr() { return parseAdd(); }
-    double parseAdd() {
-      double v = parseMul();
-      for (;;) {
-        if (match("+")) {
-          v += parseMul();
-        } else if (match("-")) {
-          v -= parseMul();
-        } else {
-          break;
-        }
-      }
-      return v;
-    }
-    double parseMul() {
-      double v = parseUnary();
-      for (;;) {
-        if (match("*")) {
-          v *= parseUnary();
-        } else if (match("/")) {
-          const double d = parseUnary();
-          v = (d != 0.0) ? v / d : 0.0;
-        } else {
-          break;
-        }
-      }
-      return v;
-    }
-    double parseUnary() {
-      if (match("+")) {
-        return parseUnary();
-      }
-      if (match("-")) {
-        return -parseUnary();
-      }
-      return parsePrimary();
-    }
-    double parsePrimary() {
-      skip();
-      if (match("(")) {
-        const double v = parseExpr();
-        match(")");
-        return v;
-      }
-
-      if (match("query.anim_time") || match("q.anim_time")) {
-        return anim_time;
-      }
-
-      const std::size_t start = i;
-      while (i < s.size() && (std::isalnum(static_cast<unsigned char>(s[i])) ||
-                              s[i] == '.' || s[i] == '_')) {
-        ++i;
-      }
-      const std::string_view name = s.substr(start, i - start);
-      skip();
-      if (!name.empty() && i < s.size() && s[i] == '(') {
-        match("(");
-        const double arg = parseExpr();
-        match(")");
-        std::string lower(name);
-        for (char &c : lower) {
-          c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        }
-
-        constexpr double kDeg2Rad = 0.017453292519943295;
-        if (lower == "math.sin" || lower == "sin") {
-          return std::sin(arg * kDeg2Rad);
-        }
-        if (lower == "math.cos" || lower == "cos") {
-          return std::cos(arg * kDeg2Rad);
-        }
-        if (lower == "math.abs" || lower == "abs") {
-          return std::abs(arg);
-        }
-        return 0.0;
-      }
-
-      i = start;
-      skip();
-      if (i < s.size() &&
-          (std::isdigit(static_cast<unsigned char>(s[i])) || s[i] == '.')) {
-        std::size_t idx = 0;
-        try {
-          const double d = std::stod(std::string(s.substr(i)), &idx);
-          i += idx;
-          return d;
-        } catch (...) {
-          return 0.0;
-        }
-      }
-
-      while (i < s.size() && (std::isalnum(static_cast<unsigned char>(s[i])) ||
-                              s[i] == '.' || s[i] == '_')) {
-        ++i;
-      }
-      return 0.0;
-    }
-  };
-  Parser p;
-  p.s = expr;
-  p.anim_time = anim_time;
-  try {
-    return p.parseExpr();
-  } catch (...) {
-    return 0.0;
-  }
-}
-
-std::string jsonAxisToString(const nlohmann::json &v) {
-  if (v.is_string()) {
-    return v.get<std::string>();
-  }
-  if (v.is_number()) {
-    return std::to_string(v.get<double>());
-  }
-  return "0";
-}
-
-
-struct BbAxis {
-  bool is_molang = false;
-  double value = 0.0;
-  std::string expr;
-};
-
-BbAxis parseBbAxis(const nlohmann::json &v) {
-  BbAxis a;
-  if (auto n = parseBbNumberStrict(v)) {
-    a.value = *n;
-    return a;
-  }
-  a.is_molang = true;
-  a.expr = jsonAxisToString(v);
-  return a;
-}
-
-
-void bbToBedrockChannelAxes(const std::string &channel, BbAxis &x, BbAxis &y,
-                            BbAxis &z) {
-  if (channel == "position") {
-
-    if (x.is_molang) {
-      x.expr = "-(" + x.expr + ")";
-    } else {
-      x.value = -x.value;
-    }
-    (void)y;
-    (void)z;
-  } else if (channel == "rotation") {
-
-    if (x.is_molang) {
-      x.expr = "-(" + x.expr + ")";
-    } else {
-      x.value = -x.value;
-    }
-    if (y.is_molang) {
-      y.expr = "-(" + y.expr + ")";
-    } else {
-      y.value = -y.value;
-    }
-    (void)z;
-  }
-
-}
-
-double evalAxis(const BbAxis &a, double t) {
-  if (a.is_molang) {
-    return evalSimpleMolang(a.expr, t);
-  }
-  return a.value;
-}
-
-
-loader::AnimationRoot convertBbAnimations(const nlohmann::json &root) {
-  loader::AnimationRoot out;
-  out.format_version = "1.8.0";
-  if (!root.contains("animations") || !root.at("animations").is_array()) {
-    return out;
-  }
-  nlohmann::json bedrock = nlohmann::json::object();
-  bedrock["format_version"] = "1.8.0";
-  bedrock["animations"] = nlohmann::json::object();
-
-  for (const auto &anim : root.at("animations")) {
-    if (!anim.is_object() || !anim.contains("name")) {
-      continue;
-    }
-    const std::string name = anim.at("name").get<std::string>();
-    nlohmann::json a = nlohmann::json::object();
-
-    bool is_loop = false;
-    if (anim.contains("loop")) {
-      const auto &lp = anim.at("loop");
-      if (lp.is_boolean()) {
-        is_loop = lp.get<bool>();
-        a["loop"] = is_loop;
-      } else if (lp.is_string()) {
-        const std::string s = lp.get<std::string>();
-        if (s == "loop" || s == "true") {
-          is_loop = true;
-          a["loop"] = true;
-        } else if (s == "hold" || s == "hold_on_last_frame") {
-          a["loop"] = "hold_on_last_frame";
-        } else {
-          a["loop"] = false;
-        }
-      }
-    }
-    double length = 0.0;
-    if (anim.contains("length") && anim.at("length").is_number()) {
-      length = anim.at("length").get<double>();
-    }
-    a["bones"] = nlohmann::json::object();
-
-
-    using AxisKf = std::map<double, std::array<BbAxis, 3>>;
-    std::map<std::string, std::map<std::string, AxisKf>> bone_channels;
-    double max_kf_time = 0.0;
-    bool any_molang = false;
-
-    if (anim.contains("animators") && anim.at("animators").is_object()) {
-      for (auto it = anim.at("animators").begin();
-           it != anim.at("animators").end(); ++it) {
-        const auto &an = it.value();
-        if (!an.is_object() || !an.contains("name") ||
-            !an.contains("keyframes")) {
-          continue;
-        }
-        if (an.contains("type") && an.at("type").is_string() &&
-            an.at("type").get<std::string>() != "bone") {
-          continue;
-        }
-        const std::string bone = an.at("name").get<std::string>();
-        for (const auto &kf : an.at("keyframes")) {
-          if (!kf.is_object() || !kf.contains("channel") ||
-              !kf.contains("time") || !kf.contains("data_points") ||
-              !kf.at("data_points").is_array() ||
-              kf.at("data_points").empty()) {
-            continue;
-          }
-          const std::string ch = kf.at("channel").get<std::string>();
-          if (ch != "position" && ch != "rotation" && ch != "scale") {
-            continue;
-          }
-          const double t =
-              kf.at("time").is_number()
-                  ? kf.at("time").get<double>()
-                  : parseBbNumberStrict(kf.at("time")).value_or(0.0);
-          max_kf_time = std::max(max_kf_time, t);
-          const auto &dp = kf.at("data_points").at(0);
-          std::array<BbAxis, 3> axes{};
-          if (dp.is_object()) {
-            axes[0] =
-                parseBbAxis(dp.contains("x") ? dp.at("x") : nlohmann::json(0));
-            axes[1] =
-                parseBbAxis(dp.contains("y") ? dp.at("y") : nlohmann::json(0));
-            axes[2] =
-                parseBbAxis(dp.contains("z") ? dp.at("z") : nlohmann::json(0));
-          }
-          bbToBedrockChannelAxes(ch, axes[0], axes[1], axes[2]);
-          for (const auto &ax : axes) {
-            if (ax.is_molang) {
-              any_molang = true;
-            }
-          }
-          bone_channels[bone][ch][t] = axes;
-        }
-      }
-    }
-
-
-
-    if (!(length > 1e-9)) {
-      length = std::max(1.0, max_kf_time > 1e-9 ? max_kf_time : 1.0);
-      if (is_loop && any_molang) {
-        length = std::max(length, 1.0);
-      }
-    }
-    a["animation_length"] = length;
-
-    for (const auto &[bone, channels] : bone_channels) {
-      nlohmann::json bone_json = nlohmann::json::object();
-      for (const auto &[ch, times] : channels) {
-        bool channel_molang = false;
-        for (const auto &[t, axes] : times) {
-          (void)t;
-          for (const auto &ax : axes) {
-            if (ax.is_molang) {
-              channel_molang = true;
-            }
-          }
-        }
-        auto emitVec = [](double x, double y, double z) {
-          return nlohmann::json::array({x, y, z});
-        };
-        if (channel_molang) {
-
-
-          const int samples = std::max(
-              2, std::min(64, static_cast<int>(std::ceil(length * 20.0)) + 1));
-          nlohmann::json timeline = nlohmann::json::object();
-          for (int i = 0; i < samples; ++i) {
-            const double t = length * (static_cast<double>(i) /
-                                       static_cast<double>(samples - 1));
-
-            auto it = times.upper_bound(t);
-            if (it != times.begin()) {
-              --it;
-            }
-            const auto &axes = it->second;
-            const double x = evalAxis(axes[0], t);
-            const double y = evalAxis(axes[1], t);
-            const double z = evalAxis(axes[2], t);
-            char key[32];
-            std::snprintf(key, sizeof(key), "%.4f", t);
-            timeline[key] = emitVec(x, y, z);
-          }
-          bone_json[ch] = timeline;
-        } else if (times.size() == 1) {
-          const auto &axes = times.begin()->second;
-          bone_json[ch] = emitVec(axes[0].value, axes[1].value, axes[2].value);
-        } else {
-          nlohmann::json timeline = nlohmann::json::object();
-          for (const auto &[t, axes] : times) {
-            char key[32];
-            std::snprintf(key, sizeof(key), "%.4f", t);
-            timeline[key] =
-                emitVec(axes[0].value, axes[1].value, axes[2].value);
-          }
-          bone_json[ch] = timeline;
-        }
-      }
-      if (!bone_json.empty()) {
-        a["bones"][bone] = bone_json;
-      }
-    }
-    bedrock["animations"][name] = a;
-  }
-  try {
-    out = loader::AnimationRoot::fromJson(bedrock);
-  } catch (...) {
-    out = {};
-  }
-  return out;
-}
-
-bool loadTextureFromBbEntry(const nlohmann::json &tex,
-                            const std::filesystem::path &bb_path,
-                            gfx::TextureImage &out, std::string *err) {
-
-  if (tex.contains("source") && tex.at("source").is_string()) {
-    const std::string src = tex.at("source").get<std::string>();
-    const std::string prefix = "data:image/";
-    if (src.rfind(prefix, 0) == 0) {
-      const auto pos = src.find("base64,");
-      if (pos != std::string::npos) {
-        const auto bytes = decodeBase64(std::string_view(src).substr(pos + 7));
-        if (!bytes.empty()) {
-          return gfx::loadTextureImageFromMemory(
-              bytes.data(), static_cast<int>(bytes.size()), out, err);
-        }
-      }
-    }
-  }
-
-  if (tex.contains("relative_path") && tex.at("relative_path").is_string()) {
-    const auto rel =
-        bb_path.parent_path() / tex.at("relative_path").get<std::string>();
-    std::error_code ec;
-    const auto canon = std::filesystem::weakly_canonical(rel, ec);
-    if (!ec && std::filesystem::exists(canon)) {
-      return gfx::loadTextureImage(canon, out, err);
-    }
-    if (std::filesystem::exists(rel)) {
-      return gfx::loadTextureImage(rel, out, err);
-    }
-  }
-  if (tex.contains("path") && tex.at("path").is_string()) {
-    const std::filesystem::path p = tex.at("path").get<std::string>();
-    if (std::filesystem::exists(p)) {
-      return gfx::loadTextureImage(p, out, err);
-    }
-  }
-  if (err) {
-    *err = "no usable texture source in bbmodel";
-  }
-  return false;
-}
 
 }
 
@@ -2019,16 +1596,32 @@ void runBakeWorker(std::stop_token stop,
   BakeJobResult result;
   result.generation = execution->input.generation;
   result.fingerprint = execution->input.fingerprint;
+  const std::size_t diagnostic_bone_count =
+      execution->input.mapper.allBones().size();
+  const std::uint64_t diagnostic_cube_count =
+      vulkanDiagnosticsEnabled() ? modelCubeCount(execution->input.mapper) : 0;
+  const std::uint64_t diagnostic_generation = result.generation;
+  std::size_t diagnostic_frame_count = 0;
   try {
     execution->baker->setCancellationCheck(
         [stop]() { return stop.stop_requested(); });
     const std::weak_ptr<BakeWorkerMailbox> weak_mailbox = mailbox;
-    execution->baker->setAuditPhaseCallback([weak_mailbox]() {
+    execution->baker->setAuditPhaseCallback(
+        [weak_mailbox, diagnostic_bone_count, diagnostic_cube_count,
+         diagnostic_generation]() {
       if (const auto locked = weak_mailbox.lock()) {
         locked->phase = WorkerPhase::Auditing;
+        logBakeDiagnostic(
+            "audit_begin", WorkerPhase::Auditing, locked->current.load(),
+            locked->total.load(), 0, diagnostic_bone_count,
+            diagnostic_cube_count, diagnostic_generation);
       }
     });
     mailbox->phase = WorkerPhase::Preparing;
+    logBakeDiagnostic("worker_begin", WorkerPhase::Preparing,
+                      mailbox->current.load(), mailbox->total.load(), 0,
+                      diagnostic_bone_count, diagnostic_cube_count,
+                      diagnostic_generation);
     if (!execution->initialized) {
       execution->baker->initialize();
       execution->initialized = true;
@@ -2043,12 +1636,26 @@ void runBakeWorker(std::stop_token stop,
       mailbox->current = execution->baker->currentStep();
     }
     mailbox->phase = WorkerPhase::Finalizing;
+    logBakeDiagnostic("finalize_begin", WorkerPhase::Finalizing,
+                      mailbox->current.load(), mailbox->total.load(), 0,
+                      diagnostic_bone_count, diagnostic_cube_count,
+                      diagnostic_generation);
     execution->baker->finalizeFrames();
+    diagnostic_frame_count = execution->baker->frames().size();
+    mailbox->phase = WorkerPhase::Finalizing;
+    logBakeDiagnostic("finalize_end", WorkerPhase::Finalizing,
+                      mailbox->current.load(), mailbox->total.load(),
+                      diagnostic_frame_count, diagnostic_bone_count,
+                      diagnostic_cube_count, diagnostic_generation);
     if (stop.stop_requested()) {
       throw baker::BakeCancelled{};
     }
     mailbox->current = execution->baker->currentStep();
     mailbox->phase = WorkerPhase::Committing;
+    logBakeDiagnostic("commit_begin", WorkerPhase::Committing,
+                      mailbox->current.load(), mailbox->total.load(),
+                      diagnostic_frame_count, diagnostic_bone_count,
+                      diagnostic_cube_count, diagnostic_generation);
     result.export_preflight = preflightFor(*execution);
     if (stop.stop_requested()) {
       throw baker::BakeCancelled{};
@@ -2064,7 +1671,12 @@ void runBakeWorker(std::stop_token stop,
     result.frames =
         std::make_shared<const std::vector<baker::BakedFrame>>(
             execution->baker->takeFinalizedFrames());
+    diagnostic_frame_count = result.frames->size();
     result.terminal_state = BakeState::Completed;
+    logBakeDiagnostic("publish_result", WorkerPhase::Committing,
+                      mailbox->current.load(), mailbox->total.load(),
+                      diagnostic_frame_count, diagnostic_bone_count,
+                      diagnostic_cube_count, diagnostic_generation);
     {
       std::lock_guard lock(mailbox->mutex);
       mailbox->completed_execution = std::move(execution);
@@ -2075,6 +1687,10 @@ void runBakeWorker(std::stop_token stop,
     result.error = "Bake cancelled";
     result.export_preflight.block_reasons.push_back(
         {ExportBlockCode::Cancelled, result.error});
+    logBakeDiagnostic("worker_cancelled", WorkerPhase::Finished,
+                      mailbox->current.load(), mailbox->total.load(),
+                      diagnostic_frame_count, diagnostic_bone_count,
+                      diagnostic_cube_count, diagnostic_generation);
     std::lock_guard lock(mailbox->mutex);
     mailbox->result = std::move(result);
   } catch (const std::exception &error) {
@@ -2082,11 +1698,19 @@ void runBakeWorker(std::stop_token stop,
     result.error = error.what();
     result.export_preflight.block_reasons.push_back(
         {ExportBlockCode::Failed, result.error});
+    logBakeDiagnostic("worker_failed", WorkerPhase::Finished,
+                      mailbox->current.load(), mailbox->total.load(),
+                      diagnostic_frame_count, diagnostic_bone_count,
+                      diagnostic_cube_count, diagnostic_generation);
     std::lock_guard lock(mailbox->mutex);
     mailbox->result = std::move(result);
   }
   mailbox->phase = WorkerPhase::Finished;
   mailbox->finished = true;
+  logBakeDiagnostic("worker_finished", WorkerPhase::Finished,
+                    mailbox->current.load(), mailbox->total.load(),
+                    diagnostic_frame_count, diagnostic_bone_count,
+                    diagnostic_cube_count, diagnostic_generation);
 }
 
 }
@@ -2344,99 +1968,11 @@ void AppSession::loadModel(const std::filesystem::path &path) {
     camera_needs_fit = true;
     last_error.clear();
 
-    std::string extra;
-    const std::string ext = path.extension().string();
-    std::string ext_l = ext;
-    std::transform(
-        ext_l.begin(), ext_l.end(), ext_l.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-
-
-    if (ext_l == ".bbmodel") {
-      std::ifstream in(path, std::ios::binary);
-      if (in) {
-        std::ostringstream ss;
-        ss << in.rdbuf();
-        nlohmann::json root = nlohmann::json::parse(ss.str());
-        int tex_n = 0;
-        if (root.contains("textures") && root.at("textures").is_array() &&
-            !root.at("textures").empty()) {
-
-          std::string err;
-          bool ok = false;
-          for (const auto &t : root.at("textures")) {
-            if (!t.is_object()) {
-              continue;
-            }
-            gfx::TextureImage loaded_texture;
-            if (loadTextureFromBbEntry(t, path, loaded_texture, &err)) {
-              const bool texture_changed =
-                  !sameTextureResource(model_texture, loaded_texture);
-              model_texture = std::move(loaded_texture);
-              texture_path = path.string() + "#embedded";
-              if (t.contains("name") && t.at("name").is_string()) {
-                texture_path = t.at("name").get<std::string>();
-              }
-              if (texture_changed) {
-                advanceGeneration(texture_generation_);
-              }
-              ok = true;
-              ++tex_n;
-              break;
-            }
-          }
-          if (!ok) {
-            last_error = err.empty() ? "bbmodel texture extract failed" : err;
-          }
-        }
-
-
-
-        int anim_n = 0;
-        try {
-          auto ar = convertBbAnimations(root);
-          if (!ar.animations.empty()) {
-            animation_root = std::move(ar);
-            animation_path = path.string();
-            clearAnimationSelection();
-            anim_n = static_cast<int>(animation_root.animations.size());
-          }
-        } catch (...) {
-
-        }
-
-        if (anim_n == 0 && root.contains("animations") &&
-            root.at("animations").is_array() &&
-            !root.at("animations").empty()) {
-          const auto &a0 = root.at("animations").at(0);
-          if (a0.is_object() && a0.contains("path") &&
-              a0.at("path").is_string()) {
-            const auto ap =
-                path.parent_path() / a0.at("path").get<std::string>();
-            std::error_code ec;
-            auto canon = std::filesystem::weakly_canonical(ap, ec);
-            if (!ec && std::filesystem::exists(canon)) {
-              try {
-
-                animation_root = loader::AnimationLoader::load(canon);
-                animation_path = canon.string();
-                clearAnimationSelection();
-                anim_n = static_cast<int>(animation_root.animations.size());
-              } catch (...) {
-              }
-            }
-          }
-        }
-        extra = " | tex " + std::to_string(tex_n) + " | anim " +
-                std::to_string(anim_n);
-      }
-    }
-
     invalidatePhysicsArtifacts(
         InvalidationReason::Model,
         "Model loaded — select physics bones and play to bake");
     status = "Model: " + path.filename().string() + " (" +
-             std::to_string(geometry.bones.size()) + " bones)" + extra;
+             std::to_string(geometry.bones.size()) + " bones)";
     if (geometry.description.has_texture_size) {
       status += " UV " + std::to_string(geometry.description.texture_width) +
                 "x" + std::to_string(geometry.description.texture_height);
@@ -2479,7 +2015,7 @@ bool AppSession::loadTexture(const std::filesystem::path &path) {
     status += "  [!] model UV " +
               std::to_string(geometry.description.texture_width) + "x" +
               std::to_string(geometry.description.texture_height) +
-              " — prefer matching PNG or load .bbmodel for face UVs";
+              " — use a texture matching the model UV resolution";
   }
   return true;
 }
@@ -2530,17 +2066,6 @@ void AppSession::selectAnimation(const std::string &name) {
   playback_state = PlaybackState::Paused;
   invalidatePhysicsArtifacts(InvalidationReason::Animation,
                              "Anim: " + name + " — play to bake");
-}
-
-void AppSession::clearAnimationSelection() {
-  selected_animation_name.clear();
-  selected_animation = nullptr;
-  preview_time = 0.0;
-  playback_state = PlaybackState::Paused;
-  invalidatePhysicsArtifacts(
-      InvalidationReason::Animation,
-      "Rest pose — select an animation to bake");
-  status = "Rest pose (no animation selected)";
 }
 
 void AppSession::updateCameraFollowPreview() {
@@ -3145,13 +2670,6 @@ BakeJobInput AppSession::makeBakeJobInput(
       allow_selected_molang_zero;
   input.fingerprint = fingerprintFor(input);
   return input;
-}
-
-SessionFingerprint AppSession::currentSessionFingerprint() const {
-  if (selected_animation == nullptr) {
-    return {};
-  }
-  return makeBakeJobInput(false, false).fingerprint;
 }
 
 void AppSession::startBake() {
@@ -4319,6 +3837,27 @@ void AppSession::pollBakeProgress() {
     playback_state = PlaybackState::Playing;
     preview_time = 0.0;
     preview_frame_index = 0;
+    if (vulkanDiagnosticsEnabled()) {
+      xpbd::log::infof(
+          "VKDIAG commit ts_us=%llu thread=%llu event=result_commit "
+          "worker_phase=%d presentation=%d playback=%d preview_time=%.9g "
+          "preview_index=%d frames=%zu bones=%zu cubes=%llu "
+          "gen_model=%llu gen_animation=%llu gen_physics=%llu "
+          "gen_texture=%llu",
+          static_cast<unsigned long long>(diagnosticTimestampUs()),
+          static_cast<unsigned long long>(diagnosticThreadId()),
+          static_cast<int>(worker_phase), static_cast<int>(presentation_mode),
+          static_cast<int>(playback_state), preview_time, preview_frame_index,
+          final_result_->frames->size(),
+          final_execution_->input.mapper.allBones().size(),
+          static_cast<unsigned long long>(
+              modelCubeCount(final_execution_->input.mapper)),
+          static_cast<unsigned long long>(model_generation_),
+          static_cast<unsigned long long>(animation_generation_),
+          static_cast<unsigned long long>(physics_generation_),
+          static_cast<unsigned long long>(texture_generation_));
+      xpbd::log::flush();
+    }
     status = (exportPreflight().animation_allowed
                   ? "Bake complete"
                   : "Bake complete — export blocked") +

@@ -28,7 +28,6 @@ public:
 private:
     static void validateGeometry(const Geometry& geo);
     static Geometry parseGeometryRoot(const nlohmann::json& root);
-    static Geometry parseBlockbenchModel(const nlohmann::json& root);
     static Bone parseBone(const nlohmann::json& json);
     static Cube parseCube(const nlohmann::json& json);
     static FaceUV parseFaceUV(const nlohmann::json& face_json);

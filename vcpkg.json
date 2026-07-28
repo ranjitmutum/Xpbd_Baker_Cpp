@@ -6,7 +6,6 @@
   "dependencies": [
     "nlohmann-json",
     "bullet3",
-    "gtest",
     {
       "name": "sdl3",
       "features": ["vulkan"]

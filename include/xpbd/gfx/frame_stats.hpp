@@ -8,7 +8,6 @@ struct FrameStats {
   float frame_ms = 0.0f;
   float ema_frame_ms = 16.0f;
   float fps = 0.0f;
-  float ui_ms = 0.0f;
   float mesh_ms = 0.0f;
   float pick_ms = 0.0f;
   std::uint32_t pick_queries = 0;

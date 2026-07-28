@@ -60,14 +60,14 @@ void affineTransform8Scalar(double *output_xyz_aos,
 
 const SimdKernelTable &selectedSimdKernelTable(SimdMode requested) noexcept {
   static constexpr SimdKernelTable sse2{
-      SimdMode::SSE2, denseScaledAddSse2, boxProjectionOverlapSse2,
-      targetPositionSse2, affineTransform8Sse2};
+      SimdMode::SSE2, boxProjectionOverlapSse2, targetPositionSse2,
+      affineTransform8Sse2};
 
 
   // 刻意使用 SSE2 版 box projection：8 顶点的小规模负载下 AVX2 实测为负提升。
   static constexpr SimdKernelTable avx2{
-      SimdMode::AVX2, denseScaledAddAvx2, boxProjectionOverlapSse2,
-      targetPositionAvx2, affineTransform8Avx2};
+      SimdMode::AVX2, boxProjectionOverlapSse2, targetPositionAvx2,
+      affineTransform8Avx2};
   return selectedSimdMode(requested) == SimdMode::AVX2 ? avx2 : sse2;
 }
 

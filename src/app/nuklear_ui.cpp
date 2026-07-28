@@ -2,6 +2,7 @@
 
 #include "xpbd/app/app_session.hpp"
 #include "xpbd/app/i18n.hpp"
+#include "xpbd/baker/output_timeline_resampler.hpp"
 
 #define NK_INCLUDE_FIXED_TYPES
 #define NK_INCLUDE_STANDARD_IO
@@ -1246,10 +1247,7 @@ void applyDarkStyle(nk_context *ctx, float ) {
 
 UiFrameResult composeNuklearUi(nk_context *ctx, int win_w, int win_h,
                                float ui_scale, const char *backend_name,
-                               const char *device_name,
-                               const gfx::FrameStats &stats) {
-  (void)stats;
-
+                               const char *device_name) {
   UiFrameResult result;
   auto &session = AppSession::instance();
   session.pollBakeProgress();
@@ -1352,10 +1350,7 @@ UiFrameResult composeNuklearUi(nk_context *ctx, int win_w, int win_h,
     nk_layout_row_begin(ctx, NK_STATIC, menu_row_h, 7);
     file_btn(tr("open_model"), w_om, true, [&] {
       if (auto p = openFileDialog(
-              L"Open Bedrock/Blockbench Model",
-              L"Models "
-              L"(*.geo.json;*.json;*.bbmodel)\0*.geo.json;*.json;*.bbmodel\0"
-              L"Blockbench (*.bbmodel)\0*.bbmodel\0"
+              L"Open Bedrock Geometry Model",
               L"Geometry JSON "
               L"(*.geo.json;*.json)\0*.geo.json;*.json\0All\0*.*\0")) {
         session.loadModel(*p);
@@ -1888,6 +1883,33 @@ UiFrameResult composeNuklearUi(nk_context *ctx, int win_w, int win_h,
             session.output_timeline_mode = selected;
             markDirty("Output timeline changed - play to rebake");
           }
+        }
+        if (session.output_timeline_mode == 1 &&
+            session.selected_animation != nullptr) {
+          const auto &animation = *session.selected_animation;
+          const int source_snapping_fps =
+              baker::OutputTimelineResampler::detectSourceSnappingFps(
+                  animation);
+          char source_snapping_text[256];
+          if (source_snapping_fps > 0) {
+            // Bedrock 循环输出也保留 animation_length 处的闭合关键帧，
+            // 所以严格吸附模式显示的数量始终按闭区间计算。
+            const std::size_t frame_count =
+                baker::OutputTimelineResampler::snappedFrameCount(
+                    animation.animation_length, source_snapping_fps,
+                    baker::OutputEndpointPolicy::Closed);
+            std::snprintf(source_snapping_text,
+                          sizeof(source_snapping_text),
+                          tr("source_snapping_detected"),
+                          source_snapping_fps,
+                          1.0 / static_cast<double>(source_snapping_fps),
+                          frame_count);
+          } else {
+            std::snprintf(source_snapping_text,
+                          sizeof(source_snapping_text), "%s",
+                          tr("source_snapping_undetected"));
+          }
+          mutedWrap(ctx, g, source_snapping_text);
         }
         if (session.solver_mode == 1) {
           slide(tr("rb_unit_scale"), session.unit_scale, 0.0001f, 10.0f,

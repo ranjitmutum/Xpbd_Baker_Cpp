@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cmath>
 #include <limits>
 #include <set>
@@ -12,6 +13,39 @@ namespace xpbd::baker {
 namespace {
 
 constexpr double kTimeEpsilon = 1e-12;
+constexpr int kMinimumSourceSnappingFps = 10;
+constexpr int kMaximumSourceSnappingFps = 500;
+// Blockbench 导出的时间码通常会进行十进制裁剪。这里同时保留旧实现
+// 的 0.015 帧容差，并允许约 4 位小数的时间码舍入误差。
+constexpr double kSourceTimeRoundingTolerance = 5.1e-5;
+
+double snappingFrameTolerance(int fps) {
+  return std::max(0.015,
+                  static_cast<double>(fps) * kSourceTimeRoundingTolerance);
+}
+
+bool timeMatchesSnapping(double time, int fps) {
+  const double frame = time * static_cast<double>(fps);
+  return std::abs(frame - std::nearbyint(frame)) <=
+         snappingFrameTolerance(fps);
+}
+
+int declaredSnappingFps(const nlohmann::json &animation_json) {
+  if (!animation_json.is_object() ||
+      !animation_json.contains("snapping") ||
+      !animation_json.at("snapping").is_number()) {
+    return 0;
+  }
+  const double value = animation_json.at("snapping").get<double>();
+  const double rounded = std::nearbyint(value);
+  if (!std::isfinite(value) ||
+      std::abs(value - rounded) > 1e-9 ||
+      rounded < static_cast<double>(kMinimumSourceSnappingFps) ||
+      rounded > static_cast<double>(kMaximumSourceSnappingFps)) {
+    return 0;
+  }
+  return static_cast<int>(rounded);
+}
 
 RotationUtil::Quat normalized(RotationUtil::Quat value) {
   double length_squared = 0.0;
@@ -48,10 +82,38 @@ void collectKeyTimes(std::set<double> &target,
   }
 }
 
+void collectEffectKeyTimes(std::set<double> &target,
+                           const nlohmann::json &animation_json,
+                           const char *field_name) {
+  if (!animation_json.is_object() || !animation_json.contains(field_name) ||
+      !animation_json.at(field_name).is_object()) {
+    return;
+  }
+  for (auto it = animation_json.at(field_name).begin();
+       it != animation_json.at(field_name).end(); ++it) {
+    try {
+      std::size_t consumed = 0;
+      const double time = std::stod(it.key(), &consumed);
+      if (consumed == it.key().size() && std::isfinite(time) && time >= 0.0) {
+        target.insert(time);
+      }
+    } catch (const std::exception &) {
+      // 非时间键不是有效的 Bedrock 效果关键帧，检测时忽略即可。
+    }
+  }
 }
 
-double OutputTimelineResampler::inferSourceFrameInterval(
-    const loader::Animation &animation, double fallback_interval) {
+}
+
+int OutputTimelineResampler::detectSourceSnappingFps(
+    const loader::Animation &animation) {
+  // Blockbench 动画对象已经保存了 snapping；第二模式优先直接读取，
+  // 不再用稀疏关键帧反推并误判源吸附。仅在旧文件没有该字段时回退推断。
+  if (const int declared = declaredSnappingFps(animation.original_json);
+      declared > 0) {
+    return declared;
+  }
+
   std::set<double> key_times;
   for (const auto &[unused_name, bone] : animation.bones) {
     (void)unused_name;
@@ -59,26 +121,113 @@ double OutputTimelineResampler::inferSourceFrameInterval(
     collectKeyTimes(key_times, bone.rotation);
     collectKeyTimes(key_times, bone.scale);
   }
-  if (key_times.size() < 3) {
-    return fallback_interval;
+  collectEffectKeyTimes(key_times, animation.original_json, "timeline");
+  collectEffectKeyTimes(key_times, animation.original_json, "sound_effects");
+  collectEffectKeyTimes(key_times, animation.original_json,
+                        "particle_effects");
+  if (std::isfinite(animation.animation_length) &&
+      animation.animation_length >= 0.0) {
+    key_times.insert(animation.animation_length);
+  }
+  if (key_times.size() < 2) {
+    return 0;
   }
 
-  constexpr std::array<int, 13> kCandidateFps{
-      20, 24, 25, 30, 40, 48, 50, 60, 72, 90, 120, 144, 240};
-  for (int fps : kCandidateFps) {
-    bool aligned = true;
-    for (double time : key_times) {
-      const double frame = time * static_cast<double>(fps);
-      if (std::abs(frame - std::nearbyint(frame)) > 0.015) {
-        aligned = false;
-        break;
-      }
-    }
+  // Blockbench 的动画吸附是整数 FPS。返回能容纳全部源时间码的
+  // 最小网格，避免把 20 FPS 源动画误判成同样兼容的 40/60 FPS。
+  for (int fps = kMinimumSourceSnappingFps;
+       fps <= kMaximumSourceSnappingFps; ++fps) {
+    const bool aligned = std::all_of(
+        key_times.begin(), key_times.end(),
+        [fps](double time) { return timeMatchesSnapping(time, fps); });
     if (aligned) {
-      return 1.0 / static_cast<double>(fps);
+      return fps;
     }
   }
-  return fallback_interval;
+  return 0;
+}
+
+std::size_t OutputTimelineResampler::snappedFrameCount(
+    double clip_length, int snapping_fps,
+    OutputEndpointPolicy endpoint_policy) {
+  if (!std::isfinite(clip_length) || clip_length < 0.0 || snapping_fps <= 0) {
+    return 0;
+  }
+  const double frame_position =
+      clip_length * static_cast<double>(snapping_fps);
+  const double rounded_position = std::nearbyint(frame_position);
+  if (std::abs(frame_position - rounded_position) >
+          snappingFrameTolerance(snapping_fps) ||
+      rounded_position < 0.0 ||
+      rounded_position >
+          static_cast<double>(std::numeric_limits<std::size_t>::max() - 1U)) {
+    return 0;
+  }
+  const auto steps = static_cast<std::size_t>(rounded_position);
+  if (endpoint_policy == OutputEndpointPolicy::HalfOpenPeriodic) {
+    return steps;
+  }
+  return steps + 1U;
+}
+
+double OutputTimelineResampler::inferSourceFrameInterval(
+    const loader::Animation &animation, double fallback_interval) {
+  const int source_snapping_fps = detectSourceSnappingFps(animation);
+  return source_snapping_fps > 0
+             ? 1.0 / static_cast<double>(source_snapping_fps)
+             : fallback_interval;
+}
+
+std::vector<BakedFrame> OutputTimelineResampler::resampleToSnappingFps(
+    const std::vector<BakedFrame> &source,
+    const std::map<std::string, loader::Bone> &bones_by_name,
+    int snapping_fps, double clip_length,
+    OutputEndpointPolicy endpoint_policy) {
+  const std::size_t expected_count =
+      snappedFrameCount(clip_length, snapping_fps, endpoint_policy);
+  if (expected_count == 0) {
+    throw std::invalid_argument(
+        "source animation length is not aligned to the declared snapping grid");
+  }
+
+  const std::size_t snapped_steps =
+      endpoint_policy == OutputEndpointPolicy::HalfOpenPeriodic
+          ? expected_count
+          : expected_count - 1U;
+  const double snapped_length =
+      static_cast<double>(snapped_steps) /
+      static_cast<double>(snapping_fps);
+
+  // animation_length 常被 JSON 十进制格式化成 1.6667 之类的值。
+  // 若直接按该浮点长度 floor，会在网格上方舍入时多生成一帧。
+  // 严格模式应由 snapping 和整数步数构造时间线，而不是再次推算帧数。
+  const std::vector<BakedFrame> *sampling_source = &source;
+  std::vector<BakedFrame> extended_source;
+  if (!source.empty() && source.back().time < snapped_length) {
+    const double maximum_rounding_gap =
+        snappingFrameTolerance(snapping_fps) /
+            static_cast<double>(snapping_fps) +
+        kTimeEpsilon;
+    if (source.back().time < clip_length - kTimeEpsilon ||
+        snapped_length - source.back().time > maximum_rounding_gap) {
+      throw std::invalid_argument(
+          "output resample source does not cover the declared snapping grid");
+    }
+    extended_source = source;
+    BakedFrame endpoint = extended_source.back();
+    endpoint.time = snapped_length;
+    extended_source.push_back(std::move(endpoint));
+    sampling_source = &extended_source;
+  }
+
+  auto result = resample(*sampling_source, bones_by_name,
+                         1.0 / static_cast<double>(snapping_fps),
+                         snapped_length, endpoint_policy);
+  if (result.size() != expected_count) {
+    throw std::logic_error(
+        "strict source snapping resample produced an unexpected frame count");
+  }
+  return result;
 }
 
 RotationUtil::Quat OutputTimelineResampler::interpolateQuaternionShortestArc(

@@ -233,6 +233,15 @@ int app_main(int argc, char **argv) {
     return 1;
   }
 
+  {
+    std::string log_path = "xpbd_baker.log";
+    if (const char *base = SDL_GetBasePath()) {
+      // SDL3 owns and releases this cached const path during SDL_Quit().
+      log_path = std::string(base) + "xpbd_baker.log";
+    }
+    xpbd::log::init(log_path);
+  }
+
   constexpr int kWinW = 1280;
   constexpr int kWinH = 800;
   const char *kTitle = "XPBD Bone Baker - Bedrock Physics Baking Tool";
@@ -250,21 +259,15 @@ int app_main(int argc, char **argv) {
     if (window) {
       SDL_DestroyWindow(window);
     }
+    xpbd::log::errorf("GPU backend init failed: %s", msg.c_str());
+    xpbd::log::shutdown();
     SDL_Quit();
     return 1;
   }
-  {
-    std::string log_path = "xpbd_baker.log";
-    if (const char *base = SDL_GetBasePath()) {
-      // SDL3 owns and releases this cached const path during SDL_Quit().
-      log_path = std::string(base) + "xpbd_baker.log";
-    }
-    xpbd::log::init(log_path);
-    xpbd::log::infof("Active backend: %s (%s) pref=%s force=%d",
-                     backend->name(), backend->deviceName(),
-                     xpbd::gfx::preferenceName(backend_req.pref),
-                     backend_req.force ? 1 : 0);
-  }
+  xpbd::log::infof("Active backend: %s (%s) pref=%s force=%d",
+                   backend->name(), backend->deviceName(),
+                   xpbd::gfx::preferenceName(backend_req.pref),
+                   backend_req.force ? 1 : 0);
   const char *legacy_uv_env = std::getenv("XPBD_VULKAN_LEGACY_UV");
   const bool use_static_model = xpbd::gfx::useStaticModelViewport(
       backend->supportsStaticModel(),
@@ -432,6 +435,10 @@ int app_main(int argc, char **argv) {
   bool running = true;
   auto last = std::chrono::steady_clock::now();
   auto &session = xpbd::app::AppSession::instance();
+  std::uint64_t render_frame_number = 0;
+  std::uint64_t result_commit_frame_number = 0;
+  std::uint32_t completion_diagnostic_frames = 0;
+  auto previous_bake_state = session.bake_state;
   bool hover_pick_snapshot_valid = false;
   float hover_pick_mouse_x = 0.0f;
   float hover_pick_mouse_y = 0.0f;
@@ -742,7 +749,13 @@ int app_main(int argc, char **argv) {
 
     const auto ui_result =
         xpbd::app::composeNuklearUi(&ctx, win_w, win_h, 1.0f, backend->name(),
-                                    backend->deviceName(), frame_stats);
+                                    backend->deviceName());
+    if (session.bake_state == xpbd::app::BakeState::Completed &&
+        previous_bake_state != xpbd::app::BakeState::Completed) {
+      result_commit_frame_number = render_frame_number;
+      completion_diagnostic_frames = 30;
+    }
+    previous_bake_state = session.bake_state;
     prev_layout = ui_result.layout;
     SDL_Cursor *requested_cursor = ui_result.layout.horizontal_resize_cursor &&
                                            horizontal_resize_cursor != nullptr
@@ -898,12 +911,33 @@ int app_main(int argc, char **argv) {
       frame.static_model_generation = session.modelGeneration();
       frame.static_texture_generation = session.textureGeneration();
     }
+    frame.diagnostics.active = completion_diagnostic_frames > 0;
+    frame.diagnostics.render_frame = render_frame_number;
+    frame.diagnostics.result_commit_frame = result_commit_frame_number;
+    frame.diagnostics.frames_remaining = completion_diagnostic_frames;
+    frame.diagnostics.worker_phase = static_cast<int>(session.worker_phase);
+    frame.diagnostics.presentation_mode =
+        static_cast<int>(session.presentation_mode);
+    frame.diagnostics.playback_state =
+        static_cast<int>(session.playback_state);
+    frame.diagnostics.preview_frame_index = session.preview_frame_index;
+    frame.diagnostics.bake_current = session.bake_current;
+    frame.diagnostics.bake_total = session.bake_total;
+    frame.diagnostics.preview_time = session.preview_time;
+    frame.diagnostics.model_generation = session.modelGeneration();
+    frame.diagnostics.animation_generation = session.animationGeneration();
+    frame.diagnostics.physics_generation = session.physicsGeneration();
+    frame.diagnostics.texture_generation = session.textureGeneration();
     frame.ui = &ui_draw;
     frame.clear_r = 26.0f / 255.0f;
     frame.clear_g = 28.0f / 255.0f;
     frame.clear_b = 34.0f / 255.0f;
 
     backend->render(frame);
+    if (completion_diagnostic_frames > 0) {
+      --completion_diagnostic_frames;
+    }
+    ++render_frame_number;
     const auto backend_stats = backend->stats();
     frame_stats.gpu_ms = backend_stats.gpu_ms;
     frame_stats.upload_ms = backend_stats.upload_ms;

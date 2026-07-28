@@ -615,17 +615,20 @@ public:
     return model_generation_;
   }
 
+  [[nodiscard]] std::uint64_t animationGeneration() const noexcept {
+    return animation_generation_;
+  }
+
+  [[nodiscard]] std::uint64_t physicsGeneration() const noexcept {
+    return physics_generation_;
+  }
+
   [[nodiscard]] std::uint64_t textureGeneration() const noexcept {
     return texture_generation_;
   }
 
   bool loadTexture(const std::filesystem::path &path);
   void clearTexture();
-
-
-  float bone_list_scroll = 0.0f;
-  float anim_list_scroll = 0.0f;
-  float property_scroll = 0.0f;
 
 
   bool show_debug_hud = false;
@@ -666,7 +669,6 @@ public:
   float debug_gpu_ms = 0.0f;
   int debug_cube_count = 0;
   int debug_frame_count = 0;
-  double debug_last_sample_time = 0.0;
 
 
 
@@ -691,9 +693,6 @@ public:
   void loadModel(const std::filesystem::path &path);
   void loadAnimation(const std::filesystem::path &path);
   void selectAnimation(const std::string &name);
-
-  void clearAnimationSelection();
-
 
   void updateCameraFollowPreview();
   void togglePhysicsBone(const std::string &name, bool enabled);
@@ -755,7 +754,6 @@ public:
   [[nodiscard]] const loader::Animation *currentPreviewReferenceAnimation()
       const;
   [[nodiscard]] double currentPreviewReferenceTime() const;
-  [[nodiscard]] SessionFingerprint currentSessionFingerprint() const;
   void setPresentationMode(PresentationMode mode);
   void pollBakeProgress();
   void fitCameraToModel();

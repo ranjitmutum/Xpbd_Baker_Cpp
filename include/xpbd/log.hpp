@@ -11,6 +11,7 @@ enum class Level { Trace, Debug, Info, Warn, Error };
 
 void init(const std::string& path = "xpbd_baker.log");
 void shutdown();
+void flush();
 
 void setLevel(Level level);
 

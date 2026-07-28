@@ -93,6 +93,10 @@ struct Animation {
   std::optional<bool> override_previous_animation;
   std::map<std::string, BoneAnimation> bones;
 
+  // 保留完整的原始动画对象，导出时用于原样保留 timeline、音效、粒子等
+  // 当前求解器不解析的动画级字段。
+  nlohmann::json original_json = nullptr;
+
   [[nodiscard]] static Animation
   fromJson(const nlohmann::json &json,
            const std::string &animation_name = "<animation>");

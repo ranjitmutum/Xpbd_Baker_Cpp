@@ -83,6 +83,19 @@ void shutdown() {
 #endif
 }
 
+void flush() {
+#if XPBD_HAS_SPDLOG
+    if (g_logger) {
+        g_logger->flush();
+    }
+#else
+    std::lock_guard lock(g_mu);
+    if (g_file) {
+        std::fflush(g_file);
+    }
+#endif
+}
+
 void setLevel(Level level) {
 #if XPBD_HAS_SPDLOG
     if (!g_logger) {
@@ -106,6 +119,7 @@ void setLevel(Level level) {
             break;
     }
 #else
+    std::lock_guard lock(g_mu);
     g_level = level;
 #endif
 }
@@ -136,12 +150,14 @@ void log(Level level, std::string_view msg) {
             break;
     }
 #else
+    std::unique_lock lock(g_mu);
     if (static_cast<int>(level) < static_cast<int>(g_level)) {
         return;
     }
-    std::lock_guard lock(g_mu);
     if (!g_file) {
+        lock.unlock();
         init();
+        lock.lock();
     }
     if (!g_file) {
         return;

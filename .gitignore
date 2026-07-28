@@ -50,6 +50,7 @@ desktop.ini
 !.env.example
 
 # ===== C++ / CMake / vcpkg =====
+/build/
 /build-mingw-release/
 /.toolchain/
 /vcpkg_installed_mingw/

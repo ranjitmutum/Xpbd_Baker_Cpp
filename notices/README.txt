@@ -17,6 +17,4 @@ Third-party components (summaries; see files / upstream for full text):
   - Bullet Physics ........ zlib                        (vcpkg bullet3; BULLET-ZLIB.txt)
   - spdlog / fmt .......... MIT                         (vcpkg)
   - Vulkan-Headers/Loader . Apache-2.0                  (vcpkg)
-  - GoogleTest ............ BSD-3-Clause                (tests only)
-
 EUI-NEO under third_party/EUI-NEO is NOT linked into the shipping GUI.

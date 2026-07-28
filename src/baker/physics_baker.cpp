@@ -1535,29 +1535,28 @@ std::vector<BakedFrame> PhysicsBaker::takeFinalizedFrames() {
 
 void PhysicsBaker::resampleOutputTimeline() {
   auto resample_scope = profiler_.scope(BakeProfiler::Stage::Resample);
-  if (source_animation_ == nullptr || frames_.size() < 3 ||
+  if (source_animation_ == nullptr || frames_.size() < 2 ||
       bone_mapper_.config().output_timeline_mode !=
           BoneMapper::OutputTimelineMode::SourceKeyframeGrid) {
     return;
   }
-  const double interval =
-      OutputTimelineResampler::inferSourceFrameInterval(
-          *source_animation_, output_frame_interval_);
-  if (!std::isfinite(interval) || !(interval > 0.0)) {
-    return;
+  const int source_snapping_fps =
+      OutputTimelineResampler::detectSourceSnappingFps(*source_animation_);
+  if (source_snapping_fps <= 0) {
+    throw std::runtime_error(
+        "strict source snapping mode could not detect the source animation "
+        "snapping; use Bake FPS mode or add snapped source keyframes");
   }
-  const double interval_scale = std::max(interval, output_frame_interval_);
-  if (std::abs(interval - output_frame_interval_) <=
-      interval_scale * 1e-9) {
-    return;
-  }
-  const double length = frames_.back().time;
+  const double length = source_animation_->animation_length;
   if (!std::isfinite(length) || !(length > 0.0)) {
     return;
   }
-  frames_ = OutputTimelineResampler::resample(
-      frames_, bones_by_name_, interval, length, OutputEndpointPolicy::Closed);
-  output_frame_interval_ = interval;
+  // 第二种输出模式不再用输出 FPS 兜底，也不沿用求解步数；
+  // 最终关键帧数严格由源动画长度和检测到的吸附 FPS 决定。
+  frames_ = OutputTimelineResampler::resampleToSnappingFps(
+      frames_, bones_by_name_, source_snapping_fps, length,
+      OutputEndpointPolicy::Closed);
+  output_frame_interval_ = 1.0 / static_cast<double>(source_snapping_fps);
 }
 
 void PhysicsBaker::normalizePeriodicOutputTimeline() {
@@ -1573,9 +1572,26 @@ void PhysicsBaker::normalizePeriodicOutputTimeline() {
 
 
 
-  frames_ = OutputTimelineResampler::resample(
-      frames_, bones_by_name_, output_frame_interval_, length,
-      OutputEndpointPolicy::HalfOpenPeriodic);
+  if (bone_mapper_.config().output_timeline_mode ==
+      BoneMapper::OutputTimelineMode::SourceKeyframeGrid) {
+    const int source_snapping_fps =
+        OutputTimelineResampler::detectSourceSnappingFps(*source_animation_);
+    if (source_snapping_fps <= 0) {
+      throw std::runtime_error(
+          "strict source snapping mode lost its detected snapping before "
+          "periodic output normalization");
+    }
+    // 内部循环时间线保持半开区间 [0, L)，避免在最终校验阶段再次
+    // 引入重复端点。显式闭合关键帧只在 JSON 序列化时生成。
+    frames_ = OutputTimelineResampler::resampleToSnappingFps(
+        frames_, bones_by_name_, source_snapping_fps, length,
+        OutputEndpointPolicy::HalfOpenPeriodic);
+    output_frame_interval_ = 1.0 / static_cast<double>(source_snapping_fps);
+  } else {
+    frames_ = OutputTimelineResampler::resample(
+        frames_, bones_by_name_, output_frame_interval_, length,
+        OutputEndpointPolicy::HalfOpenPeriodic);
+  }
 }
 
 std::set<std::string> PhysicsBaker::fixedBones() const {

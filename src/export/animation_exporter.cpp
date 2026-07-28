@@ -114,7 +114,13 @@ nlohmann::json AnimationExporter::bakedAnimationToJson(
         "transition reference export requires a pose sampler and model bones");
   }
 
-  nlohmann::json anim = nlohmann::json::object();
+  // 从原始动画对象开始覆盖烘焙字段，避免删除 timeline、sound_effects、
+  // particle_effects 以及其他当前未解析的动画级扩展字段。
+  nlohmann::json anim =
+      reference_animation != nullptr &&
+              reference_animation->original_json.is_object()
+          ? reference_animation->original_json
+          : nlohmann::json::object();
   if (loop_behavior == loader::Animation::LoopBehavior::HoldLast) {
     anim["loop"] = "hold_on_last_frame";
   } else {
@@ -133,16 +139,13 @@ nlohmann::json AnimationExporter::bakedAnimationToJson(
   }
   requireFinite(animLen, "animation length");
   anim["animation_length"] = animLen;
-  const bool halfOpenPeriodic =
+  const bool synthesizeLoopEndpoint =
       loop_behavior == loader::Animation::LoopBehavior::Loop &&
-      reference_animation != nullptr &&
+      reference_animation != nullptr && !frames.empty() &&
       std::isfinite(reference_animation->animation_length) &&
       reference_animation->animation_length > 0.0;
   const double periodicLength =
-      halfOpenPeriodic ? reference_animation->animation_length : 0.0;
-  const auto serializeFrame = [&](const baker::BakedFrame &frame) {
-    return !halfOpenPeriodic || frame.time < periodicLength;
-  };
+      synthesizeLoopEndpoint ? reference_animation->animation_length : 0.0;
   const auto stableFrameLayout =
       baker::StableFrameLayout::tryCreate(frames);
 
@@ -267,9 +270,6 @@ nlohmann::json AnimationExporter::bakedAnimationToJson(
       nlohmann::json rotObj = nlohmann::json::object();
       nlohmann::json posObj = nlohmann::json::object();
       for (const auto &frame : frames) {
-        if (!serializeFrame(frame)) {
-          continue;
-        }
         const baker::BoneState *bs =
             stableBakedIndex.has_value()
                 ? &frame.bone_states[*stableBakedIndex]
@@ -287,6 +287,28 @@ nlohmann::json AnimationExporter::bakedAnimationToJson(
         }
         rotObj[fmtTime(frame.time)] = toArray(bs->rotation);
         posObj[fmtTime(frame.time)] = toArray(bs->position);
+      }
+      // 烘焙器内部使用半开循环时间线 [0, L)。导出时仅为 Bedrock JSON
+      // 合成一个 t=L 的闭合关键帧，并直接复用第 0 帧通道值。
+      // 这样既能明确保证首尾一致，也不会让重复端点进入最终碰撞/关节校验。
+      if (synthesizeLoopEndpoint) {
+        const auto &firstFrame = frames.front();
+        const baker::BoneState *firstState =
+            stableBakedIndex.has_value()
+                ? &firstFrame.bone_states[*stableBakedIndex]
+                : firstFrame.getBoneState(boneName);
+        if (firstState == nullptr && !stableFrameLayout.has_value()) {
+          for (const auto &state : firstFrame.bone_states) {
+            if (state.bone_name == boneName) {
+              firstState = &state;
+              break;
+            }
+          }
+        }
+        if (firstState != nullptr) {
+          rotObj[fmtTime(periodicLength)] = toArray(firstState->rotation);
+          posObj[fmtTime(periodicLength)] = toArray(firstState->position);
+        }
       }
       boneObj["position"] = posObj;
       boneObj["rotation"] = rotObj;
@@ -336,6 +358,10 @@ nlohmann::json AnimationExporter::bakedAnimationToJson(
 
 nlohmann::json AnimationExporter::sourceAnimationToJson(
     const loader::Animation &animation) {
+  if (animation.original_json.is_object()) {
+    return animation.original_json;
+  }
+
   nlohmann::json result = nlohmann::json::object();
   if (animation.loop_behavior == loader::Animation::LoopBehavior::HoldLast) {
     result["loop"] = "hold_on_last_frame";

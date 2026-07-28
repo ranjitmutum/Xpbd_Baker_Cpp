@@ -207,9 +207,6 @@ Compilation BedrockRigidBodyCompiler::compileCompound(
                 ++result.skipped_degenerate_cube_count;
                 continue;
             }
-            const double minimumHalfExtent = *std::min_element(
-                halfExtents.begin(), halfExtents.end());
-
             std::array<Vec3, 3> axes{};
             for (std::size_t axis = 0; axis < 3; ++axis) {
                 axes[axis] = normalized(edges[axis], geometryContext);

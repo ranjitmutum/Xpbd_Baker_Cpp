@@ -47,6 +47,24 @@ struct ViewportRect {
   int h = 0;
 };
 
+struct FrameDiagnosticContext {
+  bool active = false;
+  std::uint64_t render_frame = 0;
+  std::uint64_t result_commit_frame = 0;
+  std::uint32_t frames_remaining = 0;
+  int worker_phase = 0;
+  int presentation_mode = 0;
+  int playback_state = 0;
+  int preview_frame_index = 0;
+  int bake_current = 0;
+  int bake_total = 0;
+  double preview_time = 0.0;
+  std::uint64_t model_generation = 0;
+  std::uint64_t animation_generation = 0;
+  std::uint64_t physics_generation = 0;
+  std::uint64_t texture_generation = 0;
+};
+
 struct FrameInput {
   int fb_width = 0;
   int fb_height = 0;
@@ -61,6 +79,7 @@ struct FrameInput {
   std::uint64_t static_model_generation = 0;
   std::uint64_t static_texture_generation = 0;
   const UiDrawData *ui = nullptr;
+  FrameDiagnosticContext diagnostics;
   float clear_r = 0.176f;
   float clear_g = 0.176f;
   float clear_b = 0.176f;

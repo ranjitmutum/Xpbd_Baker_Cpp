@@ -26,10 +26,8 @@
           "type": "PATH",
           "value": "${sourceDir}/vcpkg_installed"
         },
-        "XPBD_BUILD_TESTS": "OFF",
         "XPBD_BUILD_CLI": "ON",
-        "XPBD_BUILD_APP": "ON",
-        "XPBD_BUILD_BENCHMARKS": "OFF"
+        "XPBD_BUILD_APP": "ON"
       }
     },
     {

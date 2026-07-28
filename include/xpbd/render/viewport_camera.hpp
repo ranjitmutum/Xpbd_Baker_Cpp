@@ -230,12 +230,9 @@ struct ViewportCamera {
 
 
 
-        float rx = fy * 0.0f - fz * 1.0f;
-        float ry = fz * 0.0f - fx * 0.0f;
-        float rz = fx * 1.0f - fy * 0.0f;
-        rx = -fz;
-        ry = 0.0f;
-        rz = fx;
+        float rx = -fz;
+        float ry = 0.0f;
+        float rz = fx;
         float rl = std::sqrt(rx * rx + ry * ry + rz * rz);
         if (rl < 1e-6f) {
 

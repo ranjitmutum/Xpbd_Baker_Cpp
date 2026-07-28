@@ -24,7 +24,6 @@ using GLchar = char;
 using GLubyte = unsigned char;
 using GLintptr = ptrdiff_t;
 using GLsizeiptr = ptrdiff_t;
-using GLvoid = void;
 
 #ifndef GL_FALSE
 #define GL_FALSE 0

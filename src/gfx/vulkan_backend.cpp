@@ -33,12 +33,17 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <string>
+#include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace xpbd::gfx {
@@ -85,6 +90,92 @@ constexpr std::uint32_t queryIndex(GpuTimestampQuery query) {
 
 constexpr std::uint32_t kGpuTimestampQueryCount =
     queryIndex(GpuTimestampQuery::Count);
+
+constexpr std::uint64_t kDiagnosticWaitSliceNs = 250'000'000ull;
+constexpr auto kSwapchainRecreateRetryDelay = std::chrono::milliseconds(100);
+
+bool environmentFlagEnabled(const char *name) {
+  const char *value = std::getenv(name);
+  return value != nullptr && value[0] != '\0' &&
+         std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 &&
+         std::strcmp(value, "FALSE") != 0;
+}
+
+std::uint64_t diagnosticTimestampUs() {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          Clock::now().time_since_epoch())
+          .count());
+}
+
+std::uint64_t diagnosticThreadId() {
+  return static_cast<std::uint64_t>(
+      std::hash<std::thread::id>{}(std::this_thread::get_id()));
+}
+
+template <typename Handle> std::uint64_t diagnosticHandle(Handle handle) {
+  if constexpr (std::is_pointer_v<Handle>) {
+    return static_cast<std::uint64_t>(
+        reinterpret_cast<std::uintptr_t>(handle));
+  } else {
+    return static_cast<std::uint64_t>(handle);
+  }
+}
+
+const char *vkResultName(VkResult result) {
+  switch (result) {
+  case VK_SUCCESS:
+    return "VK_SUCCESS";
+  case VK_NOT_READY:
+    return "VK_NOT_READY";
+  case VK_TIMEOUT:
+    return "VK_TIMEOUT";
+  case VK_EVENT_SET:
+    return "VK_EVENT_SET";
+  case VK_EVENT_RESET:
+    return "VK_EVENT_RESET";
+  case VK_INCOMPLETE:
+    return "VK_INCOMPLETE";
+  case VK_ERROR_OUT_OF_HOST_MEMORY:
+    return "VK_ERROR_OUT_OF_HOST_MEMORY";
+  case VK_ERROR_OUT_OF_DEVICE_MEMORY:
+    return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+  case VK_ERROR_INITIALIZATION_FAILED:
+    return "VK_ERROR_INITIALIZATION_FAILED";
+  case VK_ERROR_DEVICE_LOST:
+    return "VK_ERROR_DEVICE_LOST";
+  case VK_ERROR_MEMORY_MAP_FAILED:
+    return "VK_ERROR_MEMORY_MAP_FAILED";
+  case VK_ERROR_LAYER_NOT_PRESENT:
+    return "VK_ERROR_LAYER_NOT_PRESENT";
+  case VK_ERROR_EXTENSION_NOT_PRESENT:
+    return "VK_ERROR_EXTENSION_NOT_PRESENT";
+  case VK_ERROR_FEATURE_NOT_PRESENT:
+    return "VK_ERROR_FEATURE_NOT_PRESENT";
+  case VK_ERROR_INCOMPATIBLE_DRIVER:
+    return "VK_ERROR_INCOMPATIBLE_DRIVER";
+  case VK_ERROR_TOO_MANY_OBJECTS:
+    return "VK_ERROR_TOO_MANY_OBJECTS";
+  case VK_ERROR_FORMAT_NOT_SUPPORTED:
+    return "VK_ERROR_FORMAT_NOT_SUPPORTED";
+  case VK_ERROR_FRAGMENTED_POOL:
+    return "VK_ERROR_FRAGMENTED_POOL";
+  case VK_ERROR_SURFACE_LOST_KHR:
+    return "VK_ERROR_SURFACE_LOST_KHR";
+  case VK_ERROR_NATIVE_WINDOW_IN_USE_KHR:
+    return "VK_ERROR_NATIVE_WINDOW_IN_USE_KHR";
+  case VK_SUBOPTIMAL_KHR:
+    return "VK_SUBOPTIMAL_KHR";
+  case VK_ERROR_OUT_OF_DATE_KHR:
+    return "VK_ERROR_OUT_OF_DATE_KHR";
+  case VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT:
+    return "VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT";
+  case VK_ERROR_PRESENT_TIMING_QUEUE_FULL_EXT:
+    return "VK_ERROR_PRESENT_TIMING_QUEUE_FULL_EXT";
+  default:
+    return "VK_RESULT_UNKNOWN";
+  }
+}
 
 
 
@@ -151,6 +242,8 @@ class VulkanBackend final : public IGpuBackend {
 public:
   bool init(SDL_Window *window) override {
     window_ = window;
+    diagnostics_enabled_ =
+        environmentFlagEnabled("XPBD_VULKAN_DIAGNOSTICS");
     writeLog("VulkanBackend::init");
 
     uint32_t ext_count = 0;
@@ -160,6 +253,89 @@ public:
       return false;
     }
     std::vector<const char *> instance_exts(exts, exts + ext_count);
+
+    std::uint32_t available_extension_count = 0;
+    VkResult available_extension_result =
+        vkEnumerateInstanceExtensionProperties(
+            nullptr, &available_extension_count, nullptr);
+    std::vector<VkExtensionProperties> available_extensions;
+    if (available_extension_result == VK_SUCCESS &&
+        available_extension_count > 0) {
+      available_extensions.resize(available_extension_count);
+      available_extension_result = vkEnumerateInstanceExtensionProperties(
+          nullptr, &available_extension_count, available_extensions.data());
+      if (available_extension_result == VK_SUCCESS) {
+        available_extensions.resize(available_extension_count);
+      } else {
+        available_extensions.clear();
+      }
+    }
+    const auto extension_available =
+        [&](const char *extension_name) {
+          return std::any_of(
+              available_extensions.begin(), available_extensions.end(),
+              [extension_name](const VkExtensionProperties &property) {
+                return std::strcmp(property.extensionName, extension_name) ==
+                       0;
+              });
+        };
+    const auto append_instance_extension =
+        [&](const char *extension_name) {
+          if (!extension_available(extension_name)) {
+            return false;
+          }
+          const bool already_enabled =
+              std::any_of(instance_exts.begin(), instance_exts.end(),
+                          [extension_name](const char *enabled_name) {
+                            return std::strcmp(enabled_name, extension_name) ==
+                                   0;
+                          });
+          if (!already_enabled) {
+            instance_exts.push_back(extension_name);
+          }
+          return true;
+        };
+    if (append_instance_extension(
+            VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)) {
+      surface_maintenance1_khr_enabled_ = append_instance_extension(
+          VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
+      surface_maintenance1_ext_enabled_ = append_instance_extension(
+          VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
+    }
+
+    if (diagnostics_enabled_) {
+      xpbd::log::infof(
+          "VKDIAG config ts_us=%llu thread=%llu enabled=1 "
+          "application_enabled_layers=0 instance_extensions=%u wait_slice_ms=250",
+          static_cast<unsigned long long>(diagnosticTimestampUs()),
+          static_cast<unsigned long long>(diagnosticThreadId()),
+          static_cast<unsigned>(instance_exts.size()));
+      for (const char *extension : instance_exts) {
+        xpbd::log::infof("VKDIAG instance_extension name=%s",
+                         extension != nullptr ? extension : "<null>");
+      }
+      std::uint32_t layer_count = 0;
+      VkResult layer_result =
+          vkEnumerateInstanceLayerProperties(&layer_count, nullptr);
+      std::vector<VkLayerProperties> layers;
+      if (layer_result == VK_SUCCESS && layer_count > 0) {
+        layers.resize(layer_count);
+        layer_result =
+            vkEnumerateInstanceLayerProperties(&layer_count, layers.data());
+      }
+      xpbd::log::infof(
+          "VKDIAG available_instance_layers result=%s(%d) count=%u",
+          vkResultName(layer_result), static_cast<int>(layer_result),
+          layer_result == VK_SUCCESS ? layer_count : 0u);
+      if (layer_result == VK_SUCCESS) {
+        for (const auto &layer : layers) {
+          xpbd::log::infof(
+              "VKDIAG available_instance_layer name=%s spec=%u impl=%u",
+              layer.layerName, layer.specVersion, layer.implementationVersion);
+        }
+      }
+      xpbd::log::flush();
+    }
 
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "XPBD Bone Baker";
@@ -214,7 +390,23 @@ public:
 
   void shutdown() override {
     if (device_) {
-      vkDeviceWaitIdle(device_);
+      const FrameSync &sync = frames_[frame_index_];
+      const auto idle_start = Clock::now();
+      logDiagnosticApi("vkDeviceWaitIdle.shutdown", "before", std::nullopt,
+                       0.0, UINT32_MAX, sync.fence, VK_NULL_HANDLE, sync.cmd,
+                       true, true);
+      const VkResult idle_result = vkDeviceWaitIdle(device_);
+      logDiagnosticApi(
+          "vkDeviceWaitIdle.shutdown", "after", idle_result,
+          std::chrono::duration<double, std::milli>(Clock::now() - idle_start)
+              .count(),
+          UINT32_MAX, sync.fence, VK_NULL_HANDLE, sync.cmd, true, false);
+      if (idle_result != VK_SUCCESS) {
+        SDL_Log("Vulkan device idle wait during shutdown failed: %d",
+                static_cast<int>(idle_result));
+      } else if (!waitForPendingPresentFences("shutdown")) {
+        SDL_Log("Vulkan present completion wait during shutdown failed");
+      }
     }
     destroySwapchainObjects();
     if (font_view_) {
@@ -442,8 +634,17 @@ public:
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cmd;
+    const FrameSync &sync = frames_[frame_index_];
+    const auto submit_start = Clock::now();
+    logDiagnosticApi("vkQueueSubmit.font_upload", "before", std::nullopt, 0.0,
+                     UINT32_MAX, sync.fence, VK_NULL_HANDLE, cmd, true, true);
     const VkResult submit_result =
         vkQueueSubmit(graphics_queue_, 1, &si, VK_NULL_HANDLE);
+    logDiagnosticApi(
+        "vkQueueSubmit.font_upload", "after", submit_result,
+        std::chrono::duration<double, std::milli>(Clock::now() - submit_start)
+            .count(),
+        UINT32_MAX, sync.fence, VK_NULL_HANDLE, cmd, true, false);
     if (submit_result != VK_SUCCESS) {
       SDL_Log("Vulkan font upload submit failed: %d",
               static_cast<int>(submit_result));
@@ -451,7 +652,16 @@ public:
       destroyBuffer(staging);
       return false;
     }
+    const auto idle_start = Clock::now();
+    logDiagnosticApi("vkQueueWaitIdle.font_upload", "before", std::nullopt,
+                     0.0, UINT32_MAX, sync.fence, VK_NULL_HANDLE, cmd, true,
+                     true);
     const VkResult idle_result = vkQueueWaitIdle(graphics_queue_);
+    logDiagnosticApi(
+        "vkQueueWaitIdle.font_upload", "after", idle_result,
+        std::chrono::duration<double, std::milli>(Clock::now() - idle_start)
+            .count(),
+        UINT32_MAX, sync.fence, VK_NULL_HANDLE, cmd, true, false);
     if (idle_result != VK_SUCCESS) {
       SDL_Log("Vulkan font upload queue wait failed: %d",
               static_cast<int>(idle_result));
@@ -504,19 +714,70 @@ public:
 
   void render(const FrameInput &frame) override {
     const auto t0 = Clock::now();
+    diagnostic_context_ = frame.diagnostics;
+    diagnostic_trace_frame_ =
+        diagnostics_enabled_ && frame.diagnostics.active;
     if (fatal_error_ || !device_) {
       return;
     }
+    FrameSync &fs = frames_[frame_index_];
+    logDiagnosticFrame(frame, fs);
     if (recreate_swapchain_ || !swapchain_) {
+      if (Clock::now() < next_swapchain_recreate_attempt_) {
+        SDL_Delay(16);
+        return;
+      }
       if (!recreateSwapchain()) {
         recreate_swapchain_ = true;
+        if (!fatal_error_) {
+          next_swapchain_recreate_attempt_ =
+              Clock::now() + kSwapchainRecreateRetryDelay;
+          SDL_Delay(16);
+        }
         return;
       }
       recreate_swapchain_ = false;
+      next_swapchain_recreate_attempt_ = {};
     }
-    FrameSync &fs = frames_[frame_index_];
+
+    auto wait_for_fence = [&](VkFence fence, const char *stage,
+                              std::uint32_t image_index,
+                              VkFence image_fence) {
+      const auto wait_start = Clock::now();
+      logDiagnosticApi(stage, "before", std::nullopt, 0.0, image_index,
+                       fence, image_fence, fs.cmd, false, true);
+      VkResult result = VK_SUCCESS;
+      bool timed_out = false;
+      if (!diagnostics_enabled_) {
+        result =
+            vkWaitForFences(device_, 1, &fence, VK_TRUE, UINT64_MAX);
+      } else {
+        do {
+          result = vkWaitForFences(device_, 1, &fence, VK_TRUE,
+                                   kDiagnosticWaitSliceNs);
+          if (result == VK_TIMEOUT) {
+            timed_out = true;
+            const double elapsed_ms =
+                std::chrono::duration<double, std::milli>(Clock::now() -
+                                                          wait_start)
+                    .count();
+            logDiagnosticApi(stage, "timeout", result, elapsed_ms,
+                             image_index, fence, image_fence, fs.cmd, true,
+                             true);
+          }
+        } while (result == VK_TIMEOUT);
+      }
+      const double elapsed_ms =
+          std::chrono::duration<double, std::milli>(Clock::now() - wait_start)
+              .count();
+      logDiagnosticApi(stage, "after", result, elapsed_ms, image_index,
+                       fence, image_fence, fs.cmd, timed_out, false);
+      return result;
+    };
+
     const VkResult wait_result =
-        vkWaitForFences(device_, 1, &fs.fence, VK_TRUE, UINT64_MAX);
+        wait_for_fence(fs.fence, "vkWaitForFences.frame", UINT32_MAX,
+                       VK_NULL_HANDLE);
     if (wait_result != VK_SUCCESS) {
       SDL_Log("Vulkan fence wait failed: %d", static_cast<int>(wait_result));
       return;
@@ -618,7 +879,16 @@ public:
     if (static_input &&
         static_generations_.needsRefresh(frame.static_model_generation,
                                          frame.static_texture_generation)) {
+      const auto idle_start = Clock::now();
+      logDiagnosticApi("vkDeviceWaitIdle.static_rebuild", "before",
+                       std::nullopt, 0.0, UINT32_MAX, fs.fence, VK_NULL_HANDLE,
+                       fs.cmd, true, true);
       const VkResult idle_result = vkDeviceWaitIdle(device_);
+      logDiagnosticApi(
+          "vkDeviceWaitIdle.static_rebuild", "after", idle_result,
+          std::chrono::duration<double, std::milli>(Clock::now() - idle_start)
+              .count(),
+          UINT32_MAX, fs.fence, VK_NULL_HANDLE, fs.cmd, true, false);
       if (idle_result != VK_SUCCESS) {
         SDL_Log("Vulkan static resource idle wait failed: %d",
                 static_cast<int>(idle_result));
@@ -655,10 +925,12 @@ public:
       static_mismatch_logged_ = true;
     }
 
+    VkDeviceSize requested_bone_bytes = 0;
     if (draw_static) {
       const VkDeviceSize bone_bytes =
           static_cast<VkDeviceSize>(frame.static_model_frame->bones.size() *
                                     sizeof(StaticModelBoneState));
+      requested_bone_bytes = bone_bytes;
       if (!ensure_owned_buffer(fs.bone_ssbo, bone_bytes,
                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ||
           !uploadBuffer(fs.bone_ssbo, 0, bone_bytes,
@@ -726,11 +998,47 @@ public:
     stats_.upload_ms =
         std::chrono::duration<float, std::milli>(Clock::now() - upload_start)
             .count();
+    logDiagnosticResources(
+        frame, fs, requested_bone_bytes,
+        static_cast<VkDeviceSize>(mesh_upload.total_bytes), ui_vertex_bytes,
+        ui_index_bytes,
+        stats_.buffer_reallocations > 0 ||
+            stats_.static_resource_upload_bytes > 0);
 
     uint32_t image_index = 0;
-    VkResult acq =
-        vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX,
-                              fs.image_available, VK_NULL_HANDLE, &image_index);
+    const auto acquire_start = Clock::now();
+    logDiagnosticApi("vkAcquireNextImageKHR", "before", std::nullopt, 0.0,
+                     UINT32_MAX, fs.fence, VK_NULL_HANDLE, fs.cmd, false, true);
+    VkResult acq = VK_SUCCESS;
+    bool acquire_timed_out = false;
+    if (!diagnostics_enabled_) {
+      acq = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX,
+                                  fs.image_available, VK_NULL_HANDLE,
+                                  &image_index);
+    } else {
+      do {
+        acq = vkAcquireNextImageKHR(device_, swapchain_,
+                                    kDiagnosticWaitSliceNs,
+                                    fs.image_available, VK_NULL_HANDLE,
+                                    &image_index);
+        if (acq == VK_TIMEOUT || acq == VK_NOT_READY) {
+          acquire_timed_out = true;
+          logDiagnosticApi(
+              "vkAcquireNextImageKHR", "timeout", acq,
+              std::chrono::duration<double, std::milli>(Clock::now() -
+                                                        acquire_start)
+                  .count(),
+              UINT32_MAX, fs.fence, VK_NULL_HANDLE, fs.cmd, true, true);
+        }
+      } while (acq == VK_TIMEOUT || acq == VK_NOT_READY);
+    }
+    logDiagnosticApi(
+        "vkAcquireNextImageKHR", "after", acq,
+        std::chrono::duration<double, std::milli>(Clock::now() - acquire_start)
+            .count(),
+        acq == VK_SUCCESS || acq == VK_SUBOPTIMAL_KHR ? image_index
+                                                       : UINT32_MAX,
+        fs.fence, VK_NULL_HANDLE, fs.cmd, acquire_timed_out, false);
     if (acq == VK_ERROR_OUT_OF_DATE_KHR) {
       recreate_swapchain_ = true;
       return;
@@ -757,10 +1065,17 @@ public:
       fatal_error_ = true;
       return;
     }
+    if (swapchain_maintenance1_enabled_ &&
+        !image_resource.present_fence) {
+      writeLog("Vulkan swapchain image has no present completion fence");
+      fatal_error_ = true;
+      return;
+    }
     if (image_resource.last_in_flight &&
         image_resource.last_in_flight != fs.fence) {
-      const VkResult image_wait = vkWaitForFences(
-          device_, 1, &image_resource.last_in_flight, VK_TRUE, UINT64_MAX);
+      const VkResult image_wait = wait_for_fence(
+          image_resource.last_in_flight, "vkWaitForFences.image", image_index,
+          image_resource.last_in_flight);
       if (image_wait != VK_SUCCESS) {
         SDL_Log("Vulkan swapchain image fence wait failed: %d",
                 static_cast<int>(image_wait));
@@ -769,14 +1084,67 @@ public:
       }
     }
 
-    const VkResult reset_fence = vkResetFences(device_, 1, &fs.fence);
+    auto call_with_diagnostics = [&](const char *stage, auto &&call) {
+      const auto call_start = Clock::now();
+      logDiagnosticApi(stage, "before", std::nullopt, 0.0, image_index,
+                       fs.fence, image_resource.last_in_flight, fs.cmd, false,
+                       true);
+      const VkResult result = call();
+      logDiagnosticApi(
+          stage, "after", result,
+          std::chrono::duration<double, std::milli>(Clock::now() - call_start)
+              .count(),
+          image_index, fs.fence, image_resource.last_in_flight, fs.cmd, false,
+          false);
+      return result;
+    };
+
+    if (swapchain_maintenance1_enabled_ &&
+        image_resource.present_pending) {
+      const VkResult present_wait =
+          wait_for_fence(image_resource.present_fence,
+                         "vkWaitForFences.present_reuse", image_index,
+                         image_resource.last_in_flight);
+      if (present_wait != VK_SUCCESS) {
+        SDL_Log("Vulkan present fence wait before reuse failed: %d",
+                static_cast<int>(present_wait));
+        fatal_error_ = true;
+        return;
+      }
+      image_resource.present_pending = false;
+
+      const auto reset_present_start = Clock::now();
+      logDiagnosticApi("vkResetFences.present", "before", std::nullopt, 0.0,
+                       image_index, image_resource.present_fence,
+                       image_resource.last_in_flight, fs.cmd, false, true);
+      const VkResult reset_present = vkResetFences(
+          device_, 1, &image_resource.present_fence);
+      logDiagnosticApi(
+          "vkResetFences.present", "after", reset_present,
+          std::chrono::duration<double, std::milli>(Clock::now() -
+                                                    reset_present_start)
+              .count(),
+          image_index, image_resource.present_fence,
+          image_resource.last_in_flight, fs.cmd, false, false);
+      if (reset_present != VK_SUCCESS) {
+        SDL_Log("Vulkan present fence reset failed: %d",
+                static_cast<int>(reset_present));
+        fatal_error_ = true;
+        return;
+      }
+    }
+
+    const VkResult reset_fence = call_with_diagnostics(
+        "vkResetFences", [&] { return vkResetFences(device_, 1, &fs.fence); });
     if (reset_fence != VK_SUCCESS) {
       SDL_Log("Vulkan fence reset failed: %d",
               static_cast<int>(reset_fence));
       fatal_error_ = true;
       return;
     }
-    const VkResult reset_command = vkResetCommandBuffer(fs.cmd, 0);
+    const VkResult reset_command = call_with_diagnostics(
+        "vkResetCommandBuffer",
+        [&] { return vkResetCommandBuffer(fs.cmd, 0); });
     if (reset_command != VK_SUCCESS) {
       SDL_Log("Vulkan command buffer reset failed: %d",
               static_cast<int>(reset_command));
@@ -785,7 +1153,9 @@ public:
     }
 
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    const VkResult begin_command = vkBeginCommandBuffer(fs.cmd, &bi);
+    const VkResult begin_command = call_with_diagnostics(
+        "vkBeginCommandBuffer",
+        [&] { return vkBeginCommandBuffer(fs.cmd, &bi); });
     if (begin_command != VK_SUCCESS) {
       SDL_Log("Vulkan command buffer begin failed: %d",
               static_cast<int>(begin_command));
@@ -964,11 +1334,27 @@ public:
     }
 
     stats_.draw_calls = draws;
+    if (diagnostics_enabled_ && diagnostic_trace_frame_) {
+      xpbd::log::infof(
+          "VKDIAG command ts_us=%llu thread=%llu frame=%llu slot=%zu "
+          "image=%u draw_calls=%d upload=%llu static_bone_upload=%llu "
+          "static_resource_upload=%llu",
+          static_cast<unsigned long long>(diagnosticTimestampUs()),
+          static_cast<unsigned long long>(diagnosticThreadId()),
+          static_cast<unsigned long long>(frame.diagnostics.render_frame),
+          frame_index_, image_index, draws,
+          static_cast<unsigned long long>(stats_.upload_bytes),
+          static_cast<unsigned long long>(stats_.static_bone_upload_bytes),
+          static_cast<unsigned long long>(
+              stats_.static_resource_upload_bytes));
+    }
 
     vkCmdEndRenderPass(fs.cmd);
     write_timestamp(GpuTimestampQuery::FrameEnd,
                     VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-    const VkResult end_command = vkEndCommandBuffer(fs.cmd);
+    const VkResult end_command = call_with_diagnostics(
+        "vkEndCommandBuffer",
+        [&] { return vkEndCommandBuffer(fs.cmd); });
     if (end_command != VK_SUCCESS) {
       SDL_Log("Vulkan command buffer end failed: %d",
               static_cast<int>(end_command));
@@ -986,8 +1372,9 @@ public:
     si.pCommandBuffers = &fs.cmd;
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &image_resource.render_finished;
-    const VkResult submit_result =
-        vkQueueSubmit(graphics_queue_, 1, &si, fs.fence);
+    const VkResult submit_result = call_with_diagnostics(
+        "vkQueueSubmit",
+        [&] { return vkQueueSubmit(graphics_queue_, 1, &si, fs.fence); });
     if (submit_result != VK_SUCCESS) {
       SDL_Log("Vulkan queue submit failed: %d",
               static_cast<int>(submit_result));
@@ -1008,7 +1395,32 @@ public:
     pi.swapchainCount = 1;
     pi.pSwapchains = &swapchain_;
     pi.pImageIndices = &image_index;
+    VkSwapchainPresentFenceInfoKHR present_fence_info{
+        VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR};
+    if (swapchain_maintenance1_enabled_) {
+      present_fence_info.swapchainCount = 1;
+      present_fence_info.pFences = &image_resource.present_fence;
+      pi.pNext = &present_fence_info;
+    }
+    const auto present_start = Clock::now();
+    logDiagnosticApi("vkQueuePresentKHR", "before", std::nullopt, 0.0,
+                     image_index, fs.fence, image_resource.last_in_flight,
+                     fs.cmd, false, true);
     VkResult pr = vkQueuePresentKHR(present_queue_, &pi);
+    if (swapchain_maintenance1_enabled_) {
+      image_resource.present_pending =
+          pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR ||
+          pr == VK_ERROR_OUT_OF_DATE_KHR ||
+          pr == VK_ERROR_SURFACE_LOST_KHR ||
+          pr == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT ||
+          pr == VK_ERROR_PRESENT_TIMING_QUEUE_FULL_EXT;
+    }
+    logDiagnosticApi(
+        "vkQueuePresentKHR", "after", pr,
+        std::chrono::duration<double, std::milli>(Clock::now() - present_start)
+            .count(),
+        image_index, fs.fence, image_resource.last_in_flight, fs.cmd, false,
+        false);
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
       recreate_swapchain_ = true;
     } else if (pr != VK_SUCCESS) {
@@ -1076,8 +1488,8 @@ private:
     VkDeviceMemory depth_memory = VK_NULL_HANDLE;
     VkImageView depth_view = VK_NULL_HANDLE;
     VkSemaphore render_finished = VK_NULL_HANDLE;
-
-
+    VkFence present_fence = VK_NULL_HANDLE;
+    bool present_pending = false;
     VkFence last_in_flight = VK_NULL_HANDLE;
   };
   struct FrameSync {
@@ -1115,7 +1527,15 @@ private:
   std::array<FrameSync, 2> frames_{};
   size_t frame_index_ = 0;
   bool recreate_swapchain_ = false;
+  Clock::time_point next_swapchain_recreate_attempt_{};
   bool fatal_error_ = false;
+  bool surface_maintenance1_khr_enabled_ = false;
+  bool surface_maintenance1_ext_enabled_ = false;
+  bool swapchain_maintenance1_enabled_ = false;
+  std::string swapchain_maintenance1_extension_;
+  bool diagnostics_enabled_ = false;
+  bool diagnostic_trace_frame_ = false;
+  FrameDiagnosticContext diagnostic_context_{};
 
   VkDescriptorSetLayout desc_layout_ = VK_NULL_HANDLE;
   VkDescriptorPool desc_pool_ = VK_NULL_HANDLE;
@@ -1161,6 +1581,128 @@ private:
   double timestamp_period_ns_ = 0.0;
   bool timestamp_queries_enabled_ = false;
   bool timestamp_read_error_logged_ = false;
+
+  void logDiagnosticApi(const char *api, const char *edge,
+                        std::optional<VkResult> result, double elapsed_ms,
+                        std::uint32_t image_index, VkFence frame_fence,
+                        VkFence image_fence, VkCommandBuffer command,
+                        bool force = false, bool flush_after = false) const {
+    if (!diagnostics_enabled_) {
+      return;
+    }
+    const bool failed = result.has_value() && *result != VK_SUCCESS;
+    if (!diagnostic_trace_frame_ && !force && !failed) {
+      return;
+    }
+    const char *result_name =
+        result.has_value() ? vkResultName(*result) : "PENDING";
+    const int result_code =
+        result.has_value() ? static_cast<int>(*result) : 0;
+    xpbd::log::infof(
+        "VKDIAG api ts_us=%llu thread=%llu frame=%llu commit=%llu "
+        "slot=%zu image=%u stage=%s edge=%s result=%s(%d) elapsed_ms=%.3f "
+        "frame_fence=0x%llx image_fence=0x%llx cmd=0x%llx",
+        static_cast<unsigned long long>(diagnosticTimestampUs()),
+        static_cast<unsigned long long>(diagnosticThreadId()),
+        static_cast<unsigned long long>(diagnostic_context_.render_frame),
+        static_cast<unsigned long long>(
+            diagnostic_context_.result_commit_frame),
+        frame_index_, image_index, api, edge, result_name, result_code,
+        elapsed_ms,
+        static_cast<unsigned long long>(diagnosticHandle(frame_fence)),
+        static_cast<unsigned long long>(diagnosticHandle(image_fence)),
+        static_cast<unsigned long long>(diagnosticHandle(command)));
+    if (flush_after || failed) {
+      xpbd::log::flush();
+    }
+  }
+
+  void logDiagnosticFrame(const FrameInput &frame,
+                          const FrameSync &sync) const {
+    if (!diagnostics_enabled_ || !diagnostic_trace_frame_) {
+      return;
+    }
+    const std::size_t bone_count =
+        frame.static_model_frame ? frame.static_model_frame->bones.size() : 0;
+    const std::uint32_t cube_count =
+        frame.static_model_frame ? frame.static_model_frame->cube_count : 0;
+    const std::size_t vertex_count =
+        frame.static_model ? frame.static_model->vertices.size() : 0;
+    const std::size_t index_count =
+        frame.static_model ? frame.static_model->indices.size() : 0;
+    const std::size_t solid_count =
+        frame.scene ? frame.scene->solid.size() : 0;
+    const std::size_t transparent_count =
+        frame.scene ? frame.scene->transparent.size() : 0;
+    const std::size_t line_count =
+        frame.scene ? frame.scene->lines.size() : 0;
+    const auto &d = frame.diagnostics;
+    xpbd::log::infof(
+        "VKDIAG frame ts_us=%llu thread=%llu frame=%llu commit=%llu "
+        "remaining=%u worker=%d presentation=%d playback=%d "
+        "preview_time=%.9g preview_index=%d bake=%d/%d "
+        "gen_model=%llu gen_animation=%llu gen_physics=%llu gen_texture=%llu "
+        "static_gen_model=%llu static_gen_texture=%llu bones=%zu cubes=%u "
+        "vertices=%zu indices=%zu overlay=%zu/%zu/%zu "
+        "capacity_bone=%llu capacity_mesh=%llu capacity_ui_v=%llu "
+        "capacity_ui_i=%llu",
+        static_cast<unsigned long long>(diagnosticTimestampUs()),
+        static_cast<unsigned long long>(diagnosticThreadId()),
+        static_cast<unsigned long long>(d.render_frame),
+        static_cast<unsigned long long>(d.result_commit_frame),
+        d.frames_remaining, d.worker_phase, d.presentation_mode,
+        d.playback_state, d.preview_time, d.preview_frame_index, d.bake_current,
+        d.bake_total,
+        static_cast<unsigned long long>(d.model_generation),
+        static_cast<unsigned long long>(d.animation_generation),
+        static_cast<unsigned long long>(d.physics_generation),
+        static_cast<unsigned long long>(d.texture_generation),
+        static_cast<unsigned long long>(frame.static_model_generation),
+        static_cast<unsigned long long>(frame.static_texture_generation),
+        bone_count, cube_count, vertex_count, index_count, solid_count,
+        transparent_count, line_count,
+        static_cast<unsigned long long>(sync.bone_ssbo.capacity),
+        static_cast<unsigned long long>(sync.mesh_vbo.capacity),
+        static_cast<unsigned long long>(sync.ui_vbo.capacity),
+        static_cast<unsigned long long>(sync.ui_ibo.capacity));
+    xpbd::log::flush();
+  }
+
+  void logDiagnosticResources(const FrameInput &frame,
+                              const FrameSync &sync,
+                              VkDeviceSize requested_bone_bytes,
+                              VkDeviceSize requested_mesh_bytes,
+                              VkDeviceSize requested_ui_vertex_bytes,
+                              VkDeviceSize requested_ui_index_bytes,
+                              bool force = false) const {
+    if (!diagnostics_enabled_ || (!diagnostic_trace_frame_ && !force)) {
+      return;
+    }
+    xpbd::log::infof(
+        "VKDIAG resources ts_us=%llu thread=%llu frame=%llu slot=%zu "
+        "requested_bone=%llu requested_mesh=%llu requested_ui_v=%llu "
+        "requested_ui_i=%llu capacity_bone=%llu capacity_mesh=%llu "
+        "capacity_ui_v=%llu capacity_ui_i=%llu upload=%llu "
+        "static_upload=%llu realloc_frame=%d realloc_total=%llu "
+        "static_rebuilds=%llu",
+        static_cast<unsigned long long>(diagnosticTimestampUs()),
+        static_cast<unsigned long long>(diagnosticThreadId()),
+        static_cast<unsigned long long>(frame.diagnostics.render_frame),
+        frame_index_,
+        static_cast<unsigned long long>(requested_bone_bytes),
+        static_cast<unsigned long long>(requested_mesh_bytes),
+        static_cast<unsigned long long>(requested_ui_vertex_bytes),
+        static_cast<unsigned long long>(requested_ui_index_bytes),
+        static_cast<unsigned long long>(sync.bone_ssbo.capacity),
+        static_cast<unsigned long long>(sync.mesh_vbo.capacity),
+        static_cast<unsigned long long>(sync.ui_vbo.capacity),
+        static_cast<unsigned long long>(sync.ui_ibo.capacity),
+        static_cast<unsigned long long>(stats_.upload_bytes),
+        static_cast<unsigned long long>(stats_.static_resource_upload_bytes),
+        stats_.buffer_reallocations,
+        static_cast<unsigned long long>(total_buffer_reallocations_),
+        static_cast<unsigned long long>(static_resource_rebuilds_));
+  }
 
   static void mulMat(const float *a, const float *b, float *o) {
     for (int c = 0; c < 4; ++c)
@@ -1646,9 +2188,33 @@ private:
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &command;
-    if (vkQueueSubmit(graphics_queue_, 1, &submit, VK_NULL_HANDLE) !=
-            VK_SUCCESS ||
-        vkQueueWaitIdle(graphics_queue_) != VK_SUCCESS) {
+    const FrameSync &sync = frames_[frame_index_];
+    const auto submit_start = Clock::now();
+    logDiagnosticApi("vkQueueSubmit.static_upload", "before", std::nullopt,
+                     0.0, UINT32_MAX, sync.fence, VK_NULL_HANDLE, command, true,
+                     true);
+    const VkResult submit_result =
+        vkQueueSubmit(graphics_queue_, 1, &submit, VK_NULL_HANDLE);
+    logDiagnosticApi(
+        "vkQueueSubmit.static_upload", "after", submit_result,
+        std::chrono::duration<double, std::milli>(Clock::now() - submit_start)
+            .count(),
+        UINT32_MAX, sync.fence, VK_NULL_HANDLE, command, true, false);
+    if (submit_result != VK_SUCCESS) {
+      cleanup();
+      return false;
+    }
+    const auto idle_start = Clock::now();
+    logDiagnosticApi("vkQueueWaitIdle.static_upload", "before", std::nullopt,
+                     0.0, UINT32_MAX, sync.fence, VK_NULL_HANDLE, command, true,
+                     true);
+    const VkResult idle_result = vkQueueWaitIdle(graphics_queue_);
+    logDiagnosticApi(
+        "vkQueueWaitIdle.static_upload", "after", idle_result,
+        std::chrono::duration<double, std::milli>(Clock::now() - idle_start)
+            .count(),
+        UINT32_MAX, sync.fence, VK_NULL_HANDLE, command, true, false);
+    if (idle_result != VK_SUCCESS) {
       cleanup();
       return false;
     }
@@ -1789,7 +2355,8 @@ private:
     return false;
   }
 
-  bool supportsRequiredDeviceExtensions(VkPhysicalDevice device) const {
+  bool supportsDeviceExtension(VkPhysicalDevice device,
+                               const char *extension_name) const {
     uint32_t count = 0;
     VkResult result =
         vkEnumerateDeviceExtensionProperties(device, nullptr, &count, nullptr);
@@ -1802,9 +2369,15 @@ private:
     if (result != VK_SUCCESS) {
       return false;
     }
-    return std::any_of(properties.begin(), properties.end(), [](const auto &p) {
-      return std::strcmp(p.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0;
-    });
+    return std::any_of(
+        properties.begin(), properties.end(),
+        [extension_name](const auto &property) {
+          return std::strcmp(property.extensionName, extension_name) == 0;
+        });
+  }
+
+  bool supportsRequiredDeviceExtensions(VkPhysicalDevice device) const {
+    return supportsDeviceExtension(device, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
   }
 
   bool createDevice() {
@@ -1821,15 +2394,57 @@ private:
       q.pQueuePriorities = &prio;
       qcis.push_back(q);
     }
-    const char *dev_exts[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+
+    std::vector<const char *> device_extensions = {
+        VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    const char *maintenance_extension = nullptr;
+    if (surface_maintenance1_khr_enabled_ &&
+        supportsDeviceExtension(
+            phys_, VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME)) {
+      maintenance_extension =
+          VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME;
+    } else if (surface_maintenance1_ext_enabled_ &&
+               supportsDeviceExtension(
+                   phys_, VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME)) {
+      maintenance_extension =
+          VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME;
+    }
+
+    VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR maintenance_features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR};
+    if (maintenance_extension != nullptr) {
+      VkPhysicalDeviceFeatures2 features{
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+      features.pNext = &maintenance_features;
+      vkGetPhysicalDeviceFeatures2(phys_, &features);
+      if (maintenance_features.swapchainMaintenance1 == VK_TRUE) {
+        device_extensions.push_back(maintenance_extension);
+        swapchain_maintenance1_enabled_ = true;
+        swapchain_maintenance1_extension_ = maintenance_extension;
+      }
+    }
+    maintenance_features.swapchainMaintenance1 =
+        swapchain_maintenance1_enabled_ ? VK_TRUE : VK_FALSE;
+
     VkDeviceCreateInfo di{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    di.pNext =
+        swapchain_maintenance1_enabled_ ? &maintenance_features : nullptr;
     di.queueCreateInfoCount = static_cast<uint32_t>(qcis.size());
     di.pQueueCreateInfos = qcis.data();
-    di.enabledExtensionCount = 1;
-    di.ppEnabledExtensionNames = dev_exts;
+    di.enabledExtensionCount =
+        static_cast<uint32_t>(device_extensions.size());
+    di.ppEnabledExtensionNames = device_extensions.data();
     VK_CHECK(vkCreateDevice(phys_, &di, nullptr, &device_));
     vkGetDeviceQueue(device_, graphics_family_, 0, &graphics_queue_);
     vkGetDeviceQueue(device_, present_family_, 0, &present_queue_);
+    if (swapchain_maintenance1_enabled_) {
+      xpbd::log::infof("Vulkan present-fence lifecycle enabled via %s",
+                       swapchain_maintenance1_extension_.c_str());
+    } else {
+      xpbd::log::warn(
+          "Vulkan swapchain maintenance1 unavailable; shutdown/recreate "
+          "uses the unextended WaitIdle best-effort fallback");
+    }
     return true;
   }
 
@@ -1868,7 +2483,8 @@ private:
     return !s.formats.empty() && !s.modes.empty();
   }
 
-  bool createSwapchain() {
+  bool createSwapchain(
+      VkSwapchainKHR old_swapchain = VK_NULL_HANDLE) {
     SwapchainSupport support;
     if (!querySupport(phys_, support)) {
       writeLog("Vulkan swapchain surface has no usable formats/present modes");
@@ -1987,13 +2603,16 @@ private:
     }
     ci.presentMode = mode;
     ci.clipped = VK_TRUE;
+    ci.oldSwapchain = old_swapchain;
+    VkSwapchainKHR new_swapchain = VK_NULL_HANDLE;
     const VkResult create_swapchain =
-        vkCreateSwapchainKHR(device_, &ci, nullptr, &swapchain_);
+        vkCreateSwapchainKHR(device_, &ci, nullptr, &new_swapchain);
     if (create_swapchain != VK_SUCCESS) {
       SDL_Log("Vulkan swapchain creation failed: %d",
               static_cast<int>(create_swapchain));
       return false;
     }
+    swapchain_ = new_swapchain;
 
     uint32_t ic = 0;
     VkResult images_result =
@@ -2018,6 +2637,8 @@ private:
     swap_image_resources_.resize(ic);
     VkSemaphoreCreateInfo semaphore_info{
         VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    VkFenceCreateInfo present_fence_info{
+        VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     for (uint32_t i = 0; i < ic; ++i) {
       VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
       vi.image = swap_images_[i];
@@ -2041,6 +2662,16 @@ private:
                 static_cast<int>(result));
         destroySwapchainObjects();
         return false;
+      }
+      if (swapchain_maintenance1_enabled_) {
+        result = vkCreateFence(device_, &present_fence_info, nullptr,
+                               &resource.present_fence);
+        if (result != VK_SUCCESS) {
+          SDL_Log("Vulkan present fence creation failed: %d",
+                  static_cast<int>(result));
+          destroySwapchainObjects();
+          return false;
+        }
       }
 
       VkImageCreateInfo depth_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -2110,7 +2741,65 @@ private:
     return true;
   }
 
-  void destroySwapchainObjects() {
+  bool waitForPendingPresentFences(const char *reason) {
+    if (!swapchain_maintenance1_enabled_) {
+      return true;
+    }
+    const std::string stage =
+        std::string("vkWaitForFences.present_") + reason;
+    for (std::uint32_t image_index = 0;
+         image_index < swap_image_resources_.size(); ++image_index) {
+      SwapchainImageResource &resource =
+          swap_image_resources_[image_index];
+      if (!resource.present_pending) {
+        continue;
+      }
+      if (!resource.present_fence) {
+        writeLog("Vulkan pending present has no completion fence");
+        return false;
+      }
+
+      const auto wait_start = Clock::now();
+      logDiagnosticApi(stage.c_str(), "before", std::nullopt, 0.0,
+                       image_index, resource.present_fence,
+                       resource.last_in_flight, VK_NULL_HANDLE, true, true);
+      VkResult result = VK_SUCCESS;
+      if (!diagnostics_enabled_) {
+        result = vkWaitForFences(device_, 1, &resource.present_fence, VK_TRUE,
+                                 UINT64_MAX);
+      } else {
+        do {
+          result =
+              vkWaitForFences(device_, 1, &resource.present_fence, VK_TRUE,
+                              kDiagnosticWaitSliceNs);
+          if (result == VK_TIMEOUT) {
+            logDiagnosticApi(
+                stage.c_str(), "timeout", result,
+                std::chrono::duration<double, std::milli>(Clock::now() -
+                                                          wait_start)
+                    .count(),
+                image_index, resource.present_fence,
+                resource.last_in_flight, VK_NULL_HANDLE, true, true);
+          }
+        } while (result == VK_TIMEOUT);
+      }
+      logDiagnosticApi(
+          stage.c_str(), "after", result,
+          std::chrono::duration<double, std::milli>(Clock::now() - wait_start)
+              .count(),
+          image_index, resource.present_fence, resource.last_in_flight,
+          VK_NULL_HANDLE, true, false);
+      if (result != VK_SUCCESS) {
+        SDL_Log("Vulkan present fence wait during %s failed: %d", reason,
+                static_cast<int>(result));
+        return false;
+      }
+      resource.present_pending = false;
+    }
+    return true;
+  }
+
+  void destroySwapchainImageObjects() {
     for (auto fb : framebuffers_) {
       vkDestroyFramebuffer(device_, fb, nullptr);
     }
@@ -2122,6 +2811,9 @@ private:
     for (auto &resource : swap_image_resources_) {
       if (resource.render_finished) {
         vkDestroySemaphore(device_, resource.render_finished, nullptr);
+      }
+      if (resource.present_fence) {
+        vkDestroyFence(device_, resource.present_fence, nullptr);
       }
       if (resource.depth_view) {
         vkDestroyImageView(device_, resource.depth_view, nullptr);
@@ -2135,6 +2827,10 @@ private:
     }
     swap_image_resources_.clear();
     swap_images_.clear();
+  }
+
+  void destroySwapchainObjects() {
+    destroySwapchainImageObjects();
     if (swapchain_) {
       vkDestroySwapchainKHR(device_, swapchain_, nullptr);
       swapchain_ = VK_NULL_HANDLE;
@@ -2142,23 +2838,69 @@ private:
   }
 
   bool recreateSwapchain() {
+    if (!window_) {
+      return false;
+    }
+    const SDL_WindowFlags window_flags = SDL_GetWindowFlags(window_);
+    if ((window_flags & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN)) != 0) {
+      return false;
+    }
     int drawable_width = 0;
     int drawable_height = 0;
     SDL_GetWindowSizeInPixels(window_, &drawable_width, &drawable_height);
     if (drawable_width <= 0 || drawable_height <= 0) {
-
-
       return false;
     }
+
+    VkSurfaceCapabilitiesKHR capabilities{};
+    const VkResult capabilities_result =
+        vkGetPhysicalDeviceSurfaceCapabilitiesKHR(phys_, surface_,
+                                                  &capabilities);
+    if (capabilities_result != VK_SUCCESS) {
+      SDL_Log("Vulkan surface-capabilities query before swapchain recreate "
+              "failed: %d",
+              static_cast<int>(capabilities_result));
+      if (capabilities_result == VK_ERROR_DEVICE_LOST) {
+        fatal_error_ = true;
+      }
+      return false;
+    }
+    if (capabilities.currentExtent.width != UINT32_MAX &&
+        (capabilities.currentExtent.width == 0 ||
+         capabilities.currentExtent.height == 0)) {
+      return false;
+    }
+
+    const FrameSync &sync = frames_[frame_index_];
+    const auto idle_start = Clock::now();
+    logDiagnosticApi("vkDeviceWaitIdle.swapchain_recreate", "before",
+                     std::nullopt, 0.0, UINT32_MAX, sync.fence,
+                     VK_NULL_HANDLE, sync.cmd, true, true);
     const VkResult idle_result = vkDeviceWaitIdle(device_);
+    logDiagnosticApi(
+        "vkDeviceWaitIdle.swapchain_recreate", "after", idle_result,
+        std::chrono::duration<double, std::milli>(Clock::now() - idle_start)
+            .count(),
+        UINT32_MAX, sync.fence, VK_NULL_HANDLE, sync.cmd, true, false);
     if (idle_result != VK_SUCCESS) {
       SDL_Log("Vulkan device idle wait before swapchain recreate failed: %d",
               static_cast<int>(idle_result));
       fatal_error_ = true;
       return false;
     }
-    destroySwapchainObjects();
-    if (!createSwapchain()) {
+    if (!waitForPendingPresentFences("swapchain_recreate")) {
+      fatal_error_ = true;
+      return false;
+    }
+
+    VkSwapchainKHR old_swapchain = swapchain_;
+    swapchain_ = VK_NULL_HANDLE;
+    destroySwapchainImageObjects();
+    const bool created = createSwapchain(old_swapchain);
+    if (old_swapchain) {
+      vkDestroySwapchainKHR(device_, old_swapchain, nullptr);
+    }
+    if (!created) {
       return false;
     }
     const bool rebuild_graphics =
