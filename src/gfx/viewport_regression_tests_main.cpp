@@ -3,7 +3,6 @@
 
 #include "xpbd/gfx/ray_tracing.hpp"
 #include "xpbd/gfx/frame_generation_state.hpp"
-#include "xpbd/gfx/rtxpt_bridge.hpp"
 #include "xpbd/gfx/gpu_backend.hpp"
 #include "xpbd/gfx/labpbr_authoring.hpp"
 #include "xpbd/gfx/labpbr_export.hpp"
@@ -234,8 +233,8 @@ void testCc0PreviewSceneAssets() {
   ViewportRasterScene ocean;
   xpbd::gfx::buildViewportRasterScene(PreviewSceneId::Ocean, true, true, true,
                                       1.0f, ocean, asset_root);
-  expect(ocean.skybox.cc0_asset && !ocean.dynamic_sky &&
-             ocean.surface_dynamic_baked && ocean.show_environment,
+  expect(ocean.skybox.cc0_asset && ocean.surface_dynamic_baked &&
+             ocean.show_environment,
          "dynamic Ocean retains a static CC0 sky and animated surface");
 
   constexpr std::size_t kDesertVertexCount = 256u * 256u * 6u;
@@ -351,8 +350,7 @@ void testCc0PreviewSceneAssets() {
              ocean.environment.transparent.size() == ocean_at_one.size() &&
              changed_ocean_vertices > ocean_at_one.size() / 2u,
          "dynamic osgw Ocean advances positions with stable topology");
-  expect(ocean.skybox.rgba == ocean_sky && ocean.skybox.cc0_asset &&
-             !ocean.dynamic_sky,
+  expect(ocean.skybox.rgba == ocean_sky && ocean.skybox.cc0_asset,
          "dynamic osgw Ocean leaves the packaged CC0 sky unchanged");
 
   ViewportRasterScene static_ocean;
@@ -3062,41 +3060,56 @@ void testWorldEnvironmentFoundation() {
          "solid-angle conversion rejects a grazing light");
 }
 
-void testRtxptBridgeSelection() {
-  using xpbd::gfx::queryRtxptStatus;
+void testVulkanPathTraceImplementationSelection() {
+  using xpbd::gfx::queryVulkanPathTraceAvailability;
   using xpbd::gfx::RayTracingCapability;
-  using xpbd::gfx::RtImplementation;
-  using xpbd::gfx::selectRtImplementation;
-  using xpbd::gfx::rtImplementationName;
-
-  const auto st = queryRtxptStatus();
-  expect(rtImplementationName(RtImplementation::Rtxpt) != nullptr,
-         "RTXPT name non-null");
+  using xpbd::gfx::VulkanPathTraceAvailability;
+  using xpbd::gfx::VulkanPathTraceImplementation;
+  using xpbd::gfx::selectVulkanPathTraceImplementation;
+  using xpbd::gfx::vulkanPathTraceImplementationName;
 
   RayTracingCapability hw{};
   hw.supported = true;
   hw.device_extensions_enabled = true;
 
-  expect(selectRtImplementation(false, hw, st) == RtImplementation::None,
+  expect(vulkanPathTraceImplementationName(
+             VulkanPathTraceImplementation::RayTracingPipeline) != nullptr,
+         "Vulkan RT Pipeline name non-null");
+  expect(selectVulkanPathTraceImplementation(
+             false, hw, VulkanPathTraceAvailability{}) ==
+             VulkanPathTraceImplementation::None,
          "user off -> None");
 
-  // Without path-tracer-ready flag: hybrid shadows.
-  xpbd::gfx::setRtxptAlignedPathTracerReady(false);
-  auto st2 = queryRtxptStatus();
-  expect(selectRtImplementation(true, hw, st2) ==
-             RtImplementation::HybridRayQuery,
-         "user on + HW, no path tracer -> hybrid");
-
-  xpbd::gfx::setRtxptAlignedPathTracerReady(true);
-  auto st3 = queryRtxptStatus();
-  expect(st3.runtime_ready, "path tracer ready flag visible in status");
-  expect(selectRtImplementation(true, hw, st3) == RtImplementation::Rtxpt,
-         "user on + HW + path tracer -> Rtxpt");
+  // The built-in path tracer remains available through Ray Query while the
+  // optional full RT Pipeline is unavailable or still being created.
+  expect(selectVulkanPathTraceImplementation(
+             true, hw, VulkanPathTraceAvailability{}) ==
+             VulkanPathTraceImplementation::RayQuery,
+         "user on + HW, no pipeline -> Ray Query fallback");
+  expect(selectVulkanPathTraceImplementation(
+             true, hw, VulkanPathTraceAvailability{true, false}) ==
+             VulkanPathTraceImplementation::RayQuery,
+         "path tracer ready without pipeline -> Ray Query fallback");
+  expect(selectVulkanPathTraceImplementation(
+             true, hw, VulkanPathTraceAvailability{true, true}) ==
+             VulkanPathTraceImplementation::RayTracingPipeline,
+         "path tracer + pipeline ready -> RT Pipeline");
 
   RayTracingCapability no_hw{};
-  expect(selectRtImplementation(true, no_hw, st3) == RtImplementation::None,
-         "path tracer without HW extensions still None");
-  xpbd::gfx::setRtxptAlignedPathTracerReady(false);
+  expect(selectVulkanPathTraceImplementation(
+             true, no_hw, VulkanPathTraceAvailability{true, true}) ==
+             VulkanPathTraceImplementation::None,
+         "path tracer without HW extensions -> None");
+
+  xpbd::gfx::setVulkanPathTraceAvailability(false, false);
+  const auto cleared = queryVulkanPathTraceAvailability();
+  expect(!cleared.path_tracer_ready && !cleared.ray_tracing_pipeline_ready,
+         "availability reset clears both flags");
+  xpbd::gfx::setVulkanPathTraceAvailability(true, true);
+  const auto ready = queryVulkanPathTraceAvailability();
+  expect(ready.path_tracer_ready && ready.ray_tracing_pipeline_ready,
+         "availability setter exposes both built-in flags");
+  xpbd::gfx::setVulkanPathTraceAvailability(false, false);
 }
 
 } // namespace
@@ -3128,7 +3141,7 @@ int main() {
   testRtMotionProjection();
   testStaticMaterialClassification();
   testWorldEnvironmentFoundation();
-  testRtxptBridgeSelection();
+  testVulkanPathTraceImplementationSelection();
   if (g_failures != 0) {
     std::fprintf(stderr, "%d failure(s)\n", g_failures);
     return 1;

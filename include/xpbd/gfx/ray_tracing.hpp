@@ -582,11 +582,9 @@ struct RtMotionProjectionResult {
 evaluateRtMotionProjection(const RtMotionProjectionInput &input) noexcept;
 
 // Hardware / driver capability for NVIDIA hardware ray tracing via Vulkan RT
-// extensions (acceleration structures + ray query / pipelines).
-// Preferred software stack: NVIDIA RTX Path Tracing (RTXPT) —
-// https://github.com/NVIDIA-RTX/RTXPT (see rtxpt_bridge.hpp).
-// The built-in primary path uses unified ray-query visibility; hybrid
-// rasterization with ray-query shadows remains the initialization fallback.
+// extensions (acceleration structures + ray query / pipelines). The built-in
+// primary path prefers the Vulkan RT Pipeline and retains Ray Query as its
+// compatibility fallback.
 struct RayTracingCapability {
   bool is_nvidia = false;
   // True only for NVIDIA RTX 20-series (Turing) and newer generations.
@@ -609,6 +607,33 @@ struct RayTracingCapability {
   // Human-readable reason when supported == false (for UI / logs).
   std::string unsupported_reason;
 };
+
+enum class VulkanPathTraceImplementation : std::uint8_t {
+  None = 0,
+  RayQuery = 1,
+  RayTracingPipeline = 2,
+};
+
+struct VulkanPathTraceAvailability {
+  bool path_tracer_ready = false;
+  bool ray_tracing_pipeline_ready = false;
+};
+
+// Updated by the Vulkan backend after path-tracer pipeline creation and
+// teardown. This reports only built-in runtime capability; no vendor source
+// tree discovery participates in renderer selection.
+void setVulkanPathTraceAvailability(bool path_tracer_ready,
+                                    bool ray_tracing_pipeline_ready) noexcept;
+[[nodiscard]] VulkanPathTraceAvailability
+queryVulkanPathTraceAvailability() noexcept;
+
+[[nodiscard]] VulkanPathTraceImplementation
+selectVulkanPathTraceImplementation(
+    bool user_wants_rt, const RayTracingCapability &hardware,
+    const VulkanPathTraceAvailability &availability) noexcept;
+
+[[nodiscard]] const char *vulkanPathTraceImplementationName(
+    VulkanPathTraceImplementation implementation) noexcept;
 
 // Pure helpers (unit-tested). Inputs describe a probed physical device.
 [[nodiscard]] bool isNvidiaVendorId(std::uint32_t vendor_id) noexcept;

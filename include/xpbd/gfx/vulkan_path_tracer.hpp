@@ -1,6 +1,6 @@
 #pragma once
 
-// RTXPT-aligned viewport path tracer (compute + ray query).
+// Built-in Vulkan viewport path tracer (RT Pipeline + Ray Query fallback).
 // Composites into the existing Vulkan render pass as a fullscreen quad.
 
 #include "xpbd/gfx/labpbr_material.hpp"

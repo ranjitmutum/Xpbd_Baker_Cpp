@@ -14,8 +14,6 @@ option(XPBD_CHECK_SPIRV "Verify embedded Vulkan SPIR-V during the default build"
 option(XPBD_GFX_OPENGL "Enable OpenGL 3.3 backend in app" ON)
 option(XPBD_GFX_VULKAN "Enable Vulkan backend in app" ON)
 
-# Optional NVIDIA RTX Path Tracing (RTXPT) — https://github.com/NVIDIA-RTX/RTXPT
-include("${CMAKE_CURRENT_LIST_DIR}/cmake/Rtxpt.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/cmake/Streamline.cmake")
 
 set(XPBD_SPIRV_SOURCES
@@ -335,7 +333,6 @@ if(XPBD_BUILD_TESTS)
         src/gfx/rt_scene_records.cpp
         src/gfx/ray_tracing.cpp
         src/gfx/world_environment.cpp
-        src/gfx/rtxpt_bridge.cpp
         src/gfx/preview_scene.cpp
         src/gfx/preview_surfaces.cpp
     )
@@ -354,16 +351,6 @@ if(XPBD_BUILD_TESTS)
          _xpbd_source_dir_tests)
     target_compile_definitions(xpbd_viewport_regression_tests PRIVATE
         "XPBD_TEST_SOURCE_DIR=\"${_xpbd_source_dir_tests}\"")
-    if(XPBD_RTXPT_FOUND)
-        file(TO_CMAKE_PATH "${XPBD_RTXPT_ROOT}" _xpbd_rtxpt_root_norm_tests)
-        target_compile_definitions(xpbd_viewport_regression_tests PRIVATE
-            XPBD_WITH_RTXPT=1
-            "XPBD_RTXPT_VERSION_STR=\"${XPBD_RTXPT_VERSION}\""
-            "XPBD_RTXPT_ROOT_STR=\"${_xpbd_rtxpt_root_norm_tests}\"")
-    else()
-        target_compile_definitions(xpbd_viewport_regression_tests PRIVATE
-            XPBD_WITH_RTXPT=0)
-    endif()
     if(MSVC)
         target_compile_options(xpbd_viewport_regression_tests PRIVATE
             /W4 /permissive- /utf-8)
@@ -419,7 +406,6 @@ if(XPBD_BUILD_APP)
         src/gfx/gpu_backend_factory.cpp
         src/gfx/ray_tracing.cpp
         src/gfx/world_environment.cpp
-        src/gfx/rtxpt_bridge.cpp
         src/gfx/viewport_mesh.cpp
         src/gfx/preview_scene.cpp
         src/gfx/preview_surfaces.cpp
@@ -530,24 +516,6 @@ if(XPBD_BUILD_APP)
                 "and the app will use OpenGL when available")
         endif()
     endif()
-    # NVIDIA RTXPT bridge (tree discovery only; full path-trace is staged).
-    if(XPBD_RTXPT_FOUND)
-        file(TO_CMAKE_PATH "${XPBD_RTXPT_ROOT}" _xpbd_rtxpt_root_norm)
-        target_compile_definitions(xpbd_baker_app PRIVATE
-            XPBD_WITH_RTXPT=1
-            "XPBD_RTXPT_VERSION_STR=\"${XPBD_RTXPT_VERSION}\""
-            "XPBD_RTXPT_ROOT_STR=\"${_xpbd_rtxpt_root_norm}\""
-        )
-        target_include_directories(xpbd_baker_app PRIVATE
-            "${XPBD_RTXPT_ROOT}/Rtxpt"
-        )
-        message(STATUS "xpbd_baker: RTXPT bridge ENABLED (v${XPBD_RTXPT_VERSION})")
-    else()
-        target_compile_definitions(xpbd_baker_app PRIVATE XPBD_WITH_RTXPT=0)
-    endif()
-    if(WIN32)
-        target_link_libraries(xpbd_baker_app PRIVATE comdlg32)
-    endif()
     if(MSVC)
         target_compile_options(xpbd_baker_app PRIVATE /utf-8 /W4 /permissive- /wd5054 /wd4805 /wd4305)
         target_compile_definitions(xpbd_baker_app PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -605,6 +573,8 @@ if(XPBD_BUILD_APP)
             target_compile_options(xpbd_app_session_regression_tests PRIVATE
                 -Wall -Wextra -Wpedantic)
         endif()
+        add_test(NAME xpbd_app_session_regression
+                 COMMAND xpbd_app_session_regression_tests)
     endif()
 
     # Copy runtime DLLs next to the exe (vcpkg shared triplet).
@@ -672,9 +642,6 @@ if(XPBD_BUILD_APP)
             COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${CMAKE_CURRENT_SOURCE_DIR}/i18n"
                 "$<TARGET_FILE_DIR:xpbd_baker_app>/i18n"
-            COMMAND ${CMAKE_COMMAND} -E rm -f
-                "$<TARGET_FILE_DIR:xpbd_baker_app>/i18n/zh-HK.json"
-                "$<TARGET_FILE_DIR:xpbd_baker_app>/i18n/zh-TW.json"
             COMMENT "Copy i18n/ beside xpbd_baker_app"
         )
     endif()

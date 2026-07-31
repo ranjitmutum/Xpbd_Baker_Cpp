@@ -5,7 +5,6 @@
 #include "xpbd/gfx/backend_select.hpp"
 #include "xpbd/gfx/gpu_backend.hpp"
 #include "xpbd/gfx/preview_scene.hpp"
-#include "xpbd/gfx/rtxpt_bridge.hpp"
 #include "xpbd/gfx/static_model_draw_plan.hpp"
 #include "xpbd/gfx/viewport_mesh.hpp"
 #include "xpbd/log.hpp"
@@ -338,12 +337,12 @@ int app_main(int argc, char **argv) {
   }
 
   {
-    const auto rtxpt = xpbd::gfx::queryRtxptStatus();
-    xpbd::log::infof("Preview RT: build=%d tree=%d runtime=%d ver=%s — %s",
-                     rtxpt.build_enabled ? 1 : 0, rtxpt.tree_available ? 1 : 0,
-                     rtxpt.runtime_ready ? 1 : 0,
-                     rtxpt.version.empty() ? "-" : rtxpt.version.c_str(),
-                     rtxpt.detail.c_str());
+    const auto availability =
+        xpbd::gfx::queryVulkanPathTraceAvailability();
+    xpbd::log::infof(
+        "Built-in Vulkan path tracing: path_tracer=%d rt_pipeline=%d",
+        availability.path_tracer_ready ? 1 : 0,
+        availability.ray_tracing_pipeline_ready ? 1 : 0);
   }
   const char *legacy_uv_env = std::getenv("XPBD_VULKAN_LEGACY_UV");
   const bool use_static_model = xpbd::gfx::useStaticModelViewport(

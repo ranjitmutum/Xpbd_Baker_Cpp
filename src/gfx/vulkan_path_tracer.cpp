@@ -220,7 +220,7 @@ bool VulkanPathTracer::init(VkPhysicalDevice phys, VkDevice device,
     shutdown();
     return false;
   }
-  xpbd::log::info("Vulkan path tracer (RTXPT-aligned) ready");
+  xpbd::log::info("Built-in Vulkan path tracer ready");
   return true;
 }
 

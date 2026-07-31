@@ -363,6 +363,7 @@ void normalizeSun(SkyPalette &p) {
 }
 
 SkyPalette paletteFor(PreviewSceneId id) {
+  id = canonicalPreviewSceneId(id);
   SkyPalette p;
   switch (id) {
   case PreviewSceneId::Night:
@@ -393,54 +394,6 @@ SkyPalette paletteFor(PreviewSceneId id) {
     p.sun_bloom = 0.28f;
     p.cloud = 0.78f;
     break;
-  case PreviewSceneId::Dawn:
-    p.zenith = {0.22f, 0.38f, 0.72f};
-    p.horizon = {1.0f, 0.62f, 0.45f};
-    p.nadir = {0.62f, 0.48f, 0.42f};
-    p.sun_tint = {1.0f, 0.85f, 0.55f};
-    p.sun_x = -0.70f;
-    p.sun_y = 0.12f;
-    p.sun_z = 0.40f;
-    p.sun_size = 0.048f;
-    p.sun_bloom = 0.24f;
-    p.cloud = 0.70f;
-    break;
-  case PreviewSceneId::Space:
-    p.zenith = {0.002f, 0.0025f, 0.006f};
-    p.horizon = {0.003f, 0.003f, 0.008f};
-    p.nadir = {0.0015f, 0.002f, 0.005f};
-    p.nebula_a = {0.55f, 0.12f, 0.70f};
-    p.nebula_b = {0.15f, 0.35f, 0.85f};
-    p.no_sun = true;
-    p.sun_size = 0.0f;
-    p.sun_bloom = 0.0f;
-    p.cloud = 0.0f;
-    p.star_dense = 0.22f;
-    p.star_bright = 0.06f;
-    p.star_scale = 280.0f;
-    p.milky = 0.95f;
-    p.nebula = 0.85f;
-    p.full_sphere = true;
-    break;
-  case PreviewSceneId::End:
-    // Bliss end: dark void + storm fog colours — sparse stars, no space galaxies.
-    p.zenith = {0.006f, 0.003f, 0.014f};
-    p.horizon = {0.06f, 0.02f, 0.12f};
-    p.nadir = {0.008f, 0.004f, 0.016f};
-    p.sun_tint = {0.55f, 0.35f, 0.95f};
-    p.nebula_a = {0.45f, 0.12f, 0.70f};
-    p.nebula_b = {0.25f, 0.55f, 0.95f};
-    p.no_sun = true;
-    p.sun_size = 0.0f;
-    p.sun_bloom = 0.0f;
-    p.cloud = 0.0f;
-    p.star_dense = 0.04f;
-    p.star_bright = 0.008f;
-    p.star_scale = 160.0f;
-    p.nebula = 0.55f; // storm body, not galaxy islands
-    p.milky = 0.0f;
-    p.full_sphere = true;
-    break;
   case PreviewSceneId::Desert:
     p.zenith = {0.28f, 0.58f, 0.94f};
     p.horizon = {0.94f, 0.78f, 0.48f};
@@ -465,18 +418,6 @@ SkyPalette paletteFor(PreviewSceneId id) {
     p.sun_size = 0.042f;
     p.sun_bloom = 0.28f; // wider glitter-friendly bloom over water
     p.cloud = 0.36f;
-    break;
-  case PreviewSceneId::Storm:
-    // Heavy continuous overcast — cool greys, soft mass (not blotchy layers).
-    p.zenith = {0.18f, 0.20f, 0.24f};
-    p.horizon = {0.32f, 0.34f, 0.38f};
-    p.nadir = {0.22f, 0.24f, 0.27f};
-    p.no_sun = true;
-    p.sun_size = 0.0f;
-    p.sun_bloom = 0.0f;
-    p.cloud = 0.0f;
-    p.storm_layers = 1.0f;
-    p.full_sphere = true;
     break;
   case PreviewSceneId::Overcast:
     // Soft continuous grey shell — zenith ≈ nadir to kill polar seams.
@@ -1198,34 +1139,6 @@ PreviewSceneLighting makePreviewSceneLighting(PreviewSceneId id, float time_sec,
     L.clear_b = 0.18f;
     break;
   }
-  case PreviewSceneId::Dawn: {
-    L.direction = {-0.7f, 0.2f, 0.4f};
-    L.color = {1.05f, 0.85f, 0.65f};
-    L.ambient = 0.40f;
-    L.intensity = 0.88f;
-    L.clear_r = 0.55f;
-    L.clear_g = 0.48f;
-    L.clear_b = 0.55f;
-    break;
-  }
-  case PreviewSceneId::Space:
-    L.direction = {0.25f, 0.35f, -0.7f};
-    L.color = {0.95f, 0.97f, 1.15f};
-    L.ambient = 0.06f;
-    L.intensity = 1.05f;
-    L.clear_r = 0.002f;
-    L.clear_g = 0.002f;
-    L.clear_b = 0.006f;
-    break;
-  case PreviewSceneId::End:
-    L.direction = {-0.25f, 0.55f, 0.55f};
-    L.color = {0.70f, 0.45f, 0.95f};
-    L.ambient = 0.22f;
-    L.intensity = 0.55f;
-    L.clear_r = 0.02f;
-    L.clear_g = 0.01f;
-    L.clear_b = 0.04f;
-    break;
   case PreviewSceneId::Desert:
     L.direction = {0.25f, 0.8f, 0.35f};
     L.color = {1.08f, 0.98f, 0.78f};
@@ -1244,15 +1157,6 @@ PreviewSceneLighting makePreviewSceneLighting(PreviewSceneId id, float time_sec,
     L.clear_r = 0.28f;
     L.clear_g = 0.52f;
     L.clear_b = 0.78f;
-    break;
-  case PreviewSceneId::Storm:
-    L.direction = {0.2f, 0.5f, -0.4f};
-    L.color = {0.70f, 0.74f, 0.82f};
-    L.ambient = 0.30f;
-    L.intensity = 0.48f;
-    L.clear_r = 0.14f;
-    L.clear_g = 0.16f;
-    L.clear_b = 0.20f;
     break;
   case PreviewSceneId::Overcast:
     L.direction = {0.15f, 0.9f, 0.15f};
@@ -1301,42 +1205,6 @@ PreviewSceneLighting makePreviewSceneLighting(PreviewSceneId id, float time_sec,
       L.color = {1.15f, 0.55f + 0.25f * sink, 0.28f + 0.18f * sink};
       break;
     }
-    case PreviewSceneId::Dawn: {
-      const float rise = 0.5f + 0.5f * std::sin(t * 0.028f + 1.2f);
-      L.direction = {-0.7f, 0.08f + 0.22f * rise, 0.40f};
-      L.intensity = 0.70f + 0.30f * rise;
-      L.ambient = 0.32f + 0.14f * rise;
-      L.color = {1.08f, 0.72f + 0.18f * rise, 0.55f + 0.18f * rise};
-      break;
-    }
-    case PreviewSceneId::Space: {
-      // Slow key rotation (distant star / nebula fill).
-      const float a = t * 0.04f;
-      L.direction = {0.25f * std::cos(a) + 0.15f, 0.30f + 0.15f * std::sin(a * 0.7f),
-                     -0.7f * std::cos(a * 0.5f)};
-      L.intensity = 0.95f + 0.15f * std::sin(t * 0.1f);
-      L.ambient = 0.05f + 0.02f * (0.5f + 0.5f * std::sin(t * 0.07f));
-      break;
-    }
-    case PreviewSceneId::End: {
-      // Magenta key + sporadic lightning pulses (matches sky flash timing).
-      const float a = t * 0.05f;
-      L.direction = {-0.25f + 0.15f * std::sin(a), 0.50f + 0.12f * std::cos(a * 0.8f),
-                     0.55f};
-      const float seed = std::floor(t * 0.35f);
-      const float phase = t * 0.35f - seed;
-      float flash = 0.0f;
-      if (phase < 0.08f) {
-        flash = std::pow(1.0f - phase / 0.08f, 2.0f);
-      } else if (phase < 0.12f) {
-        flash = 0.35f * (1.0f - (phase - 0.08f) / 0.04f);
-      }
-      L.intensity = 0.45f + flash * 1.1f;
-      L.ambient = 0.18f + flash * 0.35f;
-      L.color = {0.70f + flash * 0.25f, 0.40f + flash * 0.15f,
-                 0.95f + flash * 0.05f};
-      break;
-    }
     case PreviewSceneId::Ocean: {
       const float a = t * 0.015f;
       L.direction = {0.42f + 0.12f * std::sin(a),
@@ -1345,27 +1213,6 @@ PreviewSceneLighting makePreviewSceneLighting(PreviewSceneId id, float time_sec,
       L.intensity = 0.95f + 0.14f * (0.5f + 0.5f * std::sin(t * 0.18f));
       L.ambient = 0.38f + 0.08f * (0.5f + 0.5f * std::sin(t * 0.12f + 1.0f));
       L.color = {0.92f, 0.98f + 0.02f * std::sin(t * 0.1f), 1.08f};
-      break;
-    }
-    case PreviewSceneId::Storm: {
-      // Directional bolt flashes (matches proceduralStorm timing).
-      const float seed = std::floor(t * 0.55f);
-      const float phase = t * 0.55f - seed;
-      float env = 0.0f;
-      if (phase < 0.04f) {
-        env = 1.0f - phase / 0.04f;
-      } else if (phase < 0.07f) {
-        env = 0.4f * (1.0f - (phase - 0.04f) / 0.03f);
-      }
-      // Cheap pseudo-random bolt direction from seed.
-      const float sx = std::sin(seed * 12.9898f) * 43758.5453f;
-      const float sy = std::sin(seed * 78.233f) * 43758.5453f;
-      const float fx = sx - std::floor(sx);
-      const float fy = sy - std::floor(sy);
-      L.direction = {fx * 2.0f - 1.0f, 0.35f + fy * 0.4f, fy * 2.0f - 1.0f};
-      L.intensity = 0.38f + env * 1.8f;
-      L.ambient = 0.26f + env * 0.45f;
-      L.color = {0.70f + env * 0.25f, 0.74f + env * 0.20f, 0.82f + env * 0.18f};
       break;
     }
     default:
@@ -1445,8 +1292,6 @@ void buildViewportRasterScene(PreviewSceneId id, bool show_grid, bool show_axes,
   out.environment_unlit = true;
   out.solid_ground = false;
   out.show_environment = false;
-  out.dynamic_sky = false;
-  out.time_sec = time_sec;
 
   if (previewSceneUsesSkybox(id)) {
     const std::uint64_t expected_asset_generation =
@@ -1479,7 +1324,6 @@ void buildViewportRasterScene(PreviewSceneId id, bool show_grid, bool show_axes,
     }
   } else {
     out.skybox.clear();
-    out.dynamic_sky = false;
   }
 
   if (rebuild_env) {

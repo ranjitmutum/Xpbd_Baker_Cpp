@@ -187,16 +187,11 @@ struct alignas(16) MeshScenePushConstants {
 static_assert(sizeof(MeshScenePushConstants) == 112);
 static_assert(alignof(MeshScenePushConstants) == 16);
 
-// Skybox push constants: VP + animation / mode (vertex + fragment).
-// params: x=time, y=scene_id, z=dynamic, w=scene_seed
+// Static cubemap skybox transform (vertex + fragment pipeline layout).
 struct alignas(16) SkyboxPushConstants {
   float mvp[16]{};
-  float time = 0.0f;
-  float scene_id = 0.0f;
-  float dynamic = 0.0f;
-  float seed = 0.0f;
 };
-static_assert(sizeof(SkyboxPushConstants) == 80);
+static_assert(sizeof(SkyboxPushConstants) == 64);
 static_assert(alignof(SkyboxPushConstants) == 16);
 
 // Procedural cubemap faces: order +X, -X, +Y, -Y, +Z, -Z.
@@ -237,9 +232,6 @@ struct ViewportRasterScene {
   bool show_environment = true;
   bool solid_ground = false;
   bool environment_unlit = true;
-  // Fully procedural sky driven by time (GPU shader path).
-  bool dynamic_sky = false;
-  float time_sec = 0.0f;
   // Incremented whenever environment triangle positions/colors/topology change.
   std::uint64_t geometry_generation = 0;
   // Randomised per scene switch (static + dynamic); drives noise offsets.
@@ -252,8 +244,6 @@ struct ViewportRasterScene {
     environment.clear();
     grid.clear();
     skybox.clear();
-    dynamic_sky = false;
-    time_sec = 0.0f;
     ++geometry_generation;
     scene_seed = 0.0f;
     surface_time_baked = -1.0e9f;

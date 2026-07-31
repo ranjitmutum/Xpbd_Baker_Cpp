@@ -3,7 +3,6 @@
 #include "xpbd/app/app_session.hpp"
 #include "xpbd/app/i18n.hpp"
 #include "xpbd/baker/output_timeline_resampler.hpp"
-#include "xpbd/gfx/rtxpt_bridge.hpp"
 
 #define NK_INCLUDE_FIXED_TYPES
 #define NK_INCLUDE_STANDARD_IO
@@ -1112,10 +1111,10 @@ void drawRendererEditor(nk_context *ctx, const Geom &g, AppSession &session,
   // Physics owns scene selection and World/Sky owns the sky source. Renderer
   // owns only the engine/integrator/post/display policy.
   heading(ctx, g, tr("pt_engine"));
-  const auto rtxpt = gfx::queryRtxptStatus();
+  const auto availability = gfx::queryVulkanPathTraceAvailability();
   const bool hw_ok = rt_cap != nullptr && rt_cap->supported &&
                      rt_cap->device_extensions_enabled;
-  const bool rt_supported = hw_ok || rtxpt.runtime_ready;
+  const bool rt_supported = hw_ok || availability.path_tracer_ready;
   if (!rt_supported && session.enable_ray_tracing) {
     session.enable_ray_tracing = false;
   }
@@ -1128,12 +1127,12 @@ void drawRendererEditor(nk_context *ctx, const Geom &g, AppSession &session,
                                            : tr("pt_path_raster"));
   muted(ctx, g, status_line);
   if (rt_supported && session.enable_ray_tracing) {
-    const auto impl = gfx::selectRtImplementation(
-        true, rt_cap ? *rt_cap : gfx::RayTracingCapability{}, rtxpt);
+    const auto impl = gfx::selectVulkanPathTraceImplementation(
+        true, rt_cap ? *rt_cap : gfx::RayTracingCapability{}, availability);
     const char *active =
-        impl == gfx::RtImplementation::Rtxpt
+        impl == gfx::VulkanPathTraceImplementation::RayTracingPipeline
             ? tr("pt_path_tracing")
-            : impl == gfx::RtImplementation::HybridRayQuery
+            : impl == gfx::VulkanPathTraceImplementation::RayQuery
                   ? tr("pt_path_ray_query")
                   : tr("pt_path_raster");
     std::snprintf(status_line, sizeof(status_line),
@@ -1190,7 +1189,7 @@ void drawRendererEditor(nk_context *ctx, const Geom &g, AppSession &session,
 
   const bool nvidia_rt_pipeline_available =
       hw_ok && rt_cap != nullptr && rt_cap->is_nvidia &&
-      rtxpt.runtime_ready;
+      availability.ray_tracing_pipeline_ready;
   toggle(tr("pt_nvidia_rt_core"),
          settings.nvidia_rt_core_acceleration,
          controls_disabled || !nvidia_rt_pipeline_available, false);

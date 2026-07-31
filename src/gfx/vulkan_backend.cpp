@@ -5,7 +5,6 @@
 #include "xpbd/gfx/labpbr_material.hpp"
 #include "xpbd/gfx/preview_scene.hpp"
 #include "xpbd/gfx/ray_tracing.hpp"
-#include "xpbd/gfx/rtxpt_bridge.hpp"
 #include "xpbd/gfx/static_model_draw_plan.hpp"
 #include "xpbd/gfx/streamline_vulkan_runtime.hpp"
 #include "xpbd/gfx/vulkan_path_tracer.hpp"
@@ -655,7 +654,7 @@ public:
       } else {
         xpbd::log::infof(
             "Vulkan RT: NVIDIA RT ready on '%s' (max recursion %u). "
-            "Preferred stack: RTXPT-aligned path tracer",
+            "Preferred path: built-in Vulkan RT Pipeline",
             rt_capability_.device_name.c_str(),
             rt_capability_.max_ray_recursion_depth);
       }
@@ -710,11 +709,18 @@ public:
             "tracing remains available");
       }
     }
-    setRtxptAlignedPathTracerReady(
+    const bool path_tracer_ready =
         std::all_of(path_tracers_.begin(), path_tracers_.end(),
                     [](const VulkanPathTracer &path_tracer) {
                       return path_tracer.ready();
-                    }));
+                    });
+    const bool rt_pipeline_ready =
+        path_tracer_ready &&
+        std::all_of(path_tracers_.begin(), path_tracers_.end(),
+                    [](const VulkanPathTracer &path_tracer) {
+                      return path_tracer.rtPipelineReady();
+                    });
+    setVulkanPathTraceAvailability(path_tracer_ready, rt_pipeline_ready);
     if (!createBuffers()) {
       return false;
     }
@@ -784,7 +790,7 @@ public:
     still_active_job_id_ = 0;
     destroyProceduralAtmosphereGpu();
     destroyWorldEnvironmentGpu();
-    setRtxptAlignedPathTracerReady(false);
+    setVulkanPathTraceAvailability(false, false);
     for (auto &scene : rt_scenes_) {
       scene.shutdown();
     }
@@ -1628,8 +1634,7 @@ public:
         valid_viewport && raster != nullptr && !raster->grid.lines.empty();
     const bool draw_skybox =
         valid_viewport && raster != nullptr && skybox_pipeline_ &&
-        skybox_layout_ && skybox_desc_set_ &&
-        (raster->dynamic_sky || raster->skybox.valid());
+        skybox_layout_ && skybox_desc_set_ && raster->skybox.valid();
     const DynamicMeshUploadLayout mesh_upload =
         draw_mesh ? makeDynamicMeshUploadLayout(frame.scene->solid.size(),
                                                 frame.scene->transparent.size(),
@@ -1753,25 +1758,10 @@ public:
       stats_.static_bone_upload_bytes = bone_bytes;
       stats_.mesh_upload_bytes += bone_bytes;
     }
-    if (draw_skybox && !raster->dynamic_sky &&
-        !uploadSkyboxCubemap(raster->skybox)) {
+    if (draw_skybox && !uploadSkyboxCubemap(raster->skybox)) {
       writeLog("Vulkan skybox cubemap upload failed");
     }
-    // Dynamic procedural sky needs a bound sampler; ensure a dummy cubemap.
-    if (draw_skybox && raster->dynamic_sky && !skybox_ready_) {
-      PreviewSkybox dummy{};
-      dummy.face_size = 1;
-      dummy.rgba.assign(1u * 1u * 4u * 6u, 8);
-      for (std::size_t i = 3; i < dummy.rgba.size(); i += 4) {
-        dummy.rgba[i] = 255;
-      }
-      dummy.generation = 0xD0000001ull;
-      if (!uploadSkyboxCubemap(dummy)) {
-        writeLog("Vulkan dummy skybox for dynamic path failed");
-      }
-    }
-    const bool skybox_draw =
-        draw_skybox && (raster->dynamic_sky || skybox_ready_);
+    const bool skybox_draw = draw_skybox && skybox_ready_;
 
     const bool draw_viewport =
         valid_viewport &&
@@ -2123,7 +2113,7 @@ public:
     stats_.rt_primitive_count = active_rt_stats.primitive_count;
     stats_.rt_last_build_reason = active_rt_stats.last_build_reason;
 
-    // RTXPT-aligned path tracer dispatch (RT Pipeline preferred, before the
+    // Built-in path tracer dispatch (RT Pipeline preferred, before the
     // graphics pass).
     PathTraceFrameParams pt_params{};
     bool pt_dlss_active = false;
@@ -3031,11 +3021,6 @@ public:
         mulMat(frame.proj_matrix, view_rot, sky_mvp_gl);
         SkyboxPushConstants sky_pc{};
         glMvpToVulkan(sky_mvp_gl, sky_pc.mvp);
-        sky_pc.time = raster ? raster->time_sec : 0.0f;
-        sky_pc.scene_id =
-            raster ? static_cast<float>(static_cast<int>(raster->id)) : 0.0f;
-        sky_pc.dynamic = (raster && raster->dynamic_sky) ? 1.0f : 0.0f;
-        sky_pc.seed = raster ? raster->scene_seed : 0.0f;
         constexpr VkShaderStageFlags kSkyPcStages =
             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         vkCmdBindPipeline(fs.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -8162,7 +8147,7 @@ private:
       }
       still_path_tracer_.shutdown();
       still_active_job_id_ = 0;
-      setRtxptAlignedPathTracerReady(false);
+      setVulkanPathTraceAvailability(false, false);
       destroyGraphicsPipelines();
       if (fg_overlay_render_pass_) {
         vkDestroyRenderPass(device_, fg_overlay_render_pass_, nullptr);
@@ -8211,11 +8196,18 @@ private:
           (void)still_path_tracer_.init(phys_, device_, render_pass_, false);
         }
       }
-      setRtxptAlignedPathTracerReady(
+      const bool path_tracer_ready =
           std::all_of(path_tracers_.begin(), path_tracers_.end(),
                       [](const VulkanPathTracer &path_tracer) {
                         return path_tracer.ready();
-                      }));
+                      });
+      const bool rt_pipeline_ready =
+          path_tracer_ready &&
+          std::all_of(path_tracers_.begin(), path_tracers_.end(),
+                      [](const VulkanPathTracer &path_tracer) {
+                        return path_tracer.rtPipelineReady();
+                      });
+      setVulkanPathTraceAvailability(path_tracer_ready, rt_pipeline_ready);
     }
     if (!createFramebuffers()) {
       destroySwapchainObjects();

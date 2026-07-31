@@ -9,6 +9,9 @@
 namespace xpbd::gfx {
 namespace {
 
+bool g_vulkan_path_tracer_ready = false;
+bool g_vulkan_rt_pipeline_ready = false;
+
 [[nodiscard]] constexpr bool isPowerOfTwo(std::uint64_t value) noexcept {
   return value != 0u && (value & (value - 1u)) == 0u;
 }
@@ -1485,6 +1488,44 @@ RayTracingCapability evaluateRayTracingCapability(
     cap.unsupported_reason = "Ray tracing is not available";
   }
   return cap;
+}
+
+void setVulkanPathTraceAvailability(
+    bool path_tracer_ready, bool ray_tracing_pipeline_ready) noexcept {
+  g_vulkan_path_tracer_ready = path_tracer_ready;
+  g_vulkan_rt_pipeline_ready =
+      path_tracer_ready && ray_tracing_pipeline_ready;
+}
+
+VulkanPathTraceAvailability queryVulkanPathTraceAvailability() noexcept {
+  return {g_vulkan_path_tracer_ready, g_vulkan_rt_pipeline_ready};
+}
+
+VulkanPathTraceImplementation selectVulkanPathTraceImplementation(
+    bool user_wants_rt, const RayTracingCapability &hardware,
+    const VulkanPathTraceAvailability &availability) noexcept {
+  if (!user_wants_rt || !hardware.supported ||
+      !hardware.device_extensions_enabled) {
+    return VulkanPathTraceImplementation::None;
+  }
+  if (availability.path_tracer_ready &&
+      availability.ray_tracing_pipeline_ready) {
+    return VulkanPathTraceImplementation::RayTracingPipeline;
+  }
+  return VulkanPathTraceImplementation::RayQuery;
+}
+
+const char *vulkanPathTraceImplementationName(
+    VulkanPathTraceImplementation implementation) noexcept {
+  switch (implementation) {
+  case VulkanPathTraceImplementation::RayTracingPipeline:
+    return "Built-in Vulkan RT Pipeline";
+  case VulkanPathTraceImplementation::RayQuery:
+    return "Vulkan Ray Query Compatibility";
+  case VulkanPathTraceImplementation::None:
+  default:
+    return "None";
+  }
 }
 
 RenderPath resolveRenderPath(bool user_wants_ray_tracing,

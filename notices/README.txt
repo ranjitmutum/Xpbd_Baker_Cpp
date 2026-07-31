@@ -20,9 +20,6 @@ Third-party components (summaries; see files / upstream for full text):
   - Astronomy Engine C ..... MIT                         (third_party/astronomy; ASTRONOMY_ENGINE.txt)
   - Bruneton Atmosphere .... BSD-3-Clause                (third_party/bruneton; BRUNETON_ATMOSPHERE.txt)
   - Poly Haven HDRIs ....... CC0                         (assets/preview_scenes; POLY_HAVEN_CC0.txt)
-  - NVIDIA RTX Path Tracing (RTXPT) optional external tree
-    https://github.com/NVIDIA-RTX/RTXPT — see upstream LICENSE.txt and External/*
-
 RT Phase 0 feasibility references are not compiled, linked, or shipped.
 Their frozen revisions, license boundaries, excluded assets, and future notice
 requirements are recorded in docs/rt_phase0_feasibility_ledger.md.
