@@ -2260,22 +2260,24 @@ bool StreamlineVulkanRuntime::recordFrameGenerationInputs(
       frame.output_width, frame.output_height);
   const sl::Extent guide_extent{
       0u, 0u, frame.render_width, frame.render_height};
-  const sl::Extent full_extent{
-      0u, 0u, frame.output_width, frame.output_height};
   const sl::Extent viewport_extent{
       frame.viewport_x, frame.viewport_y,
       frame.viewport_width, frame.viewport_height};
+  // FG is intentionally limited to the preview subrect. NVIDIA requires the
+  // HUD-less and UI tag extents to exactly match the tagged backbuffer extent,
+  // even when their underlying images cover the full swapchain.
+  const sl::Extent &color_extent = viewport_extent;
   const std::array<sl::ResourceTag, 5> tags{{
       {&depth, sl::kBufferTypeDepth,
        sl::ResourceLifecycle::eValidUntilPresent, &guide_extent},
       {&motion, sl::kBufferTypeMotionVectors,
        sl::ResourceLifecycle::eValidUntilPresent, &guide_extent},
       {&hudless, sl::kBufferTypeHUDLessColor,
-       sl::ResourceLifecycle::eValidUntilPresent, &full_extent},
+       sl::ResourceLifecycle::eValidUntilPresent, &color_extent},
       {&ui, sl::kBufferTypeUIColorAndAlpha,
-       sl::ResourceLifecycle::eValidUntilPresent, &full_extent},
+       sl::ResourceLifecycle::eValidUntilPresent, &color_extent},
       {nullptr, sl::kBufferTypeBackbuffer,
-       sl::ResourceLifecycle::eValidUntilPresent, &viewport_extent},
+       sl::ResourceLifecycle::eValidUntilPresent, &color_extent},
   }};
   sl::CommandBuffer *command_buffer =
       reinterpret_cast<sl::CommandBuffer *>(frame.command_buffer);
@@ -2431,10 +2433,21 @@ updateFrameGenerationStateAfterPresent() noexcept {
     disableFrameGeneration();
     return;
   }
+  const bool was_active = impl_->frame_generation_active;
+  const std::uint32_t previous_presented =
+      impl_->frames_actually_presented;
   impl_->frames_actually_presented =
       (std::max)(1u, state.numFramesActuallyPresented);
   impl_->frame_generation_active =
       state.numFramesActuallyPresented > 1u;
+  if (impl_->frame_generation_active != was_active ||
+      impl_->frames_actually_presented != previous_presented) {
+    xpbd::log::infof(
+        "Streamline DLSS-G present state: active=%d "
+        "frames_actually_presented=%u",
+        impl_->frame_generation_active ? 1 : 0,
+        impl_->frames_actually_presented);
+  }
   impl_->frame_generation_status =
       impl_->frame_generation_active
           ? "DLSS Frame Generation active"

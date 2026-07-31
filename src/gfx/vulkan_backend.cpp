@@ -1897,7 +1897,7 @@ public:
       fatal_error_ = true;
       return;
     }
-    if (swapchain_maintenance1_enabled_ &&
+    if (presentFenceLifecycleEnabled() &&
         !image_resource.present_fence) {
       writeLog("Vulkan swapchain image has no present completion fence");
       fatal_error_ = true;
@@ -1931,7 +1931,7 @@ public:
       return result;
     };
 
-    if (swapchain_maintenance1_enabled_ &&
+    if (presentFenceLifecycleEnabled() &&
         image_resource.present_pending) {
       const VkResult present_wait =
           wait_for_fence(image_resource.present_fence,
@@ -3433,7 +3433,7 @@ public:
     pi.pImageIndices = &image_index;
     VkSwapchainPresentFenceInfoKHR present_fence_info{
         VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR};
-    if (swapchain_maintenance1_enabled_) {
+    if (presentFenceLifecycleEnabled()) {
       present_fence_info.swapchainCount = 1;
       present_fence_info.pFences = &image_resource.present_fence;
       pi.pNext = &present_fence_info;
@@ -3451,7 +3451,7 @@ public:
         streamline_vulkan_runtime_.frameGenerationActive();
     stats_.dlss_frames_actually_presented =
         streamline_vulkan_runtime_.framesActuallyPresented();
-    if (swapchain_maintenance1_enabled_) {
+    if (presentFenceLifecycleEnabled()) {
       image_resource.present_pending =
           pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR ||
           pr == VK_ERROR_OUT_OF_DATE_KHR ||
@@ -3574,6 +3574,15 @@ public:
   }
 
 private:
+  [[nodiscard]] bool presentFenceLifecycleEnabled() const noexcept {
+    // DLSS-G owns an asynchronous proxy present. Its documented Vulkan
+    // contract consumes the Present semaphore and later releases the acquired
+    // image; it does not signal an application-provided maintenance1 Present
+    // fence. Native swapchains retain the stronger fence lifecycle.
+    return swapchain_maintenance1_enabled_ &&
+           !fg_swapchain_proxy_active_;
+  }
+
   [[nodiscard]] bool
   frameGenerationPlatformSupported() const noexcept {
     return streamline_vulkan_runtime_.frameGenerationSupported() &&
@@ -3725,6 +3734,7 @@ private:
   bool fg_swapchain_color_format_supported_ = false;
   bool fg_swapchain_resources_ready_ = false;
   bool fg_swapchain_enabled_ = false;
+  bool fg_swapchain_proxy_active_ = false;
   bool fg_recreate_target_enabled_ = false;
   Clock::time_point next_swapchain_recreate_attempt_{};
   bool fatal_error_ = false;
@@ -7380,7 +7390,8 @@ private:
   }
 
   bool createSwapchain(
-      VkSwapchainKHR old_swapchain = VK_NULL_HANDLE) {
+      VkSwapchainKHR old_swapchain = VK_NULL_HANDLE,
+      bool frame_generation_proxy_active = false) {
     SwapchainSupport support;
     if (!querySupport(phys_, support)) {
       writeLog("Vulkan swapchain surface has no usable formats/present modes");
@@ -7521,6 +7532,12 @@ private:
       return false;
     }
     swapchain_ = new_swapchain;
+    fg_swapchain_proxy_active_ = frame_generation_proxy_active;
+    if (fg_swapchain_proxy_active_ && swapchain_maintenance1_enabled_) {
+      xpbd::log::info(
+          "Vulkan present-fence lifecycle disabled for the asynchronous "
+          "DLSS-G swapchain proxy");
+    }
 
     uint32_t ic = 0;
     VkResult images_result =
@@ -7573,7 +7590,7 @@ private:
         destroySwapchainObjects();
         return false;
       }
-      if (swapchain_maintenance1_enabled_) {
+      if (presentFenceLifecycleEnabled()) {
         result = vkCreateFence(device_, &present_fence_info, nullptr,
                                &resource.present_fence);
         if (result != VK_SUCCESS) {
@@ -7689,7 +7706,7 @@ private:
   }
 
   bool waitForPendingPresentFences(const char *reason) {
-    if (!swapchain_maintenance1_enabled_) {
+    if (!presentFenceLifecycleEnabled()) {
       return true;
     }
     const std::string stage =
@@ -7795,6 +7812,7 @@ private:
           device_, swapchain_, nullptr);
       swapchain_ = VK_NULL_HANDLE;
     }
+    fg_swapchain_proxy_active_ = false;
   }
 
   bool recreateSwapchain() {
@@ -7867,6 +7885,7 @@ private:
       streamline_vulkan_runtime_.destroySwapchain(
           device_, old_swapchain, nullptr);
     }
+    fg_swapchain_proxy_active_ = false;
 
     // NVIDIA's documented transition is strict: destroy the old swapchain,
     // load/unload the DLSS-G feature, then create a new swapchain. Passing a
@@ -7889,7 +7908,8 @@ private:
           "swapchain with FG disabled");
     }
 
-    const bool created = createSwapchain(VK_NULL_HANDLE);
+    const bool created =
+        createSwapchain(VK_NULL_HANDLE, effective_fg_target);
     if (!created) {
       return false;
     }

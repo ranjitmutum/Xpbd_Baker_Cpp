@@ -672,6 +672,15 @@ int app_main(int argc, char **argv) {
   apply_path_trace_bool(
       "XPBD_PT_ENV_IMPORTANCE",
       session.path_trace_settings.environment_importance_sampling);
+  bool startup_frame_generation =
+      session.path_trace_settings.requested_frame_generation ==
+      xpbd::gfx::PathTraceFrameGeneration::On;
+  apply_path_trace_bool("XPBD_PT_FRAME_GENERATION",
+                        startup_frame_generation);
+  session.path_trace_settings.requested_frame_generation =
+      startup_frame_generation
+          ? xpbd::gfx::PathTraceFrameGeneration::On
+          : xpbd::gfx::PathTraceFrameGeneration::Off;
   apply_path_trace_uint(
       "XPBD_PT_LIGHT_SAMPLES",
       session.path_trace_settings.light_samples_per_path);
