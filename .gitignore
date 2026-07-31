@@ -44,6 +44,7 @@ desktop.ini
 /docs/plans/
 /docs/*_gate.md
 /docs/*_ledger.md
+!/docs/scene_stage_S??_gate.md
 /**/*_plan.md
 /**/*_planning.md
 /**/*计划*.md

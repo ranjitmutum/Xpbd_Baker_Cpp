@@ -1,0 +1,109 @@
+{
+  "manifest_schema_version": 1,
+  "plan_version": "2.3+user-s00-blockers-2026-07-31.2",
+  "current_execution_scope": "S00-A through S00-E user-reported bug closure only; S01-S18 deferred by user on 2026-08-01",
+  "active_stage": "S00",
+  "last_successful_stage": null,
+  "baseline_commit": "664b4308fa5879ba83ad1523262cc1bc3df6f7ac",
+  "last_result_commit": null,
+  "working_tree_expected_clean": false,
+  "working_tree_scope": {
+    "main_worktree": "D:/XPBD_Baker_CPP",
+    "branch": "xpbdRT",
+    "remote_tracking_ref": "origin/xpbdRT",
+    "historical_untracked_evidence": [
+      "docs/pre_performance_*",
+      "docs/pre_cleanup_*",
+      "docs/perf/PERF00_baseline.md",
+      "artifacts/perf/PERF00/**",
+      "artifacts/pre_cleanup/DC00/**"
+    ],
+    "external_worktrees_and_packages": [
+      ".tmp/rt-base-8d9dc9e",
+      ".tmp/release-package-*"
+    ],
+    "stage_only_exact_paths": true
+  },
+  "review_boundary": {
+    "must_fix": [
+      "crash, hang, device loss, data loss or corruption",
+      "explicit error or wrong result",
+      "build, test, migration, or runtime failure",
+      "evidence-backed severe user-visible performance failure",
+      "features and gates explicitly required by the v2.3 plan"
+    ],
+    "do_not_expand_for": [
+      "style or naming preference",
+      "pure refactor without correctness evidence",
+      "minor performance difference",
+      "minor UI polish not required by the plan",
+      "theoretical optimization without reproduction or profile evidence"
+    ]
+  },
+  "required_artifacts": [
+    "docs/scene_stage_S00_gate.md",
+    "docs/scene_stage_S00_fg_revalidation.md",
+    "docs/open_source_reference_ledger.json",
+    "assets/scene_tests/s00/s00_gate_spec.json",
+    "assets/scene_tests/s00/fixture_manifest.json",
+    "assets/scene_tests/s00/SOURCES.md",
+    "artifacts/scene_stage_S00/build/**",
+    "artifacts/scene_stage_S00/tests/**",
+    "artifacts/scene_stage_S00/runtime/**",
+    "artifacts/scene_stage_S00/baselines/**"
+  ],
+  "failed_command": null,
+  "failure_summary": null,
+  "final_device_action": {
+    "action": "Windows shutdown",
+    "delay_seconds": 60,
+    "authorized_by_user": true,
+    "execute_only_after_all_s00_user_bugfix_gates_pass": true,
+    "cancel_command": "shutdown /a",
+    "status": "Pending"
+  },
+  "resume_instructions": [
+    "Read .planning/rt-multiasset-bedrock-sky-v2/task_plan.md, findings.md, and progress.md completely.",
+    "Read this manifest and docs/scene_stage_S00_gate.md.",
+    "Verify the main worktree and preserve all historical untracked evidence; never broadly stage docs or artifacts.",
+    "Continue S00-A through S00-E under gate S00-1.0; after S00 is Passed, finalize the handoff and schedule the authorized shutdown instead of entering S01.",
+    "After a final result commit, rerun the complete S00 build, CPU, runtime, Still/RR/SR, FG, visibility and UI gates before updating last_result_commit."
+  ],
+  "stages": [
+    {
+      "stage": "S00",
+      "status": "InProgress",
+      "baseline_commit": "664b4308fa5879ba83ad1523262cc1bc3df6f7ac",
+      "result_commit": null,
+      "build": "pending",
+      "definition_validation": {
+        "configure": "passed",
+        "release_targets_and_spirv": "passed",
+        "ctest": "2/2 passed in 1.29 seconds",
+        "cli_help": "exit 0",
+        "final_result_commit_rerun_required": true
+      },
+      "tests": [
+        "fixture determinism: passed locally before definition commit",
+        "clean configure/build/SPIR-V: pending",
+        "CTest/CLI smoke: pending",
+        "S00-A PT hot import: pending",
+        "S00-B rotating RR/SR+FG: pending",
+        "S00-C PT visibility/emitter: pending",
+        "S00-D Still lifecycle/character/sky/brightness: pending",
+        "S00-E Still UI focus: pending",
+        "Still/RR/SR baselines: pending",
+        "FG lifecycle: pending",
+        "reference/license candidate freeze: passed; integration probes/notices deferred with S01-S05"
+      ],
+      "runtime_probes": [],
+      "known_limits": [
+        "Historical PRE-PERF/PRE-DC artifacts are inputs only and are not bound to the final S00 result commit.",
+        "Private local Bedrock models are local reproducers only; portable verdicts use generated Apache-2.0 fixtures.",
+        "All five user-reported S00 blockers are unresolved; S00-D includes intermittent failure after switching a special background, missing content, and preview-versus-Still brightness/display-transform mismatch."
+      ],
+      "next_stage": null,
+      "post_stage_action": "final handoff and authorized 60-second delayed Windows shutdown; S01-S18 deferred"
+    }
+  ]
+}

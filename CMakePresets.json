@@ -43,6 +43,24 @@
         "lhs": "${hostSystemName}",
         "rhs": "Windows"
       }
+    },
+    {
+      "name": "s00-gate",
+      "displayName": "S00 clean regression gate",
+      "description": "Reproducible Release build with CPU tests and embedded SPIR-V verification enabled",
+      "inherits": "base",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/out/build/s00-gate",
+      "cacheVariables": {
+        "XPBD_BUILD_TESTS": "ON",
+        "XPBD_CHECK_SPIRV": "ON"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     }
   ],
   "buildPresets": [
@@ -54,6 +72,35 @@
       "targets": [
         "xpbd_baker_app"
       ]
+    },
+    {
+      "name": "s00-gate-release",
+      "displayName": "S00 clean regression gate (Release)",
+      "configurePreset": "s00-gate",
+      "configuration": "Release",
+      "targets": [
+        "xpbd_baker_app",
+        "xpbd_cli",
+        "xpbd_viewport_regression_tests",
+        "xpbd_app_session_regression_tests",
+        "xpbd_check_spirv"
+      ]
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "s00-gate-release",
+      "displayName": "S00 clean regression tests (Release)",
+      "configurePreset": "s00-gate",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error",
+        "stopOnFailure": false,
+        "timeout": 120
+      }
     }
   ]
 }

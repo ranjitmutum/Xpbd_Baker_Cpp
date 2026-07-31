@@ -1,0 +1,247 @@
+{
+  "schema_version": 1,
+  "gate_version": "S00-1.0",
+  "plan_version": "2.3+user-s00-blockers-2026-07-31",
+  "baseline_commit": "664b4308fa5879ba83ad1523262cc1bc3df6f7ac",
+  "result_commit_binding_required": true,
+  "evidence_root": "artifacts/scene_stage_S00",
+  "fixture_manifest": "assets/scene_tests/s00/fixture_manifest.json",
+  "build": {
+    "configure_preset": "s00-gate",
+    "build_preset": "s00-gate-release",
+    "test_preset": "s00-gate-release",
+    "configuration": "Release",
+    "expected_exit_code": 0,
+    "test_timeout_seconds": 120
+  },
+  "required_capabilities": {
+    "os": "Windows 10 or 11 x64",
+    "graphics_api": "Vulkan",
+    "ray_tracing": "VK_KHR_acceleration_structure and VK_KHR_ray_tracing_pipeline",
+    "gpu": "NVIDIA RTX capable of DLSS SR, Ray Reconstruction, and Frame Generation",
+    "streamline": "2.12.x pinned by the result build",
+    "frame_generation": "HAGS and driver support required only for FG cases"
+  },
+  "forbidden_log_patterns_case_insensitive": [
+    "VK_ERROR_DEVICE_LOST",
+    "Device Lost",
+    "Validation Error",
+    "assertion failed",
+    "unhandled exception",
+    "access violation",
+    "still render failed"
+  ],
+  "timeouts": {
+    "process_wall_clock_seconds": 420,
+    "primary_import_seconds": 120,
+    "extended_import_seconds": 240,
+    "user_scale_cube_density_import_seconds": 300,
+    "cancel_ack_seconds": 10,
+    "maximum_present_heartbeat_gap_seconds": 5.0,
+    "still_render_seconds_256x256_32spp": 180
+  },
+  "s00_a_hot_import": {
+    "pre_import_present_frames": 30,
+    "post_import_present_frames": 30,
+    "fixtures": [
+      "bedrock_s00_small_8cubes.geo.json",
+      "bedrock_s00_stress_1280cubes.geo.json",
+      "bedrock_s00_stress_2624cubes.geo.json",
+      "bedrock_s00_stress_10368cubes_144bones.geo.json"
+    ],
+    "required_modes": [
+      "PT Raw FG Off",
+      "PT Raw FG On"
+    ],
+    "required_events": [
+      "S00_IMPORT_BEGIN",
+      "S00_IMPORT_COMMIT",
+      "S00_IMPORT_RT_READY",
+      "S00_POST_IMPORT_PRESENT",
+      "S00_CLEAN_EXIT"
+    ],
+    "required_outcomes": {
+      "source_sha256_unchanged": true,
+      "failed_or_cancelled_import_leaves_previous_scene_unchanged": true,
+      "normal_exit": true,
+      "present_heartbeat_during_import": true,
+      "post_import_rendering_continues": true
+    }
+  },
+  "s00_b_rotating_fg": {
+    "fixed_seed": 20260731,
+    "warmup_real_frames": 30,
+    "captured_present_frames": 48,
+    "model_yaw_degrees_per_real_frame": 3.0,
+    "modes": [
+      "RR FG Off",
+      "SR Quality FG Off",
+      "Raw FG On",
+      "RR FG On",
+      "SR Quality FG On"
+    ],
+    "required_aovs": [
+      "color",
+      "depth",
+      "motion"
+    ],
+    "image_thresholds": {
+      "maximum_secondary_component_area_ratio": 0.02,
+      "maximum_bidirectional_side_lobe_energy_ratio": 0.05,
+      "minimum_primary_silhouette_iou_against_expected_pose": 0.90
+    },
+    "required_outcomes": {
+      "one_temporally_continuous_object_silhouette": true,
+      "current_previous_transform_sequence_exact": true,
+      "streamline_tags_match_rendered_frame": true,
+      "history_reset_only_at_declared_transitions": true,
+      "normal_shutdown": true
+    }
+  },
+  "s00_c_pt_visibility": {
+    "fixture": "bedrock_s00_small_8cubes.geo.json",
+    "parent_target": "branch_000_depth_00",
+    "descendant_target": "branch_000_depth_01",
+    "baseline_cube_count": 8,
+    "parent_hidden_cube_count": 4,
+    "leaf_hidden_cube_count": 6,
+    "required_modes": [
+      "Raster control",
+      "PT Raw",
+      "PT RR",
+      "PT SR Quality",
+      "PT Raw FG On",
+      "PT RR FG On",
+      "PT SR Quality FG On"
+    ],
+    "required_material_controls": [
+      "opaque rigid group (DownBody-equivalent)",
+      "alpha-tested or blended group (UpperBody control)"
+    ],
+    "required_outcomes": {
+      "hidden_tlas_instance_mask": 0,
+      "visible_tlas_instance_mask": 255,
+      "blas_build_or_refit_delta_on_hide_show": 0,
+      "packed_primitive_identity_stable": true,
+      "hidden_emitter_positive_weight_count": 0,
+      "cpu_pick_rejects_hidden_descendants": true,
+      "unhide_restores_baseline": true
+    },
+    "image_thresholds": {
+      "minimum_target_roi_mean_absolute_delta": 0.05,
+      "maximum_control_roi_mean_absolute_delta": 0.02,
+      "minimum_unhide_baseline_psnr_db": 35.0
+    }
+  },
+  "s00_d_still_snapshot": {
+    "reliability_repeat_count": 20,
+    "reliability_resolution": [
+      64,
+      64
+    ],
+    "reliability_samples": 4,
+    "background_transition_queue_offsets_in_present_frames": [
+      0,
+      1,
+      "environment_cache_ready"
+    ],
+    "required_background_transition_diagnostics": [
+      "world_environment_generation",
+      "resolved_environment_source",
+      "environment_cache_ready",
+      "environment_descriptor_identity"
+    ],
+    "required_lifecycle_events": [
+      "queue",
+      "begin",
+      "progress",
+      "readback",
+      "save",
+      "complete"
+    ],
+    "control_resolution": [
+      256,
+      256
+    ],
+    "control_samples": 32,
+    "formats": [
+      "PNG",
+      "EXR"
+    ],
+    "transparent_background_modes": [
+      false,
+      true
+    ],
+    "required_scene_content": [
+      "Bedrock character",
+      "preview surface",
+      "non-Off World/Sky"
+    ],
+    "required_outcomes": {
+      "snapshot_model_generation_matches_queue_time": true,
+      "snapshot_camera_matrices_frozen": true,
+      "snapshot_environment_source_and_generation_match_queue_time": true,
+      "snapshot_film_and_background_exposure_match_queue_time": true,
+      "preview_and_still_use_identical_tone_map_and_display_transfer": true,
+      "all_reliability_repeats_complete_and_validate_output": true,
+      "background_switch_never_requires_manual_wait_before_queue": true,
+      "resolved_character_instance_count_positive": true,
+      "nontransparent_sky_is_neither_black_nor_zero_alpha": true,
+      "png_and_exr_show_same_scene_content": true,
+      "cancel_and_second_render_are_clean": true
+    },
+    "image_thresholds": {
+      "minimum_character_mask_fraction": 0.002,
+      "minimum_nonblack_sky_roi_fraction_when_opaque": 0.50,
+      "minimum_preview_still_character_iou": 0.90,
+      "minimum_png_exr_display_psnr_db": 38.0,
+      "maximum_preview_still_median_luminance_ev_delta": 0.10,
+      "maximum_preview_still_display_mean_absolute_delta": 0.02,
+      "minimum_preview_still_display_psnr_db": 35.0
+    }
+  },
+  "s00_e_still_ui_focus": {
+    "locales": [
+      "zh-CN",
+      "en-US"
+    ],
+    "dpi_scales": [
+      1.0,
+      1.5,
+      2.0
+    ],
+    "widgets": [
+      "filename",
+      "width",
+      "height",
+      "target_samples",
+      "samples_per_submit",
+      "format",
+      "transparent_background"
+    ],
+    "required_outcomes": {
+      "pointer_hit_widget_equals_active_widget": true,
+      "keyboard_input_changes_only_active_setting": true,
+      "filename_unchanged_when_numeric_widget_active": true,
+      "tab_escape_and_ime_do_not_cross_route": true,
+      "queued_job_uses_displayed_values": true
+    }
+  },
+  "fg_revalidation": {
+    "default_off": true,
+    "modes": [
+      "Raw FG On",
+      "SR Quality FG On",
+      "RR FG On"
+    ],
+    "lifecycle_cases": [
+      "FG On/Off cycle",
+      "Resize",
+      "Minimize/restore",
+      "F11",
+      "Dialog open/close",
+      "forced FG failure to Native fallback"
+    ],
+    "proxy_application_present_fence_count": 0
+  }
+}
