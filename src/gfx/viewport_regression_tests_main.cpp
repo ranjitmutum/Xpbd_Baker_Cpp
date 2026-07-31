@@ -12,6 +12,7 @@
 #include "xpbd/gfx/rt_scene_records.hpp"
 #include "xpbd/gfx/static_model_draw_plan.hpp"
 #include "xpbd/gfx/texture_image.hpp"
+#include "xpbd/gfx/vulkan_queue_selection.hpp"
 #include "xpbd/gfx/viewport_mesh.hpp"
 #include "xpbd/gfx/world_environment.hpp"
 #include "xpbd/baker/cube_geometry.hpp"
@@ -74,6 +75,44 @@ void testLogicalFramebufferViewportContract() {
   expect(minimum.x == 4 && minimum.y == 5 &&
              minimum.w == 1 && minimum.h == 1,
          "invalid DPI and collapsed UI viewport retain a one-pixel target");
+}
+
+void testVulkanQueueFamilySelection() {
+  using xpbd::gfx::VulkanQueueFamilySupport;
+  using xpbd::gfx::selectVulkanQueueFamilies;
+
+  constexpr std::array laptop_queue_families{
+      VulkanQueueFamilySupport{true, true},
+      VulkanQueueFamilySupport{false, false},
+      VulkanQueueFamilySupport{false, true},
+  };
+  constexpr auto shared =
+      selectVulkanQueueFamilies(laptop_queue_families);
+  static_assert(shared.valid() && shared.shared());
+  static_assert(shared.graphics_family == 0u &&
+                shared.present_family == 0u);
+  expect(shared.shared() && shared.graphics_family == 0u,
+         "Vulkan queue selection prefers the first shared graphics/present "
+         "family");
+
+  constexpr std::array split_queue_families{
+      VulkanQueueFamilySupport{true, false},
+      VulkanQueueFamilySupport{false, true},
+  };
+  constexpr auto split =
+      selectVulkanQueueFamilies(split_queue_families);
+  static_assert(split.valid() && !split.shared());
+  expect(split.graphics_family == 0u && split.present_family == 1u,
+         "Vulkan queue selection retains a valid split-family fallback");
+
+  constexpr std::array unusable_queue_families{
+      VulkanQueueFamilySupport{false, true},
+  };
+  constexpr auto unusable =
+      selectVulkanQueueFamilies(unusable_queue_families);
+  static_assert(!unusable.valid());
+  expect(!unusable.valid(),
+         "Vulkan queue selection rejects devices without graphics support");
 }
 
 // Minimal 1x1 opaque white PNG (generated: RGB 8-bit, single white pixel).
@@ -2994,6 +3033,7 @@ void testRtxptBridgeSelection() {
 
 int main() {
   testLogicalFramebufferViewportContract();
+  testVulkanQueueFamilySelection();
   testTextureFromMemory();
   testCc0PreviewSceneAssets();
   testEmptyTextureSample();

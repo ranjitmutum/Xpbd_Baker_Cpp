@@ -9,6 +9,7 @@
 #include "xpbd/gfx/static_model_draw_plan.hpp"
 #include "xpbd/gfx/streamline_vulkan_runtime.hpp"
 #include "xpbd/gfx/vulkan_path_tracer.hpp"
+#include "xpbd/gfx/vulkan_queue_selection.hpp"
 #include "xpbd/gfx/vulkan_rt_scene.hpp"
 #include "xpbd/log.hpp"
 
@@ -1121,7 +1122,7 @@ public:
     streamline_vulkan_runtime_.beginLatencyFrame(
         frame_index, mode, frame_generation_requested);
     stats_.dlss_frame_generation_supported =
-        streamline_vulkan_runtime_.frameGenerationSupported();
+        frameGenerationPlatformSupported();
     stats_.dlss_frame_generation_requested =
         frame_generation_requested;
     stats_.reflex_supported =
@@ -1159,19 +1160,15 @@ public:
     const bool want_rt =
         frame.prefer_ray_tracing && !presentation_suspended_;
     active_render_path_ = resolveRenderPath(want_rt, rt_capability_);
+    const bool frame_generation_supported =
+        frameGenerationPlatformSupported();
     const bool frame_generation_available =
-        streamline_vulkan_runtime_.frameGenerationSupported() &&
-        fg_swapchain_transfer_src_supported_ &&
-        fg_swapchain_color_format_supported_ &&
-        graphics_family_ == present_family_ &&
-        !vsync_ &&
-        swap_present_mode_ == VK_PRESENT_MODE_IMMEDIATE_KHR &&
-        fg_swapchain_resources_ready_;
+        frameGenerationSwapchainReady();
     const bool desired_frame_generation =
         requested_frame_generation && frame_generation_available &&
         active_render_path_ == RenderPath::RayTracing;
     stats_.dlss_frame_generation_supported =
-        frame_generation_available;
+        frame_generation_supported;
     stats_.dlss_frame_generation_requested =
         requested_frame_generation;
     stats_.reflex_supported =
@@ -2081,11 +2078,7 @@ public:
     pt_post_capabilities.dlaa =
         streamline_vulkan_runtime_.dlssSupported();
     pt_post_capabilities.dlss_frame_generation =
-        streamline_vulkan_runtime_.frameGenerationSupported() &&
-        fg_swapchain_transfer_src_supported_ &&
-        fg_swapchain_color_format_supported_ &&
-        graphics_family_ == present_family_ &&
-        fg_swapchain_resources_ready_;
+        frame_generation_supported;
     pt_post_capabilities.reflex =
         streamline_vulkan_runtime_.reflexSupported();
     PathTracePostProcessState pt_post{};
@@ -3514,11 +3507,7 @@ public:
     capabilities.dlss_ray_reconstruction =
         streamline_vulkan_runtime_.dlssRayReconstructionSupported();
     capabilities.dlss_frame_generation =
-        streamline_vulkan_runtime_.frameGenerationSupported() &&
-        fg_swapchain_transfer_src_supported_ &&
-        fg_swapchain_color_format_supported_ &&
-        graphics_family_ == present_family_ &&
-        fg_swapchain_resources_ready_;
+        frameGenerationPlatformSupported();
     capabilities.reflex =
         streamline_vulkan_runtime_.reflexSupported();
     return capabilities;
@@ -3548,7 +3537,8 @@ public:
     } else if (streamline_vulkan_runtime_.frameGenerationSupported() &&
                !fg_swapchain_resources_ready_) {
       post_process_status_cache_ +=
-          " | DLSS Frame Generation guide images are unavailable";
+          " | DLSS Frame Generation guide images are pending swapchain "
+          "creation";
     }
     return post_process_status_cache_;
   }
@@ -3584,6 +3574,21 @@ public:
   }
 
 private:
+  [[nodiscard]] bool
+  frameGenerationPlatformSupported() const noexcept {
+    return streamline_vulkan_runtime_.frameGenerationSupported() &&
+           fg_swapchain_transfer_src_supported_ &&
+           fg_swapchain_color_format_supported_ &&
+           graphics_family_ == present_family_;
+  }
+
+  [[nodiscard]] bool
+  frameGenerationSwapchainReady() const noexcept {
+    return frameGenerationPlatformSupported() && !vsync_ &&
+           swap_present_mode_ == VK_PRESENT_MODE_IMMEDIATE_KHR &&
+           fg_swapchain_resources_ready_;
+  }
+
   struct StaticGpuVertex {
     float px = 0.0f, py = 0.0f, pz = 0.0f;
     float nx = 0.0f, ny = 1.0f, nz = 0.0f;
@@ -6938,34 +6943,43 @@ private:
       }
       std::vector<VkQueueFamilyProperties> qs(qcount);
       vkGetPhysicalDeviceQueueFamilyProperties(d, &qcount, qs.data());
-      std::optional<uint32_t> gfx, pres;
+      std::vector<VulkanQueueFamilySupport> queue_support(qcount);
       for (uint32_t i = 0; i < qcount; ++i) {
-        if (qs[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
-          gfx = i;
-        }
+        queue_support[i].graphics =
+            (qs[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0;
         VkBool32 support = VK_FALSE;
         const VkResult support_result =
             vkGetPhysicalDeviceSurfaceSupportKHR(d, i, surface_, &support);
         if (support_result != VK_SUCCESS) {
           support = VK_FALSE;
         }
-        if (support) {
-          pres = i;
-        }
+        queue_support[i].present = support == VK_TRUE;
       }
-      if (gfx && pres) {
+      // Prefer one queue family that can both render and present. Apart from
+      // avoiding needless ownership transfers, Streamline's conservative
+      // Vulkan DLSS-G mode blocks the presenting client queue while it
+      // consumes resources produced by that queue.
+      const VulkanQueueFamilySelection queue_selection =
+          selectVulkanQueueFamilies(queue_support);
+      if (queue_selection.valid()) {
         SwapchainSupport swapchain_support;
         if (!querySupport(d, swapchain_support)) {
           continue;
         }
         phys_ = d;
-        graphics_family_ = *gfx;
-        present_family_ = *pres;
+        graphics_family_ = queue_selection.graphics_family;
+        present_family_ = queue_selection.present_family;
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(d, &props);
         device_name_ = props.deviceName;
-        timestamp_valid_bits_ = qs[*gfx].timestampValidBits;
+        timestamp_valid_bits_ =
+            qs[queue_selection.graphics_family].timestampValidBits;
         timestamp_period_ns_ = props.limits.timestampPeriod;
+        xpbd::log::infof(
+            "Vulkan queues selected: graphics_family=%u present_family=%u "
+            "shared=%d",
+            graphics_family_, present_family_,
+            graphics_family_ == present_family_ ? 1 : 0);
         return true;
       }
     }
@@ -7451,11 +7465,7 @@ private:
         (support.caps.supportedUsageFlags &
          VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
     fg_swapchain_resources_ready_ = false;
-    bool allocate_fg_resources =
-        fg_swapchain_transfer_src_supported_ &&
-        fg_swapchain_color_format_supported_ &&
-        graphics_family_ == present_family_ &&
-        streamline_vulkan_runtime_.frameGenerationSupported();
+    bool allocate_fg_resources = frameGenerationPlatformSupported();
 
 
     uint32_t images = support.caps.minImageCount;
@@ -7666,6 +7676,15 @@ private:
     } else {
       fg_swapchain_resources_ready_ = true;
     }
+    xpbd::log::infof(
+        "Vulkan DLSS-G capability: runtime=%d transfer_src=%d color_format=%d "
+        "shared_queue=%d guide_images=%d vsync=%d present_mode=%u",
+        streamline_vulkan_runtime_.frameGenerationSupported() ? 1 : 0,
+        fg_swapchain_transfer_src_supported_ ? 1 : 0,
+        fg_swapchain_color_format_supported_ ? 1 : 0,
+        graphics_family_ == present_family_ ? 1 : 0,
+        fg_swapchain_resources_ready_ ? 1 : 0, vsync_ ? 1 : 0,
+        static_cast<unsigned>(swap_present_mode_));
     return true;
   }
 

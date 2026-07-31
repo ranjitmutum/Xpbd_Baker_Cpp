@@ -1478,7 +1478,9 @@ bool VulkanPathTracer::ensureTarget(std::uint32_t width, std::uint32_t height) {
         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     descriptor_image.sampler = sampler_;
   }
-  std::array<VkWriteDescriptorSet, 6> writes{};
+  std::array<VkWriteDescriptorSet, 3> writes{};
+  static_assert(writes.size() == descriptor_images.size(),
+                "composite descriptor writes must match image bindings");
   for (std::uint32_t binding = 0; binding < writes.size(); ++binding) {
     writes[binding].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[binding].dstSet = composite_set_;
