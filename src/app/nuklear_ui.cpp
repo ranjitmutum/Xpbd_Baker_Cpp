@@ -2854,6 +2854,8 @@ UiFrameResult composeNuklearUi(nk_context *ctx, int win_w, int win_h,
   }
 
   bool finish_splitter_drag = false;
+  result.layout.viewport_resize_active =
+      ui_state.splitter_drag != SplitterDrag::None;
   if (ui_state.splitter_drag != SplitterDrag::None) {
     const float delta_x = ctx->input.mouse.pos.x - ui_state.drag_anchor_x;
     if (ui_state.splitter_drag == SplitterDrag::Left) {

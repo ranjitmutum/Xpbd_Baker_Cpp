@@ -3,6 +3,7 @@
 #include "xpbd/gfx/ray_tracing.hpp"
 #include "xpbd/gfx/vulkan_rt_scene.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
@@ -24,6 +25,7 @@ struct RtPipelineDispatchParams {
   std::uint32_t material_feature_flags = 0;
   bool temporal_reconstruction_input = false;
   bool ray_reconstruction_guides = false;
+  std::uint32_t output_write_mask = 0;
   float camera_jitter[2]{0.0f, 0.0f};
   std::uint32_t frame_index = 0;
   float light_direction[3]{0.35f, 0.85f, 0.40f};
@@ -60,6 +62,12 @@ struct RtPipelineStats {
   std::uint32_t shader_group_base_alignment = 0;
   std::uint32_t shader_group_stride = 0;
   std::uint64_t sbt_bytes = 0;
+  // Per-record descriptor instrumentation.  A cache hit means the descriptor
+  // set already described the same handles, ranges, and image views.
+  std::uint64_t descriptor_write_calls = 0;
+  std::uint64_t descriptor_cache_hits = 0;
+  std::uint64_t descriptor_entries_written = 0;
+  float descriptor_update_ms = 0.0f;
 };
 
 class VulkanRtPipeline {
@@ -84,6 +92,16 @@ public:
       VkCommandBuffer command_buffer, const VulkanRtScene &scene,
       const RtPipelineDispatchParams &params);
 
+  // Reset the per-record descriptor counters before a new dispatch attempt.
+  // The pipeline is owned by one in-flight path-tracer slot, so this is safe
+  // immediately before recording that slot's command buffer.
+  void resetDescriptorStats() noexcept {
+    descriptor_write_calls_ = 0;
+    descriptor_cache_hits_ = 0;
+    descriptor_entries_written_ = 0;
+    descriptor_update_ms_ = 0.0f;
+  }
+
   [[nodiscard]] RtPipelineStats stats() const noexcept;
 
 private:
@@ -93,6 +111,17 @@ private:
     VkDeviceSize size = 0;
     VkDeviceAddress address = 0;
     void *mapped = nullptr;
+  };
+
+  struct DescriptorKey {
+    VkAccelerationStructureKHR tlas = VK_NULL_HANDLE;
+    std::array<VkImageView, 13> image_views{};
+    std::array<VkSampler, 13> image_samplers{};
+    std::array<VkBuffer, 14> buffers{};
+    std::array<VkDeviceSize, 14> buffer_sizes{};
+
+    [[nodiscard]] constexpr bool operator==(const DescriptorKey &) const =
+        default;
   };
 
   [[nodiscard]] bool loadProcedures();
@@ -125,6 +154,12 @@ private:
   std::uint32_t shader_group_stride_ = 0;
   bool dispatch_logged_ = false;
   bool bounds_failure_logged_ = false;
+  DescriptorKey descriptor_key_{};
+  bool descriptor_key_valid_ = false;
+  std::uint64_t descriptor_write_calls_ = 0;
+  std::uint64_t descriptor_cache_hits_ = 0;
+  std::uint64_t descriptor_entries_written_ = 0;
+  float descriptor_update_ms_ = 0.0f;
 
   PFN_vkCreateRayTracingPipelinesKHR vkCreateRayTracingPipelinesKHR_ = nullptr;
   PFN_vkGetRayTracingShaderGroupHandlesKHR

@@ -85,6 +85,10 @@ struct NkVertex {
 
 enum class GpuTimestampQuery : std::uint32_t {
   FrameBegin,
+  AsBegin,
+  AsEnd,
+  PathTraceBegin,
+  PathTraceEnd,
   UiEnd,
   OpaqueEnd,
   TransparentEnd,
@@ -416,6 +420,9 @@ public:
     window_ = window;
     diagnostics_enabled_ =
         environmentFlagEnabled("XPBD_VULKAN_DIAGNOSTICS");
+    perf_diagnostics_enabled_ =
+        diagnostics_enabled_ ||
+        environmentFlagEnabled("XPBD_PERF_DIAGNOSTICS");
     validation_requested_ =
         environmentFlagEnabled("XPBD_VULKAN_VALIDATION");
     validation_enabled_ = false;
@@ -796,6 +803,11 @@ public:
     }
     rt_scene_built_.fill(false);
     last_rt_scene_hash_.fill(0);
+    rt_fallback_generation_serial_ = 0;
+    last_mesh_rt_descriptor_sets_ = {};
+    last_static_rt_descriptor_sets_ = {};
+    last_mesh_rt_tlas_ = {};
+    last_static_rt_tlas_ = {};
     if (static_sampler_) {
       vkDestroySampler(device_, static_sampler_, nullptr);
       static_sampler_ = VK_NULL_HANDLE;
@@ -1165,7 +1177,7 @@ public:
     const auto t0 = Clock::now();
     diagnostic_context_ = frame.diagnostics;
     diagnostic_trace_frame_ =
-        diagnostics_enabled_ && frame.diagnostics.active;
+        perf_diagnostics_enabled_ && frame.diagnostics.active;
     if (fatal_error_ || !device_) {
       return;
     }
@@ -1173,12 +1185,17 @@ public:
     if (presentation_suspended_) {
       return;
     }
+    rt_descriptor_write_calls_frame_ = 0;
+    rt_descriptor_cache_hits_frame_ = 0;
+    rt_descriptor_entries_written_frame_ = 0;
 
     const PathTraceSettings normalized_frame_settings =
         normalizePathTraceSettings(frame.path_trace_settings);
     const bool requested_frame_generation =
         normalized_frame_settings.requested_frame_generation ==
         PathTraceFrameGeneration::On;
+    const bool interactive_preview_resize =
+        frame.interactive_viewport_resize;
     // Keep the runtime's atomic request authoritative even when a caller
     // reaches the backend without the normal latency-frame prelude.
     streamline_vulkan_runtime_.requestFrameGeneration(
@@ -1323,7 +1340,19 @@ public:
     }
 
     readCompletedTimestamps(fs);
+    logDiagnosticPerf(fs);
+    fs.perf_pending = false;
     stats_.backend_cpu_ms = 0.0f;
+    stats_.cpu_scene_assembly_ms = 0.0f;
+    stats_.cpu_scene_hash_ms = 0.0f;
+    stats_.cpu_emitter_distribution_ms = 0.0f;
+    stats_.cpu_descriptor_update_ms = 0.0f;
+    stats_.gpu_as_build_ms = 0.0f;
+    stats_.gpu_path_trace_ms = 0.0f;
+    stats_.gpu_rr_ms = 0.0f;
+    stats_.gpu_sr_ms = 0.0f;
+    stats_.gpu_fg_present_ms = 0.0f;
+    stats_.rt_aov_write_mask = 0;
     ResolvedWorldEnvironment resolved_world_environment =
         frame.world_environment != nullptr
             ? resolveWorldEnvironment(*frame.world_environment)
@@ -1360,11 +1389,14 @@ public:
     const bool importance_environment_ready =
         hdr_environment_ready || procedural_environment_ready;
 
+    const auto rt_scene_cpu_begin = Clock::now();
     // RT acceleration: CPU-skin when poses change, then record BLAS build/refit
     // into the frame command buffer (no per-frame QueueWaitIdle — that froze
     // the app when playing animations with RT enabled).
     bool path_trace_active = false;
     bool rt_as_needs_record = false;
+    std::uint64_t rt_upload_bytes_frame = 0;
+    float rt_emitter_distribution_frame_ms = 0.0f;
     std::uint64_t rt_streamline_topology_hash =
         14695981039346656037ull;
     std::uint64_t rt_streamline_material_hash =
@@ -1389,76 +1421,102 @@ public:
       }
 
       std::array<RtColoredGeometryView, 4> geometry_views{};
-      std::array<bool, 4> hash_geometry_contents{};
       std::size_t geometry_view_count = 0;
       auto append_geometry = [&](const std::vector<MeshVertex> &vertices,
-                                 bool alpha_blended, bool hash_contents,
+                                 bool alpha_blended,
                                  RtGeometryKind kind,
-                                 RtBlasPolicy blas_policy) {
+                                 RtBlasPolicy blas_policy,
+                                 std::uint64_t content_generation,
+                                 std::uint64_t topology_generation,
+                                 std::uint64_t material_generation,
+                                 std::uint64_t emission_generation) {
         if (vertices.empty() ||
             geometry_view_count >= geometry_views.size()) {
           return;
         }
         geometry_views[geometry_view_count] = {
             vertices.data(), vertices.size(), alpha_blended, kind,
-            blas_policy};
-        hash_geometry_contents[geometry_view_count] = hash_contents;
+            blas_policy, content_generation, topology_generation,
+            material_generation, emission_generation};
         ++geometry_view_count;
       };
       if (frame.scene != nullptr) {
-        append_geometry(frame.scene->solid, false, true,
+        append_geometry(frame.scene->solid, false,
                         RtGeometryKind::SkinnedModel,
-                        RtBlasPolicy::DynamicRefit);
-        append_geometry(frame.scene->transparent, true, true,
+                        RtBlasPolicy::DynamicRefit,
+                        frame.rt_scene_generations.positions,
+                        frame.rt_scene_generations.topology,
+                        frame.rt_scene_generations.materials,
+                        frame.rt_scene_generations.emission);
+        append_geometry(frame.scene->transparent, true,
                         RtGeometryKind::SkinnedModel,
-                        RtBlasPolicy::DynamicRefit);
+                        RtBlasPolicy::DynamicRefit,
+                        frame.rt_scene_generations.positions,
+                        frame.rt_scene_generations.topology,
+                        frame.rt_scene_generations.materials,
+                        frame.rt_scene_generations.emission);
       }
       if (frame.raster_scene != nullptr) {
         const bool ocean =
             frame.raster_scene->id == PreviewSceneId::Ocean;
         const RtGeometryKind environment_kind =
             ocean ? RtGeometryKind::Ocean : RtGeometryKind::StaticScene;
-        append_geometry(frame.raster_scene->environment.solid, false, false,
+        const std::uint64_t raster_static_generation =
+            ocean ? frame.raster_scene->topology_generation
+                  : frame.raster_scene->geometry_generation;
+        append_geometry(frame.raster_scene->environment.solid, false,
                         environment_kind,
-                        RtBlasPolicy::StaticBuildCompact);
+                        RtBlasPolicy::StaticBuildCompact,
+                        raster_static_generation,
+                        frame.raster_scene->topology_generation,
+                        frame.rt_scene_generations.materials,
+                        frame.rt_scene_generations.emission);
         append_geometry(frame.raster_scene->environment.transparent, true,
-                        false, environment_kind,
-                        ocean && frame.raster_scene->surface_dynamic_baked
-                            ? RtBlasPolicy::DynamicRefit
-                            : RtBlasPolicy::StaticBuildCompact);
+                        environment_kind,
+                         ocean && frame.raster_scene->surface_dynamic_baked
+                             ? RtBlasPolicy::DynamicRefit
+                             : RtBlasPolicy::StaticBuildCompact,
+                         frame.raster_scene->geometry_generation,
+                         frame.raster_scene->topology_generation,
+                        frame.rt_scene_generations.materials,
+                        frame.rt_scene_generations.emission);
       }
 
-      std::uint64_t scene_hash = 14695981039346656037ull;
-      std::uint64_t topology_hash = 14695981039346656037ull;
-      auto hash_bytes = [&](const void *data, std::size_t byte_count) {
-        const auto *bytes = static_cast<const std::uint8_t *>(data);
-        for (std::size_t i = 0; i < byte_count; ++i) {
-          scene_hash ^= bytes[i];
-          scene_hash *= 1099511628211ull;
-        }
-      };
-      auto hash_topology_bytes = [&](const void *data,
-                                     std::size_t byte_count) {
-        const auto *bytes = static_cast<const std::uint8_t *>(data);
-        for (std::size_t i = 0; i < byte_count; ++i) {
-          topology_hash ^= bytes[i];
-          topology_hash *= 1099511628211ull;
-        }
-      };
-      hash_bytes(packed_bones.data(),
-                 packed_bones.size() * sizeof(float));
-      hash_bytes(packed_tints.data(),
-                 packed_tints.size() * sizeof(float));
-      hash_bytes(&static_input, sizeof(static_input));
-      hash_topology_bytes(&static_input, sizeof(static_input));
-      const std::size_t packed_bone_count = packed_bones.size() / 16u;
-      hash_topology_bytes(&packed_bone_count, sizeof(packed_bone_count));
-      hash_topology_bytes(&frame.static_model_generation,
-                          sizeof(frame.static_model_generation));
-      if (frame.raster_scene != nullptr) {
-        hash_bytes(&frame.raster_scene->geometry_generation,
-                   sizeof(frame.raster_scene->geometry_generation));
+      const auto scene_hash_begin = Clock::now();
+      RtSceneGenerations effective_generations = frame.rt_scene_generations;
+      if (!frame.rt_scene_generations_valid) {
+        // Compatibility callers may not know the generation ABI.  A
+        // conservative serial preserves correctness without scanning vertex
+        // arrays; the normal application path always supplies generations.
+        effective_generations = {};
+        effective_generations.topology = ++rt_fallback_generation_serial_;
+        effective_generations.positions = rt_fallback_generation_serial_;
+        effective_generations.transforms = rt_fallback_generation_serial_;
+        effective_generations.materials = rt_fallback_generation_serial_;
+        effective_generations.emission = rt_fallback_generation_serial_;
+        effective_generations.visibility = rt_fallback_generation_serial_;
       }
+      for (std::size_t i = 0; i < geometry_view_count; ++i) {
+        RtColoredGeometryView &view = geometry_views[i];
+        if (view.content_generation == 0u) {
+          view.content_generation = effective_generations.positions;
+        }
+        if (view.topology_generation == 0u) {
+          view.topology_generation = effective_generations.topology;
+        }
+        if (view.material_generation == 0u) {
+          view.material_generation = effective_generations.materials;
+        }
+        if (view.emission_generation == 0u) {
+          view.emission_generation = effective_generations.emission;
+        }
+      }
+      std::uint64_t scene_hash = rtSceneGenerationKey(effective_generations);
+      std::uint64_t topology_hash =
+          mixRtGeneration(0xcbf29ce484222325ull,
+                          effective_generations.topology);
+      topology_hash = mixRtGeneration(topology_hash,
+                                      effective_generations.visibility);
       for (std::size_t i = 0; i < geometry_view_count; ++i) {
         const RtColoredGeometryView &view = geometry_views[i];
         const std::uint64_t range_tag =
@@ -1466,27 +1524,32 @@ public:
             (view.alpha_blended ? (std::uint64_t{1} << 63u) : 0u) ^
             (static_cast<std::uint64_t>(view.kind) << 48u) ^
             (static_cast<std::uint64_t>(view.blas_policy) << 40u);
-        hash_bytes(&range_tag, sizeof(range_tag));
-        hash_topology_bytes(&range_tag, sizeof(range_tag));
-        if (hash_geometry_contents[i]) {
-          hash_bytes(view.vertices,
-                     view.vertex_count * sizeof(MeshVertex));
-        }
+        scene_hash = mixRtGeneration(scene_hash, range_tag);
+        scene_hash = mixRtGeneration(scene_hash, view.content_generation);
+        scene_hash = mixRtGeneration(scene_hash, view.material_generation);
+        scene_hash = mixRtGeneration(scene_hash, view.emission_generation);
+        topology_hash = mixRtGeneration(topology_hash, range_tag);
+        topology_hash = mixRtGeneration(topology_hash,
+                                        view.topology_generation);
       }
-      scene_hash ^=
-          geometry_view_count * 0x9e3779b97f4a7c15ull;
-      topology_hash ^=
-          geometry_view_count * 0x9e3779b97f4a7c15ull;
+      scene_hash = mixRtGeneration(scene_hash, geometry_view_count);
+      topology_hash = mixRtGeneration(topology_hash, geometry_view_count);
       rt_streamline_topology_hash = topology_hash;
-      if (!packed_tints.empty()) {
-        appendPathTraceHistoryBytes(
-            rt_streamline_material_hash, packed_tints.data(),
-            packed_tints.size() * sizeof(float));
-      }
+      rt_streamline_material_hash = mixRtGeneration(
+          rt_streamline_material_hash, effective_generations.materials);
+      rt_streamline_material_hash = mixRtGeneration(
+          rt_streamline_material_hash, effective_generations.emission);
+      stats_.cpu_scene_hash_ms =
+          std::chrono::duration<float, std::milli>(Clock::now() -
+                                                   scene_hash_begin)
+              .count();
 
       const bool have_rt_geometry = static_input || geometry_view_count != 0u;
       bool as_ok = !static_refresh_pending && rt_scene_built &&
                    rt_scene.ready() && scene_hash == last_rt_scene_hash;
+      if (as_ok) {
+        rt_scene.markMotionStable();
+      }
       // Empty-scene transition frames are valid: there is no BLAS/TLAS input
       // to build yet, so keep the raster path quiet until geometry arrives.
       if (!as_ok && !static_refresh_pending && have_rt_geometry) {
@@ -1494,26 +1557,36 @@ public:
         const bool explicit_motion_history_valid =
             rt_motion_history_valid_ &&
             topology_hash == rt_motion_topology_hash_;
-        if (rt_scene.updateGeometry(
-                packed_bones.empty() ? nullptr : packed_bones.data(),
-                packed_bones.size() / 16u,
-                packed_tints.empty() ? nullptr : packed_tints.data(),
-                 packed_tints.size() / 4u,
-                 std::span<const RtColoredGeometryView>(
-                     geometry_views.data(), geometry_view_count),
-                 static_input,
-                 explicit_motion_history_valid
-                     ? std::span<const float>(
-                           rt_motion_previous_positions_)
-                     : std::span<const float>{},
-                 explicit_motion_history_valid &&
-                         !rt_motion_previous_bones_.empty()
-                     ? rt_motion_previous_bones_.data()
-                     : nullptr,
-                 explicit_motion_history_valid
-                     ? rt_motion_previous_bones_.size() / 16u
-                     : 0u,
-                 explicit_motion_history_valid)) {
+        const RtSceneStats before_scene_update = rt_scene.stats();
+        const bool scene_updated = rt_scene.updateGeometry(
+            packed_bones.empty() ? nullptr : packed_bones.data(),
+            packed_bones.size() / 16u,
+            packed_tints.empty() ? nullptr : packed_tints.data(),
+            packed_tints.size() / 4u,
+            std::span<const RtColoredGeometryView>(
+                geometry_views.data(), geometry_view_count),
+            static_input,
+            explicit_motion_history_valid
+                ? std::span<const float>(rt_motion_previous_positions_)
+                : std::span<const float>{},
+            explicit_motion_history_valid &&
+                    !rt_motion_previous_bones_.empty()
+                ? rt_motion_previous_bones_.data()
+                : nullptr,
+            explicit_motion_history_valid
+                ? rt_motion_previous_bones_.size() / 16u
+                : 0u,
+            explicit_motion_history_valid, effective_generations,
+            frame.rt_scene_generations_valid);
+        const RtSceneStats after_scene_update = rt_scene.stats();
+        if (after_scene_update.upload_bytes >=
+            before_scene_update.upload_bytes) {
+          rt_upload_bytes_frame += after_scene_update.upload_bytes -
+                                   before_scene_update.upload_bytes;
+        }
+        rt_emitter_distribution_frame_ms +=
+            after_scene_update.emitter_distribution_ms;
+        if (scene_updated) {
           rt_scene_built = true;
           last_rt_scene_hash = scene_hash;
           as_ok = true;
@@ -1546,14 +1619,49 @@ public:
       if (as_ok) {
         rt_shadows_active = rt_scene.ready() && rt_pipelines_ready_;
         if (rt_shadows_active) {
+          const VkAccelerationStructureKHR active_tlas = rt_scene.tlas();
+          const auto descriptor_update_begin = Clock::now();
           if (mesh_rt_desc_set) {
-            rt_scene.writeTlasDescriptor(mesh_rt_desc_set, 0);
+            if (last_mesh_rt_descriptor_sets_[frame_index_] !=
+                    mesh_rt_desc_set ||
+                last_mesh_rt_tlas_[frame_index_] != active_tlas) {
+              rt_scene.writeTlasDescriptor(mesh_rt_desc_set, 0);
+              last_mesh_rt_descriptor_sets_[frame_index_] = mesh_rt_desc_set;
+              last_mesh_rt_tlas_[frame_index_] = active_tlas;
+              ++rt_descriptor_write_calls_frame_;
+              ++rt_descriptor_entries_written_frame_;
+            } else {
+              ++rt_descriptor_cache_hits_frame_;
+            }
+          } else {
+            // A descriptor pool/layout refresh can temporarily remove the
+            // slot.  Do not let a later reuse of the same handle look like a
+            // valid cache hit after the set has been reset.
+            last_mesh_rt_descriptor_sets_[frame_index_] = VK_NULL_HANDLE;
+            last_mesh_rt_tlas_[frame_index_] = VK_NULL_HANDLE;
           }
           const VkDescriptorSet static_rt_set =
               static_rt_descriptor_sets_[frame_index_];
           if (static_rt_set) {
-            rt_scene.writeTlasDescriptor(static_rt_set, 2);
+            if (last_static_rt_descriptor_sets_[frame_index_] !=
+                    static_rt_set ||
+                last_static_rt_tlas_[frame_index_] != active_tlas) {
+              rt_scene.writeTlasDescriptor(static_rt_set, 2);
+              last_static_rt_descriptor_sets_[frame_index_] = static_rt_set;
+              last_static_rt_tlas_[frame_index_] = active_tlas;
+              ++rt_descriptor_write_calls_frame_;
+              ++rt_descriptor_entries_written_frame_;
+            } else {
+              ++rt_descriptor_cache_hits_frame_;
+            }
+          } else {
+            last_static_rt_descriptor_sets_[frame_index_] = VK_NULL_HANDLE;
+            last_static_rt_tlas_[frame_index_] = VK_NULL_HANDLE;
           }
+          stats_.cpu_descriptor_update_ms =
+              std::chrono::duration<float, std::milli>(Clock::now() -
+                                                       descriptor_update_begin)
+                  .count();
         }
         path_trace_active = rt_scene.ready() && path_tracer.ready();
         if (path_trace_active && !unified_rt_logged_) {
@@ -1567,6 +1675,13 @@ public:
           unified_rt_logged_ = true;
         }
       }
+    }
+    if (active_render_path_ == RenderPath::RayTracing &&
+        rt_capability_.device_extensions_enabled && !presentation_suspended_) {
+      stats_.cpu_scene_assembly_ms =
+          std::chrono::duration<float, std::milli>(Clock::now() -
+                                                   rt_scene_cpu_begin)
+              .count();
     }
 
     stats_.upload_ms = 0.0f;
@@ -1693,22 +1808,10 @@ public:
     };
 
     if (static_refresh_pending) {
-      const auto idle_start = Clock::now();
-      logDiagnosticApi("vkDeviceWaitIdle.static_rebuild", "before",
-                       std::nullopt, 0.0, UINT32_MAX, fs.fence, VK_NULL_HANDLE,
-                       fs.cmd, true, true);
-      const VkResult idle_result =
-          streamline_vulkan_runtime_.deviceWaitIdle(device_);
-      logDiagnosticApi(
-          "vkDeviceWaitIdle.static_rebuild", "after", idle_result,
-          std::chrono::duration<double, std::milli>(Clock::now() - idle_start)
-              .count(),
-          UINT32_MAX, fs.fence, VK_NULL_HANDLE, fs.cmd, true, false);
-      if (idle_result != VK_SUCCESS) {
-        SDL_Log("Vulkan static resource idle wait failed: %d",
-                static_cast<int>(idle_result));
-        return;
-      }
+      // rebuildStaticModelResources submits its upload after all previously
+      // queued graphics work and waits only for that submission's fence. Once
+      // it signals, the old static resources are no longer referenced and can
+      // be replaced without a device-wide idle.
       std::uint64_t resource_upload_bytes = 0;
       if (!rebuildStaticModelResources(
               *frame.static_model, frame.static_model_texture,
@@ -2060,6 +2163,8 @@ public:
     }
 
     // Record pending BLAS full-build / animation refit before any ray queries.
+    write_timestamp(GpuTimestampQuery::AsBegin,
+                    VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
     if (rt_as_needs_record) {
       const RtSceneStats before_build = rt_scene.stats();
       rt_scene.recordBuilds(fs.cmd);
@@ -2088,6 +2193,8 @@ public:
       }
       ++diagnostic_rt_as_events_logged_;
     }
+    write_timestamp(GpuTimestampQuery::AsEnd,
+                    VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
     const RtSceneStats active_rt_stats = rt_scene.stats();
     stats_.rt_blas_count = 0;
     stats_.rt_tlas_count = 0;
@@ -2098,6 +2205,14 @@ public:
     stats_.rt_allocated_bytes = 0;
     stats_.rt_full_builds = 0;
     stats_.rt_refits = 0;
+    stats_.rt_tlas_full_builds = 0;
+    stats_.rt_tlas_updates = 0;
+    stats_.rt_upload_bytes = rt_upload_bytes_frame;
+    stats_.cpu_emitter_distribution_ms = rt_emitter_distribution_frame_ms;
+    stats_.rt_emitter_distribution_rebuilds = 0;
+    stats_.rt_descriptor_write_calls = 0;
+    stats_.rt_descriptor_cache_hits = 0;
+    stats_.rt_descriptor_entries_written = 0;
     for (const auto &scene : rt_scenes_) {
       const RtSceneStats scene_stats = scene.stats();
       stats_.rt_blas_count += scene_stats.blas_count;
@@ -2109,9 +2224,20 @@ public:
       stats_.rt_allocated_bytes += scene_stats.allocated_bytes;
       stats_.rt_full_builds += scene_stats.full_builds;
       stats_.rt_refits += scene_stats.refits;
+      stats_.rt_tlas_full_builds += scene_stats.tlas_full_builds;
+      stats_.rt_tlas_updates += scene_stats.tlas_updates;
+      stats_.rt_emitter_distribution_rebuilds +=
+          scene_stats.emitter_distribution_rebuilds;
+      stats_.rt_descriptor_write_calls += scene_stats.descriptor_write_count;
+      stats_.rt_descriptor_cache_hits += scene_stats.descriptor_cache_hits;
     }
     stats_.rt_primitive_count = active_rt_stats.primitive_count;
     stats_.rt_last_build_reason = active_rt_stats.last_build_reason;
+    stats_.rt_last_tlas_reason = active_rt_stats.last_tlas_reason;
+    stats_.rt_descriptor_write_calls = rt_descriptor_write_calls_frame_;
+    stats_.rt_descriptor_cache_hits = rt_descriptor_cache_hits_frame_;
+    stats_.rt_descriptor_entries_written =
+        rt_descriptor_entries_written_frame_;
 
     // Built-in path tracer dispatch (RT Pipeline preferred, before the
     // graphics pass).
@@ -2133,8 +2259,16 @@ public:
         streamline_vulkan_runtime_.reflexSupported();
     PathTracePostProcessState pt_post{};
     if (path_trace_active && draw_viewport) {
-      const PathTraceSettings path_settings =
+      PathTraceSettings path_settings =
           normalizePathTraceSettings(frame.path_trace_settings);
+      if (interactive_preview_resize) {
+        // Splitter motion produces a stream of temporary output extents. Keep
+        // the current PT images alive, render one responsive raw sample, and
+        // restart temporal reconstruction once the final extent is known.
+        path_settings.samples_per_frame = 1u;
+        streamline_vulkan_runtime_.invalidateDlssHistory();
+        streamline_temporal_history_valid_ = false;
+      }
       pt_post = resolvePathTracePostProcess(
           path_settings, pt_post_capabilities);
       const std::uint32_t preview_output_width =
@@ -2145,7 +2279,7 @@ public:
       const bool pt_rr_requested =
           pt_post.active_denoiser ==
           PathTraceDenoiser::DlssRayReconstruction;
-      if (pt_rr_requested) {
+      if (!interactive_preview_resize && pt_rr_requested) {
         dlss_settings =
             streamline_vulkan_runtime_
                 .queryDlssRayReconstructionOptimalSettings(
@@ -2162,7 +2296,8 @@ public:
           pt_post.reconstruction_mode = PathTraceUpscale::Off;
           streamline_vulkan_runtime_.invalidateDlssHistory();
         }
-      } else if (pt_post.active_upscale != PathTraceUpscale::Off) {
+      } else if (!interactive_preview_resize &&
+                 pt_post.active_upscale != PathTraceUpscale::Off) {
         dlss_settings =
             streamline_vulkan_runtime_.queryDlssOptimalSettings(
                 pt_post.active_upscale, preview_output_width,
@@ -2180,20 +2315,26 @@ public:
       }
       const float preview_scale =
           path_settings.preview_resolution_scale;
-      const std::uint32_t ptw =
+      const std::uint32_t requested_ptw =
           dlss_settings.valid
               ? dlss_settings.render_width
               : static_cast<std::uint32_t>((std::max)(
                     1, static_cast<int>(std::lround(
                            static_cast<float>(safe_viewport.w) *
                            preview_scale))));
-      const std::uint32_t pth =
+      const std::uint32_t requested_pth =
           dlss_settings.valid
               ? dlss_settings.render_height
               : static_cast<std::uint32_t>((std::max)(
                     1, static_cast<int>(std::lround(
                            static_cast<float>(safe_viewport.h) *
                            preview_scale))));
+      const PathTraceTargetExtent target_extent =
+          choosePathTraceTargetExtent(
+              requested_ptw, requested_pth, path_tracer.targetWidth(),
+              path_tracer.targetHeight(), interactive_preview_resize);
+      const std::uint32_t ptw = target_extent.width;
+      const std::uint32_t pth = target_extent.height;
       if (path_tracer.ensureTarget(ptw, pth)) {
         pt_params.view = frame.view_matrix;
         pt_params.proj = frame.proj_matrix;
@@ -2276,6 +2417,22 @@ public:
         pt_params.viewport_y = safe_viewport.y;
         pt_params.viewport_w = safe_viewport.w;
         pt_params.viewport_h = safe_viewport.h;
+        // Raw preview writes no optional images. SR/FG need dense motion;
+        // RR needs the complete dedicated guide set. Debug and unattended AOV
+        // capture are augmented inside VulkanPathTracer.
+        if (dlss_settings.valid ||
+            (requested_frame_generation && !interactive_preview_resize)) {
+          pt_params.output_write_mask |= kPathTraceRrMotionOutputMask;
+        }
+        if (pt_params.ray_reconstruction_guides) {
+          pt_params.output_write_mask |= kPathTraceAllRrGuideOutputMask;
+        }
+        if (pt_params.rt_debug_view != RtDebugView::Off ||
+            pt_params.material_debug_view != LabPbrDebugView::Shaded) {
+          pt_params.output_write_mask |=
+              kPathTraceAllAovOutputMask |
+              kPathTraceStatisticsOutputMask;
+        }
 
         // The key contains only radiance/visibility-affecting state. SPP and
         // maximum_samples intentionally remain compatible with the current
@@ -2306,6 +2463,8 @@ public:
             static_cast<std::uint32_t>(pt_params.rt_debug_view));
         appendPathTraceHistoryValue(
             history_key, pt_params.material_feature_flags);
+        appendPathTraceHistoryValue(
+            history_key, pt_params.output_write_mask);
         appendPathTraceHistoryValue(
             history_key, resolvedPathTraceSeed(pt_params.settings));
         appendPathTraceHistoryValue(
@@ -2478,6 +2637,9 @@ public:
             break;
           }
         }
+        if (interactive_preview_resize) {
+          pt_params.settings.samples_per_frame = 1u;
+        }
         pt_history_reset =
             path_tracer.historyKey() != history_key ||
             !pt_params.motion_history_valid;
@@ -2559,8 +2721,20 @@ public:
             static_specular_texture_.view != VK_NULL_HANDLE
                 ? static_specular_texture_.view
                 : VK_NULL_HANDLE;
+        write_timestamp(GpuTimestampQuery::PathTraceBegin,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
         path_tracer.recordDispatch(fs.cmd, rt_scene, pt_params, albedo_view,
                                    normal_view, specular_view, VK_NULL_HANDLE);
+        stats_.rt_aov_write_mask = path_tracer.lastOutputWriteMask();
+        const VulkanPathTracer::DescriptorStats path_descriptor_stats =
+            path_tracer.descriptorStats();
+        stats_.rt_descriptor_write_calls += path_descriptor_stats.write_calls;
+        stats_.rt_descriptor_cache_hits += path_descriptor_stats.cache_hits;
+        stats_.rt_descriptor_entries_written +=
+            path_descriptor_stats.entries_written;
+        stats_.cpu_descriptor_update_ms += path_descriptor_stats.update_ms;
+        write_timestamp(GpuTimestampQuery::PathTraceEnd,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
         if (dlss_settings.valid) {
           auto fill_dlss_frame =
               [&](StreamlineDlssFrame &dlss_frame,
@@ -2685,6 +2859,14 @@ public:
       } else {
         path_trace_active = false;
       }
+    }
+    if (!(path_trace_active && draw_viewport)) {
+      // Keep the optional timestamp pair valid on raster/fallback frames so a
+      // previous slot's query result can never be mistaken for this frame.
+      write_timestamp(GpuTimestampQuery::PathTraceBegin,
+                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+      write_timestamp(GpuTimestampQuery::PathTraceEnd,
+                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     }
 
     // Independent still-render accumulator. It intentionally records only on
@@ -2902,6 +3084,7 @@ public:
         streamline_vulkan_runtime_.swapchainOwnership() ==
             SwapchainOwnership::StreamlineFrameGenerationProxy &&
         frame_generation_available &&
+        !interactive_preview_resize &&
         path_trace_active && draw_viewport &&
         image_index < swap_images_.size() &&
         image_resource.fg_hudless.image != VK_NULL_HANDLE &&
@@ -3420,7 +3603,8 @@ public:
       xpbd::log::infof(
           "VKDIAG command ts_us=%llu thread=%llu frame=%llu slot=%zu "
           "image=%u draw_calls=%d upload=%llu static_bone_upload=%llu "
-          "static_resource_upload=%llu fg_recorded=%d",
+          "static_resource_upload=%llu fg_recorded=%d "
+          "interactive_resize=%d pt_target=%ux%u",
           static_cast<unsigned long long>(diagnosticTimestampUs()),
           static_cast<unsigned long long>(diagnosticThreadId()),
           static_cast<unsigned long long>(frame.diagnostics.render_frame),
@@ -3429,7 +3613,9 @@ public:
           static_cast<unsigned long long>(stats_.static_bone_upload_bytes),
           static_cast<unsigned long long>(
               stats_.static_resource_upload_bytes),
-          fg_inputs_recorded ? 1 : 0);
+          fg_inputs_recorded ? 1 : 0,
+          interactive_preview_resize ? 1 : 0,
+          path_tracer.targetWidth(), path_tracer.targetHeight());
     }
 
     write_timestamp(GpuTimestampQuery::FrameEnd,
@@ -3472,6 +3658,13 @@ public:
 
     stats_.backend_cpu_ms =
         std::chrono::duration<float, std::milli>(Clock::now() - t0).count();
+    // GPU timestamps become readable only when this frame slot's fence is
+    // waited on during a later render. Preserve the CPU-side measurements and
+    // RT counters in the slot so the eventual diagnostic row cannot mix them
+    // with a newer frame recorded through another slot.
+    fs.perf_snapshot = stats_;
+    fs.perf_render_frame = frame.diagnostics.render_frame;
+    fs.perf_pending = diagnostic_trace_frame_;
 
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1;
@@ -3816,6 +4009,9 @@ private:
     VkDescriptorSet static_descriptor_set = VK_NULL_HANDLE;
     VkQueryPool timestamp_pool = VK_NULL_HANDLE;
     bool timestamps_pending = false;
+    FrameStats perf_snapshot{};
+    std::uint64_t perf_render_frame = 0;
+    bool perf_pending = false;
   };
 
   SDL_Window *window_ = nullptr;
@@ -3861,6 +4057,7 @@ private:
   bool swapchain_maintenance1_enabled_ = false;
   std::string swapchain_maintenance1_extension_;
   bool diagnostics_enabled_ = false;
+  bool perf_diagnostics_enabled_ = false;
   bool validation_requested_ = false;
   bool validation_enabled_ = false;
   bool storage_image_extended_formats_enabled_ = false;
@@ -3958,6 +4155,14 @@ private:
   bool presentation_suspended_ = false;
   std::uint32_t path_trace_frame_index_ = 0;
   std::array<std::uint64_t, 2> last_rt_scene_hash_{};
+  std::uint64_t rt_fallback_generation_serial_ = 0;
+  std::array<VkDescriptorSet, 2> last_mesh_rt_descriptor_sets_{};
+  std::array<VkDescriptorSet, 2> last_static_rt_descriptor_sets_{};
+  std::array<VkAccelerationStructureKHR, 2> last_mesh_rt_tlas_{};
+  std::array<VkAccelerationStructureKHR, 2> last_static_rt_tlas_{};
+  std::uint64_t rt_descriptor_write_calls_frame_ = 0;
+  std::uint64_t rt_descriptor_cache_hits_frame_ = 0;
+  std::uint64_t rt_descriptor_entries_written_frame_ = 0;
   // One rendered-frame CPU snapshot shared by both in-flight scene slots.
   // Per-slot previous state would otherwise describe a two-frame delta.
   std::vector<float> rt_motion_previous_positions_;
@@ -4101,6 +4306,49 @@ private:
         static_cast<unsigned long long>(sync.ui_vbo.capacity),
         static_cast<unsigned long long>(sync.ui_ibo.capacity));
     xpbd::log::flush();
+  }
+
+  void logDiagnosticPerf(const FrameSync &sync) const {
+    if (!perf_diagnostics_enabled_ || !sync.perf_pending) {
+      return;
+    }
+    const FrameStats &recorded = sync.perf_snapshot;
+    // CPU values and RT counters were captured when this slot was submitted;
+    // GPU values have just been read from this same slot's completed query
+    // pool. Keep those sources separate to avoid cross-slot frame mixing.
+    xpbd::log::infof(
+        "VKDIAG rt_perf frame=%llu slot=%zu cpu_backend_ms=%.4f "
+        "cpu_scene_assembly_ms=%.4f cpu_scene_hash_ms=%.4f "
+        "cpu_emitter_distribution_ms=%.4f cpu_descriptor_update_ms=%.4f "
+        "gpu_total_ms=%.4f gpu_as_build_ms=%.4f gpu_path_trace_ms=%.4f "
+        "gpu_timestamp_valid=%d rt_upload_bytes=%llu "
+        "rt_emitter_distribution_rebuilds=%llu "
+        "rt_descriptor_write_calls=%llu rt_descriptor_entries_written=%llu "
+        "rt_descriptor_cache_hits=%llu rt_blas_full_builds=%llu "
+        "rt_blas_refits=%llu rt_tlas_full_builds=%llu rt_tlas_updates=%llu "
+        "rt_allocated_bytes=%llu rt_aov_write_mask=0x%08x "
+        "last_build_reason=%s last_tlas_reason=%s",
+        static_cast<unsigned long long>(sync.perf_render_frame), frame_index_,
+        recorded.backend_cpu_ms, recorded.cpu_scene_assembly_ms,
+        recorded.cpu_scene_hash_ms, recorded.cpu_emitter_distribution_ms,
+        recorded.cpu_descriptor_update_ms, stats_.gpu_timestamp_total_ms,
+        stats_.gpu_as_build_ms, stats_.gpu_path_trace_ms,
+        stats_.gpu_timestamp_valid ? 1 : 0,
+        static_cast<unsigned long long>(recorded.rt_upload_bytes),
+        static_cast<unsigned long long>(
+            recorded.rt_emitter_distribution_rebuilds),
+        static_cast<unsigned long long>(recorded.rt_descriptor_write_calls),
+        static_cast<unsigned long long>(
+            recorded.rt_descriptor_entries_written),
+        static_cast<unsigned long long>(recorded.rt_descriptor_cache_hits),
+        static_cast<unsigned long long>(recorded.rt_full_builds),
+        static_cast<unsigned long long>(recorded.rt_refits),
+        static_cast<unsigned long long>(recorded.rt_tlas_full_builds),
+        static_cast<unsigned long long>(recorded.rt_tlas_updates),
+        static_cast<unsigned long long>(recorded.rt_allocated_bytes),
+        static_cast<unsigned>(recorded.rt_aov_write_mask),
+        rtAccelerationBuildReasonName(recorded.rt_last_build_reason),
+        rtAccelerationBuildReasonName(recorded.rt_last_tlas_reason));
   }
 
   void logDiagnosticResources(const FrameInput &frame,
@@ -6666,7 +6914,12 @@ private:
     ImageResource new_normal_texture{};
     ImageResource new_specular_texture{};
     VkCommandBuffer command = VK_NULL_HANDLE;
+    VkFence upload_fence = VK_NULL_HANDLE;
     auto cleanup = [&] {
+      if (upload_fence) {
+        vkDestroyFence(device_, upload_fence, nullptr);
+        upload_fence = VK_NULL_HANDLE;
+      }
       if (command) {
         vkFreeCommandBuffers(device_, cmd_pool_, 1, &command);
         command = VK_NULL_HANDLE;
@@ -6804,36 +7057,44 @@ private:
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &command;
-    const FrameSync &sync = frames_[frame_index_];
+    VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (vkCreateFence(device_, &fence_info, nullptr, &upload_fence) !=
+        VK_SUCCESS) {
+      cleanup();
+      return false;
+    }
     const auto submit_start = Clock::now();
     logDiagnosticApi("vkQueueSubmit.static_upload", "before", std::nullopt,
-                     0.0, UINT32_MAX, sync.fence, VK_NULL_HANDLE, command, true,
-                     true);
+                     0.0, UINT32_MAX, upload_fence, VK_NULL_HANDLE, command,
+                     true, true);
     const VkResult submit_result =
-        vkQueueSubmit(graphics_queue_, 1, &submit, VK_NULL_HANDLE);
+        vkQueueSubmit(graphics_queue_, 1, &submit, upload_fence);
     logDiagnosticApi(
         "vkQueueSubmit.static_upload", "after", submit_result,
         std::chrono::duration<double, std::milli>(Clock::now() - submit_start)
             .count(),
-        UINT32_MAX, sync.fence, VK_NULL_HANDLE, command, true, false);
+        UINT32_MAX, upload_fence, VK_NULL_HANDLE, command, true, false);
     if (submit_result != VK_SUCCESS) {
       cleanup();
       return false;
     }
-    const auto idle_start = Clock::now();
-    logDiagnosticApi("vkQueueWaitIdle.static_upload", "before", std::nullopt,
-                     0.0, UINT32_MAX, sync.fence, VK_NULL_HANDLE, command, true,
-                     true);
-    const VkResult idle_result = vkQueueWaitIdle(graphics_queue_);
+    const auto wait_start = Clock::now();
+    logDiagnosticApi("vkWaitForFences.static_upload", "before", std::nullopt,
+                     0.0, UINT32_MAX, upload_fence, VK_NULL_HANDLE, command,
+                     true, true);
+    const VkResult wait_result =
+        vkWaitForFences(device_, 1, &upload_fence, VK_TRUE, UINT64_MAX);
     logDiagnosticApi(
-        "vkQueueWaitIdle.static_upload", "after", idle_result,
-        std::chrono::duration<double, std::milli>(Clock::now() - idle_start)
+        "vkWaitForFences.static_upload", "after", wait_result,
+        std::chrono::duration<double, std::milli>(Clock::now() - wait_start)
             .count(),
-        UINT32_MAX, sync.fence, VK_NULL_HANDLE, command, true, false);
-    if (idle_result != VK_SUCCESS) {
+        UINT32_MAX, upload_fence, VK_NULL_HANDLE, command, true, false);
+    if (wait_result != VK_SUCCESS) {
       cleanup();
       return false;
     }
+    vkDestroyFence(device_, upload_fence, nullptr);
+    upload_fence = VK_NULL_HANDLE;
     vkFreeCommandBuffers(device_, cmd_pool_, 1, &command);
     command = VK_NULL_HANDLE;
     destroyBuffer(staging);
@@ -7000,6 +7261,8 @@ private:
     stats_.gpu_timestamp_opaque_ms = 0.0f;
     stats_.gpu_timestamp_transparent_ms = 0.0f;
     stats_.gpu_timestamp_lines_ms = 0.0f;
+    stats_.gpu_as_build_ms = 0.0f;
+    stats_.gpu_path_trace_ms = 0.0f;
     stats_.gpu_timestamp_valid_bits = timestamp_valid_bits_;
     stats_.gpu_timestamp_period_ns = static_cast<float>(timestamp_period_ns_);
     stats_.gpu_ms = 0.0f;
@@ -7038,6 +7301,10 @@ private:
         GpuTimestampQuery::OpaqueEnd, GpuTimestampQuery::TransparentEnd);
     stats_.gpu_timestamp_lines_ms = milliseconds(
         GpuTimestampQuery::TransparentEnd, GpuTimestampQuery::LinesEnd);
+    stats_.gpu_as_build_ms =
+        milliseconds(GpuTimestampQuery::AsBegin, GpuTimestampQuery::AsEnd);
+    stats_.gpu_path_trace_ms = milliseconds(GpuTimestampQuery::PathTraceBegin,
+                                            GpuTimestampQuery::PathTraceEnd);
     stats_.gpu_timestamp_valid = true;
     stats_.gpu_ms = stats_.gpu_timestamp_total_ms;
   }

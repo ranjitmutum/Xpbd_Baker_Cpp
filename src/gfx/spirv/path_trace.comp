@@ -74,6 +74,12 @@ const int kAovMotion = 6;
 const int kAovEmission = 7;
 const int kAovTransparency = 8;
 const int kAovSpecularHitDistance = 9;
+const uint kOutputRrMotion = 1u << 10u;
+const uint kOutputRrSpecularHitDistance = 1u << 11u;
+const uint kOutputRrDiffuseAlbedo = 1u << 12u;
+const uint kOutputRrSpecularAlbedo = 1u << 13u;
+const uint kOutputRrNormalRoughness = 1u << 14u;
+const uint kOutputStatistics = 1u << 15u;
 
 layout(push_constant) uniform PC {
   mat4 invViewProj;  // OpenGL clip convention, used to construct primary rays
@@ -85,6 +91,14 @@ layout(push_constant) uniform PC {
   uvec4 sizeFrame;
   vec4 cameraJitter;
 } pc;
+
+bool outputEnabled(uint bit) {
+  return (floatBitsToUint(pc.cameraJitter.w) & bit) != 0u;
+}
+
+bool aovOutputEnabled(int layer) {
+  return outputEnabled(1u << uint(layer));
+}
 
 const uint kMaterialTextured = 1u << 0u;
 const uint kMaterialCutout = 1u << 1u;
@@ -229,6 +243,8 @@ vec4 motionVector(vec2 currentUv, vec3 previousWorld, bool valid) {
     return vec4(0.0, 0.0, 1.0, 0.0);
   }
   vec2 previousNdc = previousClip.xy / previousClip.w;
+  // previousViewProj is pre-converted by glMvpToVulkan(), so its NDC Y already
+  // maps directly to the top-left-origin storage-image UV convention.
   vec2 previousUv = previousNdc * 0.5 + 0.5;
   bool inside = all(greaterThanEqual(previousUv, vec2(0.0))) &&
                 all(lessThanEqual(previousUv, vec2(1.0)));
@@ -243,20 +259,20 @@ vec4 motionVector(vec2 currentUv, vec3 previousWorld, bool valid) {
 
 vec4 surfaceMotion(uint primitive, uint instanceId, vec2 barycentrics,
                    vec2 currentUv) {
-  if (motionInfo.y == 0u ||
-      instanceMotion[instanceId].metadata.x == 0u) {
-    return vec4(0.0, 0.0, 1.0, 0.0);
-  }
   uint i0 = indices[primitive * 3u + 0u];
   uint i1 = indices[primitive * 3u + 1u];
   uint i2 = indices[primitive * 3u + 2u];
   float w = 1.0 - barycentrics.x - barycentrics.y;
+  bool sceneMotionValid =
+      motionInfo.y != 0u && instanceMotion[instanceId].metadata.x != 0u;
   vec3 previousLocal =
-      packedPosition(i0, true) * w +
-      packedPosition(i1, true) * barycentrics.x +
-      packedPosition(i2, true) * barycentrics.y;
+      packedPosition(i0, sceneMotionValid) * w +
+      packedPosition(i1, sceneMotionValid) * barycentrics.x +
+      packedPosition(i2, sceneMotionValid) * barycentrics.y;
   vec3 previousWorld =
-      (instanceMotion[instanceId].previousTransform *
+      ((sceneMotionValid
+            ? instanceMotion[instanceId].previousTransform
+            : instanceMotion[instanceId].currentTransform) *
        vec4(previousLocal, 1.0)).xyz;
   return motionVector(currentUv, previousWorld, true);
 }
@@ -682,28 +698,60 @@ void main() {
     vec3 previousSkyPoint = origin + direction * 10000.0;
     motionAov = motionVector(sampleUv, previousSkyPoint, true);
   }
-  imageStore(outputAov, ivec3(pixel, kAovGeometry), geometryAov);
-  imageStore(outputAov, ivec3(pixel, kAovShading), shadingAov);
-  imageStore(outputAov, ivec3(pixel, kAovDiffuseAlbedo),
-             diffuseAlbedoAov);
-  imageStore(outputAov, ivec3(pixel, kAovSpecularAlbedo),
-             specularAlbedoAov);
-  imageStore(outputAov, ivec3(pixel, kAovDiffuseRadiance),
-             diffuseRadianceAov);
-  imageStore(outputAov, ivec3(pixel, kAovSpecularRadiance),
-             specularRadianceAov);
-  imageStore(outputAov, ivec3(pixel, kAovMotion), motionAov);
-  imageStore(outputAov, ivec3(pixel, kAovEmission), emissionAov);
-  imageStore(outputAov, ivec3(pixel, kAovTransparency),
-             clamp(transparencyAov, vec4(0.0), vec4(65504.0)));
-  imageStore(outputAov, ivec3(pixel, kAovSpecularHitDistance),
-             vec4(specularHitDistanceAov));
-  imageStore(outputRrMotion, ivec2(pixel), motionAov);
-  imageStore(outputRrSpecularHitDistance, ivec2(pixel),
-             vec4(specularHitDistanceAov));
-  imageStore(outputRrDiffuseAlbedo, ivec2(pixel), diffuseAlbedoAov);
-  imageStore(outputRrSpecularAlbedo, ivec2(pixel), specularAlbedoAov);
-  imageStore(outputRrNormalRoughness, ivec2(pixel), shadingAov);
-  imageStore(outputStatistics, ivec2(pixel),
-             vec4(0.0, pathLength, 1.0, linearDepth));
+  if (aovOutputEnabled(kAovGeometry)) {
+    imageStore(outputAov, ivec3(pixel, kAovGeometry), geometryAov);
+  }
+  if (aovOutputEnabled(kAovShading)) {
+    imageStore(outputAov, ivec3(pixel, kAovShading), shadingAov);
+  }
+  if (aovOutputEnabled(kAovDiffuseAlbedo)) {
+    imageStore(outputAov, ivec3(pixel, kAovDiffuseAlbedo),
+               diffuseAlbedoAov);
+  }
+  if (aovOutputEnabled(kAovSpecularAlbedo)) {
+    imageStore(outputAov, ivec3(pixel, kAovSpecularAlbedo),
+               specularAlbedoAov);
+  }
+  if (aovOutputEnabled(kAovDiffuseRadiance)) {
+    imageStore(outputAov, ivec3(pixel, kAovDiffuseRadiance),
+               diffuseRadianceAov);
+  }
+  if (aovOutputEnabled(kAovSpecularRadiance)) {
+    imageStore(outputAov, ivec3(pixel, kAovSpecularRadiance),
+               specularRadianceAov);
+  }
+  if (aovOutputEnabled(kAovMotion)) {
+    imageStore(outputAov, ivec3(pixel, kAovMotion), motionAov);
+  }
+  if (aovOutputEnabled(kAovEmission)) {
+    imageStore(outputAov, ivec3(pixel, kAovEmission), emissionAov);
+  }
+  if (aovOutputEnabled(kAovTransparency)) {
+    imageStore(outputAov, ivec3(pixel, kAovTransparency),
+               clamp(transparencyAov, vec4(0.0), vec4(65504.0)));
+  }
+  if (aovOutputEnabled(kAovSpecularHitDistance)) {
+    imageStore(outputAov, ivec3(pixel, kAovSpecularHitDistance),
+               vec4(specularHitDistanceAov));
+  }
+  if (outputEnabled(kOutputRrMotion)) {
+    imageStore(outputRrMotion, ivec2(pixel), motionAov);
+  }
+  if (outputEnabled(kOutputRrSpecularHitDistance)) {
+    imageStore(outputRrSpecularHitDistance, ivec2(pixel),
+               vec4(specularHitDistanceAov));
+  }
+  if (outputEnabled(kOutputRrDiffuseAlbedo)) {
+    imageStore(outputRrDiffuseAlbedo, ivec2(pixel), diffuseAlbedoAov);
+  }
+  if (outputEnabled(kOutputRrSpecularAlbedo)) {
+    imageStore(outputRrSpecularAlbedo, ivec2(pixel), specularAlbedoAov);
+  }
+  if (outputEnabled(kOutputRrNormalRoughness)) {
+    imageStore(outputRrNormalRoughness, ivec2(pixel), shadingAov);
+  }
+  if (outputEnabled(kOutputStatistics)) {
+    imageStore(outputStatistics, ivec2(pixel),
+               vec4(0.0, pathLength, 1.0, linearDepth));
+  }
 }

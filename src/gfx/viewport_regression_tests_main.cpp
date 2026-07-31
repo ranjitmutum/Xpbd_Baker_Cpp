@@ -8,8 +8,10 @@
 #include "xpbd/gfx/labpbr_export.hpp"
 #include "xpbd/gfx/labpbr_import.hpp"
 #include "xpbd/gfx/labpbr_material.hpp"
+#include "xpbd/gfx/path_trace_aov.hpp"
 #include "xpbd/gfx/preview_scene.hpp"
 #include "xpbd/gfx/rt_scene_records.hpp"
+#include "xpbd/gfx/rt_scene_generations.hpp"
 #include "xpbd/gfx/static_model_draw_plan.hpp"
 #include "xpbd/gfx/texture_image.hpp"
 #include "xpbd/gfx/vulkan_queue_selection.hpp"
@@ -18,6 +20,7 @@
 #include "xpbd/baker/cube_geometry.hpp"
 #include "xpbd/loader/bedrock_animation_data.hpp"
 #include "xpbd/loader/bedrock_model_data.hpp"
+#include "xpbd/render/skeleton_viewport.hpp"
 
 #include <array>
 #include <algorithm>
@@ -75,6 +78,17 @@ void testLogicalFramebufferViewportContract() {
   expect(minimum.x == 4 && minimum.y == 5 &&
              minimum.w == 1 && minimum.h == 1,
          "invalid DPI and collapsed UI viewport retain a one-pixel target");
+
+  using xpbd::gfx::choosePathTraceTargetExtent;
+  expect(choosePathTraceTargetExtent(900u, 600u, 640u, 480u, true) ==
+             xpbd::gfx::PathTraceTargetExtent{640u, 480u},
+         "interactive preview resize reuses the complete current PT target");
+  expect(choosePathTraceTargetExtent(900u, 600u, 0u, 0u, true) ==
+             xpbd::gfx::PathTraceTargetExtent{900u, 600u},
+         "first-frame resize allocates the requested PT target once");
+  expect(choosePathTraceTargetExtent(900u, 600u, 640u, 480u, false) ==
+             xpbd::gfx::PathTraceTargetExtent{900u, 600u},
+         "released splitter adopts the final requested PT target");
 }
 
 void testVulkanQueueFamilySelection() {
@@ -333,6 +347,7 @@ void testCc0PreviewSceneAssets() {
   const std::vector<xpbd::gfx::MeshVertex> ocean_at_one =
       ocean.environment.transparent;
   const std::uint64_t ocean_generation = ocean.geometry_generation;
+  const std::uint64_t ocean_topology_generation = ocean.topology_generation;
   const std::vector<std::uint8_t> ocean_sky = ocean.skybox.rgba;
   xpbd::gfx::buildViewportRasterScene(PreviewSceneId::Ocean, true, true, true,
                                       1.2f, ocean, asset_root);
@@ -347,6 +362,7 @@ void testCc0PreviewSceneAssets() {
     }
   }
   expect(ocean.geometry_generation == ocean_generation + 1u &&
+             ocean.topology_generation == ocean_topology_generation &&
              ocean.environment.transparent.size() == ocean_at_one.size() &&
              changed_ocean_vertices > ocean_at_one.size() / 2u,
          "dynamic osgw Ocean advances positions with stable topology");
@@ -1319,6 +1335,63 @@ void testRtNormalTransformAndUpdatePolicy() {
          "built dynamic geometry position change selects BLAS refit");
 }
 
+void testRtSceneGenerationContract() {
+  using xpbd::gfx::RtSceneGenerations;
+  using xpbd::gfx::rtSceneGenerationKey;
+
+  const RtSceneGenerations stable{7u, 11u, 13u, 17u, 19u, 23u};
+  const RtSceneGenerations same = stable;
+  expect(stable == same, "RT generation records compare by domain");
+  expect(rtSceneGenerationKey(stable) == rtSceneGenerationKey(same),
+         "equal RT generations produce a stable scene key");
+
+  for (std::size_t index = 0; index < 6u; ++index) {
+    RtSceneGenerations changed = stable;
+    switch (index) {
+    case 0:
+      ++changed.topology;
+      break;
+    case 1:
+      ++changed.positions;
+      break;
+    case 2:
+      ++changed.transforms;
+      break;
+    case 3:
+      ++changed.materials;
+      break;
+    case 4:
+      ++changed.emission;
+      break;
+    default:
+      ++changed.visibility;
+      break;
+    }
+    expect(changed != stable &&
+               rtSceneGenerationKey(changed) != rtSceneGenerationKey(stable),
+           "each RT invalidation domain changes the scene key");
+  }
+}
+
+void testPathTraceOptionalOutputMaskContract() {
+  using xpbd::gfx::kPathTraceAllAovOutputMask;
+  using xpbd::gfx::kPathTraceAllOptionalOutputMask;
+  using xpbd::gfx::kPathTraceAllRrGuideOutputMask;
+  using xpbd::gfx::kPathTraceRrMotionOutputMask;
+  using xpbd::gfx::kPathTraceStatisticsOutputMask;
+
+  expect(kPathTraceAllAovOutputMask == 0x03ffu,
+         "path-trace AOV layers occupy bits 0 through 9");
+  expect(kPathTraceRrMotionOutputMask == 0x0400u,
+         "SR/FG motion guide occupies bit 10");
+  expect(kPathTraceAllRrGuideOutputMask == 0x7c00u,
+         "all five RR guides occupy bits 10 through 14");
+  expect(kPathTraceStatisticsOutputMask == 0x8000u,
+         "path statistics occupy bit 15");
+  expect(kPathTraceAllOptionalOutputMask == 0xffffu,
+         "optional output ABI is a dense 16-bit mask");
+}
+
 void testRtNearestHitReference() {
   using xpbd::gfx::RtAlphaMode;
   using xpbd::gfx::RtHitCandidate;
@@ -2019,6 +2092,70 @@ void testViewportMeshEmptyGeometry() {
   expect(static_mesh.vertices.empty(), "static model has no vertices");
 }
 
+void testFrontFacingFlatCubePicking() {
+  xpbd::loader::Geometry geometry;
+  xpbd::loader::Bone bone;
+  bone.name = "front_facing_flat";
+  xpbd::loader::Cube cube;
+  cube.origin[0] = -5.0;
+  cube.origin[1] = -5.0;
+  cube.origin[2] = 0.0;
+  cube.size[0] = 10.0;
+  cube.size[1] = 10.0;
+  cube.size[2] = 0.0;
+  bone.cubes.push_back(cube);
+  geometry.bones.push_back(bone);
+
+  xpbd::render::SkeletonViewport viewport;
+  viewport.setGeometry(&geometry);
+  viewport.setShowBones(false);
+  xpbd::render::ViewportCamera camera;
+  camera.yaw_deg = 0.0f;
+  camera.pitch_deg = 0.0f;
+  camera.distance = 50.0f;
+  const auto draw_list = viewport.buildRest(camera, 200.0f, 200.0f, false);
+
+  expect(!draw_list.faces.empty(),
+         "front-facing zero-thickness cube contributes a pickable face");
+  expect(xpbd::render::pickBone(draw_list, 100.0f, 100.0f, 0.0f) ==
+             "front_facing_flat",
+         "front-facing zero-thickness cube is selectable from its broad side");
+
+  xpbd::render::SkeletonDrawList overlap;
+  xpbd::render::ProjectedFace tolerance_only;
+  tolerance_only.bone_name = "near_tolerance_halo";
+  tolerance_only.depth = 1.0f;
+  tolerance_only.depths = {1.0f, 1.0f, 1.0f, 1.0f};
+  tolerance_only.xy = {102.0f, 95.0f, 112.0f, 95.0f,
+                       112.0f, 105.0f, 102.0f, 105.0f};
+  xpbd::render::ProjectedFace exact_visible;
+  exact_visible.bone_name = "exact_visible_face";
+  exact_visible.depth = 10.0f;
+  exact_visible.depths = {10.0f, 10.0f, 10.0f, 10.0f};
+  exact_visible.xy = {90.0f, 90.0f, 101.0f, 90.0f,
+                      101.0f, 110.0f, 90.0f, 110.0f};
+  overlap.faces = {tolerance_only, exact_visible};
+  expect(xpbd::render::pickBone(overlap, 100.0f, 100.0f, 6.0f) ==
+             "exact_visible_face",
+         "visible face hit wins over a nearer neighbour's tolerance halo");
+
+  xpbd::render::SkeletonDrawList edge_fallback;
+  auto cursor_far = tolerance_only;
+  cursor_far.bone_name = "near_depth_far_cursor";
+  cursor_far.xy = {103.0f, 95.0f, 113.0f, 95.0f,
+                   113.0f, 105.0f, 103.0f, 105.0f};
+  auto cursor_close = tolerance_only;
+  cursor_close.bone_name = "far_depth_close_cursor";
+  cursor_close.depth = 10.0f;
+  cursor_close.depths = {10.0f, 10.0f, 10.0f, 10.0f};
+  cursor_close.xy = {101.0f, 95.0f, 111.0f, 95.0f,
+                     111.0f, 105.0f, 101.0f, 105.0f};
+  edge_fallback.faces = {cursor_far, cursor_close};
+  expect(xpbd::render::pickBone(edge_fallback, 100.0f, 100.0f, 6.0f) ==
+             "far_depth_close_cursor",
+         "edge fallback follows cursor distance before depth");
+}
+
 void testCanonicalCubeAndRtSceneRecords() {
   xpbd::loader::Geometry geometry;
   geometry.description.has_texture_size = true;
@@ -2595,6 +2732,18 @@ void testRtMotionProjection() {
   expectNear(projected.current_to_previous_pixels[1], 0.0f, 1.0e-6f,
              "static motion y is zero");
 
+  // The uploaded previous clip matrix is already GL-to-Vulkan converted. A
+  // top-left UV therefore has the same numeric Y as the Vulkan clip mapping.
+  input.current_uv = {0.25f, 0.20f};
+  input.previous_clip = {-0.50f, -0.60f, 0.5f, 1.0f};
+  projected = evaluateRtMotionProjection(input);
+  expect(projected.valid, "off-centre static motion remains valid");
+  expectNear(projected.current_to_previous_pixels[0], 0.0f, 1.0e-4f,
+             "off-centre static motion x is zero");
+  expectNear(projected.current_to_previous_pixels[1], 0.0f, 1.0e-4f,
+             "Vulkan clip y maps directly to top-left framebuffer motion");
+
+  input.current_uv = {0.5f, 0.5f};
   input.previous_clip = {0.25f, -0.5f, 0.5f, 1.0f};
   projected = evaluateRtMotionProjection(input);
   expect(projected.valid, "translated motion remains valid");
@@ -3129,11 +3278,14 @@ int main() {
   testLabPbrBundleExport();
   testTangentFrames();
   testRtNormalTransformAndUpdatePolicy();
+  testRtSceneGenerationContract();
+  testPathTraceOptionalOutputMaskContract();
   testRtNearestHitReference();
   testPathTraceSamplingAndAccumulation();
   testPathTraceAdjustableSettingsContract();
   testPathTraceBsdfAndDepth();
   testViewportMeshEmptyGeometry();
+  testFrontFacingFlatCubePicking();
   testCanonicalCubeAndRtSceneRecords();
   testRayTracingCapability();
   testFrameGenerationStateLegality();

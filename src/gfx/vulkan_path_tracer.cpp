@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
@@ -35,7 +36,8 @@ struct PathTracePushConstants {
   float light_color_int[4]{1, 1, 1, 0.85f};
   float clear_color[4]{0.1f, 0.12f, 0.16f, 1.15f};
   std::uint32_t size_frame[4]{1, 1, 0, 0};
-  // xy: pixel-space camera jitter; z: temporal reconstruction input flag.
+  // xy: pixel-space camera jitter; z: temporal reconstruction input flag;
+  // w: optional-output mask, bit-cast from uint32_t.
   float camera_jitter[4]{0, 0, 0, 0};
 };
 static_assert(sizeof(PathTracePushConstants) == 224);
@@ -912,6 +914,13 @@ void VulkanPathTracer::shutdown() {
   sampler_ = VK_NULL_HANDLE;
   albedo_sampler_ = VK_NULL_HANDLE;
   rt_fallback_logged_ = false;
+  compute_descriptor_key_ = {};
+  compute_descriptor_key_valid_ = false;
+  descriptor_write_calls_ = 0;
+  descriptor_cache_hits_ = 0;
+  descriptor_entries_written_ = 0;
+  descriptor_update_ms_ = 0.0f;
+  rt_pipeline_.resetDescriptorStats();
   history_key_ = 0;
   history_reset_count_ = 0;
   accumulated_samples_ = 0;
@@ -1502,6 +1511,22 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
                                       VkImageView normal_view,
                                       VkImageView specular_view,
                                       VkSampler albedo_sampler) {
+  descriptor_write_calls_ = 0;
+  descriptor_cache_hits_ = 0;
+  descriptor_entries_written_ = 0;
+  descriptor_update_ms_ = 0.0f;
+  rt_pipeline_.resetDescriptorStats();
+  const bool debug_requested =
+      params.rt_debug_view != RtDebugView::Off ||
+      params.material_debug_view != LabPbrDebugView::Shaded;
+  const bool diagnostic_aovs_requested =
+      !aov_summary_path_.empty() && !capture_completed_;
+  last_output_write_mask_ = params.output_write_mask;
+  if (debug_requested || diagnostic_aovs_requested) {
+    last_output_write_mask_ |=
+        kPathTraceAllAovOutputMask | kPathTraceStatisticsOutputMask;
+  }
+  last_output_write_mask_ &= kPathTraceAllOptionalOutputMask;
   // This slot's frame fence has been waited before the backend records its
   // next frame, so a copy queued on the prior use is now host-visible.
   flushPendingCapture();
@@ -1524,9 +1549,6 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
   }
 
   const bool use_fallback = albedo_view == VK_NULL_HANDLE;
-  const bool debug_requested =
-      params.rt_debug_view != RtDebugView::Off ||
-      params.material_debug_view != LabPbrDebugView::Shaded;
   const PathTraceSettings settings =
       normalizePathTraceSettings(params.settings);
   if (settings.pause_accumulation && history_valid_ &&
@@ -1869,7 +1891,48 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
   writes[23].descriptorCount = 1;
   writes[23].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
   writes[23].pImageInfo = &rr_normal_roughness_img;
-  vkUpdateDescriptorSets(device_, 24u, writes, 0, nullptr);
+  ComputeDescriptorKey descriptor_key{};
+  descriptor_key.tlas = tlas;
+  descriptor_key.image_views = {
+      img.imageView,
+      depth_img.imageView,
+      aov_img.imageView,
+      statistics_img.imageView,
+      rr_motion_img.imageView,
+      rr_specular_hit_distance_img.imageView,
+      rr_diffuse_albedo_img.imageView,
+      rr_specular_albedo_img.imageView,
+      rr_normal_roughness_img.imageView,
+      albedo.imageView,
+      normal_map.imageView,
+      specular_map.imageView};
+  descriptor_key.image_samplers = {albedo.sampler, normal_map.sampler,
+                                   specular_map.sampler};
+  descriptor_key.buffers = {
+      nbuf.buffer, ibuf.buffer, uvbuf.buffer, colorbuf.buffer, flagbuf.buffer,
+      tangentbuf.buffer, instancebuf.buffer, positionbuf.buffer,
+      previous_positionbuf.buffer, instance_motionbuf.buffer,
+      motion_framebuf.buffer};
+  descriptor_key.buffer_sizes = {
+      nbuf.range, ibuf.range, uvbuf.range, colorbuf.range, flagbuf.range,
+      tangentbuf.range, instancebuf.range, positionbuf.range,
+      previous_positionbuf.range, instance_motionbuf.range,
+      motion_framebuf.range};
+  if (compute_descriptor_key_valid_ &&
+      descriptor_key == compute_descriptor_key_) {
+    ++descriptor_cache_hits_;
+  } else {
+    const auto update_begin = std::chrono::steady_clock::now();
+    vkUpdateDescriptorSets(device_, 24u, writes, 0, nullptr);
+    descriptor_update_ms_ =
+        std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - update_begin)
+            .count();
+    compute_descriptor_key_ = descriptor_key;
+    compute_descriptor_key_valid_ = true;
+    descriptor_write_calls_ = 1;
+    descriptor_entries_written_ = 24u;
+  }
 
   // Transition color, depth, AOVs and exact-format RR guides to GENERAL.
   std::array<VkImageMemoryBarrier, 9> barriers{};
@@ -1974,6 +2037,8 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
   pc.camera_jitter[1] = params.camera_jitter[1];
   pc.camera_jitter[2] =
       params.temporal_reconstruction_input ? 1.0f : 0.0f;
+  pc.camera_jitter[3] =
+      std::bit_cast<float>(last_output_write_mask_);
 
   auto *motion_frame =
       static_cast<PathTraceMotionFrameGpu *>(motion_frame_mapped_);
@@ -2019,6 +2084,7 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
         params.temporal_reconstruction_input;
     rt_params.ray_reconstruction_guides =
         params.ray_reconstruction_guides;
+    rt_params.output_write_mask = last_output_write_mask_;
     rt_params.camera_jitter[0] = params.camera_jitter[0];
     rt_params.camera_jitter[1] = params.camera_jitter[1];
     rt_params.frame_index = params.frame_index;

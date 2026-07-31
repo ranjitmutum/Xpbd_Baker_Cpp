@@ -29,6 +29,8 @@ struct PathTraceFrameParams {
   // progressively averaged preview. This does not invalidate its own history.
   bool temporal_reconstruction_input = false;
   bool ray_reconstruction_guides = false;
+  // Optional AOV/RR/statistics writes. Color and depth remain mandatory.
+  std::uint32_t output_write_mask = 0;
   float camera_jitter[2]{0.0f, 0.0f};
   float light_dir[3]{0.35f, 0.85f, 0.40f};
   float ambient = 0.38f;
@@ -69,6 +71,13 @@ enum class PathTraceCaptureState : std::uint8_t {
 
 class VulkanPathTracer {
 public:
+  struct DescriptorStats {
+    std::uint64_t write_calls = 0;
+    std::uint64_t cache_hits = 0;
+    std::uint64_t entries_written = 0;
+    float update_ms = 0.0f;
+  };
+
   VulkanPathTracer() = default;
   ~VulkanPathTracer() { shutdown(); }
 
@@ -101,6 +110,17 @@ public:
   }
   [[nodiscard]] std::uint64_t historyGeneration() const noexcept {
     return history_generation_;
+  }
+  [[nodiscard]] DescriptorStats descriptorStats() const noexcept {
+    const RtPipelineStats pipeline_stats = rt_pipeline_.stats();
+    return {descriptor_write_calls_ + pipeline_stats.descriptor_write_calls,
+            descriptor_cache_hits_ + pipeline_stats.descriptor_cache_hits,
+            descriptor_entries_written_ +
+                pipeline_stats.descriptor_entries_written,
+            descriptor_update_ms_ + pipeline_stats.descriptor_update_ms};
+  }
+  [[nodiscard]] std::uint32_t lastOutputWriteMask() const noexcept {
+    return last_output_write_mask_;
   }
   [[nodiscard]] PathTraceCaptureState captureState() const noexcept {
     return runtime_capture_state_;
@@ -224,6 +244,17 @@ private:
     VkDeviceSize capacity = 0;
   };
 
+  struct ComputeDescriptorKey {
+    VkAccelerationStructureKHR tlas = VK_NULL_HANDLE;
+    std::array<VkImageView, 12> image_views{};
+    std::array<VkSampler, 3> image_samplers{};
+    std::array<VkBuffer, 11> buffers{};
+    std::array<VkDeviceSize, 11> buffer_sizes{};
+
+    [[nodiscard]] constexpr bool operator==(
+        const ComputeDescriptorKey &) const = default;
+  };
+
   [[nodiscard]] std::uint32_t findMemoryType(std::uint32_t bits,
                                              VkMemoryPropertyFlags props) const;
   [[nodiscard]] VkShaderModule makeModule(const std::uint32_t *words,
@@ -262,6 +293,13 @@ private:
   VkDeviceMemory fallback_albedo_memory_ = VK_NULL_HANDLE;
   VkImageView fallback_albedo_view_ = VK_NULL_HANDLE;
   bool fallback_albedo_cleared_ = false;
+  ComputeDescriptorKey compute_descriptor_key_{};
+  bool compute_descriptor_key_valid_ = false;
+  std::uint64_t descriptor_write_calls_ = 0;
+  std::uint64_t descriptor_cache_hits_ = 0;
+  std::uint64_t descriptor_entries_written_ = 0;
+  float descriptor_update_ms_ = 0.0f;
+  std::uint32_t last_output_write_mask_ = 0;
 
   VkImage image_ = VK_NULL_HANDLE;
   VkDeviceMemory image_memory_ = VK_NULL_HANDLE;

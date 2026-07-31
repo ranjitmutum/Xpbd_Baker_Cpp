@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <chrono>
 #include <cstring>
 #include <iterator>
 #include <limits>
@@ -42,7 +44,8 @@ struct RtPathPushConstants {
   std::uint32_t depth_limits[4]{};
   // x/y radiance clamps, z emissive multiplier, w light samples/path.
   float integrator[4]{};
-  // xy: pixel-space camera jitter; z: temporal reconstruction input flag.
+  // xy: pixel-space camera jitter; z: temporal reconstruction input flag;
+  // w: optional-output mask, bit-cast from uint32_t.
   float camera_jitter[4]{};
 };
 static_assert(sizeof(RtPathPushConstants) == 256u);
@@ -115,6 +118,12 @@ void VulkanRtPipeline::shutdown() {
   shader_group_stride_ = 0;
   dispatch_logged_ = false;
   bounds_failure_logged_ = false;
+  descriptor_key_ = {};
+  descriptor_key_valid_ = false;
+  descriptor_write_calls_ = 0;
+  descriptor_cache_hits_ = 0;
+  descriptor_entries_written_ = 0;
+  descriptor_update_ms_ = 0.0f;
   vkCreateRayTracingPipelinesKHR_ = nullptr;
   vkGetRayTracingShaderGroupHandlesKHR_ = nullptr;
   vkCmdTraceRaysKHR_ = nullptr;
@@ -482,8 +491,16 @@ bool VulkanRtPipeline::record(
       params.motion_frame_buffer_bytes < 80u ||
       params.inverse_view_projection == nullptr ||
       params.view_projection == nullptr) {
+    descriptor_write_calls_ = 0;
+    descriptor_cache_hits_ = 0;
+    descriptor_entries_written_ = 0;
+    descriptor_update_ms_ = 0.0f;
     return false;
   }
+  descriptor_write_calls_ = 0;
+  descriptor_cache_hits_ = 0;
+  descriptor_entries_written_ = 0;
+  descriptor_update_ms_ = 0.0f;
   if (params.hdr_environment &&
       (params.environment_view == VK_NULL_HANDLE ||
        params.environment_sampler == VK_NULL_HANDLE ||
@@ -653,8 +670,30 @@ bool VulkanRtPipeline::record(
   writes[26].pImageInfo = &images[11];
   writes[27].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
   writes[27].pImageInfo = &images[12];
-  vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()),
-                         writes.data(), 0, nullptr);
+  DescriptorKey descriptor_key{};
+  descriptor_key.tlas = tlas;
+  for (std::size_t index = 0; index < images.size(); ++index) {
+    descriptor_key.image_views[index] = images[index].imageView;
+    descriptor_key.image_samplers[index] = images[index].sampler;
+  }
+  descriptor_key.buffers = buffer_handles;
+  descriptor_key.buffer_sizes = buffer_sizes;
+  if (descriptor_key_valid_ && descriptor_key == descriptor_key_) {
+    ++descriptor_cache_hits_;
+  } else {
+    const auto update_begin = std::chrono::steady_clock::now();
+    vkUpdateDescriptorSets(
+        device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0,
+        nullptr);
+    descriptor_update_ms_ =
+        std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - update_begin)
+            .count();
+    descriptor_key_ = descriptor_key;
+    descriptor_key_valid_ = true;
+    descriptor_write_calls_ = 1;
+    descriptor_entries_written_ = writes.size();
+  }
 
   RtPathPushConstants push{};
   std::memcpy(push.inverse_view_projection,
@@ -715,6 +754,8 @@ bool VulkanRtPipeline::record(
   push.camera_jitter[1] = params.camera_jitter[1];
   push.camera_jitter[2] =
       params.temporal_reconstruction_input ? 1.0f : 0.0f;
+  push.camera_jitter[3] =
+      std::bit_cast<float>(params.output_write_mask);
 
   constexpr VkShaderStageFlags kAllRtStages =
       VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
@@ -734,14 +775,15 @@ bool VulkanRtPipeline::record(
         "VKDIAG rt_pipeline dispatch mode=%s width=%u height=%u "
         "sample_base=%u samples=%u bounces=%u seed=%u material_flags=%u "
         "primitives=%llu emitters=%u instances=%u sbt_stride=%u "
-        "sbt_bytes=%llu",
+        "sbt_bytes=%llu output_mask=0x%04x",
         rtDebugViewName(params.debug_view), push.size_mode[0],
         push.size_mode[1], push.sampling[0], push.sampling[1],
         push.size_mode[3], push.sampling[2], params.material_feature_flags,
         static_cast<unsigned long long>(primitive_count),
         scene.emissiveTriangleCount(), scene_stats.instance_count,
         shader_group_stride_,
-        static_cast<unsigned long long>(sbt_.size));
+        static_cast<unsigned long long>(sbt_.size),
+        static_cast<unsigned>(params.output_write_mask));
     dispatch_logged_ = true;
   }
   return true;
@@ -758,6 +800,10 @@ RtPipelineStats VulkanRtPipeline::stats() const noexcept {
       properties_.shaderGroupBaseAlignment;
   result.shader_group_stride = shader_group_stride_;
   result.sbt_bytes = static_cast<std::uint64_t>(sbt_.size);
+  result.descriptor_write_calls = descriptor_write_calls_;
+  result.descriptor_cache_hits = descriptor_cache_hits_;
+  result.descriptor_entries_written = descriptor_entries_written_;
+  result.descriptor_update_ms = descriptor_update_ms_;
   return result;
 }
 

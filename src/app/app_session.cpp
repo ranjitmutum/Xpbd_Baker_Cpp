@@ -2019,6 +2019,7 @@ void AppSession::loadModel(const std::filesystem::path &path) {
       }
     }
     selected_bone_name.clear();
+    hovered_bone_name.clear();
     labpbr_group_overrides.clear();
     labpbr_draft = {};
     labpbr_draft_dirty = false;
@@ -2045,6 +2046,8 @@ void AppSession::loadModel(const std::filesystem::path &path) {
                 std::to_string(model_texture.height);
     }
     advanceGeneration(model_generation_);
+    advanceGeneration(viewport_appearance_generation_);
+    advanceGeneration(viewport_visibility_generation_);
     scene_selection.source_identity = model_path;
     if (scene_selection.kind != SceneSelectionKind::Preset) {
       scene_selection.kind = SceneSelectionKind::Loaded;
@@ -4585,10 +4588,22 @@ void AppSession::selectBone(const std::string &name) {
   if (bone_context_open && bone_context_bone_name != name) {
     closeBoneContext();
   }
+  const bool selection_changed = selected_bone_name != name;
   selected_bone_name = name;
   skeleton_view.setSelectedBone(name);
+  if (selection_changed) {
+    advanceGeneration(viewport_appearance_generation_);
+  }
   loadSelectedBoneEditors();
   loadSelectedLabPbrDraft();
+}
+
+void AppSession::setHoveredBone(std::string name) {
+  if (hovered_bone_name == name) {
+    return;
+  }
+  hovered_bone_name = std::move(name);
+  advanceGeneration(viewport_appearance_generation_);
 }
 
 void AppSession::setBoneVisible(const std::string &name, bool visible) {
@@ -4621,6 +4636,8 @@ void AppSession::setBoneVisible(const std::string &name, bool visible) {
   if (changed_count == 0) {
     return;
   }
+  advanceGeneration(viewport_appearance_generation_);
+  advanceGeneration(viewport_visibility_generation_);
   status = std::string("Bone subtree ") + (visible ? "shown: " : "hidden: ") +
            name + " (" + std::to_string(changed_count) +
            (visible ? " newly shown)" : " newly hidden)");

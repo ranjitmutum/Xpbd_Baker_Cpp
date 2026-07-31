@@ -2914,6 +2914,10 @@ void StreamlineVulkanRuntime::clearFrameGenerationInputs(
       impl_->sl_set_tag_for_frame == nullptr) {
     return;
   }
+  // A preview splitter changes only the tagged subrect, not the window or
+  // swapchain. Null-tag temporary invalid inputs while keeping the proxy mode
+  // unchanged; NVIDIA reserves the heavier eOff + swapchain-recreate path for
+  // actual window/fullscreen resolution changes.
   sl::FrameToken *token = frameTokenFor(*impl_, frame_index);
   if (token == nullptr) {
     return;
@@ -2944,6 +2948,9 @@ void StreamlineVulkanRuntime::clearFrameGenerationInputs(
     impl_->frame_generation_status =
         std::string("DLSS Frame Generation null-tag update failed: ") +
         sl::getResultAsStr(result);
+  } else {
+    impl_->frame_generation_status =
+        "DLSS Frame Generation paused until stable inputs resume";
   }
   impl_->frame_generation.valid_inputs_tagged = false;
   impl_->frame_generation.tag_generation = 0u;

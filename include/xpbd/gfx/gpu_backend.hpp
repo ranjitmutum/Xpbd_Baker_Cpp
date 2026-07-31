@@ -4,6 +4,7 @@
 #include "xpbd/gfx/labpbr_material.hpp"
 #include "xpbd/gfx/preview_scene.hpp"
 #include "xpbd/gfx/ray_tracing.hpp"
+#include "xpbd/gfx/rt_scene_generations.hpp"
 #include "xpbd/gfx/still_image_export.hpp"
 #include "xpbd/gfx/viewport_mesh.hpp"
 #include "xpbd/gfx/world_environment.hpp"
@@ -79,6 +80,29 @@ struct ViewportRect {
     result.h = std::clamp(result.h, 1, framebuffer_height - result.y);
   }
   return result;
+}
+
+struct PathTraceTargetExtent {
+  std::uint32_t width = 1u;
+  std::uint32_t height = 1u;
+
+  [[nodiscard]] constexpr bool operator==(
+      const PathTraceTargetExtent &) const noexcept = default;
+};
+
+// Splitter extents are transient. Reuse a complete existing target throughout
+// the gesture, then accept the requested final extent on the first stable
+// frame. A first-frame drag still gets a valid one-pixel-or-larger target.
+[[nodiscard]] constexpr PathTraceTargetExtent choosePathTraceTargetExtent(
+    std::uint32_t requested_width, std::uint32_t requested_height,
+    std::uint32_t current_width, std::uint32_t current_height,
+    bool interactive_resize) noexcept {
+  PathTraceTargetExtent requested{
+      std::max(1u, requested_width), std::max(1u, requested_height)};
+  if (interactive_resize && current_width > 0u && current_height > 0u) {
+    return {current_width, current_height};
+  }
+  return requested;
 }
 
 struct FrameDiagnosticContext {
@@ -167,6 +191,17 @@ struct FrameInput {
   // User preference for NVIDIA hardware ray tracing (default off in session).
   // Backend forces Raster when capability is missing or device RT is not armed.
   bool prefer_ray_tracing = false;
+
+  // The preview splitter is being dragged. A temporal renderer should reuse
+  // its current target and suspend frame interpolation until the final extent
+  // is known instead of reallocating on every pointer event.
+  bool interactive_viewport_resize = false;
+
+  // Explicit RT invalidation ABI.  When false, a backend uses a conservative
+  // per-frame serial (never a full vertex-buffer hash) for compatibility with
+  // older callers.
+  RtSceneGenerations rt_scene_generations{};
+  bool rt_scene_generations_valid = false;
 };
 
 struct DynamicMeshUploadRange {

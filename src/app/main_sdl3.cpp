@@ -9,6 +9,7 @@
 #include "xpbd/gfx/viewport_mesh.hpp"
 #include "xpbd/log.hpp"
 
+#include <bit>
 #include <charconv>
 #include <cstdio>
 #include <system_error>
@@ -280,6 +281,10 @@ int app_main(int argc, char **argv) {
     std::string log_path = "xpbd_baker.log";
     if (!executable_base_path.empty()) {
       log_path = (executable_base_path / "xpbd_baker.log").string();
+    }
+    if (const char *override_path = std::getenv("XPBD_LOG_PATH");
+        override_path != nullptr && override_path[0] != '\0') {
+      log_path = override_path;
     }
     xpbd::log::init(log_path);
   }
@@ -1157,6 +1162,11 @@ int app_main(int argc, char **argv) {
   bool unattended_resize_gate = false;
   apply_path_trace_bool(
       "XPBD_UNATTENDED_RESIZE_GATE", unattended_resize_gate);
+  bool perf_diagnostics = false;
+  apply_path_trace_bool("XPBD_PERF_DIAGNOSTICS", perf_diagnostics);
+  bool vulkan_diagnostics = false;
+  apply_path_trace_bool("XPBD_VULKAN_DIAGNOSTICS", vulkan_diagnostics);
+  perf_diagnostics = perf_diagnostics || vulkan_diagnostics;
   int unattended_initial_width = 0;
   int unattended_initial_height = 0;
   if (unattended_resize_gate) {
@@ -1168,6 +1178,14 @@ int app_main(int argc, char **argv) {
   }
   std::uint64_t result_commit_frame_number = 0;
   std::uint32_t completion_diagnostic_frames = 0;
+  if (perf_diagnostics) {
+    const std::uint64_t requested_frames =
+        unattended_frame_limit > 0u ? unattended_frame_limit : 300u;
+    completion_diagnostic_frames = static_cast<std::uint32_t>(
+        (std::min)(requested_frames, static_cast<std::uint64_t>(10000u)));
+    xpbd::log::infof("Performance diagnostics enabled for %u frames",
+                     completion_diagnostic_frames);
+  }
   auto previous_bake_state = session.bake_state;
   bool hover_pick_snapshot_valid = false;
   float hover_pick_mouse_x = 0.0f;
@@ -1543,9 +1561,9 @@ int app_main(int argc, char **argv) {
             now - hover_pick_last_query >= kSceneOnlyPickInterval;
         if (pointer_or_layout_changed || hover_pick_force_refresh ||
             scene_refresh_due) {
-          session.hovered_bone_name =
+          session.setHoveredBone(
               timedPickBone(mx - prev_layout.vp_x, my - prev_layout.vp_y,
-                            prev_layout.vp_w, prev_layout.vp_h);
+                            prev_layout.vp_w, prev_layout.vp_h));
           hover_pick_last_query = now;
           hover_pick_snapshot_valid = true;
           hover_pick_mouse_x = mx;
@@ -1559,7 +1577,7 @@ int app_main(int argc, char **argv) {
         }
       } else if (!prev_layout.viewport_hovered ||
                  !pointInsideViewport(prev_layout, mx, my)) {
-        session.hovered_bone_name.clear();
+        session.setHoveredBone(std::string{});
         hover_pick_snapshot_valid = false;
       }
     }
@@ -1895,6 +1913,8 @@ int app_main(int argc, char **argv) {
     frame.prefer_ray_tracing =
         session.enable_ray_tracing && !xpbd::app::nativeDialogOpen() &&
         !backend->presentationSuspended();
+    frame.interactive_viewport_resize =
+        ui_result.layout.viewport_resize_active;
     if (vulkan_raster_path) {
       frame.raster_scene = &raster_scene;
       frame.clear_r = raster_scene.lighting.clear_r;
@@ -1905,6 +1925,59 @@ int app_main(int argc, char **argv) {
       frame.clear_g = 28.0f / 255.0f;
       frame.clear_b = 34.0f / 255.0f;
     }
+
+    // Feed the RT backend authoritative invalidation domains.  Playback is a
+    // transform/position change even when the source animation generation is
+    // stable; a paused camera move must not invalidate geometry.  This keeps
+    // release hot paths independent of full vertex-buffer hashes.
+    const std::uint64_t model_generation =
+        still_snapshot != nullptr ? still_snapshot->model_generation
+                                  : session.modelGeneration();
+    const std::uint64_t animation_generation = session.animationGeneration();
+    const std::uint64_t physics_generation = session.physicsGeneration();
+    const std::uint64_t material_generation =
+        still_snapshot != nullptr ? still_snapshot->material_generation
+                                  : session.materialGeneration();
+    std::uint64_t pose_generation = xpbd::gfx::mixRtGeneration(
+        animation_generation, physics_generation);
+    pose_generation = xpbd::gfx::mixRtGeneration(
+        pose_generation, std::bit_cast<std::uint64_t>(preview_reference_time));
+    pose_generation = xpbd::gfx::mixRtGeneration(
+        pose_generation,
+        static_cast<std::uint64_t>(session.preview_frame_index));
+    pose_generation = xpbd::gfx::mixRtGeneration(
+        pose_generation, static_cast<std::uint64_t>(session.presentation_mode));
+    const std::uint64_t appearance_generation =
+        session.viewportAppearanceGeneration();
+    const std::uint64_t visibility_generation =
+        session.viewportVisibilityGeneration();
+    auto &rt_generations = frame.rt_scene_generations;
+    rt_generations.topology = xpbd::gfx::mixRtGeneration(
+        xpbd::gfx::mixRtGeneration(
+            model_generation, static_cast<std::uint64_t>(use_static_model)),
+        raster_scene.topology_generation);
+    const std::uint64_t dynamic_position_serial =
+        use_static_model ? 0u : pose_generation;
+    rt_generations.positions = xpbd::gfx::mixRtGeneration(
+        xpbd::gfx::mixRtGeneration(animation_generation, physics_generation),
+        xpbd::gfx::mixRtGeneration(
+            dynamic_position_serial,
+            raster_scene.surface_dynamic_baked
+                ? raster_scene.geometry_generation
+                : 0u));
+    rt_generations.transforms = pose_generation;
+    rt_generations.materials = xpbd::gfx::mixRtGeneration(
+        xpbd::gfx::mixRtGeneration(material_generation,
+                                   session.textureGeneration()),
+        xpbd::gfx::mixRtGeneration(physics_generation,
+                                   appearance_generation));
+    rt_generations.emission = rt_generations.materials;
+    rt_generations.visibility = xpbd::gfx::mixRtGeneration(
+        xpbd::gfx::mixRtGeneration(
+            static_cast<std::uint64_t>(session.preview_scene_id),
+            static_cast<std::uint64_t>(render_loaded_scene)),
+        visibility_generation);
+    frame.rt_scene_generations_valid = true;
 
     backend->render(frame);
     if (completion_diagnostic_frames > 0) {
@@ -1979,6 +2052,17 @@ int app_main(int argc, char **argv) {
         backend_stats.backend_cpu_ms > 0.0f
             ? backend_stats.backend_cpu_ms
             : (backend_stats.gpu_timestamp_valid ? 0.0f : backend_stats.gpu_ms);
+    frame_stats.cpu_scene_assembly_ms = backend_stats.cpu_scene_assembly_ms;
+    frame_stats.cpu_scene_hash_ms = backend_stats.cpu_scene_hash_ms;
+    frame_stats.cpu_emitter_distribution_ms =
+        backend_stats.cpu_emitter_distribution_ms;
+    frame_stats.cpu_descriptor_update_ms =
+        backend_stats.cpu_descriptor_update_ms;
+    frame_stats.gpu_as_build_ms = backend_stats.gpu_as_build_ms;
+    frame_stats.gpu_path_trace_ms = backend_stats.gpu_path_trace_ms;
+    frame_stats.gpu_rr_ms = backend_stats.gpu_rr_ms;
+    frame_stats.gpu_sr_ms = backend_stats.gpu_sr_ms;
+    frame_stats.gpu_fg_present_ms = backend_stats.gpu_fg_present_ms;
     frame_stats.gpu_timestamp_valid = backend_stats.gpu_timestamp_valid;
     frame_stats.gpu_timestamp_total_ms = backend_stats.gpu_timestamp_total_ms;
     frame_stats.gpu_timestamp_ui_ms = backend_stats.gpu_timestamp_ui_ms;
@@ -2011,7 +2095,20 @@ int app_main(int argc, char **argv) {
     frame_stats.rt_allocated_bytes = backend_stats.rt_allocated_bytes;
     frame_stats.rt_full_builds = backend_stats.rt_full_builds;
     frame_stats.rt_refits = backend_stats.rt_refits;
+    frame_stats.rt_tlas_full_builds = backend_stats.rt_tlas_full_builds;
+    frame_stats.rt_tlas_updates = backend_stats.rt_tlas_updates;
+    frame_stats.rt_upload_bytes = backend_stats.rt_upload_bytes;
+    frame_stats.rt_emitter_distribution_rebuilds =
+        backend_stats.rt_emitter_distribution_rebuilds;
+    frame_stats.rt_descriptor_write_calls =
+        backend_stats.rt_descriptor_write_calls;
+    frame_stats.rt_descriptor_cache_hits =
+        backend_stats.rt_descriptor_cache_hits;
+    frame_stats.rt_descriptor_entries_written =
+        backend_stats.rt_descriptor_entries_written;
+    frame_stats.rt_aov_write_mask = backend_stats.rt_aov_write_mask;
     frame_stats.rt_last_build_reason = backend_stats.rt_last_build_reason;
+    frame_stats.rt_last_tlas_reason = backend_stats.rt_last_tlas_reason;
 
 
 

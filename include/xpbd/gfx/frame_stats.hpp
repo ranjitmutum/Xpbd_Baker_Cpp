@@ -61,6 +61,18 @@ struct FrameStats {
   float gpu_ms = 0.0f;
 
   float backend_cpu_ms = 0.0f;
+  // PERF00 RT instrumentation.  These are CPU-side recording costs; GPU
+  // timestamp fields below are populated independently when the device
+  // exposes timestamp queries.
+  float cpu_scene_assembly_ms = 0.0f;
+  float cpu_scene_hash_ms = 0.0f;
+  float cpu_emitter_distribution_ms = 0.0f;
+  float cpu_descriptor_update_ms = 0.0f;
+  float gpu_as_build_ms = 0.0f;
+  float gpu_path_trace_ms = 0.0f;
+  float gpu_rr_ms = 0.0f;
+  float gpu_sr_ms = 0.0f;
+  float gpu_fg_present_ms = 0.0f;
   bool gpu_timestamp_valid = false;
   float gpu_timestamp_total_ms = 0.0f;
   float gpu_timestamp_ui_ms = 0.0f;
@@ -111,7 +123,17 @@ struct FrameStats {
   std::uint64_t rt_allocated_bytes = 0;
   std::uint64_t rt_full_builds = 0;
   std::uint64_t rt_refits = 0;
+  std::uint64_t rt_tlas_full_builds = 0;
+  std::uint64_t rt_tlas_updates = 0;
+  std::uint64_t rt_upload_bytes = 0;
+  std::uint64_t rt_emitter_distribution_rebuilds = 0;
+  std::uint64_t rt_descriptor_write_calls = 0;
+  std::uint64_t rt_descriptor_cache_hits = 0;
+  std::uint64_t rt_descriptor_entries_written = 0;
+  std::uint32_t rt_aov_write_mask = 0;
   RtAccelerationBuildReason rt_last_build_reason =
+      RtAccelerationBuildReason::None;
+  RtAccelerationBuildReason rt_last_tlas_reason =
       RtAccelerationBuildReason::None;
 };
 

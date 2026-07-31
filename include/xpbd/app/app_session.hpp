@@ -749,6 +749,14 @@ public:
     return material_generation_;
   }
 
+  [[nodiscard]] std::uint64_t viewportAppearanceGeneration() const noexcept {
+    return viewport_appearance_generation_;
+  }
+
+  [[nodiscard]] std::uint64_t viewportVisibilityGeneration() const noexcept {
+    return viewport_visibility_generation_;
+  }
+
   bool loadWorldHdr(const std::filesystem::path &path);
   // Selects the single World/Sky rendering source. Scene/preset selection is
   // intentionally independent and never calls this method.
@@ -884,6 +892,7 @@ public:
 
   void clearCollisionRoots();
   void selectBone(const std::string &name);
+  void setHoveredBone(std::string name);
   [[nodiscard]] bool isBoneVisible(const std::string &name) const {
     return !hidden_bone_names.contains(name);
   }
@@ -970,6 +979,8 @@ private:
   std::uint64_t animation_generation_ = 0;
   std::uint64_t material_generation_ = 0;
   std::uint64_t physics_generation_ = 0;
+  std::uint64_t viewport_appearance_generation_ = 0;
+  std::uint64_t viewport_visibility_generation_ = 0;
   gfx::ResolvedMaterialTable labpbr_source_material_;
   gfx::LabPbrSuiteImportCache labpbr_import_cache_;
   std::optional<std::filesystem::path> pending_labpbr_import_path_;

@@ -1328,6 +1328,9 @@ void buildViewportRasterScene(PreviewSceneId id, bool show_grid, bool show_axes,
 
   if (rebuild_env) {
     ++out.geometry_generation;
+    if (previous_id != id) {
+      ++out.topology_generation;
+    }
   }
 
   if (show_grid || show_axes) {

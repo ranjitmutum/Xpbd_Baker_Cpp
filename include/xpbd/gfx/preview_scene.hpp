@@ -234,6 +234,10 @@ struct ViewportRasterScene {
   bool environment_unlit = true;
   // Incremented whenever environment triangle positions/colors/topology change.
   std::uint64_t geometry_generation = 0;
+  // Incremented only when the packed triangle topology or scene identity
+  // changes.  Dynamic Ocean rebakes keep this stable so RT can refit/update
+  // instead of rebuilding BLAS/TLAS for every surface sample.
+  std::uint64_t topology_generation = 0;
   // Randomised per scene switch (static + dynamic); drives noise offsets.
   float scene_seed = 0.0f;
   // Last surface mesh bake time (ocean/desert throttle).
@@ -245,6 +249,7 @@ struct ViewportRasterScene {
     grid.clear();
     skybox.clear();
     ++geometry_generation;
+    ++topology_generation;
     scene_seed = 0.0f;
     surface_time_baked = -1.0e9f;
     surface_dynamic_baked = false;

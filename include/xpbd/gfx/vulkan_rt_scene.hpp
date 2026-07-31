@@ -2,6 +2,7 @@
 
 #include "xpbd/gfx/frame_stats.hpp"
 #include "xpbd/gfx/rt_scene_records.hpp"
+#include "xpbd/gfx/rt_scene_generations.hpp"
 
 // Vulkan ray-tracing scene helpers. Rigid bone groups, dynamic overlays, and
 // preview-environment geometry keep distinct BLAS policies while sharing one
@@ -45,6 +46,18 @@ struct RtRestGeometry {
   std::vector<RtRestGeometryRange> geometry_ranges;
 };
 
+// std430 mesh-light record cached on the CPU.  Keeping this typed cache alive
+// across frames avoids reallocating and rebuilding the dense alias table when
+// positions/transforms change in scenes that contain no emissive primitives.
+struct alignas(16) RtEmissiveTriangleGpu {
+  std::array<float, 4> p0_probability{};
+  std::array<float, 4> p1_acceptance{};
+  std::array<float, 4> p2_area{};
+  std::array<float, 4> emission_luminance{};
+  std::array<std::uint32_t, 4> metadata{};
+};
+static_assert(sizeof(RtEmissiveTriangleGpu) == 80u);
+
 // Non-indexed world-space triangle list appended as a distinct BLAS.
 // `alpha_blended` identifies the source raster range; per-vertex alpha remains
 // authoritative for the exact transmittance.
@@ -54,6 +67,12 @@ struct RtColoredGeometryView {
   bool alpha_blended = false;
   RtGeometryKind kind = RtGeometryKind::StaticScene;
   RtBlasPolicy blas_policy = RtBlasPolicy::StaticBuildCompact;
+  // Zero means that a legacy caller did not provide a generation.  The
+  // backend supplies non-zero values so release hot paths never hash vertices.
+  std::uint64_t content_generation = 0;
+  std::uint64_t topology_generation = 0;
+  std::uint64_t material_generation = 0;
+  std::uint64_t emission_generation = 0;
 };
 
 struct RtSceneStats {
@@ -67,7 +86,16 @@ struct RtSceneStats {
   std::uint64_t allocated_bytes = 0;
   std::uint64_t full_builds = 0;
   std::uint64_t refits = 0;
+  std::uint64_t tlas_full_builds = 0;
+  std::uint64_t tlas_updates = 0;
+  std::uint64_t upload_bytes = 0;
+  float emitter_distribution_ms = 0.0f;
+  std::uint64_t emitter_distribution_rebuilds = 0;
+  std::uint64_t descriptor_write_count = 0;
+  std::uint64_t descriptor_cache_hits = 0;
   RtAccelerationBuildReason last_build_reason =
+      RtAccelerationBuildReason::None;
+  RtAccelerationBuildReason last_tlas_reason =
       RtAccelerationBuildReason::None;
 };
 
@@ -106,7 +134,9 @@ public:
       std::span<const float> previous_packed_positions = {},
       const float *previous_bone_transforms_column_major = nullptr,
       std::size_t previous_bone_count = 0,
-      bool explicit_motion_history_valid = false);
+      bool explicit_motion_history_valid = false,
+      RtSceneGenerations generations = {},
+      bool generations_valid = false);
 
   // Record pending BLAS/TLAS build or refit into cmd (before path-trace /
   // ray-query draws). No-op when nothing is pending. Inserts barriers so
@@ -203,6 +233,10 @@ public:
   [[nodiscard]] bool motionHistoryValid() const noexcept {
     return motion_history_valid_;
   }
+  // The authoritative scene generations did not change for this rendered
+  // frame. Shaders should use current geometry with the previous camera, not
+  // replay the last object-motion sample stored in this frame slot.
+  void markMotionStable() noexcept { motion_history_valid_ = false; }
   [[nodiscard]] std::uint32_t emissiveTriangleCount() const noexcept {
     return emissive_triangle_count_;
   }
@@ -233,6 +267,17 @@ private:
     VkDeviceSize buffer_size = 0;
   };
 
+  struct BoneTransformCacheEntry {
+    std::array<float, 16> transform{
+        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    // Row-major inverse-transpose 3x3 (or the finite upper-3x3 fallback).
+    std::array<float, 9> normal_matrix{1, 0, 0, 0, 1, 0, 0, 0, 1};
+    std::array<float, 9> tangent_matrix{1, 0, 0, 0, 1, 0, 0, 0, 1};
+    float determinant_sign = 1.0f;
+    bool valid = false;
+    bool used_fallback = false;
+  };
+
   enum class PendingBuild : std::uint8_t {
     None = 0,
     TopLevel = 1,
@@ -254,6 +299,7 @@ private:
     bool pending_full_build = false;
     bool pending_refit = false;
     bool transform_history_valid = false;
+    bool opaque_geometry = false;
     std::array<float, 16> current_transform{
         1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     std::array<float, 16> previous_transform{
@@ -286,7 +332,7 @@ private:
       const float *previous_bone_transforms_column_major,
       std::size_t previous_bone_count, bool motion_history_valid);
   void recordBlasBuild(VkCommandBuffer cmd, GeometryState &state, bool update);
-  void recordTlasBuild(VkCommandBuffer cmd);
+  void recordTlasBuild(VkCommandBuffer cmd, bool update);
   void destroyGeometryStates();
 
   VkPhysicalDevice phys_ = VK_NULL_HANDLE;
@@ -297,7 +343,6 @@ private:
   bool initialized_ = false;
   bool procs_ok_ = false;
   bool geometry_prepared_ = false;
-  bool static_attribs_uploaded_ = false; // indices + UVs for current topology
   PendingBuild pending_ = PendingBuild::None;
 
   PFN_vkGetBufferDeviceAddressKHR vkGetBufferDeviceAddressKHR_ = nullptr;
@@ -330,6 +375,9 @@ private:
   Buffer scratch_{};
   Buffer instance_buffer_{};
   std::vector<GeometryState> geometry_states_;
+  std::vector<BoneTransformCacheEntry> bone_transform_cache_;
+  std::uint64_t bone_cache_generation_ = 0;
+  bool bone_cache_generation_valid_ = false;
   AccelerationStructure tlas_{};
   std::vector<float> scratch_positions_;
   std::vector<float> previous_positions_;
@@ -340,6 +388,11 @@ private:
   std::vector<std::uint32_t> scratch_indices_;
   std::vector<std::uint32_t> scratch_primitive_flags_;
   std::vector<std::array<std::uint32_t, 4>> scratch_primitive_metadata_;
+  std::vector<RtEmissiveTriangleGpu> emissive_records_cache_;
+  std::vector<double> emissive_weights_cache_;
+  std::uint32_t cached_emissive_count_ = 0;
+  bool cached_positive_emission_source_ = false;
+  bool emissive_distribution_valid_ = false;
   std::uint32_t last_vertex_count_ = 0;
   std::uint32_t last_index_count_ = 0;
   std::uint32_t emissive_triangle_count_ = 0;
@@ -347,9 +400,33 @@ private:
   VkDeviceSize tlas_build_scratch_ = 0;
   std::uint64_t full_build_count_ = 0;
   std::uint64_t refit_count_ = 0;
+  std::uint64_t tlas_full_build_count_ = 0;
+  std::uint64_t tlas_update_count_ = 0;
+  std::uint64_t upload_bytes_ = 0;
+  float emitter_distribution_ms_ = 0.0f;
+  std::uint64_t emitter_distribution_rebuild_count_ = 0;
+  mutable std::uint64_t descriptor_write_count_ = 0;
+  std::uint64_t descriptor_cache_hits_ = 0;
+  VkDeviceSize tlas_update_scratch_ = 0;
+  bool tlas_built_once_ = false;
+  bool tlas_requires_full_build_ = true;
+  RtSceneGenerations last_generations_{};
+  bool generations_valid_ = false;
+  std::uint64_t uploaded_topology_generation_ = 0;
+  std::uint64_t uploaded_positions_generation_ = 0;
+  std::uint64_t uploaded_transforms_generation_ = 0;
+  std::uint64_t uploaded_material_generation_ = 0;
+  std::uint64_t uploaded_emission_generation_ = 0;
+  bool uploaded_topology_valid_ = false;
+  bool uploaded_positions_valid_ = false;
+  bool uploaded_transforms_valid_ = false;
+  bool uploaded_material_valid_ = false;
+  bool uploaded_emission_valid_ = false;
   RtAccelerationBuildReason pending_build_reason_ =
       RtAccelerationBuildReason::None;
   RtAccelerationBuildReason last_build_reason_ =
+      RtAccelerationBuildReason::None;
+  RtAccelerationBuildReason last_tlas_reason_ =
       RtAccelerationBuildReason::None;
   std::string last_update_failure_reason_;
 };
