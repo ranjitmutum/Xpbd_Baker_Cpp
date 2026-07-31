@@ -2,6 +2,7 @@
 // Linked as xpbd_viewport_regression_tests (see CMakeLists.txt).
 
 #include "xpbd/gfx/ray_tracing.hpp"
+#include "xpbd/gfx/frame_generation_state.hpp"
 #include "xpbd/gfx/rtxpt_bridge.hpp"
 #include "xpbd/gfx/gpu_backend.hpp"
 #include "xpbd/gfx/labpbr_authoring.hpp"
@@ -2422,6 +2423,7 @@ void testCanonicalCubeAndRtSceneRecords() {
 void testRayTracingCapability() {
   using xpbd::gfx::evaluateRayTracingCapability;
   using xpbd::gfx::isNvidiaVendorId;
+  using xpbd::gfx::isNvidiaRtx20OrNewer;
   using xpbd::gfx::kVendorIdNvidia;
   using xpbd::gfx::RenderPath;
   using xpbd::gfx::resolveRenderPath;
@@ -2430,6 +2432,12 @@ void testRayTracingCapability() {
   expect(isNvidiaVendorId(kVendorIdNvidia), "NVIDIA vendor id match");
   expect(!isNvidiaVendorId(0x1002u), "AMD vendor is not NVIDIA");
   expect(!isNvidiaVendorId(0x8086u), "Intel vendor is not NVIDIA");
+  expect(isNvidiaRtx20OrNewer(0x1E04u, "NVIDIA GeForce RTX 2080"),
+         "RTX 20-series is eligible for path tracing");
+  expect(isNvidiaRtx20OrNewer(0x2684u, "NVIDIA GeForce RTX 4090"),
+         "RTX 40-series is eligible for path tracing");
+  expect(!isNvidiaRtx20OrNewer(0x2184u, "NVIDIA GeForce GTX 1660 Ti"),
+         "GTX 16-series is not eligible for path tracing");
 
   auto amd = evaluateRayTracingCapability(0x1002u, 1, "Radeon", true, true, 1);
   expect(!amd.supported, "AMD with RT exts still unsupported (NVIDIA-only)");
@@ -2449,6 +2457,14 @@ void testRayTracingCapability() {
   expect(nv_ok.supported, "NVIDIA with RT extensions+features supported");
   expect(nv_ok.is_nvidia, "flag is_nvidia");
   expect(nv_ok.max_ray_recursion_depth == 31u, "recursion depth stored");
+  auto nv_old_generation = evaluateRayTracingCapability(
+      kVendorIdNvidia, 0x2184u, "NVIDIA GeForce GTX 1660 Ti", true, true, 31,
+      0, 0);
+  expect(!nv_old_generation.supported,
+         "pre-RTX-20 NVIDIA hardware cannot enable path tracing");
+  expect(nv_old_generation.unsupported_reason.find("RTX 20-series") !=
+             std::string::npos,
+         "pre-RTX-20 reason names the minimum generation");
 
   expect(resolveRenderPath(false, nv_ok) == RenderPath::Raster,
          "default path is raster");
@@ -2466,6 +2482,60 @@ void testRayTracingCapability() {
          "clamp keeps preference when HW supported");
   expect(!clampRayTracingPreference(false, true),
          "clamp keeps default-off preference");
+}
+
+void testFrameGenerationStateLegality() {
+  using xpbd::gfx::frameGenerationRuntimeCombinationIsLegal;
+  using xpbd::gfx::FrameGenerationRuntimeState;
+  using xpbd::gfx::SwapchainOwnership;
+  constexpr SwapchainOwnership native = SwapchainOwnership::Native;
+  constexpr SwapchainOwnership proxy =
+      SwapchainOwnership::StreamlineFrameGenerationProxy;
+
+  expect(frameGenerationRuntimeCombinationIsLegal(
+             FrameGenerationRuntimeState::Unsupported, false, native, false,
+             false),
+         "DLSS-G unsupported state owns only a Native swapchain");
+  expect(!frameGenerationRuntimeCombinationIsLegal(
+             FrameGenerationRuntimeState::Unsupported, true, native, false,
+             false),
+         "DLSS-G unsupported state rejects a loaded plugin");
+  expect(frameGenerationRuntimeCombinationIsLegal(
+             FrameGenerationRuntimeState::EnablingCreateProxySwapchain, true,
+             native, false, false),
+         "DLSS-G enable creates proxy only after plugin load");
+  expect(!frameGenerationRuntimeCombinationIsLegal(
+             FrameGenerationRuntimeState::EnablingCreateProxySwapchain,
+             false, native, false, false),
+         "DLSS-G enable rejects proxy creation before plugin load");
+  expect(frameGenerationRuntimeCombinationIsLegal(
+             FrameGenerationRuntimeState::ProxyArmed, true, proxy, false,
+             false),
+         "DLSS-G proxy may arm before the first valid tagged frame");
+  expect(frameGenerationRuntimeCombinationIsLegal(
+             FrameGenerationRuntimeState::Active, true, proxy, true, true),
+         "DLSS-G Active requires proxy, options, and valid tags");
+  expect(!frameGenerationRuntimeCombinationIsLegal(
+             FrameGenerationRuntimeState::Active, true, native, true, true),
+         "DLSS-G Active rejects Native swapchain ownership");
+  expect(!frameGenerationRuntimeCombinationIsLegal(
+             FrameGenerationRuntimeState::Active, true, proxy, false, true),
+         "DLSS-G Active rejects disabled options");
+  expect(!frameGenerationRuntimeCombinationIsLegal(
+             FrameGenerationRuntimeState::Active, true, proxy, true, false),
+         "DLSS-G Active rejects null resource tags");
+  expect(frameGenerationRuntimeCombinationIsLegal(
+             FrameGenerationRuntimeState::DisablingOptions, false, native,
+             false, false),
+         "DLSS-G Native resize uses an idempotent disable transaction");
+  expect(frameGenerationRuntimeCombinationIsLegal(
+             FrameGenerationRuntimeState::DisablingDrain, true, proxy, false,
+             false),
+         "DLSS-G proxy drain begins only after options and tags are cleared");
+  expect(!frameGenerationRuntimeCombinationIsLegal(
+             FrameGenerationRuntimeState::DisablingDrain, true, proxy, true,
+             false),
+         "DLSS-G drain rejects enabled options");
 }
 
 void testRtAlphaSemantics() {
@@ -3053,6 +3123,7 @@ int main() {
   testViewportMeshEmptyGeometry();
   testCanonicalCubeAndRtSceneRecords();
   testRayTracingCapability();
+  testFrameGenerationStateLegality();
   testRtAlphaSemantics();
   testRtMotionProjection();
   testStaticMaterialClassification();

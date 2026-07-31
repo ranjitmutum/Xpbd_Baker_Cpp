@@ -1,6 +1,8 @@
 #include "xpbd/gfx/ray_tracing.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <cmath>
 #include <limits>
 
@@ -1407,6 +1409,40 @@ bool isNvidiaVendorId(std::uint32_t vendor_id) noexcept {
   return vendor_id == kVendorIdNvidia;
 }
 
+bool isNvidiaRtx20OrNewer(
+    std::uint32_t device_id, std::string_view device_name) noexcept {
+  (void)device_id;
+  std::string name(device_name);
+  std::transform(name.begin(), name.end(), name.begin(),
+                 [](unsigned char value) {
+                   return static_cast<char>(std::toupper(value));
+                 });
+  // Consumer and workstation names are stable across desktop/mobile SKUs.
+  // Explicitly require a generation marker so a generic "NVIDIA GPU" or a
+  // GTX 16/10/9 adapter cannot accidentally opt into the path tracer.
+  constexpr std::array<std::string_view, 8> kRtxMarkers{{
+      "RTX 20", "RTX20", "RTX 30", "RTX30",
+      "RTX 40", "RTX40", "RTX 50", "RTX50",
+  }};
+  for (const std::string_view marker : kRtxMarkers) {
+    if (name.find(marker) != std::string::npos) {
+      return true;
+    }
+  }
+  // NVIDIA professional/datacenter products use a non-numbered RTX/A/L/H/B
+  // naming scheme but are Turing-or-newer RT hardware.
+  constexpr std::array<std::string_view, 8> kProfessionalMarkers{{
+      "QUADRO RTX", "RTX A", "A10", "A16", "A40",
+      "A100", "L4", "L40",
+  }};
+  for (const std::string_view marker : kProfessionalMarkers) {
+    if (name.find(marker) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
 RayTracingCapability evaluateRayTracingCapability(
     std::uint32_t vendor_id, std::uint32_t device_id, std::string_view device_name,
     bool has_required_extensions, bool has_required_features,
@@ -1420,10 +1456,13 @@ RayTracingCapability evaluateRayTracingCapability(
   cap.driver_version = driver_version;
   cap.max_ray_recursion_depth = max_ray_recursion_depth;
   cap.is_nvidia = isNvidiaVendorId(vendor_id);
+  cap.is_rtx20_or_newer =
+      cap.is_nvidia && isNvidiaRtx20OrNewer(device_id, device_name);
   cap.has_required_extensions = has_required_extensions;
   cap.has_required_features = has_required_features;
   cap.supported =
-      cap.is_nvidia && cap.has_required_extensions && cap.has_required_features;
+      cap.is_rtx20_or_newer && cap.has_required_extensions &&
+      cap.has_required_features;
 
   if (cap.supported) {
     cap.unsupported_reason.clear();
@@ -1433,6 +1472,9 @@ RayTracingCapability evaluateRayTracingCapability(
   if (!cap.is_nvidia) {
     cap.unsupported_reason =
         "GPU is not NVIDIA (ray tracing option requires an NVIDIA GPU with RT cores)";
+  } else if (!cap.is_rtx20_or_newer) {
+    cap.unsupported_reason =
+        "Path tracing requires an NVIDIA RTX 20-series GPU or newer";
   } else if (!cap.has_required_extensions) {
     cap.unsupported_reason =
         "Vulkan ray-tracing extensions are missing (update GPU driver / Vulkan runtime)";

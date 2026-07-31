@@ -1,5 +1,6 @@
 #pragma once
 
+#include "xpbd/gfx/frame_generation_state.hpp"
 #include "xpbd/gfx/ray_tracing.hpp"
 
 #include <cstdint>
@@ -98,6 +99,31 @@ struct StreamlineFrameGenerationFrame {
   bool reset_history = false;
 };
 
+struct FrameGenerationDiagnostic {
+  FrameGenerationRuntimeState state =
+      FrameGenerationRuntimeState::Unsupported;
+  SwapchainOwnership ownership = SwapchainOwnership::Native;
+  bool supported = false;
+  bool requested = false;
+  bool plugin_loaded = false;
+  bool proxy_swapchain = false;
+  bool valid_inputs_tagged = false;
+  bool options_on = false;
+  bool state_ok = false;
+  bool failure_latched = false;
+  bool recovery_required = false;
+  bool present_thread_bound = false;
+  std::uint32_t frames_actually_presented = 1u;
+  std::uint64_t swapchain_generation = 0u;
+  std::uint64_t options_generation = 0u;
+  std::uint64_t tag_generation = 0u;
+  std::uint64_t present_thread_id = 0u;
+  std::uint32_t constants_frame_index = 0u;
+  std::uint32_t tag_frame_index = 0u;
+  std::uint32_t present_frame_index = 0u;
+  std::string status;
+};
+
 // Secure, optional Vulkan bridge around NVIDIA Streamline. The public header
 // deliberately contains no Streamline SDK types so an SDK-less build has the
 // same application ABI and always falls back to native Vulkan.
@@ -128,11 +154,38 @@ public:
   [[nodiscard]] bool
   dlssRayReconstructionSupported() const noexcept;
   [[nodiscard]] bool frameGenerationSupported() const noexcept;
-  // DLSS-G must be completely unhooked while the user-facing option is Off.
-  // Call only after draining Vulkan work and while no Vulkan API is running
-  // concurrently; changing this state requires a fresh swapchain.
-  [[nodiscard]] bool
-  setFrameGenerationFeatureLoaded(bool loaded) noexcept;
+  // UI and other producers only publish a request. Vulkan render/Present
+  // consumes it on its own thread.
+  void requestFrameGeneration(bool enabled) noexcept;
+  [[nodiscard]] bool frameGenerationRequested() const noexcept;
+  [[nodiscard]] bool frameGenerationActivationAllowed() const noexcept;
+  [[nodiscard]] bool frameGenerationRecoveryRequired() const noexcept;
+  [[nodiscard]] FrameGenerationDiagnostic
+  frameGenerationDiagnostic() const;
+  [[nodiscard]] SwapchainOwnership swapchainOwnership() const noexcept;
+  [[nodiscard]] bool bindFrameGenerationPresentThread() noexcept;
+  // Enter the terminal lifecycle before the backend drains or destroys any
+  // presentation object.  This disables Options and nulls all FG tags on the
+  // Present thread while preserving the explicit ShuttingDown state.
+  void beginFrameGenerationShutdown(std::uint64_t frame_index) noexcept;
+  [[nodiscard]] bool unloadFrameGenerationForShutdown() noexcept;
+  [[nodiscard]] bool beginFrameGenerationSwapchainTransition(
+      SwapchainOwnership target, std::uint64_t frame_index,
+      const char *reason) noexcept;
+  [[nodiscard]] bool configureFrameGenerationFeature(
+      SwapchainOwnership target, std::uint64_t frame_index,
+      const char *reason) noexcept;
+  void completeFrameGenerationSwapchainTransition(
+      SwapchainOwnership ownership, bool resources_ready,
+      std::uint64_t frame_index, const char *reason) noexcept;
+  void notifyFrameGenerationSwapchainDestroyed(
+      std::uint64_t frame_index, const char *reason) noexcept;
+  void requestFrameGenerationNativeRecovery(
+      const char *reason, bool latch_failure) noexcept;
+  [[nodiscard]] FrameGenerationTransitionResult
+  classifyFrameGenerationVkResult(VkResult result,
+                                  const char *stage) noexcept;
+  [[nodiscard]] VkResult consumeFrameGenerationApiError() noexcept;
   [[nodiscard]] bool reflexSupported() const noexcept;
   [[nodiscard]] bool pclSupported() const noexcept;
   [[nodiscard]] bool frameGenerationActive() const noexcept;
@@ -178,11 +231,11 @@ public:
                                   std::uint32_t viewport_y,
                                   std::uint32_t viewport_width,
                                   std::uint32_t viewport_height) noexcept;
-  // NVIDIA requires disabling FG before swapchain/window manipulation.
-  void disableFrameGeneration() noexcept;
   // Query after each intercepted present; numFramesActuallyPresented then
   // represents this application's most recent present interval.
-  void updateFrameGenerationStateAfterPresent() noexcept;
+  [[nodiscard]] FrameGenerationTransitionResult
+  updateFrameGenerationStateAfterPresent(
+      VkResult present_result = VK_SUCCESS) noexcept;
 
   [[nodiscard]] VkResult createInstance(
       const VkInstanceCreateInfo *create_info,
@@ -202,7 +255,8 @@ public:
 
   [[nodiscard]] VkResult createSwapchain(
       VkDevice device, const VkSwapchainCreateInfoKHR *create_info,
-      const VkAllocationCallbacks *allocator, VkSwapchainKHR *swapchain);
+      const VkAllocationCallbacks *allocator, VkSwapchainKHR *swapchain,
+      SwapchainOwnership *ownership = nullptr);
   void destroySwapchain(VkDevice device, VkSwapchainKHR swapchain,
                         const VkAllocationCallbacks *allocator);
   [[nodiscard]] VkResult getSwapchainImages(VkDevice device,
@@ -220,6 +274,12 @@ public:
   [[nodiscard]] VkResult deviceWaitIdle(VkDevice device);
 
 private:
+  // Raw plugin/options mutations are implementation details of the
+  // Present-thread transaction and shutdown path; callers can only request a
+  // lifecycle transition through the public state-machine methods above.
+  [[nodiscard]] bool
+  setFrameGenerationFeatureLoaded(bool loaded) noexcept;
+  void disableFrameGeneration() noexcept;
   std::unique_ptr<Impl> impl_;
 };
 

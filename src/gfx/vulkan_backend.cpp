@@ -40,6 +40,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -673,6 +674,13 @@ public:
     if (!createFramebuffers()) {
       return false;
     }
+    streamline_vulkan_runtime_.completeFrameGenerationSwapchainTransition(
+        streamline_vulkan_runtime_.swapchainOwnership(),
+        streamline_vulkan_runtime_.swapchainOwnership() ==
+                SwapchainOwnership::StreamlineFrameGenerationProxy &&
+            fg_swapchain_resources_ready_,
+        static_cast<std::uint64_t>(frame_index_),
+        "initial native swapchain");
     if (!createDescriptors()) {
       return false;
     }
@@ -726,8 +734,10 @@ public:
     if (device_) {
       // Turn interpolation off before draining or destroying any presentation
       // object. The feature itself is unloaded after the swapchain is gone.
-      streamline_vulkan_runtime_.disableFrameGeneration();
-      fg_swapchain_enabled_ = false;
+      streamline_vulkan_runtime_.beginFrameGenerationShutdown(
+          static_cast<std::uint64_t>(frame_index_));
+      swapchain_recreate_target_ = SwapchainOwnership::Native;
+      fg_force_native_recovery_ = true;
       const FrameSync &sync = frames_[frame_index_];
       const auto idle_start = Clock::now();
       logDiagnosticApi("vkDeviceWaitIdle.shutdown", "before", std::nullopt,
@@ -748,7 +758,11 @@ public:
       }
     }
     destroySwapchainObjects();
-    (void)streamline_vulkan_runtime_.setFrameGenerationFeatureLoaded(false);
+    if (!streamline_vulkan_runtime_.unloadFrameGenerationForShutdown()) {
+      xpbd::log::warn(
+          "DLSS Frame Generation plugin did not unload cleanly during "
+          "shutdown");
+    }
     if (font_view_) {
       vkDestroyImageView(device_, font_view_, nullptr);
     }
@@ -874,10 +888,12 @@ public:
   }
 
   void resize(int, int) override {
-    streamline_vulkan_runtime_.disableFrameGeneration();
-    fg_swapchain_enabled_ = false;
+    // A resize is a mandatory Native transition.  Keep the user's FG request
+    // intact so the next stable frame can opt back in through a fresh proxy
+    // swapchain.
     recreate_swapchain_ = true;
-    fg_recreate_target_enabled_ = false;
+    swapchain_recreate_target_ = SwapchainOwnership::Native;
+    fg_force_native_recovery_ = true;
     // A window minimize/restore or framebuffer resize can skip presentation
     // frames entirely, so invalidate temporal reconstruction at the event
     // boundary rather than waiting for a drawable viewport.
@@ -1157,6 +1173,10 @@ public:
     const bool requested_frame_generation =
         normalized_frame_settings.requested_frame_generation ==
         PathTraceFrameGeneration::On;
+    // Keep the runtime's atomic request authoritative even when a caller
+    // reaches the backend without the normal latency-frame prelude.
+    streamline_vulkan_runtime_.requestFrameGeneration(
+        requested_frame_generation);
     const bool want_rt =
         frame.prefer_ray_tracing && !presentation_suspended_;
     active_render_path_ = resolveRenderPath(want_rt, rt_capability_);
@@ -1164,9 +1184,19 @@ public:
         frameGenerationPlatformSupported();
     const bool frame_generation_available =
         frameGenerationSwapchainReady();
+    const FrameGenerationDiagnostic fg_diagnostic =
+        streamline_vulkan_runtime_.frameGenerationDiagnostic();
+    // Capability and current proxy readiness are deliberately separate.  A
+    // requested FG transition must be allowed to create the proxy resources;
+    // requiring resources here would make activation impossible from a native
+    // swapchain.  The next transaction still enforces Vulkan Immediate mode,
+    // shared queues, transfer-source usage, and guide-image allocation.
     const bool desired_frame_generation =
-        requested_frame_generation && frame_generation_available &&
-        active_render_path_ == RenderPath::RayTracing;
+        requested_frame_generation && frame_generation_supported &&
+        !vsync_ && !fg_force_native_recovery_ &&
+        !fg_diagnostic.recovery_required &&
+        active_render_path_ == RenderPath::RayTracing &&
+        streamline_vulkan_runtime_.frameGenerationActivationAllowed();
     stats_.dlss_frame_generation_supported =
         frame_generation_supported;
     stats_.dlss_frame_generation_requested =
@@ -1178,16 +1208,22 @@ public:
     stats_.dlss_frames_actually_presented =
         streamline_vulkan_runtime_.framesActuallyPresented();
 
+    const SwapchainOwnership desired_ownership =
+        desired_frame_generation
+            ? SwapchainOwnership::StreamlineFrameGenerationProxy
+            : SwapchainOwnership::Native;
     // Streamline requires a fresh swapchain for every FG on/off transition.
+    // Recovery/resize/dialog gates force one Native transaction first.
     if (!recreate_swapchain_ &&
-        desired_frame_generation != fg_swapchain_enabled_) {
-      streamline_vulkan_runtime_.disableFrameGeneration();
-      fg_recreate_target_enabled_ = desired_frame_generation;
-      fg_swapchain_enabled_ = false;
+        streamline_vulkan_runtime_.swapchainOwnership() !=
+            desired_ownership) {
+      swapchain_recreate_target_ = desired_ownership;
       recreate_swapchain_ = true;
     }
     if (recreate_swapchain_ || !swapchain_) {
-      fg_recreate_target_enabled_ = desired_frame_generation;
+      swapchain_recreate_target_ =
+          fg_force_native_recovery_ ? SwapchainOwnership::Native
+                                    : desired_ownership;
     }
 
     // Path selection: honor user RT preference only when NVIDIA RT is armed.
@@ -1873,16 +1909,40 @@ public:
         fs.fence, VK_NULL_HANDLE, fs.cmd, acquire_timed_out, false);
     if (acq == VK_ERROR_OUT_OF_DATE_KHR) {
       recreate_swapchain_ = true;
+      if (streamline_vulkan_runtime_.swapchainOwnership() ==
+          SwapchainOwnership::StreamlineFrameGenerationProxy) {
+        fg_force_native_recovery_ = true;
+        swapchain_recreate_target_ = SwapchainOwnership::Native;
+      }
       return;
     }
     if (acq == VK_SUBOPTIMAL_KHR) {
-
-
       recreate_swapchain_ = true;
+      if (streamline_vulkan_runtime_.swapchainOwnership() ==
+          SwapchainOwnership::StreamlineFrameGenerationProxy) {
+        fg_force_native_recovery_ = true;
+        swapchain_recreate_target_ = SwapchainOwnership::Native;
+      }
     } else if (acq != VK_SUCCESS) {
-      SDL_Log("Vulkan acquire failed: %d", static_cast<int>(acq));
-      fatal_error_ = true;
-      return;
+      if (streamline_vulkan_runtime_.swapchainOwnership() ==
+          SwapchainOwnership::StreamlineFrameGenerationProxy) {
+        const FrameGenerationTransitionResult transition =
+            streamline_vulkan_runtime_.classifyFrameGenerationVkResult(
+                acq, "Acquire");
+        if (transition == FrameGenerationTransitionResult::FatalDeviceLost) {
+          fatal_error_ = true;
+        } else {
+          fg_force_native_recovery_ = true;
+          swapchain_recreate_target_ = SwapchainOwnership::Native;
+          recreate_swapchain_ = true;
+        }
+      } else {
+        SDL_Log("Vulkan acquire failed: %d", static_cast<int>(acq));
+        fatal_error_ = true;
+      }
+      if (fatal_error_ || recreate_swapchain_) {
+        return;
+      }
     }
     if (image_index >= framebuffers_.size() ||
         image_index >= swap_image_resources_.size()) {
@@ -2849,7 +2909,9 @@ public:
     }
 
     const bool fg_frame_candidate =
-        fg_swapchain_enabled_ && frame_generation_available &&
+        streamline_vulkan_runtime_.swapchainOwnership() ==
+            SwapchainOwnership::StreamlineFrameGenerationProxy &&
+        frame_generation_available &&
         path_trace_active && draw_viewport &&
         image_index < swap_images_.size() &&
         image_resource.fg_hudless.image != VK_NULL_HANDLE &&
@@ -3354,7 +3416,8 @@ public:
             fg_frame.viewport_y, fg_frame.viewport_width,
             fg_frame.viewport_height);
       }
-    } else if (fg_swapchain_enabled_) {
+    } else if (streamline_vulkan_runtime_.swapchainOwnership() ==
+               SwapchainOwnership::StreamlineFrameGenerationProxy) {
       // NVIDIA's checklist requires explicit null tags whenever loading,
       // raster fallback, or a collapsed preview makes depth/motion invalid.
       streamline_vulkan_runtime_.clearFrameGenerationInputs(
@@ -3438,6 +3501,15 @@ public:
       present_fence_info.pFences = &image_resource.present_fence;
       pi.pNext = &present_fence_info;
     }
+#ifndef NDEBUG
+    if (streamline_vulkan_runtime_.swapchainOwnership() ==
+        SwapchainOwnership::StreamlineFrameGenerationProxy) {
+      assert(pi.pNext == nullptr &&
+             "DLSS-G proxy Present must not carry a maintenance1 fence");
+      assert(image_resource.present_fence == VK_NULL_HANDLE &&
+             "DLSS-G proxy images must not own application present fences");
+    }
+#endif
     const auto present_start = Clock::now();
     logDiagnosticApi("vkQueuePresentKHR", "before", std::nullopt, 0.0,
                      image_index, fs.fence, image_resource.last_in_flight,
@@ -3446,11 +3518,23 @@ public:
     VkResult pr =
         streamline_vulkan_runtime_.queuePresent(present_queue_, &pi);
     streamline_vulkan_runtime_.markPresentEnd();
-    streamline_vulkan_runtime_.updateFrameGenerationStateAfterPresent();
+    const FrameGenerationTransitionResult fg_present_transition =
+        streamline_vulkan_runtime_.updateFrameGenerationStateAfterPresent(pr);
     stats_.dlss_frame_generation_active =
         streamline_vulkan_runtime_.frameGenerationActive();
     stats_.dlss_frames_actually_presented =
         streamline_vulkan_runtime_.framesActuallyPresented();
+    if (fg_present_transition == FrameGenerationTransitionResult::RecoverNative) {
+      const FrameGenerationDiagnostic diagnostic =
+          streamline_vulkan_runtime_.frameGenerationDiagnostic();
+      fg_force_native_recovery_ = true;
+      fg_recovery_reason_ = diagnostic.status;
+      swapchain_recreate_target_ = SwapchainOwnership::Native;
+      recreate_swapchain_ = true;
+    } else if (fg_present_transition ==
+               FrameGenerationTransitionResult::FatalDeviceLost) {
+      fatal_error_ = true;
+    }
     if (presentFenceLifecycleEnabled()) {
       image_resource.present_pending =
           pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR ||
@@ -3468,8 +3552,22 @@ public:
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
       recreate_swapchain_ = true;
     } else if (pr != VK_SUCCESS) {
-      SDL_Log("Vulkan present failed: %d", static_cast<int>(pr));
-      fatal_error_ = true;
+      if (streamline_vulkan_runtime_.swapchainOwnership() ==
+          SwapchainOwnership::StreamlineFrameGenerationProxy) {
+        // The runtime has already classified the intercepted proxy result;
+        // non-device-lost errors recover through a Native transaction.
+        if (fg_present_transition ==
+            FrameGenerationTransitionResult::FatalDeviceLost) {
+          fatal_error_ = true;
+        } else {
+          fg_force_native_recovery_ = true;
+          swapchain_recreate_target_ = SwapchainOwnership::Native;
+          recreate_swapchain_ = true;
+        }
+      } else {
+        SDL_Log("Vulkan present failed: %d", static_cast<int>(pr));
+        fatal_error_ = true;
+      }
     }
 
     frame_index_ = (frame_index_ + 1) % frames_.size();
@@ -3488,10 +3586,9 @@ public:
       return;
     }
     vsync_ = enabled;
-    streamline_vulkan_runtime_.disableFrameGeneration();
-    fg_swapchain_enabled_ = false;
     recreate_swapchain_ = true;
-    fg_recreate_target_enabled_ = false;
+    swapchain_recreate_target_ = SwapchainOwnership::Native;
+    fg_force_native_recovery_ = true;
   }
   bool vsyncEnabled() const override { return vsync_; }
   BackendKind kind() const override { return BackendKind::Vulkan; }
@@ -3516,12 +3613,25 @@ public:
     post_process_status_cache_ = streamline_vulkan_runtime_.status();
     const std::string fg_status =
         streamline_vulkan_runtime_.frameGenerationStatus();
+    const FrameGenerationDiagnostic fg_diagnostic =
+        streamline_vulkan_runtime_.frameGenerationDiagnostic();
     if (!fg_status.empty()) {
       if (!post_process_status_cache_.empty()) {
         post_process_status_cache_ += " | ";
       }
       post_process_status_cache_ += fg_status;
     }
+    post_process_status_cache_ +=
+        " | FG Requested=" +
+        std::string(fg_diagnostic.requested ? "On" : "Off") +
+        " Active=" + (fg_diagnostic.state ==
+                               FrameGenerationRuntimeState::Active
+                           ? "On"
+                           : "Off") +
+        " Swapchain=" +
+        swapchainOwnershipName(fg_diagnostic.ownership) +
+        " Frames=" +
+        std::to_string(fg_diagnostic.frames_actually_presented);
     if (streamline_vulkan_runtime_.frameGenerationSupported() &&
         !fg_swapchain_color_format_supported_) {
       post_process_status_cache_ +=
@@ -3530,6 +3640,12 @@ public:
                graphics_family_ != present_family_) {
       post_process_status_cache_ +=
           " | DLSS Frame Generation requires a shared graphics/present queue";
+    } else if (streamline_vulkan_runtime_.frameGenerationSupported() &&
+               !vsync_ &&
+               swap_present_mode_ != VK_PRESENT_MODE_IMMEDIATE_KHR) {
+      post_process_status_cache_ +=
+          " | DLSS Frame Generation requires "
+          "VK_PRESENT_MODE_IMMEDIATE_KHR";
     } else if (streamline_vulkan_runtime_.frameGenerationSupported() &&
                !fg_swapchain_transfer_src_supported_) {
       post_process_status_cache_ +=
@@ -3551,9 +3667,18 @@ public:
   RenderPath activeRenderPath() const override { return active_render_path_; }
 
   void prepareForSystemDialog() override {
+    swapchain_recreate_target_ = SwapchainOwnership::Native;
+    fg_force_native_recovery_ = true;
+    recreate_swapchain_ = true;
+    // If a proxy is currently armed, complete the Native transition while
+    // the window is still drawable.  If the shell has already hidden it,
+    // resumeAfterSystemDialog() retries the same transaction.
+    if (device_ && swapchain_ &&
+        streamline_vulkan_runtime_.swapchainOwnership() ==
+            SwapchainOwnership::StreamlineFrameGenerationProxy) {
+      (void)recreateSwapchain();
+    }
     presentation_suspended_ = true;
-    streamline_vulkan_runtime_.disableFrameGeneration();
-    fg_swapchain_enabled_ = false;
     streamline_temporal_history_valid_ = false;
     if (device_) {
       // Drain all queues so the modal shell dialog cannot race RT builds.
@@ -3564,7 +3689,8 @@ public:
     presentation_suspended_ = false;
     // Dialog may have resized/minimized the window or stolen the GPU.
     recreate_swapchain_ = true;
-    fg_recreate_target_enabled_ = false;
+    swapchain_recreate_target_ = SwapchainOwnership::Native;
+    fg_force_native_recovery_ = true;
     rt_scene_built_.fill(false);
     last_rt_scene_hash_.fill(0);
     streamline_temporal_history_valid_ = false;
@@ -3580,7 +3706,8 @@ private:
     // image; it does not signal an application-provided maintenance1 Present
     // fence. Native swapchains retain the stronger fence lifecycle.
     return swapchain_maintenance1_enabled_ &&
-           !fg_swapchain_proxy_active_;
+           streamline_vulkan_runtime_.swapchainOwnership() ==
+               SwapchainOwnership::Native;
   }
 
   [[nodiscard]] bool
@@ -3595,6 +3722,8 @@ private:
   frameGenerationSwapchainReady() const noexcept {
     return frameGenerationPlatformSupported() && !vsync_ &&
            swap_present_mode_ == VK_PRESENT_MODE_IMMEDIATE_KHR &&
+           streamline_vulkan_runtime_.swapchainOwnership() ==
+               SwapchainOwnership::StreamlineFrameGenerationProxy &&
            fg_swapchain_resources_ready_;
   }
 
@@ -3733,9 +3862,13 @@ private:
   bool fg_swapchain_transfer_src_supported_ = false;
   bool fg_swapchain_color_format_supported_ = false;
   bool fg_swapchain_resources_ready_ = false;
-  bool fg_swapchain_enabled_ = false;
-  bool fg_swapchain_proxy_active_ = false;
-  bool fg_recreate_target_enabled_ = false;
+  // The Streamline runtime owns the current swapchain mode.  The backend
+  // stores only the target for the next atomic destroy -> feature transition
+  // -> create transaction and a one-shot Native recovery gate.
+  SwapchainOwnership swapchain_recreate_target_ =
+      SwapchainOwnership::Native;
+  bool fg_force_native_recovery_ = false;
+  std::string fg_recovery_reason_;
   Clock::time_point next_swapchain_recreate_attempt_{};
   bool fatal_error_ = false;
   bool surface_maintenance1_khr_enabled_ = false;
@@ -7391,7 +7524,7 @@ private:
 
   bool createSwapchain(
       VkSwapchainKHR old_swapchain = VK_NULL_HANDLE,
-      bool frame_generation_proxy_active = false) {
+      SwapchainOwnership target_ownership = SwapchainOwnership::Native) {
     SwapchainSupport support;
     if (!querySupport(phys_, support)) {
       writeLog("Vulkan swapchain surface has no usable formats/present modes");
@@ -7454,6 +7587,13 @@ private:
       }
     }
     swap_present_mode_ = mode;
+    if (target_ownership == SwapchainOwnership::StreamlineFrameGenerationProxy &&
+        mode != VK_PRESENT_MODE_IMMEDIATE_KHR) {
+      xpbd::log::warn(
+          "DLSS Frame Generation requires VK_PRESENT_MODE_IMMEDIATE_KHR; "
+          "keeping FG disabled");
+      return false;
+    }
     if (support.caps.currentExtent.width != UINT32_MAX) {
       swap_extent_ = support.caps.currentExtent;
     } else {
@@ -7475,8 +7615,17 @@ private:
     fg_swapchain_transfer_src_supported_ =
         (support.caps.supportedUsageFlags &
          VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
+    if (target_ownership == SwapchainOwnership::StreamlineFrameGenerationProxy &&
+        (!fg_swapchain_transfer_src_supported_ ||
+         !fg_swapchain_color_format_supported_ ||
+         graphics_family_ != present_family_)) {
+      xpbd::log::warn(
+          "DLSS Frame Generation proxy requirements are unavailable for the "
+          "selected swapchain format/queue; keeping FG disabled");
+      return false;
+    }
     fg_swapchain_resources_ready_ = false;
-    bool allocate_fg_resources = frameGenerationPlatformSupported();
+    bool allocate_fg_resources = false;
 
 
     uint32_t images = support.caps.minImageCount;
@@ -7523,17 +7672,27 @@ private:
     ci.clipped = VK_TRUE;
     ci.oldSwapchain = old_swapchain;
     VkSwapchainKHR new_swapchain = VK_NULL_HANDLE;
+    SwapchainOwnership actual_ownership = SwapchainOwnership::Native;
     const VkResult create_swapchain =
         streamline_vulkan_runtime_.createSwapchain(
-            device_, &ci, nullptr, &new_swapchain);
+            device_, &ci, nullptr, &new_swapchain, &actual_ownership);
     if (create_swapchain != VK_SUCCESS) {
       SDL_Log("Vulkan swapchain creation failed: %d",
               static_cast<int>(create_swapchain));
       return false;
     }
     swapchain_ = new_swapchain;
-    fg_swapchain_proxy_active_ = frame_generation_proxy_active;
-    if (fg_swapchain_proxy_active_ && swapchain_maintenance1_enabled_) {
+    if (target_ownership == SwapchainOwnership::StreamlineFrameGenerationProxy &&
+        actual_ownership !=
+            SwapchainOwnership::StreamlineFrameGenerationProxy) {
+      xpbd::log::warn(
+          "DLSS Frame Generation proxy was not armed; keeping a Native "
+          "swapchain");
+    }
+    allocate_fg_resources =
+        actual_ownership == SwapchainOwnership::StreamlineFrameGenerationProxy;
+    if (actual_ownership == SwapchainOwnership::StreamlineFrameGenerationProxy &&
+        swapchain_maintenance1_enabled_) {
       xpbd::log::info(
           "Vulkan present-fence lifecycle disabled for the asynchronous "
           "DLSS-G swapchain proxy");
@@ -7806,25 +7965,32 @@ private:
   }
 
   void destroySwapchainObjects() {
+    if (swapchain_ != VK_NULL_HANDLE ||
+        streamline_vulkan_runtime_.swapchainOwnership() ==
+            SwapchainOwnership::StreamlineFrameGenerationProxy) {
+      streamline_vulkan_runtime_.notifyFrameGenerationSwapchainDestroyed(
+          static_cast<std::uint64_t>(frame_index_),
+          "swapchain destroyed");
+    }
     destroySwapchainImageObjects();
     if (swapchain_) {
       streamline_vulkan_runtime_.destroySwapchain(
           device_, swapchain_, nullptr);
       swapchain_ = VK_NULL_HANDLE;
     }
-    fg_swapchain_proxy_active_ = false;
+    swapchain_recreate_target_ = SwapchainOwnership::Native;
   }
 
   bool recreateSwapchain() {
     if (!window_) {
       return false;
     }
-    const bool target_fg_enabled = fg_recreate_target_enabled_;
-    // NVIDIA requires DLSS-G to be off before any swapchain/window
-    // manipulation. The presenting-queue mode also guarantees all tagged
-    // resources are no longer in use after the device-idle wait below.
-    streamline_vulkan_runtime_.disableFrameGeneration();
-    fg_swapchain_enabled_ = false;
+    SwapchainOwnership target_ownership = swapchain_recreate_target_;
+    if (target_ownership == SwapchainOwnership::StreamlineFrameGenerationProxy &&
+        (!streamline_vulkan_runtime_.frameGenerationActivationAllowed() ||
+         !frameGenerationPlatformSupported() || vsync_)) {
+      target_ownership = SwapchainOwnership::Native;
+    }
     const SDL_WindowFlags window_flags = SDL_GetWindowFlags(window_);
     if ((window_flags & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN)) != 0) {
       return false;
@@ -7855,6 +8021,22 @@ private:
       return false;
     }
 
+    // Do not mutate Streamline's lifecycle while the window has no drawable
+    // surface.  A minimized/hidden retry must leave the current swapchain and
+    // its FG state intact until a real transaction can drain and rebuild it.
+    const std::uint64_t transition_frame =
+        static_cast<std::uint64_t>(frame_index_);
+    const char *transition_reason =
+        fg_recovery_reason_.empty()
+            ? "swapchain recreate"
+            : fg_recovery_reason_.c_str();
+    if (!streamline_vulkan_runtime_.beginFrameGenerationSwapchainTransition(
+            target_ownership, transition_frame, transition_reason)) {
+      fg_force_native_recovery_ = true;
+      swapchain_recreate_target_ = SwapchainOwnership::Native;
+      return false;
+    }
+
     const FrameSync &sync = frames_[frame_index_];
     const auto idle_start = Clock::now();
     logDiagnosticApi("vkDeviceWaitIdle.swapchain_recreate", "before",
@@ -7873,6 +8055,8 @@ private:
       fatal_error_ = true;
       return false;
     }
+    // Proxy presents do not expose an application maintenance1 fence. Native
+    // fences are still drained before their swapchain is destroyed.
     if (!waitForPendingPresentFences("swapchain_recreate")) {
       fatal_error_ = true;
       return false;
@@ -7881,37 +8065,93 @@ private:
     VkSwapchainKHR old_swapchain = swapchain_;
     swapchain_ = VK_NULL_HANDLE;
     destroySwapchainImageObjects();
+    streamline_vulkan_runtime_.notifyFrameGenerationSwapchainDestroyed(
+        transition_frame, "old swapchain destroyed");
     if (old_swapchain) {
       streamline_vulkan_runtime_.destroySwapchain(
           device_, old_swapchain, nullptr);
     }
-    fg_swapchain_proxy_active_ = false;
 
     // NVIDIA's documented transition is strict: destroy the old swapchain,
     // load/unload the DLSS-G feature, then create a new swapchain. Passing a
     // swapchain created under the opposite hook state as oldSwapchain is not
     // valid and can deadlock the first intercepted Present.
-    bool effective_fg_target = target_fg_enabled;
-    if (!streamline_vulkan_runtime_.setFrameGenerationFeatureLoaded(
-            effective_fg_target)) {
-      if (!effective_fg_target ||
-          !streamline_vulkan_runtime_.setFrameGenerationFeatureLoaded(false)) {
+    bool effective_proxy_target =
+        target_ownership == SwapchainOwnership::StreamlineFrameGenerationProxy;
+    if (!streamline_vulkan_runtime_.configureFrameGenerationFeature(
+            effective_proxy_target
+                ? SwapchainOwnership::StreamlineFrameGenerationProxy
+                : SwapchainOwnership::Native,
+            transition_frame, transition_reason)) {
+      if (effective_proxy_target) {
+        effective_proxy_target = false;
+        target_ownership = SwapchainOwnership::Native;
+        fg_force_native_recovery_ = true;
+        fg_recovery_reason_ =
+            "DLSS Frame Generation plugin load failed; using Native";
+        xpbd::log::warn(fg_recovery_reason_);
+        if (!streamline_vulkan_runtime_.configureFrameGenerationFeature(
+                SwapchainOwnership::Native, transition_frame,
+                fg_recovery_reason_.c_str())) {
+          xpbd::log::error(
+              "DLSS Frame Generation could not reach a safe Native state");
+          fatal_error_ = true;
+          return false;
+        }
+      } else {
         xpbd::log::error(
-            "DLSS Frame Generation plugin could not reach a safe unloaded "
-            "state before swapchain creation");
+            "DLSS Frame Generation could not reach a safe Native state");
         fatal_error_ = true;
         return false;
       }
-      effective_fg_target = false;
-      xpbd::log::warn(
-          "DLSS Frame Generation plugin load failed; recreated a native "
-          "swapchain with FG disabled");
     }
 
-    const bool created =
-        createSwapchain(VK_NULL_HANDLE, effective_fg_target);
+    SwapchainOwnership actual_ownership = SwapchainOwnership::Native;
+    bool created = createSwapchain(
+        VK_NULL_HANDLE,
+        effective_proxy_target
+            ? SwapchainOwnership::StreamlineFrameGenerationProxy
+            : SwapchainOwnership::Native);
     if (!created) {
-      return false;
+      if (!effective_proxy_target) {
+        return false;
+      }
+      // A proxy creation failure must not take down SR/RR/native rendering.
+      // Tear down any partial objects, unload DLSS-G, and retry once as
+      // Native in the same transaction.
+      destroySwapchainObjects();
+      effective_proxy_target = false;
+      target_ownership = SwapchainOwnership::Native;
+      fg_force_native_recovery_ = true;
+      fg_recovery_reason_ =
+          "DLSS Frame Generation proxy creation failed; using Native";
+      if (!streamline_vulkan_runtime_.configureFrameGenerationFeature(
+              SwapchainOwnership::Native, transition_frame,
+              fg_recovery_reason_.c_str()) ||
+          !createSwapchain(VK_NULL_HANDLE, SwapchainOwnership::Native)) {
+        return false;
+      }
+    }
+    actual_ownership = streamline_vulkan_runtime_.swapchainOwnership();
+    if (actual_ownership ==
+            SwapchainOwnership::StreamlineFrameGenerationProxy &&
+        !fg_swapchain_resources_ready_) {
+      xpbd::log::warn(
+          "DLSS Frame Generation guide resources unavailable; retrying "
+          "Native swapchain");
+      destroySwapchainObjects();
+      effective_proxy_target = false;
+      target_ownership = SwapchainOwnership::Native;
+      fg_force_native_recovery_ = true;
+      fg_recovery_reason_ =
+          "DLSS Frame Generation guide resources unavailable; using Native";
+      if (!streamline_vulkan_runtime_.configureFrameGenerationFeature(
+              SwapchainOwnership::Native, transition_frame,
+              fg_recovery_reason_.c_str()) ||
+          !createSwapchain(VK_NULL_HANDLE, SwapchainOwnership::Native)) {
+        return false;
+      }
+      actual_ownership = streamline_vulkan_runtime_.swapchainOwnership();
     }
     const bool rebuild_graphics =
         !render_pass_ || render_pass_format_ != swap_format_ ||
@@ -7981,12 +8221,16 @@ private:
       destroySwapchainObjects();
       return false;
     }
-    fg_swapchain_enabled_ =
-        effective_fg_target && fg_swapchain_resources_ready_;
-    if (effective_fg_target && !fg_swapchain_enabled_) {
-      xpbd::log::warn(
-          "DLSS Frame Generation requested but swapchain guide resources are "
-          "unavailable; keeping FG disabled");
+    actual_ownership = streamline_vulkan_runtime_.swapchainOwnership();
+    streamline_vulkan_runtime_.completeFrameGenerationSwapchainTransition(
+        actual_ownership,
+        actual_ownership == SwapchainOwnership::StreamlineFrameGenerationProxy &&
+        fg_swapchain_resources_ready_,
+        transition_frame, transition_reason);
+    if (actual_ownership == SwapchainOwnership::Native) {
+      // A forced recovery is consumed only after a complete Native rebuild.
+      fg_force_native_recovery_ = false;
+      fg_recovery_reason_.clear();
     }
     return true;
   }

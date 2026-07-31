@@ -589,6 +589,10 @@ evaluateRtMotionProjection(const RtMotionProjectionInput &input) noexcept;
 // rasterization with ray-query shadows remains the initialization fallback.
 struct RayTracingCapability {
   bool is_nvidia = false;
+  // True only for NVIDIA RTX 20-series (Turing) and newer generations.
+  // Older NVIDIA adapters must not expose the path-tracing renderer even if a
+  // driver advertises a partial Vulkan RT extension set.
+  bool is_rtx20_or_newer = false;
   bool has_required_extensions = false;
   bool has_required_features = false;
   // True only when the GPU is NVIDIA and exposes usable RT extensions+features.
@@ -608,6 +612,8 @@ struct RayTracingCapability {
 
 // Pure helpers (unit-tested). Inputs describe a probed physical device.
 [[nodiscard]] bool isNvidiaVendorId(std::uint32_t vendor_id) noexcept;
+[[nodiscard]] bool isNvidiaRtx20OrNewer(
+    std::uint32_t device_id, std::string_view device_name) noexcept;
 
 // Evaluate whether RT should be advertised. Requires NVIDIA + extensions + features.
 [[nodiscard]] RayTracingCapability evaluateRayTracingCapability(
