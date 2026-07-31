@@ -9,33 +9,25 @@ struct SDL_Window;
 
 namespace xpbd::gfx {
 
-
 enum class BackendPreference {
-    Auto,
-    OpenGL,
-    Vulkan,
-    Dx11,
-    Metal,
+  Auto,
+  OpenGL,
+  Vulkan,
 };
 
 struct BackendRequest {
-    BackendPreference pref = BackendPreference::Auto;
-
-    bool force = false;
-    std::string parse_error;
+  BackendPreference pref = BackendPreference::Auto;
+  bool force = false;
+  std::string parse_error;
 };
 
+BackendRequest parseBackendRequest(int argc, char **argv);
 
+const char *preferenceName(BackendPreference p);
 
+bool createWindowAndBackend(const BackendRequest &req, const char *title, int w,
+                            int h, SDL_Window *&window,
+                            std::unique_ptr<IGpuBackend> &backend,
+                            std::string &err);
 
-
-BackendRequest parseBackendRequest(int argc, char** argv);
-
-const char* preferenceName(BackendPreference p);
-
-
-bool createWindowAndBackend(const BackendRequest& req, const char* title, int w, int h,
-                            SDL_Window*& window, std::unique_ptr<IGpuBackend>& backend,
-                            std::string& err);
-
-}
+} // namespace xpbd::gfx

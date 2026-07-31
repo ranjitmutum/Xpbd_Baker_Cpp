@@ -164,6 +164,7 @@ Cube ModelLoader::parseCube(const nlohmann::json& json) {
 
 FaceUV ModelLoader::parseFaceUV(const nlohmann::json& face_json) {
     FaceUV f;
+    f.size_explicit = false;
     if (face_json.contains("uv") && face_json.at("uv").is_array()) {
         const auto& uva = face_json.at("uv");
         if (uva.size() >= 4) {
@@ -179,6 +180,25 @@ FaceUV ModelLoader::parseFaceUV(const nlohmann::json& face_json) {
         face_json.at("uv_size").size() >= 2) {
         f.size_u = face_json.at("uv_size").at(0).get<double>();
         f.size_v = face_json.at("uv_size").at(1).get<double>();
+        f.size_explicit = true;
+    }
+    if (face_json.contains("uv_rotation") &&
+        face_json.at("uv_rotation").is_number()) {
+        const double rotation =
+            face_json.at("uv_rotation").get<double>();
+        const double rounded = std::round(rotation);
+        if (!std::isfinite(rotation) ||
+            std::abs(rotation - rounded) > 1.0e-9 ||
+            std::abs(rounded) > 1000000000.0 ||
+            std::fmod(std::abs(rounded), 90.0) > 1.0e-9) {
+            throw std::invalid_argument(
+                "face uv_rotation must be a finite multiple of 90 degrees");
+        }
+        int degrees = static_cast<int>(rounded) % 360;
+        if (degrees < 0) {
+            degrees += 360;
+        }
+        f.rotation_degrees = degrees;
     }
     if (!std::isfinite(f.u) || !std::isfinite(f.v) || !std::isfinite(f.size_u) ||
         !std::isfinite(f.size_v)) {
@@ -204,6 +224,7 @@ FaceUV ModelLoader::parseFaceUVArray(const nlohmann::json& uv_array) {
     f.v = v0;
     f.size_u = u1 - u0;
     f.size_v = v1 - v0;
+    f.size_explicit = true;
     f.present = true;
     return f;
 }

@@ -19,6 +19,8 @@ dependency-reduced-pom.xml
 
 # ===== Logs / crashes =====
 *.log
+*.dmp
+*.mdmp
 hs_err_pid*
 replay_pid*
 xpbd_gfx_log.txt
@@ -33,6 +35,8 @@ desktop.ini
 /.agents/
 /.planning/
 /.tmp/
+/.cache/
+/.codex/
 /findings.md
 /progress.md
 /task_plan.md
@@ -43,6 +47,8 @@ desktop.ini
 *.orig
 *.rej
 /xpbd-baker-*.zip
+*.7z
+*.rar
 
 # ===== Env secrets =====
 .env
@@ -51,10 +57,13 @@ desktop.ini
 
 # ===== C++ / CMake / vcpkg =====
 /build/
+/build-*/
 /build-mingw-release/
+/out/
+/dist/
+/output/
 /.toolchain/
 /vcpkg_installed_mingw/
-/dist/
 /real_fixture_regression_compact/
 /real_model_tests/
 /.tmp_transition_audit/
@@ -100,10 +109,32 @@ vcpkg_installed/
 *.aps
 *.ipch
 ipch/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+*.vcxproj
+*.vcxproj.filters
+*.sln
+*.obj
+*.pch
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+/Debug/
+/Release/
+/RelWithDebInfo/
+/MinSizeRel/
 
 # Keep tracked third-party headers (Nuklear, SPIR-V includes)
 !/cpp/third_party/nuklear/
 !/cpp/src/gfx/spirv/
+
+# Optional NVIDIA sample tree (tools/vendor_rtxpt.ps1; large submodules)
+/third_party/RTXPT/
 
 # ===== Generated / local =====
 *.bmp
@@ -120,3 +151,5 @@ xpbd_gfx_log.txt
 !*.mk
 
 out/
+build/
+build-app/

@@ -3,8 +3,7 @@
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
 #define STBI_ONLY_JPEG
-#define STBI_NO_HDR
-#define STBI_NO_LINEAR
+#define STBI_ONLY_HDR
 #include "stb_image.h"
 
 #include <algorithm>
@@ -73,6 +72,7 @@ bool loadTextureImageFromMemory(const void* data, int size, TextureImage& out, s
     }
     out.width = w;
     out.height = h;
+    out.source_channels = n;
     out.rgba.assign(pixels,
                     pixels + static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4u);
     stbi_image_free(pixels);
@@ -97,6 +97,7 @@ bool loadTextureImage(const std::filesystem::path& path, TextureImage& out, std:
     }
     out.width = w;
     out.height = h;
+    out.source_channels = n;
     out.path = p;
     out.rgba.assign(data, data + static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4u);
     stbi_image_free(data);

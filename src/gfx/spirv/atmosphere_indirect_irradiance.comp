@@ -1,0 +1,36 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#include "src/gfx/spirv/atmosphere_common.glsl"
+
+layout(set = 0, binding = 7) uniform sampler3D
+    single_rayleigh_scattering_texture;
+layout(set = 0, binding = 8) uniform sampler3D
+    single_mie_scattering_texture;
+layout(set = 0, binding = 9) uniform sampler3D
+    multiple_scattering_texture;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D
+    delta_irradiance_output;
+layout(set = 0, binding = 3, rgba16f) uniform image2D irradiance_output;
+
+layout(push_constant) uniform AtmosphereOrderPush {
+  int scattering_order;
+} order_push;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+void main() {
+  const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+  if (any(greaterThanEqual(
+          pixel, ivec2(IRRADIANCE_TEXTURE_WIDTH,
+                       IRRADIANCE_TEXTURE_HEIGHT)))) {
+    return;
+  }
+  const vec3 indirect = ComputeIndirectIrradianceTexture(
+      ATMOSPHERE, single_rayleigh_scattering_texture,
+      single_mie_scattering_texture, multiple_scattering_texture,
+      vec2(pixel) + vec2(0.5), order_push.scattering_order);
+  imageStore(delta_irradiance_output, pixel, vec4(indirect, 1.0));
+  const vec3 accumulated = imageLoad(irradiance_output, pixel).rgb + indirect;
+  imageStore(irradiance_output, pixel, vec4(accumulated, 1.0));
+}

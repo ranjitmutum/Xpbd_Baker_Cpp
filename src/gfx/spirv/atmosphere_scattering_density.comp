@@ -1,0 +1,37 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#include "src/gfx/spirv/atmosphere_common.glsl"
+
+layout(set = 0, binding = 1) uniform sampler2D transmittance_texture;
+layout(set = 0, binding = 7) uniform sampler3D
+    single_rayleigh_scattering_texture;
+layout(set = 0, binding = 8) uniform sampler3D
+    single_mie_scattering_texture;
+layout(set = 0, binding = 9) uniform sampler3D
+    multiple_scattering_texture;
+layout(set = 0, binding = 10) uniform sampler2D irradiance_texture;
+layout(set = 0, binding = 11, rgba16f) uniform writeonly image3D
+    scattering_density_output;
+
+layout(push_constant) uniform AtmosphereOrderPush {
+  int scattering_order;
+} order_push;
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+void main() {
+  const ivec3 pixel = ivec3(gl_GlobalInvocationID.xyz);
+  const ivec3 dimensions =
+      ivec3(SCATTERING_TEXTURE_NU_SIZE * SCATTERING_TEXTURE_MU_S_SIZE,
+            SCATTERING_TEXTURE_MU_SIZE, SCATTERING_TEXTURE_R_SIZE);
+  if (any(greaterThanEqual(pixel, dimensions))) {
+    return;
+  }
+  const vec3 density = ComputeScatteringDensityTexture(
+      ATMOSPHERE, transmittance_texture,
+      single_rayleigh_scattering_texture, single_mie_scattering_texture,
+      multiple_scattering_texture, irradiance_texture,
+      vec3(pixel) + vec3(0.5), order_push.scattering_order);
+  imageStore(scattering_density_output, pixel, vec4(density, 1.0));
+}

@@ -46,6 +46,8 @@ struct StaticModelVertex {
   float px = 0, py = 0, pz = 0;
   float nx = 0, ny = 1, nz = 0;
   float u = 0, v = 0;
+  float tx = 1, ty = 0, tz = 0;
+  float tangent_handedness = 1;
   std::uint32_t bone_index = 0;
 };
 

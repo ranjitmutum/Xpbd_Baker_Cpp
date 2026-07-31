@@ -23,12 +23,23 @@ struct StaticModelIndexRange {
   std::uint32_t index_count = 0;
 };
 
+struct StaticModelPrimitiveMaterial {
+  StaticModelMaterialClass material = StaticModelMaterialClass::Opaque;
+  bool textured = false;
+  std::uint32_t source_face_index = 0;
+  std::uint32_t source_triangle_index = 0;
+  std::uint32_t bone_index = 0;
+  std::uint32_t cube_index = 0;
+  StaticModelFaceDirection face_direction =
+      StaticModelFaceDirection::West;
+};
 
 
 
 
 struct StaticModelDrawPlan {
   std::vector<std::uint32_t> indices;
+  std::vector<StaticModelPrimitiveMaterial> primitive_materials;
 
   std::vector<std::uint8_t> textured_vertices;
   StaticModelIndexRange opaque;
@@ -237,11 +248,19 @@ makeStaticModelDrawPlan(const StaticIndexedModelMesh &mesh,
   std::vector<std::uint32_t> opaque;
   std::vector<std::uint32_t> cutout;
   std::vector<std::uint32_t> blend;
+  std::vector<StaticModelPrimitiveMaterial> opaque_materials;
+  std::vector<StaticModelPrimitiveMaterial> cutout_materials;
+  std::vector<StaticModelPrimitiveMaterial> blend_materials;
   opaque.reserve(mesh.indices.size());
   cutout.reserve(mesh.indices.size());
   blend.reserve(mesh.indices.size());
+  opaque_materials.reserve(mesh.indices.size() / 3u);
+  cutout_materials.reserve(mesh.indices.size() / 3u);
+  blend_materials.reserve(mesh.indices.size() / 3u);
 
-  for (const auto &face : mesh.faces) {
+  for (std::size_t face_index = 0; face_index < mesh.faces.size();
+       ++face_index) {
+    const auto &face = mesh.faces[face_index];
     if (!detail::validFace(mesh, face)) {
       ++plan.skipped_face_count;
       continue;
@@ -256,31 +275,53 @@ makeStaticModelDrawPlan(const StaticIndexedModelMesh &mesh,
                 plan.textured_vertices.begin() + vertex_end, 1u);
     }
 
+    const StaticModelMaterialClass material =
+        staticModelFaceMaterial(mesh, face, texture);
     std::vector<std::uint32_t> *destination = &opaque;
-    switch (staticModelFaceMaterial(mesh, face, texture)) {
+    std::vector<StaticModelPrimitiveMaterial> *material_destination =
+        &opaque_materials;
+    switch (material) {
     case StaticModelMaterialClass::Opaque:
       break;
     case StaticModelMaterialClass::Cutout:
       destination = &cutout;
+      material_destination = &cutout_materials;
       break;
     case StaticModelMaterialClass::Blend:
       destination = &blend;
+      material_destination = &blend_materials;
       break;
     }
     const auto begin = mesh.indices.begin() + face.first_index;
     destination->insert(destination->end(), begin, begin + face.index_count);
+    for (std::uint32_t triangle = 0; triangle < face.index_count / 3u;
+         ++triangle) {
+      StaticModelPrimitiveMaterial primitive;
+      primitive.material = material;
+      primitive.textured = textured;
+      primitive.source_face_index =
+          static_cast<std::uint32_t>(face_index);
+      primitive.source_triangle_index = triangle;
+      primitive.bone_index = face.bone_index;
+      primitive.cube_index = face.cube_index;
+      primitive.face_direction = face.direction;
+      material_destination->push_back(primitive);
+    }
   }
 
   plan.indices.reserve(opaque.size() + cutout.size() + blend.size());
   auto append = [&](const std::vector<std::uint32_t> &source,
+                    const std::vector<StaticModelPrimitiveMaterial> &materials,
                     StaticModelIndexRange &range) {
     range.first_index = static_cast<std::uint32_t>(plan.indices.size());
     range.index_count = static_cast<std::uint32_t>(source.size());
     plan.indices.insert(plan.indices.end(), source.begin(), source.end());
+    plan.primitive_materials.insert(plan.primitive_materials.end(),
+                                    materials.begin(), materials.end());
   };
-  append(opaque, plan.opaque);
-  append(cutout, plan.cutout);
-  append(blend, plan.blend);
+  append(opaque, opaque_materials, plan.opaque);
+  append(cutout, cutout_materials, plan.cutout);
+  append(blend, blend_materials, plan.blend);
   return plan;
 }
 

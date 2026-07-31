@@ -186,7 +186,8 @@ struct ViewportCamera {
         const float a = (aspect > 1e-6f) ? aspect : 1.0f;
         const float f = 1.0f / std::tan(fov_y_deg * 0.017453292519943295f * 0.5f);
         const float near_p = near_z;
-        const float far_p = (std::max)(distance * 20.0f + 50.0f, 200.0f);
+        // Large enough for desert/ocean ground planes (~km-scale preview meshes).
+        const float far_p = (std::max)(distance * 80.0f + 500.0f, 8000.0f);
 
         for (int i = 0; i < 16; ++i) {
             out_proj16[i] = 0.0f;

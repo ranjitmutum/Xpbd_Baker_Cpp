@@ -49,9 +49,8 @@ command and rebuild the application.
 
 ## Vulkan static UV A/B
 
-The Vulkan viewport uses the static indexed UV path by default. OpenGL and
-Direct3D keep the legacy dynamic path. To force the Vulkan legacy path for an
-A/B comparison:
+The Vulkan viewport uses the static indexed UV path by default. To force the
+legacy dynamic UV path for an A/B comparison:
 
 ```powershell
 $env:XPBD_GFX = "vulkan"

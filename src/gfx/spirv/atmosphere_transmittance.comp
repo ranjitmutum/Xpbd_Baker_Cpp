@@ -1,0 +1,23 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#include "src/gfx/spirv/atmosphere_common.glsl"
+
+layout(set = 0, binding = 0, rgba16f) uniform writeonly image2D
+    transmittance_output;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+void main() {
+  const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+  if (any(greaterThanEqual(pixel,
+                           ivec2(TRANSMITTANCE_TEXTURE_WIDTH,
+                                 TRANSMITTANCE_TEXTURE_HEIGHT)))) {
+    return;
+  }
+  const vec3 transmittance =
+      ComputeTransmittanceToTopAtmosphereBoundaryTexture(
+          ATMOSPHERE, vec2(pixel) + vec2(0.5));
+  imageStore(transmittance_output, pixel,
+             vec4(clamp(transmittance, vec3(0.0), vec3(1.0)), 1.0));
+}

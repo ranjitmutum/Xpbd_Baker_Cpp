@@ -12,6 +12,8 @@ struct FaceUV {
     double size_u = 0.0;
     double size_v = 0.0;
     bool present = false;
+    int rotation_degrees = 0;
+    bool size_explicit = true;
 };
 
 enum class CubeUVMode {

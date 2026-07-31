@@ -1,9 +1,11 @@
 #include "xpbd/app/app_session.hpp"
+#include "xpbd/app/native_dialog.hpp"
 
 #include "xpbd/baker/bone_pose_calculator.hpp"
 #include "xpbd/baker/rigid_body_input_compat.hpp"
 #include "xpbd/export/animation_exporter.hpp"
 #include "xpbd/export/velocity_cache_exporter.hpp"
+#include "xpbd/gfx/labpbr_export.hpp"
 #include "xpbd/log.hpp"
 
 #include <algorithm>
@@ -40,6 +42,7 @@
 
 #include <windows.h>
 #include <commdlg.h>
+#include <shobjidl.h>
 
 #endif
 
@@ -109,6 +112,63 @@ bool sameTextureResource(const gfx::TextureImage &lhs,
 
 bool hasTextureResourceState(const gfx::TextureImage &texture) noexcept {
   return texture.width != 0 || texture.height != 0 || !texture.rgba.empty();
+}
+
+bool buildSessionLabPbrMaterial(
+    const loader::Geometry &geometry, const baker::BoneMapper &bone_mapper,
+    const gfx::TextureImage &base,
+    const gfx::ResolvedMaterialTable &source_material,
+    const std::map<std::string, gfx::GroupLabPbrOverride> &overrides,
+    const gfx::ReadOnlyIrisNormalAsset *imported_normal,
+    gfx::LabPbrUvCoverage &coverage,
+    gfx::LabPbrCompositionResult &composition,
+    gfx::ResolvedMaterialTable &resolved, std::string *error) {
+  if (!base.valid()) {
+    coverage = {};
+    composition = {};
+    resolved = source_material;
+    if (error != nullptr) {
+      error->clear();
+    }
+    return true;
+  }
+
+  gfx::ViewportMeshBuilder builder;
+  builder.setGeometry(&geometry);
+  builder.setBoneMapper(&bone_mapper);
+  builder.setTexture(&base);
+  gfx::StaticIndexedModelMesh mesh;
+  builder.buildStaticIndexedModel(mesh);
+  auto next_coverage =
+      gfx::rasterizeLabPbrUvCoverage(mesh, base.width, base.height);
+  const gfx::TextureImage *source_specular =
+      source_material.specular_map_active
+          ? &source_material.specular_image
+          : nullptr;
+  auto next_composition = gfx::composeLabPbrSpecular(
+      base.width, base.height, source_specular, next_coverage, overrides);
+  if (!next_composition.errors.empty()) {
+    if (error != nullptr) {
+      *error = next_composition.errors.front();
+    }
+    return false;
+  }
+  const gfx::TextureImage *normal =
+      imported_normal != nullptr && imported_normal->valid()
+          ? &imported_normal->decoded
+          : nullptr;
+  gfx::ResolvedMaterialTable next_resolved;
+  const gfx::TextureImage *authored_specular =
+      overrides.empty() ? nullptr : &next_composition.specular;
+  if (!gfx::buildAuthoredResolvedMaterial(
+          base, source_material, normal, authored_specular,
+          next_resolved, error)) {
+    return false;
+  }
+  coverage = std::move(next_coverage);
+  composition = std::move(next_composition);
+  resolved = std::move(next_resolved);
+  return true;
 }
 
 // 动画导出始终使用 JSON 后缀，避免名称中的 .bake/.baked 被误认为最终扩展名。
@@ -1959,6 +2019,9 @@ void AppSession::loadModel(const std::filesystem::path &path) {
       }
     }
     selected_bone_name.clear();
+    labpbr_group_overrides.clear();
+    labpbr_draft = {};
+    labpbr_draft_dirty = false;
     hidden_bone_names.clear();
     closeBoneContext();
     skeleton_view.setGeometry(&geometry);
@@ -1982,13 +2045,432 @@ void AppSession::loadModel(const std::filesystem::path &path) {
                 std::to_string(model_texture.height);
     }
     advanceGeneration(model_generation_);
+    scene_selection.source_identity = model_path;
+    if (scene_selection.kind != SceneSelectionKind::Preset) {
+      scene_selection.kind = SceneSelectionKind::Loaded;
+      scene_selection.preset = gfx::PreviewSceneId::None;
+      preview_scene_id = gfx::PreviewSceneId::None;
+    }
+    advanceGeneration(scene_selection.generation);
+    resetPathTraceAccumulation();
+    if (model_texture.valid() && !refreshLabPbrAuthoring()) {
+      status += " [!] LabPBR coverage refresh failed";
+    }
   } catch (const std::exception &e) {
     last_error = e.what();
     status = "Model load failed";
   }
 }
 
+bool AppSession::selectScene(SceneSelectionKind kind) {
+  if (kind == SceneSelectionKind::Preset) {
+    last_error = "Preset scenes must be selected with an explicit preset";
+    status = "Scene selection failed";
+    return false;
+  }
+  if ((kind == SceneSelectionKind::Loaded ||
+       kind == SceneSelectionKind::UserBuilt) &&
+      !hasLoadedSceneContent()) {
+    last_error =
+        kind == SceneSelectionKind::Loaded
+            ? "Loaded Scene requires a successfully loaded model"
+            : "User-Built Scene requires current scene content";
+    status = "Scene selection failed";
+    return false;
+  }
+
+  const gfx::PreviewSceneId next_preview = gfx::PreviewSceneId::None;
+  if (scene_selection.kind == kind &&
+      scene_selection.preset == gfx::PreviewSceneId::None &&
+      preview_scene_id == next_preview) {
+    last_error.clear();
+    return true;
+  }
+
+  scene_selection.kind = kind;
+  scene_selection.preset = gfx::PreviewSceneId::None;
+  if (hasLoadedSceneContent()) {
+    scene_selection.source_identity = model_path;
+  }
+  preview_scene_id = next_preview;
+  advanceGeneration(scene_selection.generation);
+  resetPathTraceAccumulation();
+  last_error.clear();
+  switch (kind) {
+  case SceneSelectionKind::Empty:
+    status = "Scene: Empty";
+    break;
+  case SceneSelectionKind::UserBuilt:
+    status = "Scene: User-Built";
+    break;
+  case SceneSelectionKind::Loaded:
+    status = "Scene: Loaded";
+    break;
+  case SceneSelectionKind::Preset:
+    break;
+  }
+  return true;
+}
+
+bool AppSession::selectPresetScene(gfx::PreviewSceneId preset) {
+  preset = gfx::canonicalPreviewSceneId(preset);
+  if (preset == gfx::PreviewSceneId::None) {
+    return selectScene(SceneSelectionKind::Empty);
+  }
+  const auto first = gfx::kPreviewSceneChoices.begin() + 1;
+  if (std::find(first, gfx::kPreviewSceneChoices.end(), preset) ==
+      gfx::kPreviewSceneChoices.end()) {
+    last_error = "Preview preset is not in the curated scene list";
+    status = "Scene preset selection failed";
+    return false;
+  }
+
+  if (scene_selection.kind == SceneSelectionKind::Preset &&
+      scene_selection.preset == preset && preview_scene_id == preset) {
+    last_error.clear();
+    return true;
+  }
+  scene_selection.kind = SceneSelectionKind::Preset;
+  scene_selection.preset = preset;
+  if (hasLoadedSceneContent()) {
+    scene_selection.source_identity = model_path;
+  }
+  preview_scene_id = preset;
+  advanceGeneration(scene_selection.generation);
+  resetPathTraceAccumulation();
+  last_error.clear();
+  status = std::string("Scene preset: ") + gfx::previewSceneIdKey(preset);
+  return true;
+}
+
+bool AppSession::saveSceneSelectionSettings(
+    const std::filesystem::path &path) {
+  try {
+    const nlohmann::ordered_json json = {
+        {"schema", "xpbd-scene-selection/1"},
+        {"kind", static_cast<int>(scene_selection.kind)},
+        {"preset", static_cast<int>(scene_selection.preset)},
+        {"source_identity", scene_selection.source_identity},
+        {"show_grid", show_preview_grid},
+        {"show_axes", show_preview_axes},
+        {"dynamic_surface", dynamic_preview_scene},
+    };
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output) {
+      throw std::runtime_error("failed to open scene settings output");
+    }
+    output << json.dump(2) << '\n';
+    if (!output.good()) {
+      throw std::runtime_error("failed to write scene settings");
+    }
+    last_error.clear();
+    status = "Scene settings saved: " + path.filename().string();
+    return true;
+  } catch (const std::exception &error) {
+    last_error = error.what();
+    status = "Scene settings save failed";
+    return false;
+  }
+}
+
+bool AppSession::loadSceneSelectionSettings(
+    const std::filesystem::path &path) {
+  try {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+      throw std::runtime_error("failed to open scene settings");
+    }
+    nlohmann::json json;
+    input >> json;
+    if (!json.is_object() ||
+        json.value("schema", std::string{}) != "xpbd-scene-selection/1") {
+      throw std::runtime_error("unsupported scene settings schema");
+    }
+
+    const int kind_value = json.at("kind").get<int>();
+    if (kind_value < static_cast<int>(SceneSelectionKind::Empty) ||
+        kind_value > static_cast<int>(SceneSelectionKind::Loaded)) {
+      throw std::runtime_error("invalid scene selection kind");
+    }
+    const auto kind = static_cast<SceneSelectionKind>(kind_value);
+    const int preset_value =
+        json.value("preset", static_cast<int>(gfx::PreviewSceneId::None));
+    if (preset_value < 0 || preset_value >= gfx::kPreviewSceneCount) {
+      throw std::runtime_error("invalid scene preset");
+    }
+    const auto preset =
+        gfx::canonicalPreviewSceneId(static_cast<gfx::PreviewSceneId>(
+            preset_value));
+    const std::string source_identity =
+        json.value("source_identity", std::string{});
+    const bool next_grid = json.value("show_grid", show_preview_grid);
+    const bool next_axes = json.value("show_axes", show_preview_axes);
+    const bool next_dynamic =
+        json.value("dynamic_surface", dynamic_preview_scene);
+
+    // Resolve Loaded Scene before committing any selection/UI fields. Model
+    // loading itself is transactional and leaves the current model untouched
+    // on parse/decode failure.
+    if (kind == SceneSelectionKind::Loaded &&
+        (!hasLoadedSceneContent() || source_identity != model_path)) {
+      if (source_identity.empty() ||
+          !std::filesystem::is_regular_file(source_identity)) {
+        throw std::runtime_error(
+            "saved Loaded Scene source is unavailable");
+      }
+      loadModel(std::filesystem::path(source_identity));
+      if (!last_error.empty() || !hasLoadedSceneContent()) {
+        throw std::runtime_error(
+            "saved Loaded Scene source could not be loaded");
+      }
+    }
+
+    bool selected = false;
+    if (kind == SceneSelectionKind::Preset) {
+      selected = selectPresetScene(preset);
+    } else {
+      selected = selectScene(kind);
+    }
+    if (!selected) {
+      throw std::runtime_error(last_error.empty()
+                                   ? "scene selection could not be restored"
+                                   : last_error);
+    }
+    show_preview_grid = next_grid;
+    show_preview_axes = next_axes;
+    dynamic_preview_scene = next_dynamic;
+    if (!source_identity.empty()) {
+      scene_selection.source_identity = source_identity;
+    }
+    last_error.clear();
+    status = "Scene settings loaded: " + path.filename().string();
+    return true;
+  } catch (const std::exception &error) {
+    last_error = error.what();
+    status = "Scene settings load failed";
+    return false;
+  }
+}
+
+bool AppSession::importLabPbrSuiteInternal(
+    const std::filesystem::path &base_path,
+    bool confirm_missing_properties, bool relink) {
+  if (labpbr_draft_dirty) {
+    last_error =
+        "Apply or revert the LabPBR draft before importing a suite";
+    status = last_error;
+    return false;
+  }
+
+  auto imported = gfx::importLabPbrSuite(
+      base_path, confirm_missing_properties, &labpbr_import_cache_);
+  if (imported.status ==
+      gfx::LabPbrSuiteImportStatus::NeedsLabPbr13Confirmation) {
+    pending_labpbr_import_path_ = base_path;
+    pending_labpbr_import_is_relink_ = relink;
+    labpbr_import_confirmation_pending = true;
+    last_error.clear();
+    status =
+        "LabPBR suite requires explicit 1.3 confirmation (properties missing)";
+    return false;
+  }
+  if (!imported.imported()) {
+    last_error = imported.error.empty() ? "LabPBR suite import failed"
+                                        : imported.error;
+    status = relink ? "LabPBR relink failed" : "LabPBR suite import failed";
+    return false;
+  }
+
+  gfx::ReadOnlyIrisNormalAsset imported_normal;
+  if (imported.suite.source.normal.present) {
+    imported_normal.source_path = imported.suite.source.normal.path;
+    imported_normal.original_file_bytes =
+        *imported.suite.source.normal.original_bytes;
+    imported_normal.sha256 = imported.suite.source.normal.sha256;
+    imported_normal.decoded = imported.suite.material.normal_image;
+  }
+
+  gfx::LabPbrUvCoverage loaded_coverage;
+  gfx::LabPbrCompositionResult loaded_composition;
+  gfx::ResolvedMaterialTable loaded_resolved;
+  std::string error;
+  if (!buildSessionLabPbrMaterial(
+          geometry, bone_mapper, imported.suite.base_image,
+          imported.suite.material, labpbr_group_overrides,
+          imported_normal.valid() ? &imported_normal : nullptr,
+          loaded_coverage, loaded_composition, loaded_resolved, &error)) {
+    last_error = error.empty() ? "LabPBR authoring resolve failed" : error;
+    status = relink ? "LabPBR relink failed" : "LabPBR suite import failed";
+    return false;
+  }
+
+  const bool material_changed =
+      labpbr_suite_source.cache_key !=
+          imported.suite.source.cache_key ||
+      !sameTextureResource(model_texture, imported.suite.base_image) ||
+      !gfx::sameResolvedMaterialResource(resolved_material,
+                                         loaded_resolved) ||
+      labpbr_imported_normal.sha256 != imported_normal.sha256;
+
+  model_texture = std::move(imported.suite.base_image);
+  labpbr_source_material_ = std::move(imported.suite.material);
+  resolved_material = std::move(loaded_resolved);
+  labpbr_uv_coverage = std::move(loaded_coverage);
+  labpbr_composition = std::move(loaded_composition);
+  labpbr_imported_normal = std::move(imported_normal);
+  labpbr_suite_source = std::move(imported.suite.source);
+  labpbr_last_import_cache_hit = imported.suite.cache_hit;
+  texture_path = labpbr_suite_source.base.path.string();
+  labpbr_import_confirmation_pending = false;
+  pending_labpbr_import_path_.reset();
+  pending_labpbr_import_is_relink_ = false;
+  labpbr_source_change_pending = false;
+  labpbr_source_changed_paths.clear();
+  labpbr_next_source_poll_ =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  loadSelectedLabPbrDraft();
+  if (material_changed) {
+    advanceGeneration(material_generation_);
+  }
+
+  last_error.clear();
+  status = relink ? "LabPBR suite relinked: " :
+                    "LabPBR suite imported: ";
+  status += labpbr_suite_source.base.path.filename().string() + " (" +
+            std::to_string(model_texture.width) + "x" +
+            std::to_string(model_texture.height) + ")";
+  if (labpbr_last_import_cache_hit) {
+    status += " [cache]";
+  }
+  if (labpbr_suite_source.confirmed_labpbr13_without_properties) {
+    status += " [confirmed LabPBR 1.3]";
+  }
+  if (resolved_material.normal_map_active ||
+      resolved_material.specular_map_active) {
+    status += " [normal=" +
+              std::string(resolved_material.normal_map_active ? "on" : "off") +
+              ", specular=" +
+              std::string(resolved_material.specular_map_active ? "on"
+                                                                  : "off") +
+              "]";
+  }
+  return true;
+}
+
+bool AppSession::requestLabPbrSuiteImport(
+    const std::filesystem::path &base_path) {
+  return importLabPbrSuiteInternal(base_path, false, false);
+}
+
+bool AppSession::requestLabPbrSuiteRelink(
+    const std::filesystem::path &base_path) {
+  return importLabPbrSuiteInternal(base_path, false, true);
+}
+
+bool AppSession::requestLabPbrSuiteFolder(
+    const std::filesystem::path &folder) {
+  if (labpbr_draft_dirty) {
+    last_error =
+        "Apply or revert the LabPBR draft before importing a suite";
+    status = last_error;
+    return false;
+  }
+  std::string error;
+  auto candidates =
+      gfx::discoverLabPbrSuiteCandidates(folder, &error);
+  if (candidates.empty()) {
+    last_error = error.empty()
+                     ? "No <stem>.png + <stem>_s.png suite found in folder"
+                     : error;
+    status = "LabPBR folder import failed";
+    return false;
+  }
+  if (candidates.size() == 1u) {
+    return requestLabPbrSuiteImport(candidates.front());
+  }
+  labpbr_import_candidates = std::move(candidates);
+  labpbr_candidate_selection_pending = true;
+  last_error.clear();
+  status = "Select one LabPBR suite from the chosen folder";
+  return false;
+}
+
+void AppSession::selectLabPbrSuiteCandidate(std::size_t index) {
+  if (!labpbr_candidate_selection_pending ||
+      index >= labpbr_import_candidates.size()) {
+    return;
+  }
+  const auto selected = labpbr_import_candidates[index];
+  cancelLabPbrSuiteCandidateSelection();
+  requestLabPbrSuiteImport(selected);
+}
+
+void AppSession::cancelLabPbrSuiteCandidateSelection() {
+  labpbr_candidate_selection_pending = false;
+  labpbr_import_candidates.clear();
+}
+
+void AppSession::confirmLabPbrSuiteImport(bool proceed) {
+  const auto pending = pending_labpbr_import_path_;
+  const bool relink = pending_labpbr_import_is_relink_;
+  labpbr_import_confirmation_pending = false;
+  pending_labpbr_import_path_.reset();
+  pending_labpbr_import_is_relink_ = false;
+  if (!pending) {
+    return;
+  }
+  if (!proceed) {
+    status = "LabPBR suite import cancelled";
+    return;
+  }
+  importLabPbrSuiteInternal(*pending, true, relink);
+}
+
+bool AppSession::reloadLabPbrSuite() {
+  if (!labpbr_suite_source.valid()) {
+    last_error = "No active LabPBR suite source to reload";
+    status = last_error;
+    return false;
+  }
+  return importLabPbrSuiteInternal(
+      labpbr_suite_source.base.path,
+      labpbr_suite_source.confirmed_labpbr13_without_properties,
+      false);
+}
+
+void AppSession::pollLabPbrSourceChanges() {
+  if (!labpbr_suite_source.valid()) {
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (now < labpbr_next_source_poll_) {
+    return;
+  }
+  labpbr_next_source_poll_ = now + std::chrono::seconds(1);
+  const auto report =
+      gfx::checkLabPbrSuiteSourceChanges(labpbr_suite_source);
+  if (!report.reloadRecommended()) {
+    labpbr_source_change_pending = false;
+    labpbr_source_changed_paths.clear();
+    return;
+  }
+  labpbr_source_change_pending = true;
+  labpbr_source_changed_paths = report.changed_paths;
+  if (!report.error.empty()) {
+    last_error = report.error;
+  }
+  status = labpbr_draft_dirty
+               ? "LabPBR source changed; draft preserved, apply/revert before reload"
+               : "LabPBR source changed; reload or relink required";
+}
+
 bool AppSession::loadTexture(const std::filesystem::path &path) {
+  if (labpbr_draft_dirty) {
+    last_error =
+        "Apply or revert the LabPBR draft before loading another texture";
+    status = last_error;
+    return false;
+  }
   std::string err;
   gfx::TextureImage loaded_texture;
   if (!gfx::loadTextureImage(path, loaded_texture, &err)) {
@@ -1996,17 +2478,95 @@ bool AppSession::loadTexture(const std::filesystem::path &path) {
     status = "Texture load failed";
     return false;
   }
+  // Base color owns its own import path. LabPBR _s/_n images are attached
+  // explicitly from the material page and are never guessed from siblings.
+  const bool keep_imported_specular =
+      labpbr_source_material_.specular_map_active &&
+      labpbr_source_material_.specular_image.valid() &&
+      labpbr_source_material_.specular_image.width == loaded_texture.width &&
+      labpbr_source_material_.specular_image.height == loaded_texture.height &&
+      (labpbr_source_material_.specular_image.source_channels == 3 ||
+       labpbr_source_material_.specular_image.source_channels == 4);
+  const bool keep_imported_normal =
+      labpbr_imported_normal.valid() &&
+      labpbr_imported_normal.decoded.width == loaded_texture.width &&
+      labpbr_imported_normal.decoded.height == loaded_texture.height;
+  gfx::ResolvedMaterialTable base_source;
+  base_source.assets.base = path;
+  if (keep_imported_specular) {
+    base_source.format = gfx::LabPbrFormat::LabPbr13;
+    base_source.declared_format = "lab-pbr/1.3";
+    base_source.format_declared = true;
+    base_source.assets.specular =
+        labpbr_source_material_.assets.specular;
+    base_source.assets.specular_exists = true;
+    base_source.specular_map_active = true;
+    base_source.specular_image =
+        labpbr_source_material_.specular_image;
+  }
+  gfx::ResolvedMaterialTable loaded_material;
+  if (!gfx::buildAuthoredResolvedMaterial(
+          loaded_texture, base_source, nullptr, nullptr, loaded_material,
+          &err)) {
+    last_error = err.empty() ? "Base material resolve failed" : err;
+    status = "Texture load failed";
+    return false;
+  }
+  gfx::LabPbrUvCoverage loaded_coverage;
+  gfx::LabPbrCompositionResult loaded_composition;
+  gfx::ResolvedMaterialTable loaded_resolved;
+  if (!buildSessionLabPbrMaterial(
+          geometry, bone_mapper, loaded_texture, loaded_material,
+          labpbr_group_overrides,
+          keep_imported_normal ? &labpbr_imported_normal : nullptr,
+          loaded_coverage, loaded_composition, loaded_resolved, &err)) {
+    last_error = err.empty() ? "LabPBR authoring resolve failed" : err;
+    status = "Texture load failed";
+    return false;
+  }
   const bool texture_changed =
-      !sameTextureResource(model_texture, loaded_texture);
+      !sameTextureResource(model_texture, loaded_texture) ||
+      !gfx::sameResolvedMaterialResource(resolved_material, loaded_resolved) ||
+      (labpbr_imported_normal.valid() && !keep_imported_normal) ||
+      (labpbr_source_material_.specular_map_active &&
+       !keep_imported_specular);
   model_texture = std::move(loaded_texture);
+  labpbr_source_material_ = std::move(loaded_material);
+  resolved_material = std::move(loaded_resolved);
+  labpbr_uv_coverage = std::move(loaded_coverage);
+  labpbr_composition = std::move(loaded_composition);
+  if (!keep_imported_normal) {
+    labpbr_imported_normal.clear();
+  }
   texture_path = path.string();
+  labpbr_suite_source = {};
+  labpbr_import_confirmation_pending = false;
+  pending_labpbr_import_path_.reset();
+  pending_labpbr_import_is_relink_ = false;
+  labpbr_source_change_pending = false;
+  labpbr_source_changed_paths.clear();
+  labpbr_last_import_cache_hit = false;
+  loadSelectedLabPbrDraft();
   if (texture_changed) {
-    advanceGeneration(texture_generation_);
+    advanceGeneration(material_generation_);
   }
   last_error.clear();
   status = "Texture: " + path.filename().string() + " (" +
            std::to_string(model_texture.width) + "x" +
            std::to_string(model_texture.height) + ")";
+  if (resolved_material.normal_map_active ||
+      resolved_material.specular_map_active) {
+    status += " LabPBR 1.3 [normal=" +
+              std::string(resolved_material.normal_map_active ? "on" : "off") +
+              ", specular=" +
+              std::string(resolved_material.specular_map_active ? "on"
+                                                                  : "off") +
+              "]";
+  }
+  if (!resolved_material.warnings.empty()) {
+    status += " [!] " + std::to_string(resolved_material.warnings.size()) +
+              " material warning(s)";
+  }
 
 
   if (geometry.description.has_texture_size &&
@@ -2020,14 +2580,1847 @@ bool AppSession::loadTexture(const std::filesystem::path &path) {
   return true;
 }
 
+bool AppSession::loadWorldHdr(const std::filesystem::path &path) {
+  constexpr std::uintmax_t kMaximumEncodedBytes =
+      std::uintmax_t{256} * 1024u * 1024u;
+  std::error_code filesystem_error;
+  const std::uintmax_t encoded_size =
+      std::filesystem::file_size(path, filesystem_error);
+  if (filesystem_error || encoded_size == 0u ||
+      encoded_size > kMaximumEncodedBytes ||
+      encoded_size >
+          static_cast<std::uintmax_t>(
+              (std::numeric_limits<std::size_t>::max)())) {
+    last_error = filesystem_error
+                     ? "HDR file is unavailable: " +
+                           filesystem_error.message()
+                     : "HDR file is empty or exceeds the 256 MiB encoded limit";
+    status = "World HDRI load failed";
+    return false;
+  }
+  std::vector<std::uint8_t> encoded(static_cast<std::size_t>(encoded_size));
+  std::ifstream input(path, std::ios::binary);
+  if (!input ||
+      !input.read(reinterpret_cast<char *>(encoded.data()),
+                  static_cast<std::streamsize>(encoded.size())) ||
+      input.peek() != std::ifstream::traits_type::eof()) {
+    last_error = "HDR file read failed";
+    status = "World HDRI load failed";
+    return false;
+  }
+
+  std::filesystem::path identity_path =
+      std::filesystem::weakly_canonical(path, filesystem_error);
+  if (filesystem_error) {
+    filesystem_error.clear();
+    identity_path = std::filesystem::absolute(path, filesystem_error);
+    if (filesystem_error) {
+      identity_path = path;
+    }
+  }
+  identity_path = identity_path.lexically_normal();
+  const std::string identity = identity_path.string();
+  const std::uint64_t next_generation =
+      world_environment.generation <
+              (std::numeric_limits<std::uint64_t>::max)()
+          ? world_environment.generation + 1u
+          : world_environment.generation;
+  std::string error;
+  if (!gfx::buildHdrEnvironmentAsset(
+          encoded, identity, gfx::sha256Hex(encoded), next_generation,
+          world_environment.hdr, &error)) {
+    last_error = error.empty() ? "HDR environment decode failed" : error;
+    status = "World HDRI load failed";
+    return false;
+  }
+
+  world_environment.selected_hdr_identity = identity;
+  world_environment.sky_rendering = gfx::SkyRendering::UserHdri;
+  world_environment.generation = next_generation;
+  advanceGeneration(world_environment.lighting_generation);
+  resetPathTraceAccumulation();
+  last_error.clear();
+  status = "World HDRI: " + path.filename().string() + " (" +
+           std::to_string(world_environment.hdr.radiance.width) + "x" +
+           std::to_string(world_environment.hdr.radiance.height) + ")";
+  return true;
+}
+
+bool AppSession::setSkyRendering(gfx::SkyRendering mode) {
+  if (mode == gfx::SkyRendering::UserHdri && !world_environment.hdr.valid()) {
+    last_error = "User HDRI sky requires a successfully imported HDR file";
+    status = "World Sky selection failed";
+    return false;
+  }
+
+  if (mode == gfx::SkyRendering::ProceduralDayNight &&
+      (!world_environment.procedural_resources_ready ||
+       !world_environment.celestial.valid)) {
+    const gfx::UtcDateTime reference_utc{2024, 1, 1, 0, 0, 0.0};
+    const gfx::ObserverLocation reference_observer{
+        31.2304, 121.4737, 5.0, 0.0};
+    gfx::CelestialState celestial;
+    std::string error;
+    if (!gfx::computeCelestialState(reference_utc, reference_observer,
+                                    celestial, &error)) {
+      last_error = error.empty() ? "Procedural sky initialization failed"
+                                 : error;
+      status = "World Sky selection failed";
+      return false;
+    }
+    world_environment.celestial = celestial;
+    world_environment.atmosphere = gfx::defaultEarthAtmosphereConfig();
+    world_environment.procedural_resources_ready = true;
+  }
+
+  if (world_environment.sky_rendering == mode) {
+    return true;
+  }
+  world_environment.sky_rendering = mode;
+  advanceGeneration(world_environment.generation);
+  advanceGeneration(world_environment.lighting_generation);
+  advanceGeneration(world_environment.celestial_generation);
+  advanceGeneration(world_environment.cloud_generation);
+  resetPathTraceAccumulation();
+  last_error.clear();
+  status = mode == gfx::SkyRendering::Off
+               ? "World Sky: Off"
+               : mode == gfx::SkyRendering::ProceduralDayNight
+                     ? "World Sky: Procedural Day-Night"
+                     : "World Sky: User HDRI";
+  return true;
+}
+
+bool AppSession::setProceduralSkyControls(
+    const gfx::UtcDateTime &utc, const gfx::ObserverLocation &observer,
+    double sun_azimuth_offset_degrees,
+    double sun_altitude_offset_degrees) {
+  gfx::CelestialState candidate;
+  std::string error;
+  const double applied_sun_azimuth =
+      world_environment.sun.direction_mode ==
+              gfx::SkyDirectionMode::ArtisticOffset
+          ? sun_azimuth_offset_degrees
+          : 0.0;
+  const double applied_sun_altitude =
+      world_environment.sun.direction_mode ==
+              gfx::SkyDirectionMode::ArtisticOffset
+          ? sun_altitude_offset_degrees
+          : 0.0;
+  const double applied_moon_azimuth =
+      world_environment.moon.direction_mode ==
+              gfx::SkyDirectionMode::ArtisticOffset
+          ? world_environment.moon.azimuth_offset_degrees
+          : 0.0;
+  const double applied_moon_altitude =
+      world_environment.moon.direction_mode ==
+              gfx::SkyDirectionMode::ArtisticOffset
+          ? world_environment.moon.altitude_offset_degrees
+          : 0.0;
+  if (!gfx::computeCelestialState(utc, observer, candidate, &error) ||
+      !gfx::applyCelestialSunAngleOffsets(
+          candidate, applied_sun_azimuth, applied_sun_altitude, &error) ||
+      !gfx::applyCelestialMoonAngleOffsets(
+          candidate, applied_moon_azimuth, applied_moon_altitude, &error)) {
+    last_error = error.empty() ? "Procedural sky controls are invalid" : error;
+    status = "World Sky controls rejected";
+    return false;
+  }
+  world_environment.celestial = std::move(candidate);
+  world_environment.sun_azimuth_offset_degrees =
+      sun_azimuth_offset_degrees;
+  world_environment.sun_altitude_offset_degrees =
+      sun_altitude_offset_degrees;
+  world_environment.atmosphere = world_environment.atmosphere.valid()
+                                      ? world_environment.atmosphere
+                                      : gfx::defaultEarthAtmosphereConfig();
+  world_environment.procedural_resources_ready = true;
+  touchWorldEnvironmentCelestial();
+  last_error.clear();
+  status = "World Sky controls updated";
+  return true;
+}
+
+void AppSession::touchWorldEnvironment(bool clouds_changed) noexcept {
+  advanceGeneration(world_environment.generation);
+  advanceGeneration(world_environment.lighting_generation);
+  if (clouds_changed) {
+    advanceGeneration(world_environment.clouds.generation);
+    advanceGeneration(world_environment.cloud_generation);
+  }
+  resetPathTraceAccumulation();
+}
+
+void AppSession::touchWorldEnvironmentDisplay() noexcept {
+  advanceGeneration(world_environment.generation);
+  advanceGeneration(world_environment.display_generation);
+}
+
+void AppSession::touchWorldEnvironmentCelestial() noexcept {
+  advanceGeneration(world_environment.generation);
+  advanceGeneration(world_environment.celestial_generation);
+  resetPathTraceAccumulation();
+}
+
+void AppSession::touchWorldEnvironmentTargets() noexcept {
+  advanceGeneration(world_environment.generation);
+  advanceGeneration(world_environment.cloud_generation);
+  advanceGeneration(world_environment.target_generation);
+  advanceGeneration(world_environment.clouds.generation);
+  resetPathTraceAccumulation();
+}
+
+void AppSession::resetWorldSkyPhysicalDefaults() {
+  world_environment.global_lighting_strength_ev = 0.0f;
+  world_environment.background_exposure = 0.0f;
+  world_environment.sun.strength = 1.0f;
+  world_environment.moon.strength = 1.0f;
+  world_environment.atmosphere_controls.sky_relative_strength = 1.0f;
+  world_environment.clouds.lighting_strength = 1.0f;
+  advanceGeneration(world_environment.generation);
+  advanceGeneration(world_environment.lighting_generation);
+  advanceGeneration(world_environment.display_generation);
+  resetPathTraceAccumulation();
+  last_error.clear();
+  status = "World Sky physical defaults restored";
+}
+
+bool AppSession::advanceWorldSkyTime(double elapsed_seconds) {
+  if (!world_environment.time.playing ||
+      world_environment.sky_rendering !=
+          gfx::SkyRendering::ProceduralDayNight) {
+    return true;
+  }
+  if (!std::isfinite(elapsed_seconds) ||
+      !std::isfinite(world_environment.time.time_speed)) {
+    last_error = "World Sky playback time is invalid";
+    status = last_error;
+    return false;
+  }
+  const double bounded_elapsed =
+      std::clamp(elapsed_seconds, 0.0, 0.25);
+  const double bounded_speed = std::clamp(
+      static_cast<double>(world_environment.time.time_speed),
+      -86400.0, 86400.0);
+  gfx::UtcDateTime next_utc;
+  std::string error;
+  if (!gfx::shiftUtcDateTime(world_environment.celestial.utc,
+                             bounded_elapsed * bounded_speed,
+                             next_utc, &error)) {
+    last_error = error;
+    status = "World Sky playback stopped";
+    world_environment.time.playing = false;
+    return false;
+  }
+  if (world_environment.clouds.enabled) {
+    world_environment.clouds.time_seconds = static_cast<float>(
+        std::clamp(
+            static_cast<double>(world_environment.clouds.time_seconds) +
+                bounded_elapsed,
+            -1.0e7, 1.0e7));
+    if (world_environment.clouds.temporal_frame <
+        (std::numeric_limits<std::uint32_t>::max)()) {
+      ++world_environment.clouds.temporal_frame;
+    }
+    advanceGeneration(world_environment.clouds.generation);
+    advanceGeneration(world_environment.cloud_generation);
+  }
+  return setProceduralSkyControls(
+      next_utc, world_environment.celestial.observer,
+      world_environment.sun_azimuth_offset_degrees,
+      world_environment.sun_altitude_offset_degrees);
+}
+
+gfx::PathTraceChangeClass AppSession::applyPathTraceSettings(
+    const gfx::PathTraceSettings &settings) noexcept {
+  gfx::PathTraceSettings next =
+      gfx::normalizePathTraceSettings(settings);
+  const gfx::PathTraceChangeClass changes =
+      gfx::classifyPathTraceSettingsChange(path_trace_settings, next);
+  next.reset_generation = path_trace_settings.reset_generation;
+  next.target_generation = path_trace_settings.target_generation;
+  next.post_process_generation =
+      path_trace_settings.post_process_generation;
+  next.display_generation = path_trace_settings.display_generation;
+  if (gfx::hasPathTraceChange(
+          changes, gfx::PathTraceChangeClass::ResetAccumulation)) {
+    advanceGeneration(next.reset_generation);
+  }
+  if (gfx::hasPathTraceChange(
+          changes, gfx::PathTraceChangeClass::RecreateTarget)) {
+    advanceGeneration(next.target_generation);
+  }
+  if (gfx::hasPathTraceChange(
+          changes,
+          gfx::PathTraceChangeClass::ReconfigurePostProcess)) {
+    advanceGeneration(next.post_process_generation);
+  }
+  if (gfx::hasPathTraceChange(
+          changes, gfx::PathTraceChangeClass::DisplayOnly)) {
+    advanceGeneration(next.display_generation);
+  }
+  path_trace_settings = next;
+  return changes;
+}
+
+void AppSession::freezePathTraceRenderSnapshot() noexcept {
+  path_trace_render_snapshot =
+      gfx::makePathTraceRenderSnapshot(path_trace_settings);
+  status = "Path tracing render snapshot frozen";
+  last_error.clear();
+}
+
+void AppSession::setApplicationDirectory(
+    std::filesystem::path directory) {
+  application_directory_ =
+      directory.empty() ? std::filesystem::path{}
+                        : directory.lexically_normal();
+}
+
+std::filesystem::path AppSession::stillRenderOutputDirectory() const {
+  return application_directory_.empty()
+             ? std::filesystem::path{}
+             : application_directory_ / "output";
+}
+
+bool AppSession::stillRenderActive() const noexcept {
+  const auto state = still_render_job.status.state;
+  return state == gfx::StillRenderJobState::Queued ||
+         state == gfx::StillRenderJobState::Rendering ||
+         state == gfx::StillRenderJobState::Saving;
+}
+
+bool AppSession::queueStillRender() {
+  if (stillRenderActive()) {
+    last_error = "A still render is already running";
+    return false;
+  }
+  const std::filesystem::path output_directory =
+      stillRenderOutputDirectory();
+  if (output_directory.empty()) {
+    last_error = "Application directory is unavailable";
+    status = "Still render could not start";
+    return false;
+  }
+
+  auto &settings = still_render_job.settings;
+  settings.width = std::clamp(settings.width, 64u, 4'096u);
+  settings.height = std::clamp(settings.height, 64u, 4'096u);
+  settings.target_samples =
+      std::clamp(settings.target_samples, 32u, 65'536u);
+  settings.samples_per_submit =
+      std::clamp(settings.samples_per_submit, 1u, 32u);
+
+  std::string filename =
+      std::filesystem::path(settings.filename).filename().stem().string();
+  for (char &character : filename) {
+    const unsigned char byte = static_cast<unsigned char>(character);
+    if (byte < 32u || character == '<' || character == '>' ||
+        character == ':' || character == '"' || character == '/' ||
+        character == '\\' || character == '|' || character == '?' ||
+        character == '*') {
+      character = '_';
+    }
+  }
+  while (!filename.empty() &&
+         (filename.back() == ' ' || filename.back() == '.')) {
+    filename.pop_back();
+  }
+  if (filename.empty() || filename == "." || filename == "..") {
+    filename = "render";
+  }
+  settings.filename = filename;
+
+  std::error_code filesystem_error;
+  std::filesystem::create_directories(output_directory, filesystem_error);
+  if (filesystem_error) {
+    last_error = "Cannot create the application output folder: " +
+                 filesystem_error.message();
+    status = "Still render could not start";
+    return false;
+  }
+
+  const char *extension =
+      settings.format == gfx::StillImageFormat::Exr ? ".exr" : ".png";
+  std::filesystem::path output_path =
+      output_directory / (filename + extension);
+  for (std::uint32_t suffix = 1u;
+       std::filesystem::exists(output_path, filesystem_error) &&
+       !filesystem_error && suffix < 10'000u;
+       ++suffix) {
+    char numbered[32]{};
+    std::snprintf(numbered, sizeof(numbered), "-%03u%s", suffix,
+                  extension);
+    output_path = output_directory / (filename + numbered);
+  }
+  if (filesystem_error) {
+    last_error = "Cannot inspect the still render output path: " +
+                 filesystem_error.message();
+    status = "Still render could not start";
+    return false;
+  }
+  const bool exhausted_output_name =
+      std::filesystem::exists(output_path, filesystem_error);
+  if (filesystem_error || exhausted_output_name) {
+    last_error =
+        filesystem_error
+            ? "Cannot inspect the still render output path: " +
+                  filesystem_error.message()
+            : "Too many still render files use this filename";
+    status = "Still render could not start";
+    return false;
+  }
+
+  StillRenderSnapshot snapshot;
+  snapshot.scene_selection = scene_selection;
+  snapshot.path_trace_settings =
+      path_trace_render_snapshot.has_value()
+          ? path_trace_render_snapshot->settings
+          : gfx::normalizePathTraceSettings(path_trace_settings);
+  snapshot.path_trace_settings.maximum_samples = settings.target_samples;
+  snapshot.path_trace_settings.samples_per_frame =
+      settings.samples_per_submit;
+  snapshot.path_trace_settings.transparent_background =
+      settings.transparent_background;
+  // Render Result is a Cycles-style raw sample accumulation. Interactive
+  // reconstruction, denoising, adaptive stopping, and resolution scaling
+  // never alter the still image written to disk.
+  snapshot.path_trace_settings.requested_denoiser =
+      gfx::PathTraceDenoiser::Raw;
+  snapshot.path_trace_settings.requested_upscale =
+      gfx::PathTraceUpscale::Off;
+  snapshot.path_trace_settings.requested_frame_generation =
+      gfx::PathTraceFrameGeneration::Off;
+  snapshot.path_trace_settings.requested_reflex_mode =
+      gfx::PathTraceReflexMode::Off;
+  snapshot.path_trace_settings.adaptive_sampling = false;
+  snapshot.path_trace_settings.preview_resolution_scale = 1.0f;
+  snapshot.path_trace_settings.interactive_quality =
+      gfx::PathTraceInteractiveQuality::Full;
+  snapshot.path_trace_settings.accumulate_while_moving = false;
+  snapshot.path_trace_settings.pause_accumulation = false;
+  snapshot.world_environment = world_environment;
+  snapshot.material_debug_view = labpbr_debug_view;
+  snapshot.rt_debug_view = rt_debug_view;
+  snapshot.model_generation = modelGeneration();
+  snapshot.material_generation = materialGeneration();
+  snapshot.preview_time = preview_time;
+  snapshot.preview_scene_id = preview_scene_id;
+  snapshot.show_preview_grid = show_preview_grid;
+  snapshot.show_preview_axes = show_preview_axes;
+  snapshot.dynamic_preview_scene = dynamic_preview_scene;
+  snapshot.previous_playback_state = playback_state;
+
+  still_render_job.snapshot = std::move(snapshot);
+  still_render_job.cancel_requested = false;
+  still_render_job.status = {};
+  still_render_job.status.state = gfx::StillRenderJobState::Queued;
+  still_render_job.status.job_id = next_still_render_job_id_++;
+  still_render_job.status.target_samples = settings.target_samples;
+  still_render_job.status.output_path = output_path.string();
+  playback_state = PlaybackState::Paused;
+  still_render_playback_restored_ = false;
+  last_error.clear();
+  status = "Still render queued";
+  return true;
+}
+
+bool AppSession::freezeQueuedStillRenderCamera(
+    const float *view_matrix, const float *proj_matrix,
+    float raster_scene_time_seconds) {
+  if (still_render_job.status.state !=
+          gfx::StillRenderJobState::Queued ||
+      !still_render_job.snapshot.has_value() || view_matrix == nullptr ||
+      proj_matrix == nullptr) {
+    return false;
+  }
+  auto &snapshot = *still_render_job.snapshot;
+  std::copy_n(view_matrix, snapshot.view_matrix.size(),
+              snapshot.view_matrix.begin());
+  std::copy_n(proj_matrix, snapshot.proj_matrix.size(),
+              snapshot.proj_matrix.begin());
+  snapshot.raster_scene_time_seconds = raster_scene_time_seconds;
+  snapshot.camera_frozen = true;
+  return true;
+}
+
+void AppSession::requestStillRenderCancel() noexcept {
+  if (stillRenderActive()) {
+    still_render_job.cancel_requested = true;
+    status = "Cancelling still render";
+  }
+}
+
+void AppSession::synchronizeStillRenderState() {
+  if (still_render_playback_restored_ ||
+      !still_render_job.snapshot.has_value() || stillRenderActive()) {
+    return;
+  }
+  playback_state =
+      still_render_job.snapshot->previous_playback_state;
+  still_render_playback_restored_ = true;
+  switch (still_render_job.status.state) {
+  case gfx::StillRenderJobState::Completed:
+    status = "Still render completed";
+    last_error.clear();
+    xpbd::log::infof(
+        "Still render completed: job=%llu samples=%u/%u output=%s",
+        static_cast<unsigned long long>(still_render_job.status.job_id),
+        still_render_job.status.accumulated_samples,
+        still_render_job.status.target_samples,
+        still_render_job.status.output_path.c_str());
+    break;
+  case gfx::StillRenderJobState::Cancelled:
+    status = "Still render cancelled";
+    last_error.clear();
+    xpbd::log::infof(
+        "Still render cancelled: job=%llu samples=%u/%u",
+        static_cast<unsigned long long>(still_render_job.status.job_id),
+        still_render_job.status.accumulated_samples,
+        still_render_job.status.target_samples);
+    break;
+  case gfx::StillRenderJobState::Failed:
+    status = "Still render failed";
+    last_error = still_render_job.status.error;
+    xpbd::log::warnf(
+        "Still render failed: job=%llu samples=%u/%u error=%s",
+        static_cast<unsigned long long>(still_render_job.status.job_id),
+        still_render_job.status.accumulated_samples,
+        still_render_job.status.target_samples,
+        still_render_job.status.error.c_str());
+    break;
+  default:
+    break;
+  }
+}
+
+bool AppSession::savePathTraceSettings(
+    const std::filesystem::path &path) {
+  try {
+    const gfx::PathTraceSettings settings =
+        gfx::normalizePathTraceSettings(path_trace_settings);
+    nlohmann::ordered_json json = {
+        {"schema", "xpbd-path-tracing/1"},
+        {"preset", static_cast<int>(settings.preset)},
+        {"source_preset", static_cast<int>(settings.source_preset)},
+        {"nvidia_rt_core_acceleration",
+         settings.nvidia_rt_core_acceleration},
+        {"sampling",
+         {{"samples_per_frame", settings.samples_per_frame},
+          {"maximum_samples", settings.maximum_samples},
+          {"automatic_seed", settings.automatic_seed},
+          {"seed", settings.seed},
+          {"adaptive", settings.adaptive_sampling},
+          {"adaptive_noise_threshold",
+           settings.adaptive_noise_threshold},
+          {"adaptive_minimum_samples",
+           settings.adaptive_minimum_samples}}},
+        {"light_paths",
+         {{"maximum_bounces", settings.max_bounces},
+          {"diffuse_bounces", settings.max_diffuse_bounces},
+          {"glossy_bounces", settings.max_glossy_bounces},
+          {"transmission_bounces",
+           settings.max_transmission_bounces},
+          {"transparent_bounces",
+           settings.max_transparent_bounces},
+          {"russian_roulette", settings.russian_roulette},
+          {"russian_roulette_start",
+           settings.russian_roulette_start}}},
+        {"lighting",
+         {{"analytic_lights", settings.analytic_lights},
+          {"emissive_surfaces", settings.emissive_surfaces},
+          {"emissive_multiplier", settings.emissive_multiplier},
+          {"light_samples_per_path",
+           settings.light_samples_per_path}}},
+        {"advanced",
+         {{"next_event_estimation",
+           settings.next_event_estimation},
+          {"multiple_importance_sampling",
+           settings.multiple_importance_sampling},
+          {"environment_importance_sampling",
+           settings.environment_importance_sampling},
+          {"emissive_mesh_sampling",
+           settings.emissive_mesh_sampling},
+          {"direct_clamp", settings.direct_clamp},
+          {"indirect_clamp", settings.indirect_clamp},
+          {"analytic_environment_strength",
+           settings.analytic_environment_strength}}},
+        {"post_process",
+         {{"denoiser",
+           static_cast<int>(settings.requested_denoiser)},
+          {"upscale",
+           static_cast<int>(settings.requested_upscale)},
+          {"frame_generation",
+           static_cast<int>(
+               settings.requested_frame_generation)},
+          {"reflex_mode",
+           static_cast<int>(settings.requested_reflex_mode)}}},
+        {"film",
+         {{"transparent_background",
+           settings.transparent_background},
+          {"exposure_ev", settings.display_exposure_ev},
+          {"tone_mapping",
+           static_cast<int>(settings.tone_mapping)},
+          {"white_balance_kelvin",
+           settings.white_balance_kelvin},
+          {"bloom_strength", settings.bloom_strength}}},
+        {"performance",
+         {{"preview_resolution_scale",
+           settings.preview_resolution_scale},
+          {"target_frame_time_ms",
+           settings.target_frame_time_ms},
+          {"interactive_quality",
+           static_cast<int>(settings.interactive_quality)},
+          {"accumulate_while_moving",
+           settings.accumulate_while_moving},
+          {"pause_accumulation",
+           settings.pause_accumulation}}},
+        {"debug",
+         {{"developer_controls", settings.developer_controls},
+          {"force_software_fallback",
+           settings.force_software_fallback}}}};
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output) {
+      throw std::runtime_error(
+          "failed to open path tracing settings output");
+    }
+    output << json.dump(2) << '\n';
+    if (!output.good()) {
+      throw std::runtime_error(
+          "failed to write path tracing settings");
+    }
+    last_error.clear();
+    status = "Path tracing settings saved: " +
+             path.filename().string();
+    return true;
+  } catch (const std::exception &error) {
+    last_error = error.what();
+    status = "Path tracing settings save failed";
+    return false;
+  }
+}
+
+bool AppSession::loadPathTraceSettings(
+    const std::filesystem::path &path) {
+  try {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+      throw std::runtime_error(
+          "failed to open path tracing settings");
+    }
+    nlohmann::json json;
+    input >> json;
+    if (!json.is_object() ||
+        json.value("schema", std::string{}) !=
+            "xpbd-path-tracing/1") {
+      throw std::runtime_error(
+          "unsupported path tracing settings schema");
+    }
+    gfx::PathTraceSettings candidate = path_trace_settings;
+    const auto readFloat = [](const nlohmann::json &object,
+                              const char *key, float fallback) {
+      const float value = object.value(key, fallback);
+      if (!std::isfinite(value)) {
+        throw std::runtime_error(
+            std::string("invalid path tracing field: ") + key);
+      }
+      return value;
+    };
+    candidate.preset = static_cast<gfx::PathTracePreset>(
+        std::clamp(json.value("preset",
+                              static_cast<int>(candidate.preset)),
+                   0, 4));
+    candidate.source_preset =
+        static_cast<gfx::PathTracePreset>(std::clamp(
+            json.value("source_preset",
+                       static_cast<int>(candidate.source_preset)),
+            0, 3));
+    candidate.nvidia_rt_core_acceleration =
+        json.value("nvidia_rt_core_acceleration",
+                   candidate.nvidia_rt_core_acceleration);
+    if (const auto it = json.find("sampling");
+        it != json.end() && it->is_object()) {
+      candidate.samples_per_frame =
+          it->value("samples_per_frame",
+                    candidate.samples_per_frame);
+      candidate.maximum_samples =
+          it->value("maximum_samples",
+                    candidate.maximum_samples);
+      candidate.automatic_seed =
+          it->value("automatic_seed", candidate.automatic_seed);
+      candidate.seed = it->value("seed", candidate.seed);
+      candidate.adaptive_sampling =
+          it->value("adaptive", candidate.adaptive_sampling);
+      candidate.adaptive_noise_threshold =
+          readFloat(*it, "adaptive_noise_threshold",
+                    candidate.adaptive_noise_threshold);
+      candidate.adaptive_minimum_samples =
+          it->value("adaptive_minimum_samples",
+                    candidate.adaptive_minimum_samples);
+    }
+    if (const auto it = json.find("light_paths");
+        it != json.end() && it->is_object()) {
+      candidate.max_bounces =
+          it->value("maximum_bounces", candidate.max_bounces);
+      candidate.max_diffuse_bounces =
+          it->value("diffuse_bounces",
+                    candidate.max_diffuse_bounces);
+      candidate.max_glossy_bounces =
+          it->value("glossy_bounces",
+                    candidate.max_glossy_bounces);
+      candidate.max_transmission_bounces =
+          it->value("transmission_bounces",
+                    candidate.max_transmission_bounces);
+      candidate.max_transparent_bounces =
+          it->value("transparent_bounces",
+                    candidate.max_transparent_bounces);
+      candidate.russian_roulette =
+          it->value("russian_roulette",
+                    candidate.russian_roulette);
+      candidate.russian_roulette_start =
+          it->value("russian_roulette_start",
+                    candidate.russian_roulette_start);
+    }
+    if (const auto it = json.find("lighting");
+        it != json.end() && it->is_object()) {
+      candidate.analytic_lights =
+          it->value("analytic_lights",
+                    candidate.analytic_lights);
+      candidate.emissive_surfaces =
+          it->value("emissive_surfaces",
+                    candidate.emissive_surfaces);
+      candidate.emissive_multiplier =
+          readFloat(*it, "emissive_multiplier",
+                    candidate.emissive_multiplier);
+      candidate.light_samples_per_path =
+          it->value("light_samples_per_path",
+                    candidate.light_samples_per_path);
+    }
+    if (const auto it = json.find("advanced");
+        it != json.end() && it->is_object()) {
+      candidate.next_event_estimation =
+          it->value("next_event_estimation",
+                    candidate.next_event_estimation);
+      candidate.multiple_importance_sampling =
+          it->value("multiple_importance_sampling",
+                    candidate.multiple_importance_sampling);
+      candidate.environment_importance_sampling =
+          it->value("environment_importance_sampling",
+                    candidate.environment_importance_sampling);
+      candidate.emissive_mesh_sampling =
+          it->value("emissive_mesh_sampling",
+                    candidate.emissive_mesh_sampling);
+      candidate.direct_clamp =
+          readFloat(*it, "direct_clamp",
+                    candidate.direct_clamp);
+      candidate.indirect_clamp =
+          readFloat(*it, "indirect_clamp",
+                    candidate.indirect_clamp);
+      candidate.analytic_environment_strength =
+          readFloat(*it, "analytic_environment_strength",
+                    candidate.analytic_environment_strength);
+    }
+    if (const auto it = json.find("post_process");
+        it != json.end() && it->is_object()) {
+      candidate.requested_denoiser =
+          static_cast<gfx::PathTraceDenoiser>(std::clamp(
+              it->value("denoiser",
+                        static_cast<int>(
+                            candidate.requested_denoiser)),
+              0, 4));
+      candidate.requested_upscale =
+          static_cast<gfx::PathTraceUpscale>(std::clamp(
+              it->value("upscale",
+                        static_cast<int>(
+                            candidate.requested_upscale)),
+              0, 7));
+      candidate.requested_frame_generation =
+          static_cast<gfx::PathTraceFrameGeneration>(std::clamp(
+              it->value(
+                  "frame_generation",
+                  static_cast<int>(
+                      candidate.requested_frame_generation)),
+              0, 1));
+      candidate.requested_reflex_mode =
+          static_cast<gfx::PathTraceReflexMode>(std::clamp(
+              it->value(
+                  "reflex_mode",
+                  static_cast<int>(
+                      candidate.requested_reflex_mode)),
+              0, 2));
+    }
+    if (const auto it = json.find("film");
+        it != json.end() && it->is_object()) {
+      candidate.transparent_background =
+          it->value("transparent_background",
+                    candidate.transparent_background);
+      candidate.display_exposure_ev =
+          readFloat(*it, "exposure_ev",
+                    candidate.display_exposure_ev);
+      candidate.tone_mapping =
+          static_cast<gfx::PathTraceToneMapping>(std::clamp(
+              it->value("tone_mapping",
+                        static_cast<int>(candidate.tone_mapping)),
+              0, 2));
+      candidate.white_balance_kelvin =
+          readFloat(*it, "white_balance_kelvin",
+                    candidate.white_balance_kelvin);
+      candidate.bloom_strength =
+          readFloat(*it, "bloom_strength",
+                    candidate.bloom_strength);
+    }
+    if (const auto it = json.find("performance");
+        it != json.end() && it->is_object()) {
+      candidate.preview_resolution_scale =
+          readFloat(*it, "preview_resolution_scale",
+                    candidate.preview_resolution_scale);
+      candidate.target_frame_time_ms =
+          readFloat(*it, "target_frame_time_ms",
+                    candidate.target_frame_time_ms);
+      candidate.interactive_quality =
+          static_cast<gfx::PathTraceInteractiveQuality>(
+              std::clamp(it->value(
+                             "interactive_quality",
+                             static_cast<int>(
+                                 candidate.interactive_quality)),
+                         0, 2));
+      candidate.accumulate_while_moving =
+          it->value("accumulate_while_moving",
+                    candidate.accumulate_while_moving);
+      candidate.pause_accumulation =
+          it->value("pause_accumulation",
+                    candidate.pause_accumulation);
+    }
+    if (const auto it = json.find("debug");
+        it != json.end() && it->is_object()) {
+      candidate.developer_controls =
+          it->value("developer_controls",
+                    candidate.developer_controls);
+      candidate.force_software_fallback =
+          it->value("force_software_fallback",
+                    candidate.force_software_fallback);
+    }
+    candidate = gfx::normalizePathTraceSettings(candidate);
+    (void)applyPathTraceSettings(candidate);
+    last_error.clear();
+    status = "Path tracing settings loaded: " +
+             path.filename().string();
+    return true;
+  } catch (const std::exception &error) {
+    last_error = error.what();
+    status = "Path tracing settings load failed";
+    return false;
+  }
+}
+
+bool AppSession::saveWorldSkySettings(
+    const std::filesystem::path &path) {
+  try {
+    const auto &world = world_environment;
+    const auto &celestial = world.celestial;
+    const auto &physical = world.atmosphere.physical;
+    nlohmann::ordered_json json = {
+        {"schema", "xpbd-world-sky/1"},
+        {"sky_rendering", static_cast<int>(world.sky_rendering)},
+        {"global_lighting_strength_ev",
+         world.global_lighting_strength_ev},
+        {"environment_lighting", world.environment_lighting},
+        {"sun_moon_lighting", world.sun_moon_lighting},
+        {"background",
+         {{"visible", world.background_visible},
+          {"transparent", world.background_transparent},
+          {"exposure_ev", world.background_exposure}}},
+        {"rotation_radians", world.rotation_radians},
+        {"time",
+         {{"utc",
+           {{"year", celestial.utc.year},
+            {"month", celestial.utc.month},
+            {"day", celestial.utc.day},
+            {"hour", celestial.utc.hour},
+            {"minute", celestial.utc.minute},
+            {"second", celestial.utc.second}}},
+          {"utc_offset_hours", world.time.utc_offset_hours},
+          {"playing", world.time.playing},
+          {"speed", world.time.time_speed}}},
+        {"observer",
+         {{"latitude", celestial.observer.latitude_degrees},
+          {"longitude", celestial.observer.longitude_degrees},
+          {"elevation_meters", celestial.observer.elevation_meters},
+          {"north_offset_degrees",
+           celestial.observer.north_offset_degrees}}},
+        {"sun",
+         {{"enabled", world.sun.enabled},
+          {"strength", world.sun.strength},
+          {"direction_mode",
+           static_cast<int>(world.sun.direction_mode)},
+          {"azimuth_offset_degrees",
+           world.sun_azimuth_offset_degrees},
+          {"altitude_offset_degrees",
+           world.sun_altitude_offset_degrees},
+          {"color_temperature_kelvin",
+           world.sun.color_temperature_kelvin},
+          {"angular_diameter_degrees",
+           world.sun.angular_diameter_degrees},
+          {"disk_visible", world.sun.disk_visible},
+          {"cast_shadows", world.sun.cast_shadows}}},
+        {"moon",
+         {{"enabled", world.moon.enabled},
+          {"strength", world.moon.strength},
+          {"phase_mode", static_cast<int>(world.moon.phase_mode)},
+          {"manual_illuminated_fraction",
+           world.moon.manual_illuminated_fraction},
+          {"direction_mode",
+           static_cast<int>(world.moon.direction_mode)},
+          {"azimuth_offset_degrees",
+           world.moon.azimuth_offset_degrees},
+          {"altitude_offset_degrees",
+           world.moon.altitude_offset_degrees},
+          {"angular_diameter_degrees",
+           world.moon.angular_diameter_degrees},
+          {"surface_detail", world.moon.surface_detail},
+          {"disk_visible", world.moon.disk_visible},
+          {"cast_shadows", world.moon.cast_shadows}}},
+        {"atmosphere",
+         {{"sky_relative_strength",
+           world.atmosphere_controls.sky_relative_strength},
+          {"turbidity", world.atmosphere_controls.turbidity},
+          {"ozone", world.atmosphere_controls.ozone},
+          {"lut_quality", world.atmosphere_controls.lut_quality},
+          {"solar_irradiance", physical.solar_irradiance},
+          {"rayleigh_scattering",
+           physical.rayleigh_scattering_per_km},
+          {"mie_scattering", physical.mie_scattering_per_km},
+          {"mie_extinction", physical.mie_extinction_per_km},
+          {"mie_g", physical.mie_phase_function_g},
+          {"absorption_extinction",
+           physical.absorption_extinction_per_km},
+          {"ground_albedo", physical.ground_albedo}}},
+        {"night",
+         {{"stars_enabled", world.night.stars_enabled},
+          {"star_intensity", world.night.star_intensity},
+          {"milky_way_enabled", world.night.milky_way_enabled},
+          {"milky_way_intensity",
+           world.night.milky_way_intensity},
+          {"light_pollution", world.night.light_pollution},
+          {"star_rotation_degrees",
+           world.night.star_rotation_degrees},
+          {"night_fill", world.night.night_fill}}},
+        {"clouds",
+         {{"enabled", world.clouds.enabled},
+          {"coverage", world.clouds.coverage},
+          {"density", world.clouds.density},
+          {"base_altitude_km", world.clouds.base_altitude_km},
+          {"thickness_km", world.clouds.thickness_km},
+          {"wind_direction", world.clouds.wind_direction},
+          {"wind_speed_km_per_hour",
+           world.clouds.wind_speed_km_per_hour},
+          {"shadow_strength", world.clouds.shadow_strength},
+          {"quality", static_cast<int>(world.clouds.quality)},
+          {"weather_scale", world.clouds.weather_scale},
+          {"weather_offset_km", world.clouds.weather_offset_km},
+          {"base_shape_scale", world.clouds.base_shape_scale},
+          {"detail_scale", world.clouds.detail_scale},
+          {"erosion", world.clouds.erosion},
+          {"forward_scattering", world.clouds.forward_scattering},
+          {"silver_lining", world.clouds.silver_lining},
+          {"absorption", world.clouds.absorption},
+          {"multiple_scattering", world.clouds.multiple_scattering},
+          {"render_ratio", world.clouds.render_ratio},
+          {"reprojection", world.clouds.reprojection},
+          {"history_weight", world.clouds.history_weight},
+          {"lighting_strength", world.clouds.lighting_strength},
+          {"shadow_resolution", world.clouds.shadow_resolution},
+          {"time_seconds", world.clouds.time_seconds},
+          {"seed", world.clouds.seed},
+          {"ray_steps", world.clouds.ray_steps},
+          {"light_steps", world.clouds.light_steps}}},
+        {"hdri",
+         {{"path", world.selected_hdr_identity},
+          {"checksum", world.hdr.checksum},
+          {"runtime_resolution", world.hdri_runtime_resolution}}},
+        {"debug_view", static_cast<int>(world.debug_view)}};
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output) {
+      throw std::runtime_error("failed to open World/Sky settings output");
+    }
+    output << json.dump(2) << '\n';
+    if (!output.good()) {
+      throw std::runtime_error("failed to write World/Sky settings");
+    }
+    last_error.clear();
+    status = "World Sky settings saved: " + path.filename().string();
+    return true;
+  } catch (const std::exception &error) {
+    last_error = error.what();
+    status = "World Sky settings save failed";
+    return false;
+  }
+}
+
+bool AppSession::loadWorldSkySettings(
+    const std::filesystem::path &path) {
+  try {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+      throw std::runtime_error("failed to open World/Sky settings");
+    }
+    nlohmann::json json;
+    input >> json;
+    if (!json.is_object() ||
+        json.value("schema", std::string{}) != "xpbd-world-sky/1") {
+      throw std::runtime_error("unsupported World/Sky settings schema");
+    }
+    gfx::WorldEnvironmentState candidate = world_environment;
+    const auto readFloat = [](const nlohmann::json &object,
+                              const char *key, float fallback,
+                              float lo, float hi) {
+      const float value = object.value(key, fallback);
+      if (!std::isfinite(value)) {
+        throw std::runtime_error(std::string("invalid sky field: ") + key);
+      }
+      return std::clamp(value, lo, hi);
+    };
+    const auto readDouble = [](const nlohmann::json &object,
+                               const char *key, double fallback,
+                               double lo, double hi) {
+      const double value = object.value(key, fallback);
+      if (!std::isfinite(value)) {
+        throw std::runtime_error(std::string("invalid sky field: ") + key);
+      }
+      return std::clamp(value, lo, hi);
+    };
+    candidate.sky_rendering = static_cast<gfx::SkyRendering>(
+        std::clamp(json.value("sky_rendering",
+                              static_cast<int>(candidate.sky_rendering)),
+                   0, 2));
+    candidate.global_lighting_strength_ev =
+        readFloat(json, "global_lighting_strength_ev",
+                  candidate.global_lighting_strength_ev, -10.0f, 10.0f);
+    candidate.environment_lighting =
+        json.value("environment_lighting",
+                   candidate.environment_lighting);
+    candidate.sun_moon_lighting =
+        json.value("sun_moon_lighting", candidate.sun_moon_lighting);
+    if (const auto it = json.find("background");
+        it != json.end() && it->is_object()) {
+      candidate.background_visible =
+          it->value("visible", candidate.background_visible);
+      candidate.background_transparent =
+          it->value("transparent", candidate.background_transparent);
+      candidate.background_exposure =
+          readFloat(*it, "exposure_ev", candidate.background_exposure,
+                    -10.0f, 10.0f);
+    }
+    candidate.rotation_radians =
+        readFloat(json, "rotation_radians", candidate.rotation_radians,
+                  -1000.0f, 1000.0f);
+    gfx::UtcDateTime utc = candidate.celestial.utc;
+    if (const auto it = json.find("time");
+        it != json.end() && it->is_object()) {
+      if (const auto utc_it = it->find("utc");
+          utc_it != it->end() && utc_it->is_object()) {
+        utc.year = utc_it->value("year", utc.year);
+        utc.month = utc_it->value("month", utc.month);
+        utc.day = utc_it->value("day", utc.day);
+        utc.hour = utc_it->value("hour", utc.hour);
+        utc.minute = utc_it->value("minute", utc.minute);
+        utc.second = readDouble(*utc_it, "second", utc.second, 0.0, 59.999);
+      }
+      candidate.time.utc_offset_hours =
+          readFloat(*it, "utc_offset_hours",
+                    candidate.time.utc_offset_hours, -14.0f, 14.0f);
+      candidate.time.playing =
+          it->value("playing", candidate.time.playing);
+      candidate.time.time_speed =
+          readFloat(*it, "speed", candidate.time.time_speed,
+                    -86400.0f, 86400.0f);
+    }
+    gfx::ObserverLocation observer = candidate.celestial.observer;
+    if (const auto it = json.find("observer");
+        it != json.end() && it->is_object()) {
+      observer.latitude_degrees =
+          readDouble(*it, "latitude", observer.latitude_degrees,
+                     -90.0, 90.0);
+      observer.longitude_degrees =
+          readDouble(*it, "longitude", observer.longitude_degrees,
+                     -180.0, 180.0);
+      observer.elevation_meters =
+          readDouble(*it, "elevation_meters",
+                     observer.elevation_meters, -1000.0, 100000.0);
+      observer.north_offset_degrees =
+          readDouble(*it, "north_offset_degrees",
+                     observer.north_offset_degrees, -180.0, 180.0);
+    }
+    if (const auto it = json.find("sun");
+        it != json.end() && it->is_object()) {
+      candidate.sun.enabled = it->value("enabled", candidate.sun.enabled);
+      candidate.sun.strength =
+          readFloat(*it, "strength", candidate.sun.strength, 0.0f, 32.0f);
+      candidate.sun.direction_mode = static_cast<gfx::SkyDirectionMode>(
+          std::clamp(it->value(
+                         "direction_mode",
+                         static_cast<int>(candidate.sun.direction_mode)),
+                     0, 1));
+      candidate.sun_azimuth_offset_degrees =
+          readDouble(*it, "azimuth_offset_degrees",
+                     candidate.sun_azimuth_offset_degrees, -180.0, 180.0);
+      candidate.sun_altitude_offset_degrees =
+          readDouble(*it, "altitude_offset_degrees",
+                     candidate.sun_altitude_offset_degrees, -90.0, 90.0);
+      candidate.sun.color_temperature_kelvin =
+          readFloat(*it, "color_temperature_kelvin",
+                    candidate.sun.color_temperature_kelvin,
+                    1000.0f, 40000.0f);
+      candidate.sun.angular_diameter_degrees =
+          readFloat(*it, "angular_diameter_degrees",
+                    candidate.sun.angular_diameter_degrees, 0.05f, 5.0f);
+      candidate.sun.disk_visible =
+          it->value("disk_visible", candidate.sun.disk_visible);
+      candidate.sun.cast_shadows =
+          it->value("cast_shadows", candidate.sun.cast_shadows);
+    }
+    if (const auto it = json.find("moon");
+        it != json.end() && it->is_object()) {
+      candidate.moon.enabled = it->value("enabled", candidate.moon.enabled);
+      candidate.moon.strength =
+          readFloat(*it, "strength", candidate.moon.strength, 0.0f, 32.0f);
+      candidate.moon.phase_mode = static_cast<gfx::MoonPhaseMode>(
+          std::clamp(it->value(
+                         "phase_mode",
+                         static_cast<int>(candidate.moon.phase_mode)),
+                     0, 1));
+      candidate.moon.manual_illuminated_fraction =
+          readFloat(*it, "manual_illuminated_fraction",
+                    candidate.moon.manual_illuminated_fraction,
+                    0.0f, 1.0f);
+      candidate.moon.direction_mode = static_cast<gfx::SkyDirectionMode>(
+          std::clamp(it->value(
+                         "direction_mode",
+                         static_cast<int>(candidate.moon.direction_mode)),
+                     0, 1));
+      candidate.moon.azimuth_offset_degrees =
+          readFloat(*it, "azimuth_offset_degrees",
+                    candidate.moon.azimuth_offset_degrees,
+                    -180.0f, 180.0f);
+      candidate.moon.altitude_offset_degrees =
+          readFloat(*it, "altitude_offset_degrees",
+                    candidate.moon.altitude_offset_degrees,
+                    -90.0f, 90.0f);
+      candidate.moon.angular_diameter_degrees =
+          readFloat(*it, "angular_diameter_degrees",
+                    candidate.moon.angular_diameter_degrees, 0.05f, 5.0f);
+      candidate.moon.surface_detail =
+          readFloat(*it, "surface_detail",
+                    candidate.moon.surface_detail, 0.0f, 1.0f);
+      candidate.moon.disk_visible =
+          it->value("disk_visible", candidate.moon.disk_visible);
+      candidate.moon.cast_shadows =
+          it->value("cast_shadows", candidate.moon.cast_shadows);
+    }
+    if (const auto it = json.find("atmosphere");
+        it != json.end() && it->is_object()) {
+      candidate.atmosphere_controls.sky_relative_strength =
+          readFloat(*it, "sky_relative_strength",
+                    candidate.atmosphere_controls.sky_relative_strength,
+                    0.0f, 8.0f);
+      candidate.atmosphere_controls.turbidity =
+          readFloat(*it, "turbidity",
+                    candidate.atmosphere_controls.turbidity,
+                    0.0f, 4.0f);
+      candidate.atmosphere_controls.ozone =
+          readFloat(*it, "ozone", candidate.atmosphere_controls.ozone,
+                    0.0f, 4.0f);
+      candidate.atmosphere_controls.lut_quality =
+          static_cast<std::uint32_t>(std::clamp(
+              it->value("lut_quality", static_cast<int>(
+                                               candidate.atmosphere_controls
+                                                   .lut_quality)),
+              0, 2));
+      auto &physical = candidate.atmosphere.physical;
+      physical.solar_irradiance =
+          it->value("solar_irradiance", physical.solar_irradiance);
+      physical.rayleigh_scattering_per_km =
+          it->value("rayleigh_scattering",
+                    physical.rayleigh_scattering_per_km);
+      physical.mie_scattering_per_km =
+          it->value("mie_scattering", physical.mie_scattering_per_km);
+      physical.mie_extinction_per_km =
+          it->value("mie_extinction", physical.mie_extinction_per_km);
+      physical.mie_phase_function_g =
+          readDouble(*it, "mie_g", physical.mie_phase_function_g,
+                     -0.95, 0.95);
+      physical.absorption_extinction_per_km =
+          it->value("absorption_extinction",
+                    physical.absorption_extinction_per_km);
+      physical.ground_albedo =
+          it->value("ground_albedo", physical.ground_albedo);
+    }
+    if (const auto it = json.find("night");
+        it != json.end() && it->is_object()) {
+      candidate.night.stars_enabled =
+          it->value("stars_enabled", candidate.night.stars_enabled);
+      candidate.night.star_intensity =
+          readFloat(*it, "star_intensity",
+                    candidate.night.star_intensity, 0.0f, 32.0f);
+      candidate.night.milky_way_enabled =
+          it->value("milky_way_enabled",
+                    candidate.night.milky_way_enabled);
+      candidate.night.milky_way_intensity =
+          readFloat(*it, "milky_way_intensity",
+                    candidate.night.milky_way_intensity, 0.0f, 32.0f);
+      candidate.night.light_pollution =
+          readFloat(*it, "light_pollution",
+                    candidate.night.light_pollution, 0.0f, 16.0f);
+      candidate.night.star_rotation_degrees =
+          readFloat(*it, "star_rotation_degrees",
+                    candidate.night.star_rotation_degrees,
+                    -180.0f, 180.0f);
+      candidate.night.night_fill =
+          readFloat(*it, "night_fill",
+                    candidate.night.night_fill, 0.0f, 4.0f);
+    }
+    if (const auto it = json.find("clouds");
+        it != json.end() && it->is_object()) {
+      auto &clouds = candidate.clouds;
+      clouds.enabled = it->value("enabled", clouds.enabled);
+      clouds.coverage =
+          readFloat(*it, "coverage", clouds.coverage, 0.0f, 1.0f);
+      clouds.density =
+          readFloat(*it, "density", clouds.density, 0.01f, 8.0f);
+      clouds.base_altitude_km =
+          readFloat(*it, "base_altitude_km", clouds.base_altitude_km,
+                    0.1f, 20.0f);
+      clouds.thickness_km =
+          readFloat(*it, "thickness_km", clouds.thickness_km,
+                    0.1f, 20.0f);
+      clouds.wind_direction =
+          it->value("wind_direction", clouds.wind_direction);
+      clouds.wind_speed_km_per_hour =
+          readFloat(*it, "wind_speed_km_per_hour",
+                    clouds.wind_speed_km_per_hour, -1000.0f, 1000.0f);
+      clouds.shadow_strength =
+          readFloat(*it, "shadow_strength", clouds.shadow_strength,
+                    0.0f, 1.0f);
+      clouds.quality = static_cast<gfx::CloudQuality>(
+          std::clamp(it->value("quality",
+                               static_cast<int>(clouds.quality)),
+                     0, 3));
+      clouds.weather_scale =
+          readFloat(*it, "weather_scale", clouds.weather_scale,
+                    0.05f, 20.0f);
+      clouds.weather_offset_km =
+          it->value("weather_offset_km", clouds.weather_offset_km);
+      clouds.base_shape_scale =
+          readFloat(*it, "base_shape_scale", clouds.base_shape_scale,
+                    0.05f, 20.0f);
+      clouds.detail_scale =
+          readFloat(*it, "detail_scale", clouds.detail_scale,
+                    0.05f, 20.0f);
+      clouds.erosion =
+          readFloat(*it, "erosion", clouds.erosion, 0.0f, 1.0f);
+      clouds.forward_scattering =
+          readFloat(*it, "forward_scattering",
+                    clouds.forward_scattering, -0.95f, 0.95f);
+      clouds.silver_lining =
+          readFloat(*it, "silver_lining", clouds.silver_lining,
+                    0.0f, 4.0f);
+      clouds.absorption =
+          readFloat(*it, "absorption", clouds.absorption,
+                    0.01f, 8.0f);
+      clouds.multiple_scattering =
+          readFloat(*it, "multiple_scattering",
+                    clouds.multiple_scattering, 0.0f, 2.0f);
+      clouds.render_ratio =
+          readFloat(*it, "render_ratio", clouds.render_ratio,
+                    0.25f, 1.0f);
+      clouds.reprojection =
+          it->value("reprojection", clouds.reprojection);
+      clouds.history_weight =
+          readFloat(*it, "history_weight", clouds.history_weight,
+                    0.0f, 0.999f);
+      clouds.lighting_strength =
+          readFloat(*it, "lighting_strength",
+                    clouds.lighting_strength, 0.0f, 8.0f);
+      clouds.shadow_resolution =
+          static_cast<std::uint32_t>(std::clamp(
+              it->value("shadow_resolution",
+                        static_cast<int>(clouds.shadow_resolution)),
+              64, 4096));
+      clouds.time_seconds =
+          readFloat(*it, "time_seconds", clouds.time_seconds,
+                    -1.0e7f, 1.0e7f);
+      clouds.seed = it->value("seed", clouds.seed);
+      clouds.ray_steps = static_cast<std::uint32_t>(std::clamp(
+          it->value("ray_steps", static_cast<int>(clouds.ray_steps)),
+          8, 128));
+      clouds.light_steps = static_cast<std::uint32_t>(std::clamp(
+          it->value("light_steps",
+                    static_cast<int>(clouds.light_steps)),
+          1, 16));
+      if (!clouds.valid()) {
+        throw std::runtime_error("saved cloud settings are invalid");
+      }
+    }
+    std::string saved_hdr_path = candidate.selected_hdr_identity;
+    if (const auto it = json.find("hdri");
+        it != json.end() && it->is_object()) {
+      saved_hdr_path = it->value("path", saved_hdr_path);
+      candidate.selected_hdr_identity = saved_hdr_path;
+      candidate.hdri_runtime_resolution =
+          static_cast<std::uint32_t>(std::clamp(
+              it->value("runtime_resolution",
+                        static_cast<int>(candidate.hdri_runtime_resolution)),
+              256, 8192));
+      if (!candidate.hdr.valid() ||
+          candidate.hdr.source_identity != saved_hdr_path) {
+        candidate.hdr = {};
+      }
+    }
+    candidate.debug_view = static_cast<gfx::SkyDebugView>(
+        std::clamp(json.value("debug_view",
+                              static_cast<int>(candidate.debug_view)),
+                   0, 3));
+    gfx::CelestialState celestial;
+    std::string celestial_error;
+    const double applied_sun_azimuth =
+        candidate.sun.direction_mode == gfx::SkyDirectionMode::ArtisticOffset
+            ? candidate.sun_azimuth_offset_degrees
+            : 0.0;
+    const double applied_sun_altitude =
+        candidate.sun.direction_mode == gfx::SkyDirectionMode::ArtisticOffset
+            ? candidate.sun_altitude_offset_degrees
+            : 0.0;
+    const double applied_moon_azimuth =
+        candidate.moon.direction_mode == gfx::SkyDirectionMode::ArtisticOffset
+            ? candidate.moon.azimuth_offset_degrees
+            : 0.0;
+    const double applied_moon_altitude =
+        candidate.moon.direction_mode == gfx::SkyDirectionMode::ArtisticOffset
+            ? candidate.moon.altitude_offset_degrees
+            : 0.0;
+    if (!gfx::computeCelestialState(utc, observer, celestial,
+                                    &celestial_error) ||
+        !gfx::applyCelestialSunAngleOffsets(
+            celestial, applied_sun_azimuth, applied_sun_altitude,
+            &celestial_error) ||
+        !gfx::applyCelestialMoonAngleOffsets(
+            celestial, applied_moon_azimuth, applied_moon_altitude,
+            &celestial_error) ||
+        !candidate.atmosphere.valid()) {
+      throw std::runtime_error(
+          celestial_error.empty()
+              ? "saved atmosphere or celestial settings are invalid"
+              : celestial_error);
+    }
+    candidate.celestial = std::move(celestial);
+    candidate.procedural_resources_ready = true;
+    advanceGeneration(candidate.generation);
+    advanceGeneration(candidate.lighting_generation);
+    advanceGeneration(candidate.celestial_generation);
+    advanceGeneration(candidate.cloud_generation);
+    advanceGeneration(candidate.display_generation);
+    world_environment = std::move(candidate);
+    resetPathTraceAccumulation();
+
+    const bool needs_hdr_reload =
+        world_environment.sky_rendering == gfx::SkyRendering::UserHdri &&
+        !world_environment.hdr.valid() && !saved_hdr_path.empty();
+    if (needs_hdr_reload &&
+        std::filesystem::is_regular_file(saved_hdr_path)) {
+      if (!loadWorldHdr(saved_hdr_path)) {
+        status = "World Sky settings loaded; saved HDRI could not be reloaded";
+        return true;
+      }
+    }
+    last_error.clear();
+    status = needs_hdr_reload
+                 ? "World Sky settings loaded; saved HDRI is missing"
+                 : "World Sky settings loaded: " +
+                       path.filename().string();
+    return true;
+  } catch (const std::exception &error) {
+    last_error = error.what();
+    status = "World Sky settings load failed";
+    return false;
+  }
+}
+
 void AppSession::clearTexture() {
-  const bool texture_changed = hasTextureResourceState(model_texture);
+  if (labpbr_draft_dirty) {
+    last_error =
+        "Apply or revert the LabPBR draft before clearing the texture";
+    status = last_error;
+    return;
+  }
+  const bool texture_changed = hasTextureResourceState(model_texture) ||
+                               resolved_material.valid();
   model_texture.clear();
+  resolved_material.clear();
+  labpbr_source_material_.clear();
+  labpbr_uv_coverage = {};
+  labpbr_composition = {};
+  labpbr_group_overrides.clear();
+  labpbr_draft = {};
+  labpbr_draft_dirty = false;
+  labpbr_imported_normal.clear();
+  labpbr_suite_source = {};
+  labpbr_import_confirmation_pending = false;
+  pending_labpbr_import_path_.reset();
+  pending_labpbr_import_is_relink_ = false;
+  cancelLabPbrSuiteCandidateSelection();
+  labpbr_source_change_pending = false;
+  labpbr_source_changed_paths.clear();
+  labpbr_last_import_cache_hit = false;
+  labpbr_export_confirmation_pending = false;
+  labpbr_export_existing_paths.clear();
+  pending_labpbr_export_path_.reset();
   texture_path.clear();
   if (texture_changed) {
-    advanceGeneration(texture_generation_);
+    advanceGeneration(material_generation_);
   }
   status = "Texture cleared";
+}
+
+bool AppSession::refreshLabPbrAuthoring() {
+  gfx::LabPbrUvCoverage coverage;
+  gfx::LabPbrCompositionResult composition;
+  gfx::ResolvedMaterialTable resolved;
+  std::string error;
+  if (!buildSessionLabPbrMaterial(
+          geometry, bone_mapper, model_texture, labpbr_source_material_,
+          labpbr_group_overrides,
+          labpbr_imported_normal.valid() ? &labpbr_imported_normal : nullptr,
+          coverage, composition, resolved, &error)) {
+    last_error =
+        error.empty() ? "LabPBR authoring refresh failed" : error;
+    return false;
+  }
+  labpbr_uv_coverage = std::move(coverage);
+  labpbr_composition = std::move(composition);
+  resolved_material = std::move(resolved);
+  return true;
+}
+
+void AppSession::loadSelectedLabPbrDraft() {
+  labpbr_draft = {};
+  labpbr_draft.group_name = selected_bone_name;
+  labpbr_draft_dirty = false;
+  if (selected_bone_name.empty()) {
+    return;
+  }
+  const auto existing =
+      labpbr_group_overrides.find(selected_bone_name);
+  if (existing != labpbr_group_overrides.end()) {
+    labpbr_draft = existing->second;
+    return;
+  }
+
+  const auto *texels = labpbr_uv_coverage.find(selected_bone_name);
+  if (texels == nullptr || texels->empty()) {
+    return;
+  }
+  std::array<std::uint8_t, 4> source{0u, 10u, 0u, 0u};
+  if (labpbr_source_material_.specular_map_active) {
+    const auto &specular = labpbr_source_material_.specular_image;
+    const std::size_t offset =
+        static_cast<std::size_t>(texels->front()) * 4u;
+    if (offset + 4u <= specular.rgba.size()) {
+      std::copy_n(specular.rgba.begin() +
+                      static_cast<std::ptrdiff_t>(offset),
+                  4u, source.begin());
+    }
+  }
+  labpbr_draft.roughness =
+      1.0f - static_cast<float>(source[0]) / 255.0f;
+  if (source[1] >= 230u) {
+    labpbr_draft.metal = true;
+    labpbr_draft.metal_code = source[1];
+  } else {
+    labpbr_draft.metal = false;
+    labpbr_draft.dielectric_f0 = source[1];
+  }
+  labpbr_draft.subsurface_scattering = source[2] >= 65u;
+  if (labpbr_draft.subsurface_scattering) {
+    labpbr_draft.subsurface =
+        static_cast<float>(source[2] - 65u) / 190.0f;
+  } else {
+    labpbr_draft.porosity =
+        static_cast<float>(source[2]) / 64.0f;
+  }
+  labpbr_draft.emission =
+      source[3] == 255u ? 0.0f
+                        : static_cast<float>(source[3]) / 254.0f;
+}
+
+void AppSession::markLabPbrDraftDirty() {
+  if (!selected_bone_name.empty()) {
+    labpbr_draft.group_name = selected_bone_name;
+    labpbr_draft_dirty = true;
+  }
+}
+
+bool AppSession::applySelectedLabPbrDraft() {
+  if (selected_bone_name.empty()) {
+    last_error = "Select a model group before applying LabPBR values";
+    status = last_error;
+    return false;
+  }
+  auto draft = labpbr_draft;
+  draft.group_name = selected_bone_name;
+  std::string error;
+  if (!gfx::validGroupLabPbrOverride(draft, &error)) {
+    last_error = error;
+    status = "LabPBR draft is invalid: " + error;
+    return false;
+  }
+  auto overrides = labpbr_group_overrides;
+  const bool any_enabled =
+      draft.emission_enabled || draft.roughness_enabled ||
+      draft.metal_enabled || draft.porosity_enabled;
+  if (any_enabled) {
+    overrides[selected_bone_name] = draft;
+  } else {
+    overrides.erase(selected_bone_name);
+  }
+
+  gfx::LabPbrUvCoverage coverage;
+  gfx::LabPbrCompositionResult composition;
+  gfx::ResolvedMaterialTable resolved;
+  if (!buildSessionLabPbrMaterial(
+          geometry, bone_mapper, model_texture, labpbr_source_material_,
+          overrides,
+          labpbr_imported_normal.valid() ? &labpbr_imported_normal : nullptr,
+          coverage, composition, resolved, &error)) {
+    last_error = error;
+    status = "LabPBR apply failed: " + error;
+    return false;
+  }
+  const bool changed =
+      overrides != labpbr_group_overrides ||
+      !gfx::sameResolvedMaterialResource(resolved_material, resolved);
+  labpbr_group_overrides = std::move(overrides);
+  labpbr_uv_coverage = std::move(coverage);
+  labpbr_composition = std::move(composition);
+  resolved_material = std::move(resolved);
+  labpbr_draft = std::move(draft);
+  labpbr_draft_dirty = false;
+  if (changed) {
+    advanceGeneration(material_generation_);
+  }
+  last_error.clear();
+  status = "Applied LabPBR values to group: " + selected_bone_name;
+  if (!labpbr_composition.conflicts.empty()) {
+    status += " [!] " +
+              std::to_string(labpbr_composition.conflicts.size()) +
+              " conflicting texel/channel claim(s)";
+  }
+  return true;
+}
+
+void AppSession::revertSelectedLabPbrDraft() {
+  loadSelectedLabPbrDraft();
+  status = selected_bone_name.empty()
+               ? "Select a model group to edit LabPBR"
+               : "Reverted unapplied LabPBR draft";
+}
+
+bool AppSession::restoreSelectedLabPbrFromTexture() {
+  if (selected_bone_name.empty()) {
+    last_error = "Select a model group before restoring texture values";
+    status = last_error;
+    return false;
+  }
+  auto overrides = labpbr_group_overrides;
+  const bool removed = overrides.erase(selected_bone_name) != 0u;
+  std::string error;
+  gfx::LabPbrUvCoverage coverage;
+  gfx::LabPbrCompositionResult composition;
+  gfx::ResolvedMaterialTable resolved;
+  if (!buildSessionLabPbrMaterial(
+          geometry, bone_mapper, model_texture, labpbr_source_material_,
+          overrides,
+          labpbr_imported_normal.valid() ? &labpbr_imported_normal : nullptr,
+          coverage, composition, resolved, &error)) {
+    last_error = error;
+    status = "LabPBR restore failed: " + error;
+    return false;
+  }
+  const bool changed =
+      removed ||
+      !gfx::sameResolvedMaterialResource(resolved_material, resolved);
+  labpbr_group_overrides = std::move(overrides);
+  labpbr_uv_coverage = std::move(coverage);
+  labpbr_composition = std::move(composition);
+  resolved_material = std::move(resolved);
+  loadSelectedLabPbrDraft();
+  if (changed) {
+    advanceGeneration(material_generation_);
+  }
+  last_error.clear();
+  status = "Restored texture values for group: " + selected_bone_name;
+  return true;
+}
+
+bool AppSession::importLabPbrSpecular(const std::filesystem::path &path) {
+  if (!model_texture.valid()) {
+    last_error = "Load a base texture before importing a LabPBR specular image";
+    status = last_error;
+    return false;
+  }
+  if (labpbr_draft_dirty) {
+    last_error =
+        "Apply or revert the LabPBR draft before replacing the specular image";
+    status = last_error;
+    return false;
+  }
+
+  gfx::TextureImage imported;
+  std::string error;
+  if (!gfx::loadTextureImage(path, imported, &error)) {
+    last_error = error.empty() ? "LabPBR specular image decode failed" : error;
+    status = "LabPBR specular import failed: " + last_error;
+    return false;
+  }
+  if (imported.source_channels != 3 && imported.source_channels != 4) {
+    last_error = "LabPBR PBR image must be an RGB or RGBA PNG";
+    status = "LabPBR specular import failed: " + last_error;
+    return false;
+  }
+  if (imported.width != model_texture.width ||
+      imported.height != model_texture.height) {
+    last_error = "LabPBR specular image dimensions must match the base texture";
+    status = "LabPBR specular import failed: " + last_error;
+    return false;
+  }
+
+  auto source = labpbr_source_material_;
+  source.width = model_texture.width;
+  source.height = model_texture.height;
+  source.format = gfx::LabPbrFormat::LabPbr13;
+  source.declared_format = "lab-pbr/1.3";
+  source.format_declared = true;
+  source.assets.base = model_texture.path;
+  source.assets.specular = path;
+  source.assets.specular_exists = true;
+  source.specular_map_active = true;
+  source.specular_image = imported;
+
+  gfx::LabPbrUvCoverage coverage;
+  gfx::LabPbrCompositionResult composition;
+  gfx::ResolvedMaterialTable resolved;
+  if (!buildSessionLabPbrMaterial(
+          geometry, bone_mapper, model_texture, source,
+          labpbr_group_overrides,
+          labpbr_imported_normal.valid() ? &labpbr_imported_normal : nullptr,
+          coverage, composition, resolved, &error)) {
+    last_error = error.empty() ? "LabPBR specular resolve failed" : error;
+    status = "LabPBR specular import failed: " + last_error;
+    return false;
+  }
+
+  const bool changed =
+      !sameTextureResource(labpbr_source_material_.specular_image, imported) ||
+      !gfx::sameResolvedMaterialResource(resolved_material, resolved);
+  labpbr_source_material_ = std::move(source);
+  labpbr_uv_coverage = std::move(coverage);
+  labpbr_composition = std::move(composition);
+  resolved_material = std::move(resolved);
+  labpbr_suite_source = {};
+  labpbr_source_change_pending = false;
+  labpbr_source_changed_paths.clear();
+  labpbr_last_import_cache_hit = false;
+  loadSelectedLabPbrDraft();
+  if (changed) {
+    advanceGeneration(material_generation_);
+  }
+  last_error.clear();
+  status = "Imported LabPBR specular image: " + path.filename().string();
+  return true;
+}
+
+void AppSession::removeLabPbrSpecular() {
+  if (!labpbr_source_material_.specular_map_active) {
+    return;
+  }
+  if (labpbr_draft_dirty) {
+    last_error =
+        "Apply or revert the LabPBR draft before removing the specular image";
+    status = last_error;
+    return;
+  }
+
+  auto source = labpbr_source_material_;
+  source.specular_map_active = false;
+  source.specular_image.clear();
+  source.assets.specular.clear();
+  source.assets.specular_exists = false;
+  std::string error;
+  gfx::LabPbrUvCoverage coverage;
+  gfx::LabPbrCompositionResult composition;
+  gfx::ResolvedMaterialTable resolved;
+  if (!buildSessionLabPbrMaterial(
+          geometry, bone_mapper, model_texture, source,
+          labpbr_group_overrides,
+          labpbr_imported_normal.valid() ? &labpbr_imported_normal : nullptr,
+          coverage, composition, resolved, &error)) {
+    last_error = error.empty() ? "LabPBR specular removal failed" : error;
+    status = last_error;
+    return;
+  }
+
+  labpbr_source_material_ = std::move(source);
+  labpbr_uv_coverage = std::move(coverage);
+  labpbr_composition = std::move(composition);
+  resolved_material = std::move(resolved);
+  loadSelectedLabPbrDraft();
+  advanceGeneration(material_generation_);
+  last_error.clear();
+  status = "Removed imported LabPBR specular image";
+}
+
+bool AppSession::importLabPbrNormal(const std::filesystem::path &path) {
+  if (!model_texture.valid()) {
+    last_error = "Load a base texture before importing an Iris normal";
+    status = last_error;
+    return false;
+  }
+  if (labpbr_draft_dirty) {
+    last_error =
+        "Apply or revert the LabPBR draft before replacing the normal image";
+    status = last_error;
+    return false;
+  }
+  gfx::ReadOnlyIrisNormalAsset imported;
+  std::string error;
+  if (!gfx::importReadOnlyIrisNormal(path, model_texture.width,
+                                     model_texture.height, imported,
+                                     &error)) {
+    last_error = error;
+    status = "Iris normal import failed: " + error;
+    return false;
+  }
+  gfx::LabPbrUvCoverage coverage;
+  gfx::LabPbrCompositionResult composition;
+  gfx::ResolvedMaterialTable resolved;
+  if (!buildSessionLabPbrMaterial(
+          geometry, bone_mapper, model_texture, labpbr_source_material_,
+          labpbr_group_overrides, &imported, coverage, composition, resolved,
+          &error)) {
+    last_error = error;
+    status = "Iris normal import failed: " + error;
+    return false;
+  }
+  const bool changed =
+      imported.sha256 != labpbr_imported_normal.sha256 ||
+      !gfx::sameResolvedMaterialResource(resolved_material, resolved);
+  labpbr_imported_normal = std::move(imported);
+  labpbr_uv_coverage = std::move(coverage);
+  labpbr_composition = std::move(composition);
+  resolved_material = std::move(resolved);
+  labpbr_suite_source = {};
+  labpbr_source_change_pending = false;
+  labpbr_source_changed_paths.clear();
+  labpbr_last_import_cache_hit = false;
+  if (changed) {
+    advanceGeneration(material_generation_);
+  }
+  last_error.clear();
+  status = "Imported LabPBR / Iris normal image: " +
+           path.filename().string();
+  return true;
+}
+
+void AppSession::removeLabPbrNormal() {
+  if (!labpbr_imported_normal.valid()) {
+    return;
+  }
+  auto source_without_normal = labpbr_source_material_;
+  source_without_normal.normal_map_active = false;
+  source_without_normal.normal_image.clear();
+  std::string error;
+  gfx::LabPbrUvCoverage coverage;
+  gfx::LabPbrCompositionResult composition;
+  gfx::ResolvedMaterialTable resolved;
+  if (!buildSessionLabPbrMaterial(
+          geometry, bone_mapper, model_texture, source_without_normal,
+          labpbr_group_overrides, nullptr, coverage, composition, resolved,
+          &error)) {
+    last_error = error;
+    status = "Iris normal removal failed: " + error;
+    return;
+  }
+  labpbr_imported_normal.clear();
+  labpbr_source_material_ = std::move(source_without_normal);
+  labpbr_uv_coverage = std::move(coverage);
+  labpbr_composition = std::move(composition);
+  resolved_material = std::move(resolved);
+  advanceGeneration(material_generation_);
+  last_error.clear();
+  status = "Removed imported Iris normal";
+}
+
+bool AppSession::requestLabPbrExport(
+    const std::filesystem::path &path) {
+  if (!model_texture.valid()) {
+    last_error = "Load a base texture before exporting LabPBR";
+    status = last_error;
+    return false;
+  }
+  if (!refreshLabPbrAuthoring()) {
+    status = "LabPBR export failed: " + last_error;
+    return false;
+  }
+  const auto exported = gfx::exportLabPbrBundle(
+      path, labpbr_composition,
+      labpbr_imported_normal.valid() ? &labpbr_imported_normal : nullptr,
+      false);
+  if (exported.success) {
+    labpbr_export_confirmation_pending = false;
+    labpbr_export_existing_paths.clear();
+    pending_labpbr_export_path_.reset();
+    advanceGeneration(material_generation_);
+    last_error.clear();
+    status = "Exported LabPBR bundle: " +
+             exported.specular_path.filename().string();
+    return true;
+  }
+  if (exported.overwrite_required) {
+    labpbr_export_confirmation_pending = true;
+    labpbr_export_existing_paths = exported.existing_paths;
+    pending_labpbr_export_path_ = path;
+    status = "LabPBR export requires overwrite confirmation";
+    return false;
+  }
+  last_error = exported.error;
+  status = "LabPBR export failed: " + exported.error;
+  return false;
+}
+
+void AppSession::confirmLabPbrExport(bool proceed) {
+  const auto pending = pending_labpbr_export_path_;
+  labpbr_export_confirmation_pending = false;
+  labpbr_export_existing_paths.clear();
+  pending_labpbr_export_path_.reset();
+  if (!pending) {
+    return;
+  }
+  if (!proceed) {
+    status = "LabPBR export cancelled";
+    return;
+  }
+  const auto exported = gfx::exportLabPbrBundle(
+      *pending, labpbr_composition,
+      labpbr_imported_normal.valid() ? &labpbr_imported_normal : nullptr,
+      true);
+  if (!exported.success) {
+    last_error = exported.error;
+    status = "LabPBR export failed: " + exported.error;
+    return;
+  }
+  advanceGeneration(material_generation_);
+  last_error.clear();
+  status = "Exported LabPBR bundle: " +
+           exported.specular_path.filename().string();
 }
 
 void AppSession::loadAnimation(const std::filesystem::path &path) {
@@ -2179,6 +4572,11 @@ void AppSession::clearCollisionRoots() {
 }
 
 void AppSession::selectBone(const std::string &name) {
+  if (name != selected_bone_name && labpbr_draft_dirty) {
+    status =
+        "Cannot change group: apply or revert the LabPBR draft first";
+    return;
+  }
   if (name != selected_bone_name && per_bone_draft_dirty &&
       !applySelectedBoneConfig()) {
     status = "Cannot change bone: fix or discard the unapplied bone draft";
@@ -2190,6 +4588,7 @@ void AppSession::selectBone(const std::string &name) {
   selected_bone_name = name;
   skeleton_view.setSelectedBone(name);
   loadSelectedBoneEditors();
+  loadSelectedLabPbrDraft();
 }
 
 void AppSession::setBoneVisible(const std::string &name, bool visible) {
@@ -3855,7 +6254,7 @@ void AppSession::pollBakeProgress() {
           static_cast<unsigned long long>(model_generation_),
           static_cast<unsigned long long>(animation_generation_),
           static_cast<unsigned long long>(physics_generation_),
-          static_cast<unsigned long long>(texture_generation_));
+          static_cast<unsigned long long>(material_generation_));
       xpbd::log::flush();
     }
     status = (exportPreflight().animation_allowed
@@ -4162,39 +6561,134 @@ render::SkeletonDrawList AppSession::buildViewportDrawList(float view_w,
 #if defined(_WIN32)
 std::optional<std::filesystem::path> openFileDialog(const wchar_t *title,
                                                     const wchar_t *filter) {
+  // Pause GPU / RT before the modal shell dialog so the picker is not
+  // contending with in-flight command buffers (fixes hang after close).
+  NativeDialogScope modal_scope;
+
   wchar_t file[MAX_PATH] = {};
   OPENFILENAMEW ofn{};
   ofn.lStructSize = sizeof(ofn);
+  ofn.hwndOwner = static_cast<HWND>(nativeDialogHooks().owner_window);
   ofn.lpstrFile = file;
   ofn.nMaxFile = MAX_PATH;
   ofn.lpstrFilter = filter;
   ofn.nFilterIndex = 1;
   ofn.lpstrTitle = title;
-  ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+  ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR |
+              OFN_EXPLORER | OFN_HIDEREADONLY;
   if (GetOpenFileNameW(&ofn) == TRUE) {
     return std::filesystem::path(file);
   }
   return std::nullopt;
 }
 
+std::optional<std::filesystem::path> openFolderDialog(
+    const wchar_t *title) {
+  NativeDialogScope modal_scope;
+
+  const HRESULT initialize_result =
+      CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
+                                  COINIT_DISABLE_OLE1DDE);
+  const bool uninitialize =
+      initialize_result == S_OK || initialize_result == S_FALSE;
+  if (FAILED(initialize_result) &&
+      initialize_result != RPC_E_CHANGED_MODE) {
+    return std::nullopt;
+  }
+
+  IFileDialog *dialog = nullptr;
+  HRESULT result =
+      CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                       IID_PPV_ARGS(&dialog));
+  std::optional<std::filesystem::path> selected;
+  if (SUCCEEDED(result) && dialog != nullptr) {
+    FILEOPENDIALOGOPTIONS options{};
+    result = dialog->GetOptions(&options);
+    if (SUCCEEDED(result)) {
+      result = dialog->SetOptions(options | FOS_PICKFOLDERS |
+                                  FOS_FORCEFILESYSTEM |
+                                  FOS_PATHMUSTEXIST |
+                                  FOS_NOCHANGEDIR);
+    }
+    if (SUCCEEDED(result) && title != nullptr) {
+      result = dialog->SetTitle(title);
+    }
+    if (SUCCEEDED(result)) {
+      result = dialog->Show(
+          static_cast<HWND>(nativeDialogHooks().owner_window));
+    }
+    if (SUCCEEDED(result)) {
+      IShellItem *item = nullptr;
+      result = dialog->GetResult(&item);
+      if (SUCCEEDED(result) && item != nullptr) {
+        PWSTR path = nullptr;
+        result = item->GetDisplayName(SIGDN_FILESYSPATH, &path);
+        if (SUCCEEDED(result) && path != nullptr) {
+          selected = std::filesystem::path(path);
+        }
+        if (path != nullptr) {
+          CoTaskMemFree(path);
+        }
+        item->Release();
+      }
+    }
+    dialog->Release();
+  }
+  if (uninitialize) {
+    CoUninitialize();
+  }
+  return selected;
+}
+
 std::optional<std::filesystem::path>
 saveFileDialog(const wchar_t *title, const wchar_t *filter,
                const wchar_t *default_name) {
+  NativeDialogScope modal_scope;
+
   wchar_t file[MAX_PATH] = {};
   if (default_name != nullptr) {
     wcsncpy_s(file, default_name, _TRUNCATE);
   }
   OPENFILENAMEW ofn{};
   ofn.lStructSize = sizeof(ofn);
+  ofn.hwndOwner = static_cast<HWND>(nativeDialogHooks().owner_window);
   ofn.lpstrFile = file;
   ofn.nMaxFile = MAX_PATH;
   ofn.lpstrFilter = filter;
   ofn.nFilterIndex = 1;
   ofn.lpstrTitle = title;
   ofn.lpstrDefExt = L"json";
-  ofn.Flags = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
+  ofn.Flags = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR | OFN_EXPLORER |
+              OFN_HIDEREADONLY;
   if (GetSaveFileNameW(&ofn) == TRUE) {
     return ensureJsonExtension(std::filesystem::path(file));
+  }
+  return std::nullopt;
+}
+
+std::optional<std::filesystem::path>
+savePngFileDialog(const wchar_t *title, const wchar_t *default_name) {
+  NativeDialogScope modal_scope;
+
+  wchar_t file[MAX_PATH] = {};
+  if (default_name != nullptr) {
+    wcsncpy_s(file, default_name, _TRUNCATE);
+  }
+  static constexpr wchar_t kPngFilter[] =
+      L"PNG Image (*.png)\0*.png\0All Files (*.*)\0*.*\0\0";
+  OPENFILENAMEW ofn{};
+  ofn.lStructSize = sizeof(ofn);
+  ofn.hwndOwner = static_cast<HWND>(nativeDialogHooks().owner_window);
+  ofn.lpstrFile = file;
+  ofn.nMaxFile = MAX_PATH;
+  ofn.lpstrFilter = kPngFilter;
+  ofn.nFilterIndex = 1;
+  ofn.lpstrTitle = title;
+  ofn.lpstrDefExt = L"png";
+  ofn.Flags =
+      OFN_NOCHANGEDIR | OFN_EXPLORER | OFN_HIDEREADONLY | OFN_PATHMUSTEXIST;
+  if (GetSaveFileNameW(&ofn) == TRUE) {
+    return std::filesystem::path(file);
   }
   return std::nullopt;
 }
@@ -4203,8 +6697,15 @@ std::optional<std::filesystem::path> openFileDialog(const wchar_t *,
                                                     const wchar_t *) {
   return std::nullopt;
 }
+std::optional<std::filesystem::path> openFolderDialog(const wchar_t *) {
+  return std::nullopt;
+}
 std::optional<std::filesystem::path>
 saveFileDialog(const wchar_t *, const wchar_t *, const wchar_t *) {
+  return std::nullopt;
+}
+std::optional<std::filesystem::path>
+savePngFileDialog(const wchar_t *, const wchar_t *) {
   return std::nullopt;
 }
 #endif

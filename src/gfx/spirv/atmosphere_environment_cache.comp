@@ -1,0 +1,673 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#include "src/gfx/spirv/atmosphere_common.glsl"
+
+layout(set = 0, binding = 1) uniform sampler2D transmittance_texture;
+layout(set = 0, binding = 14) uniform sampler3D scattering_texture;
+layout(set = 0, binding = 15, rgba16f) uniform writeonly image2D
+    environment_cache_output;
+layout(set = 0, binding = 16) uniform sampler2D
+    previous_cloud_history;
+layout(set = 0, binding = 17, rgba16f) uniform writeonly image2D
+    cloud_history_output;
+
+layout(push_constant) uniform AtmosphereEnvironmentPush {
+  // World-space, Y-up Sun direction. W is observer elevation in kilometres.
+  vec4 sun_direction_observer_height;
+  // World-space Moon direction. W is apparent angular radius in radians.
+  vec4 moon_direction_angular_radius;
+  // Illuminated fraction, phase angle, libration latitude and longitude.
+  vec4 moon_phase_libration;
+  // Observer latitude, north offset, sidereal angle, geometric Sun altitude.
+  vec4 observer_sidereal_twilight;
+  // Sun angular radius, Moon magnitude, star strength, galaxy strength.
+  vec4 night_parameters;
+  // Enabled, coverage, density multiplier, base altitude in kilometres.
+  vec4 cloud_layer;
+  // Thickness and advected horizontal weather offsets in kilometres, time.
+  vec4 cloud_weather;
+  // Fixed seed, view steps, light steps, deterministic temporal frame.
+  uvec4 cloud_quality;
+  // Continuous sky, Sun, Moon, and artistic night-fill relative strengths.
+  vec4 sky_energy;
+  // Sun/Moon enable, manual phase, surface detail; remaining lanes reserved.
+  uvec4 sky_flags;
+  // Weather scale, base-shape scale, detail scale, erosion.
+  vec4 cloud_optics;
+  // Forward scattering, silver lining, absorption, multiple scattering.
+  vec4 cloud_lighting;
+  // Shadow strength, cloud lighting strength, render ratio, history weight.
+  vec4 cloud_post;
+  // Weather offset delta X/Z, history-valid flag, shadow-grid resolution.
+  vec4 cloud_history;
+} environment_push;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+vec3 worldDirectionFromUv(vec2 uv) {
+  const float phi = 6.28318530718 * uv.x;
+  const float theta = 3.14159265358979323846 * uv.y;
+  const float sin_theta = sin(theta);
+  return vec3(sin_theta * sin(phi), cos(theta), sin_theta * cos(phi));
+}
+
+vec2 worldUvFromDirection(vec3 direction) {
+  const vec3 unit_direction = normalize(direction);
+  const float phi = atan(unit_direction.x, unit_direction.z);
+  return vec2(fract(phi / (2.0 * PI)),
+              acos(clamp(unit_direction.y, -1.0, 1.0)) / PI);
+}
+
+vec3 atmosphereDirection(vec3 world_direction) {
+  // Bruneton reference coordinates are Z-up; XPBD world coordinates are Y-up.
+  return vec3(world_direction.x, world_direction.z, world_direction.y);
+}
+
+uint hashUint(uint value) {
+  value ^= value >> 16u;
+  value *= 0x7feb352du;
+  value ^= value >> 15u;
+  value *= 0x846ca68bu;
+  value ^= value >> 16u;
+  return value;
+}
+
+float hashCell(ivec2 cell, uint salt) {
+  const uint x = uint(cell.x);
+  const uint y = uint(cell.y);
+  return float(hashUint(x * 0x9e3779b9u ^ y * 0x85ebca6bu ^ salt)) *
+      (1.0 / 4294967296.0);
+}
+
+vec3 inertialDirection(vec3 world_direction) {
+  const float latitude = environment_push.observer_sidereal_twilight.x;
+  const float north_offset = environment_push.observer_sidereal_twilight.y;
+  const float sidereal = environment_push.observer_sidereal_twilight.z;
+  const float cos_north = cos(north_offset);
+  const float sin_north = sin(north_offset);
+  const float east =
+      world_direction.x * cos_north - world_direction.z * sin_north;
+  const float north =
+      world_direction.x * sin_north + world_direction.z * cos_north;
+  const float up = world_direction.y;
+  const float cos_latitude = cos(latitude);
+  const float sin_latitude = sin(latitude);
+  const float cos_hour = up * cos_latitude - north * sin_latitude;
+  const float sin_hour = -east;
+  const float declination = up * sin_latitude + north * cos_latitude;
+  const float cos_sidereal = cos(sidereal);
+  const float sin_sidereal = sin(sidereal);
+  return normalize(vec3(
+      cos_sidereal * cos_hour + sin_sidereal * sin_hour,
+      sin_sidereal * cos_hour - cos_sidereal * sin_hour,
+      declination));
+}
+
+vec3 proceduralStars(vec3 inertial_direction) {
+  const vec2 grid_size = vec2(512.0, 256.0);
+  const float longitude =
+      fract(atan(inertial_direction.y, inertial_direction.x) /
+                (2.0 * PI) +
+            0.5);
+  const float latitude =
+      asin(clamp(inertial_direction.z, -1.0, 1.0)) / PI + 0.5;
+  const vec2 coordinate = vec2(longitude, latitude) * grid_size;
+  const ivec2 base = ivec2(floor(coordinate));
+  float radiance = 0.0;
+  vec3 color_sum = vec3(0.0);
+  for (int oy = -1; oy <= 1; ++oy) {
+    for (int ox = -1; ox <= 1; ++ox) {
+      const ivec2 offset = ivec2(ox, oy);
+      ivec2 cell = base + offset;
+      cell.x = (cell.x % int(grid_size.x) + int(grid_size.x)) %
+          int(grid_size.x);
+      cell.y = clamp(cell.y, 0, int(grid_size.y) - 1);
+      const float presence = hashCell(cell, 0x124f32abu);
+      if (presence <= 0.94) {
+        continue;
+      }
+      const vec2 star_position = vec2(
+          hashCell(cell, 0x9a31d7c5u), hashCell(cell, 0x4d2c6e91u));
+      const vec2 delta =
+          coordinate - (vec2(base + offset) + star_position);
+      const float profile = exp(-dot(delta, delta) * 120.0);
+      const float magnitude =
+          0.15 + 2.85 * pow(hashCell(cell, 0xc72b841du), 8.0);
+      const float temperature = hashCell(cell, 0x71e52a3bu);
+      const vec3 color =
+          mix(vec3(1.0, 0.72, 0.52), vec3(0.62, 0.78, 1.0),
+              temperature);
+      radiance += profile * magnitude;
+      color_sum += profile * magnitude * color;
+    }
+  }
+  return radiance > 0.0
+             ? color_sum * (0.006 / max(radiance, 1.0e-6)) * radiance
+             : vec3(0.0);
+}
+
+float valueNoise(vec3 position) {
+  const ivec3 cell = ivec3(floor(position));
+  const vec3 fraction = fract(position);
+  const vec3 smooth_fraction =
+      fraction * fraction * (3.0 - 2.0 * fraction);
+  float values[8];
+  for (int z = 0; z <= 1; ++z) {
+    for (int y = 0; y <= 1; ++y) {
+      for (int x = 0; x <= 1; ++x) {
+        const ivec3 point = cell + ivec3(x, y, z);
+        const uint packed =
+            uint(point.x) * 0x9e3779b9u ^
+            uint(point.y) * 0x85ebca6bu ^
+            uint(point.z) * 0xc2b2ae35u;
+        values[x + 2 * y + 4 * z] =
+            float(hashUint(packed)) * (1.0 / 4294967296.0);
+      }
+    }
+  }
+  const float x00 = mix(values[0], values[1], smooth_fraction.x);
+  const float x10 = mix(values[2], values[3], smooth_fraction.x);
+  const float x01 = mix(values[4], values[5], smooth_fraction.x);
+  const float x11 = mix(values[6], values[7], smooth_fraction.x);
+  return mix(mix(x00, x10, smooth_fraction.y),
+             mix(x01, x11, smooth_fraction.y), smooth_fraction.z);
+}
+
+float fbm(vec3 position) {
+  float value = 0.0;
+  float weight = 0.5;
+  for (int octave = 0; octave < 4; ++octave) {
+    value += valueNoise(position) * weight;
+    position = position * 2.03 + vec3(7.1, 3.7, 5.9);
+    weight *= 0.5;
+  }
+  return value;
+}
+
+bool forwardSphereInterval(vec3 origin, vec3 direction, float radius,
+                           out float distance_near,
+                           out float distance_far) {
+  const float projected = dot(origin, direction);
+  const float discriminant =
+      projected * projected - dot(origin, origin) + radius * radius;
+  if (discriminant <= 0.0) {
+    distance_near = 0.0;
+    distance_far = 0.0;
+    return false;
+  }
+  const float root = sqrt(discriminant);
+  distance_near = max(-projected - root, 0.0);
+  distance_far = -projected + root;
+  return distance_far > distance_near;
+}
+
+float cloudHeightProfile(float normalized_height) {
+  const float base_fade = smoothstep(0.0, 0.12, normalized_height);
+  const float top_fade =
+      1.0 - smoothstep(0.68, 1.0, normalized_height);
+  return base_fade * top_fade;
+}
+
+vec3 cloudSeedOffset() {
+  const uint seed = environment_push.cloud_quality.x;
+  return vec3(
+      float(hashUint(seed ^ 0x68bc21ebu) & 0xffffu),
+      float(hashUint(seed ^ 0x02e5be93u) & 0xffffu),
+      float(hashUint(seed ^ 0x967a889bu) & 0xffffu)) *
+      (1.0 / 4096.0);
+}
+
+float cloudDensityAt(vec3 position) {
+  const float base_radius =
+      ATMOSPHERE.bottom_radius + environment_push.cloud_layer.w;
+  const float thickness = environment_push.cloud_weather.x;
+  const float normalized_height =
+      (length(position) - base_radius) / max(thickness, 1.0e-4);
+  if (normalized_height <= 0.0 || normalized_height >= 1.0) {
+    return 0.0;
+  }
+
+  const vec2 horizontal =
+      position.xy + environment_push.cloud_weather.yz;
+  const float weather_scale =
+      clamp(environment_push.cloud_optics.x, 0.05, 20.0);
+  const float base_shape_scale =
+      clamp(environment_push.cloud_optics.y, 0.05, 20.0);
+  const float detail_scale =
+      clamp(environment_push.cloud_optics.z, 0.05, 20.0);
+  const float erosion =
+      clamp(environment_push.cloud_optics.w, 0.0, 1.0);
+  const vec3 seed_offset = cloudSeedOffset();
+  const vec2 warp = vec2(
+      valueNoise(vec3(horizontal * (0.030 * weather_scale),
+                      seed_offset.x + 4.0)),
+      valueNoise(vec3(horizontal * (0.030 * weather_scale) +
+                          vec2(19.2, 7.4),
+                       seed_offset.y + 9.0))) - vec2(0.5);
+  const vec2 warped_horizontal = horizontal + warp * 6.0;
+  const float weather =
+      fbm(vec3(warped_horizontal * (0.032 * weather_scale), seed_offset.z) +
+          seed_offset);
+  const float shape = fbm(
+      vec3(warped_horizontal * (0.12 * base_shape_scale),
+           normalized_height * 3.8) +
+      seed_offset * 1.73);
+  const float detail = fbm(
+      vec3(warped_horizontal * (0.55 * detail_scale),
+           normalized_height * 9.0) +
+      seed_offset * 4.11);
+  const float coverage_threshold =
+      mix(0.88, 0.46, environment_push.cloud_layer.y);
+  const float carrier = weather * 0.55 + shape * 0.45;
+  float density =
+      smoothstep(coverage_threshold, coverage_threshold + 0.13, carrier);
+  density = max(density - (1.0 - density) * detail * erosion, 0.0);
+  return density * cloudHeightProfile(normalized_height) *
+      environment_push.cloud_layer.z;
+}
+
+float cloudPhase(float cosine_angle) {
+  const float forward_g =
+      clamp(environment_push.cloud_lighting.x, -0.95, 0.95);
+  const float backward_g = -0.18;
+  const float forward_denom =
+      pow(max(1.0 + forward_g * forward_g -
+                  2.0 * forward_g * cosine_angle,
+              1.0e-4),
+          1.5);
+  const float backward_denom =
+      pow(max(1.0 + backward_g * backward_g -
+                  2.0 * backward_g * cosine_angle,
+              1.0e-4),
+          1.5);
+  const float forward =
+      (1.0 - forward_g * forward_g) / (4.0 * PI * forward_denom);
+  const float backward =
+      (1.0 - backward_g * backward_g) /
+      (4.0 * PI * backward_denom);
+  return mix(backward, forward, 0.65) *
+      clamp(environment_push.cloud_lighting.y, 0.0, 4.0);
+}
+
+float cloudLightTransmittance(vec3 position, vec3 light_direction) {
+  const float shadow_resolution =
+      clamp(environment_push.cloud_history.w, 64.0, 4096.0);
+  const float shadow_cell_km = 400.0 / shadow_resolution;
+  position.xy =
+      floor(position.xy / shadow_cell_km + vec2(0.5)) *
+      shadow_cell_km;
+  const float outer_radius =
+      ATMOSPHERE.bottom_radius + environment_push.cloud_layer.w +
+      environment_push.cloud_weather.x;
+  float distance_near = 0.0;
+  float distance_far = 0.0;
+  if (!forwardSphereInterval(position, light_direction, outer_radius,
+                             distance_near, distance_far)) {
+    return 1.0;
+  }
+  const int requested_steps =
+      int(clamp(environment_push.cloud_quality.z, 1u, 16u));
+  const float light_distance =
+      min(distance_far, max(environment_push.cloud_weather.x * 3.0, 1.0));
+  const float step_length = light_distance / float(requested_steps);
+  float optical_depth = 0.0;
+  for (int step = 0; step < 16; ++step) {
+    if (step >= requested_steps) {
+      break;
+    }
+    const vec3 sample_position =
+        position + light_direction * (float(step) + 0.5) * step_length;
+    optical_depth += cloudDensityAt(sample_position) * step_length * 0.34 *
+        clamp(environment_push.cloud_lighting.z, 0.01, 8.0);
+    if (optical_depth >= 18.0) {
+      return 0.0;
+    }
+  }
+  return mix(1.0, exp(-optical_depth),
+             clamp(environment_push.cloud_post.x, 0.0, 1.0));
+}
+
+void integrateClouds(ivec2 pixel, vec3 camera, vec3 view_direction,
+                     vec3 sun_direction, vec3 moon_direction,
+                     out float view_transmittance,
+                     out vec3 cloud_radiance) {
+  view_transmittance = 1.0;
+  cloud_radiance = vec3(0.0);
+  if (environment_push.cloud_layer.x < 0.5 ||
+      dot(camera, view_direction) <= 0.0) {
+    return;
+  }
+
+  const float inner_radius =
+      ATMOSPHERE.bottom_radius + environment_push.cloud_layer.w;
+  const float outer_radius =
+      inner_radius + environment_push.cloud_weather.x;
+  float outer_near = 0.0;
+  float outer_far = 0.0;
+  if (!forwardSphereInterval(camera, view_direction, outer_radius,
+                             outer_near, outer_far)) {
+    return;
+  }
+  float march_start = outer_near;
+  if (length(camera) < inner_radius) {
+    float inner_near = 0.0;
+    float inner_far = 0.0;
+    if (!forwardSphereInterval(camera, view_direction, inner_radius,
+                               inner_near, inner_far)) {
+      return;
+    }
+    march_start = max(march_start, inner_far);
+  }
+  const float march_end =
+      min(outer_far, march_start + 200.0);
+  if (march_end <= march_start) {
+    return;
+  }
+
+  const int requested_steps =
+      int(clamp(environment_push.cloud_quality.y, 8u, 128u));
+  const float step_length =
+      (march_end - march_start) / float(requested_steps);
+  const uint pixel_hash =
+      hashUint(uint(pixel.x) * 0x9e3779b9u ^
+               uint(pixel.y) * 0x85ebca6bu ^
+               environment_push.cloud_quality.w * 0xc2b2ae35u ^
+               environment_push.cloud_quality.x);
+  const float jitter =
+      float(pixel_hash) * (1.0 / 4294967296.0);
+  const float sun_elevation = max(sun_direction.z, 0.0);
+  const float moon_elevation = max(moon_direction.z, 0.0);
+  const float moon_relative =
+      clamp(pow(10.0, -0.4 *
+                       (environment_push.night_parameters.y + 12.74)),
+            0.0, 1.0);
+  const bool sun_enabled =
+      (environment_push.sky_flags.x & 1u) != 0u;
+  const bool moon_enabled =
+      (environment_push.sky_flags.x & 2u) != 0u;
+  const vec3 sun_irradiance =
+      ATMOSPHERE.solar_irradiance * sun_elevation *
+      (sun_enabled ? max(environment_push.sky_energy.y, 0.0) : 0.0);
+  const vec3 moon_irradiance =
+      ATMOSPHERE.solar_irradiance * moon_elevation * moon_relative *
+      2.0e-5 *
+      (moon_enabled ? max(environment_push.sky_energy.z, 0.0) : 0.0);
+  const float sun_phase =
+      cloudPhase(dot(view_direction, sun_direction));
+  const float moon_phase =
+      cloudPhase(dot(view_direction, moon_direction));
+
+  for (int step = 0; step < 128; ++step) {
+    if (step >= requested_steps || view_transmittance <= 0.002) {
+      break;
+    }
+    const float distance =
+        march_start + (float(step) + jitter) * step_length;
+    const vec3 sample_position = camera + view_direction * distance;
+    const float density = cloudDensityAt(sample_position);
+    if (density <= 1.0e-4) {
+      continue;
+    }
+    const float segment_transmittance =
+        exp(-density * step_length * 0.34 *
+            clamp(environment_push.cloud_lighting.z, 0.01, 8.0));
+    const float sun_shadow =
+        sun_elevation > 0.0
+            ? cloudLightTransmittance(sample_position, sun_direction)
+            : 0.0;
+    const float moon_shadow =
+        moon_elevation > 0.0
+            ? cloudLightTransmittance(sample_position, moon_direction)
+            : 0.0;
+    const vec3 direct_lighting =
+        sun_irradiance * sun_phase * sun_shadow +
+        moon_irradiance * moon_phase * moon_shadow;
+    const vec3 ambient_lighting =
+        ATMOSPHERE.solar_irradiance *
+        (0.020 + 0.060 * sun_elevation) *
+        mix(vec3(0.48, 0.58, 0.78), vec3(1.0), sun_elevation) *
+        (1.0 + clamp(environment_push.cloud_lighting.w, 0.0, 2.0));
+    const vec3 source = direct_lighting + ambient_lighting;
+    cloud_radiance +=
+        view_transmittance * (1.0 - segment_transmittance) * source;
+    view_transmittance *= segment_transmittance;
+  }
+  cloud_radiance *= max(environment_push.cloud_post.y, 0.0);
+}
+
+vec3 proceduralGalaxy(vec3 inertial_direction) {
+  const float pole_ra = radians(192.85948);
+  const float pole_dec = radians(27.12825);
+  const vec3 galactic_pole = vec3(
+      cos(pole_dec) * cos(pole_ra),
+      cos(pole_dec) * sin(pole_ra), sin(pole_dec));
+  const float plane_distance = abs(dot(inertial_direction, galactic_pole));
+  const float band = exp(-plane_distance * plane_distance * 190.0);
+  const float structure =
+      0.2 + 0.8 * fbm(inertial_direction * 38.0);
+  return vec3(0.58, 0.68, 1.0) * band * structure * 0.0015;
+}
+
+vec3 rotateLunarSurface(vec3 normal) {
+  const float latitude = environment_push.moon_phase_libration.z;
+  const float longitude = environment_push.moon_phase_libration.w;
+  const float cos_latitude = cos(latitude);
+  const float sin_latitude = sin(latitude);
+  normal.yz = mat2(cos_latitude, -sin_latitude,
+                   sin_latitude, cos_latitude) * normal.yz;
+  const float cos_longitude = cos(longitude);
+  const float sin_longitude = sin(longitude);
+  normal.xz = mat2(cos_longitude, -sin_longitude,
+                   sin_longitude, cos_longitude) * normal.xz;
+  return normal;
+}
+
+float lunarAlbedo(vec3 surface_normal) {
+  const float surface_detail =
+      clamp(uintBitsToFloat(environment_push.sky_flags.y), 0.0, 1.0);
+  const vec3 mapped = rotateLunarSurface(surface_normal);
+  const float terrain = fbm(mapped * 18.0);
+  const float maria = fbm(mapped * 5.0 + vec3(17.0, 3.0, 11.0));
+  return clamp(0.10 + surface_detail *
+                   ((terrain - 0.5) * 0.11 -
+                    smoothstep(0.58, 0.78, maria) * 0.035),
+               0.045, 0.16);
+}
+
+vec3 moonDiskRadiance(ivec2 pixel, vec3 moon_direction,
+                      vec3 sun_direction, float angular_radius) {
+  if ((environment_push.sky_flags.x & 2u) == 0u) {
+    return vec3(0.0);
+  }
+  const int sample_count = 4;
+  const float sine_radius = max(sin(angular_radius), 1.0e-6);
+  vec3 tangent_x = cross(vec3(0.0, 1.0, 0.0), moon_direction);
+  if (dot(tangent_x, tangent_x) < 1.0e-6) {
+    tangent_x = cross(vec3(1.0, 0.0, 0.0), moon_direction);
+  }
+  tangent_x = normalize(tangent_x);
+  const vec3 tangent_y = normalize(cross(moon_direction, tangent_x));
+  vec3 result = vec3(0.0);
+  for (int y = 0; y < sample_count; ++y) {
+    for (int x = 0; x < sample_count; ++x) {
+      const vec2 offset =
+          (vec2(x, y) + vec2(0.5)) / float(sample_count);
+      const vec2 uv =
+          (vec2(pixel) + offset) /
+          vec2(imageSize(environment_cache_output));
+      const vec3 sample_direction = worldDirectionFromUv(uv);
+      if (dot(sample_direction, moon_direction) < cos(angular_radius)) {
+        continue;
+      }
+      const float disk_x =
+          dot(sample_direction, tangent_x) / sine_radius;
+      const float disk_y =
+          dot(sample_direction, tangent_y) / sine_radius;
+      const float radial_squared =
+          clamp(disk_x * disk_x + disk_y * disk_y, 0.0, 1.0);
+      const vec3 surface_normal = normalize(
+          tangent_x * disk_x + tangent_y * disk_y -
+          moon_direction * sqrt(max(1.0 - radial_squared, 0.0)));
+      vec3 phase_sun_direction = sun_direction;
+      if ((environment_push.sky_flags.x & 4u) != 0u) {
+        const float phase_angle =
+            clamp(environment_push.moon_phase_libration.y, 0.0, PI);
+        phase_sun_direction = normalize(
+            -moon_direction * cos(phase_angle) +
+            tangent_x * sin(phase_angle));
+      }
+      const float direct_light =
+          max(dot(surface_normal, phase_sun_direction), 0.0);
+      const float earthshine =
+          0.0025 *
+          (1.0 - environment_push.moon_phase_libration.x);
+      const float albedo = lunarAlbedo(surface_normal);
+      result += ATMOSPHERE.solar_irradiance *
+          (albedo / PI) * (direct_light + earthshine);
+    }
+  }
+  return result / float(sample_count * sample_count) *
+      max(environment_push.sky_energy.z, 0.0);
+}
+
+vec3 belowHorizonRadiance(vec3 camera, vec3 world_direction,
+                          vec3 sun_direction, vec3 world_sun,
+                          vec3 world_moon) {
+  const vec3 horizontal_world = normalize(vec3(
+      world_direction.x, 0.003,
+      abs(world_direction.z) > 1.0e-5 ? world_direction.z : 1.0e-5));
+  vec3 horizon_transmittance;
+  const vec3 horizon_radiance = GetSkyRadiance(
+      ATMOSPHERE, transmittance_texture, scattering_texture,
+      scattering_texture, camera, atmosphereDirection(horizontal_world),
+      0.0, sun_direction, horizon_transmittance);
+
+  const float sun_elevation = max(world_sun.y, 0.0);
+  const float moon_elevation = max(world_moon.y, 0.0);
+  const float moon_relative =
+      clamp(pow(10.0, -0.4 *
+                       (environment_push.night_parameters.y + 12.74)),
+            0.0, 1.0);
+  const vec3 frozen_ground_albedo = vec3(0.10, 0.085, 0.065);
+  const vec3 daylight = ATMOSPHERE.solar_irradiance *
+      (0.025 + sun_elevation) * frozen_ground_albedo / PI;
+  const vec3 moonlight = ATMOSPHERE.solar_irradiance *
+      moon_elevation * moon_relative * 2.0e-5 *
+      frozen_ground_albedo / PI;
+  const vec3 ground_radiance =
+      daylight + moonlight + vec3(2.0e-5, 2.4e-5, 3.2e-5);
+  const float ground_blend =
+      smoothstep(0.0, 0.24, max(-world_direction.y, 0.0));
+  return mix(horizon_radiance, ground_radiance, ground_blend) *
+      max(environment_push.sky_energy.x, 0.0);
+}
+
+void main() {
+  const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+  const ivec2 cache_size = imageSize(environment_cache_output);
+  if (any(greaterThanEqual(pixel, cache_size))) {
+    return;
+  }
+  const vec2 uv =
+      (vec2(pixel) + vec2(0.5)) / vec2(cache_size);
+  const vec3 world_direction = worldDirectionFromUv(uv);
+  const vec3 world_sun = normalize(
+      environment_push.sun_direction_observer_height.xyz);
+  const vec3 world_moon = normalize(
+      environment_push.moon_direction_angular_radius.xyz);
+  const vec3 view_direction = atmosphereDirection(world_direction);
+  const vec3 sun_direction = atmosphereDirection(world_sun);
+  const float observer_height =
+      max(environment_push.sun_direction_observer_height.w, 0.001);
+  const vec3 camera =
+      vec3(0.0, 0.0, ATMOSPHERE.bottom_radius + observer_height);
+
+  vec3 transmittance;
+  vec3 radiance = GetSkyRadiance(
+      ATMOSPHERE, transmittance_texture, scattering_texture,
+      scattering_texture, camera, view_direction, 0.0, sun_direction,
+      transmittance);
+  radiance *= max(environment_push.sky_energy.x, 0.0);
+  // The finite Sun is evaluated analytically in the ray-tracing shader.  Do
+  // not rasterize it into this low-resolution cache: a sub-texel disk would
+  // otherwise become a square texel in the background.  The cache still
+  // carries the atmosphere and cloud transmittance used around the disk, and
+  // the CPU distribution adds a matching circular importance lobe.
+  const float moon_angular_radius =
+      max(environment_push.moon_direction_angular_radius.w, 1.0e-6);
+  const vec3 moon_radiance =
+      moonDiskRadiance(pixel, world_moon, world_sun, moon_angular_radius) *
+      transmittance;
+
+  const float night_visibility =
+      1.0 - smoothstep(
+                -18.0, -6.0,
+                environment_push.observer_sidereal_twilight.w);
+  if (night_visibility > 0.0) {
+    const vec3 inertial_direction = inertialDirection(world_direction);
+    const vec3 stars =
+        proceduralStars(inertial_direction) *
+        environment_push.night_parameters.z;
+    const vec3 galaxy =
+        proceduralGalaxy(inertial_direction) *
+        environment_push.night_parameters.w;
+    radiance += (stars + galaxy) * night_visibility * transmittance;
+    radiance += vec3(max(environment_push.sky_energy.w, 0.0)) *
+                night_visibility;
+  }
+  if (world_direction.y < 0.0) {
+    // Background only: actual y=0 scene geometry still wins through RT depth.
+    radiance = belowHorizonRadiance(
+        camera, world_direction, sun_direction, world_sun, world_moon);
+  }
+  float cloud_transmittance = 1.0;
+  vec3 cloud_radiance = vec3(0.0);
+  integrateClouds(pixel, camera, view_direction, sun_direction,
+                  atmosphereDirection(world_moon), cloud_transmittance,
+                  cloud_radiance);
+  if (environment_push.cloud_history.z > 0.5 &&
+      environment_push.cloud_layer.x > 0.5) {
+    const float base_altitude =
+        max(environment_push.cloud_layer.w, 0.1);
+    const vec3 reprojection_offset =
+        vec3(environment_push.cloud_history.x, 0.0,
+             environment_push.cloud_history.y);
+    const vec3 previous_direction = normalize(
+        world_direction +
+        reprojection_offset *
+            (max(world_direction.y, 0.05) / base_altitude));
+    const vec4 previous =
+        textureLod(previous_cloud_history,
+                   worldUvFromDirection(previous_direction), 0.0);
+    if (all(equal(previous, previous)) &&
+        all(lessThanEqual(abs(previous), vec4(65504.0)))) {
+      const vec3 history_extent =
+          vec3(0.02) + max(cloud_radiance, vec3(0.0)) * 0.75;
+      const vec3 clipped_history =
+          clamp(previous.rgb, cloud_radiance - history_extent,
+                cloud_radiance + history_extent);
+      const float clipped_transmittance =
+          clamp(previous.a, cloud_transmittance - 0.20,
+                cloud_transmittance + 0.20);
+      const float history_weight =
+          clamp(environment_push.cloud_post.w, 0.0, 0.999);
+      cloud_radiance =
+          mix(cloud_radiance, clipped_history, history_weight);
+      cloud_transmittance =
+          mix(cloud_transmittance, clipped_transmittance,
+              history_weight);
+    }
+  }
+  imageStore(cloud_history_output, pixel,
+             vec4(clamp(cloud_radiance, vec3(0.0), vec3(65504.0)),
+                  clamp(cloud_transmittance, 0.0, 1.0)));
+  radiance = radiance * cloud_transmittance + cloud_radiance;
+  radiance = clamp(radiance, vec3(0.0), vec3(65504.0));
+  const float moon_luminance =
+      clamp(dot(moon_radiance, vec3(0.2126, 0.7152, 0.0722)) *
+                cloud_transmittance,
+            0.0, 65504.0);
+  imageStore(
+      environment_cache_output, pixel, vec4(radiance, moon_luminance));
+}

@@ -1,0 +1,28 @@
+XPBD Baker preview-scene open-source notices
+================================================
+
+FastNoiseLite
+-------------
+Project: https://github.com/Auburn/FastNoiseLite
+Frozen commit: 785f37a9ad76e283586a379675085f2063ae03f7
+License: MIT
+Copyright (c) 2020 Jordan Peck (jordan.me2@gmail.com)
+Copyright (c) 2020 Contributors
+
+The complete upstream license is included in source and packaged notices at:
+third_party/fast_noise_lite/LICENSE
+notices/FASTNOISELITE_MIT.txt
+
+osgw - Real-Time Ocean Simulation with Gerstner Waves
+------------------------------------------------------
+Project: https://github.com/CaffeineViking/osgw
+Frozen commit: 1d82fbeaabc1c04e8bed88b4dd27e0c690065dc8
+License: MIT
+Copyright (c) 2018 Erik S. Vasconcelos Jansson
+
+The complete upstream license is included in source and packaged notices at:
+third_party/osgw/LICENSE.md
+notices/OSGW_MIT.md
+
+The source boundary, hashes, and local adaptation notes are recorded at:
+third_party/PREVIEW_SCENE_UPSTREAMS.md

@@ -1,0 +1,715 @@
+#include "xpbd/gfx/labpbr_authoring.hpp"
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cmath>
+#include <cstring>
+#include <fstream>
+#include <limits>
+#include <set>
+#include <utility>
+
+namespace xpbd::gfx {
+namespace {
+
+std::uint8_t encodeUnit(float value, float scale) noexcept {
+  if (!std::isfinite(value)) {
+    value = 0.0f;
+  }
+  return static_cast<std::uint8_t>(
+      std::lround(std::clamp(value, 0.0f, 1.0f) * scale));
+}
+
+double edge(double ax, double ay, double bx, double by, double px,
+            double py) noexcept {
+  return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
+}
+
+void appendBigEndian32(std::vector<std::uint8_t> &bytes,
+                       std::uint32_t value) {
+  bytes.push_back(static_cast<std::uint8_t>(value >> 24u));
+  bytes.push_back(static_cast<std::uint8_t>(value >> 16u));
+  bytes.push_back(static_cast<std::uint8_t>(value >> 8u));
+  bytes.push_back(static_cast<std::uint8_t>(value));
+}
+
+std::uint32_t crc32(std::span<const std::uint8_t> bytes) noexcept {
+  std::uint32_t crc = 0xffffffffu;
+  for (const std::uint8_t byte : bytes) {
+    crc ^= byte;
+    for (int bit = 0; bit < 8; ++bit) {
+      const std::uint32_t mask =
+          0u - static_cast<std::uint32_t>(crc & 1u);
+      crc = (crc >> 1u) ^ (0xedb88320u & mask);
+    }
+  }
+  return ~crc;
+}
+
+std::uint32_t adler32(std::span<const std::uint8_t> bytes) noexcept {
+  constexpr std::uint32_t kMod = 65521u;
+  std::uint32_t a = 1u;
+  std::uint32_t b = 0u;
+  for (const std::uint8_t byte : bytes) {
+    a = (a + byte) % kMod;
+    b = (b + a) % kMod;
+  }
+  return (b << 16u) | a;
+}
+
+void appendPngChunk(std::vector<std::uint8_t> &png, const char type[4],
+                    std::span<const std::uint8_t> payload) {
+  appendBigEndian32(png, static_cast<std::uint32_t>(payload.size()));
+  const std::size_t crc_begin = png.size();
+  png.insert(png.end(), type, type + 4);
+  png.insert(png.end(), payload.begin(), payload.end());
+  appendBigEndian32(
+      png, crc32(std::span<const std::uint8_t>(png).subspan(
+               crc_begin, 4u + payload.size())));
+}
+
+std::uint32_t rotateRight(std::uint32_t value, unsigned shift) noexcept {
+  return std::rotr(value, static_cast<int>(shift));
+}
+
+std::array<std::uint8_t, 32>
+sha256(std::span<const std::uint8_t> input) {
+  static constexpr std::array<std::uint32_t, 64> kRound{
+      0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u,
+      0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
+      0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u,
+      0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
+      0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu,
+      0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
+      0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u,
+      0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
+      0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u,
+      0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
+      0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u,
+      0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
+      0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u,
+      0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
+      0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u,
+      0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u};
+  std::array<std::uint32_t, 8> state{
+      0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+      0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u};
+
+  const std::uint64_t bit_length =
+      static_cast<std::uint64_t>(input.size()) * 8u;
+  std::vector<std::uint8_t> padded(input.begin(), input.end());
+  padded.push_back(0x80u);
+  while ((padded.size() % 64u) != 56u) {
+    padded.push_back(0u);
+  }
+  for (int shift = 56; shift >= 0; shift -= 8) {
+    padded.push_back(
+        static_cast<std::uint8_t>(bit_length >> static_cast<unsigned>(shift)));
+  }
+
+  for (std::size_t chunk = 0; chunk < padded.size(); chunk += 64u) {
+    std::array<std::uint32_t, 64> words{};
+    for (std::size_t i = 0; i < 16u; ++i) {
+      const std::size_t offset = chunk + i * 4u;
+      words[i] = (static_cast<std::uint32_t>(padded[offset]) << 24u) |
+                 (static_cast<std::uint32_t>(padded[offset + 1u]) << 16u) |
+                 (static_cast<std::uint32_t>(padded[offset + 2u]) << 8u) |
+                 static_cast<std::uint32_t>(padded[offset + 3u]);
+    }
+    for (std::size_t i = 16u; i < words.size(); ++i) {
+      const std::uint32_t s0 =
+          rotateRight(words[i - 15u], 7u) ^
+          rotateRight(words[i - 15u], 18u) ^ (words[i - 15u] >> 3u);
+      const std::uint32_t s1 =
+          rotateRight(words[i - 2u], 17u) ^
+          rotateRight(words[i - 2u], 19u) ^ (words[i - 2u] >> 10u);
+      words[i] = words[i - 16u] + s0 + words[i - 7u] + s1;
+    }
+
+    std::uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
+    std::uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
+    for (std::size_t i = 0; i < words.size(); ++i) {
+      const std::uint32_t big_sigma1 =
+          rotateRight(e, 6u) ^ rotateRight(e, 11u) ^ rotateRight(e, 25u);
+      const std::uint32_t choose = (e & f) ^ (~e & g);
+      const std::uint32_t temp1 =
+          h + big_sigma1 + choose + kRound[i] + words[i];
+      const std::uint32_t big_sigma0 =
+          rotateRight(a, 2u) ^ rotateRight(a, 13u) ^ rotateRight(a, 22u);
+      const std::uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
+      const std::uint32_t temp2 = big_sigma0 + majority;
+      h = g;
+      g = f;
+      f = e;
+      e = d + temp1;
+      d = c;
+      c = b;
+      b = a;
+      a = temp1 + temp2;
+    }
+    state[0] += a;
+    state[1] += b;
+    state[2] += c;
+    state[3] += d;
+    state[4] += e;
+    state[5] += f;
+    state[6] += g;
+    state[7] += h;
+  }
+
+  std::array<std::uint8_t, 32> digest{};
+  for (std::size_t i = 0; i < state.size(); ++i) {
+    digest[i * 4u] = static_cast<std::uint8_t>(state[i] >> 24u);
+    digest[i * 4u + 1u] = static_cast<std::uint8_t>(state[i] >> 16u);
+    digest[i * 4u + 2u] = static_cast<std::uint8_t>(state[i] >> 8u);
+    digest[i * 4u + 3u] = static_cast<std::uint8_t>(state[i]);
+  }
+  return digest;
+}
+
+struct ChannelClaim {
+  std::uint8_t value = 0;
+  std::set<std::string> groups;
+  std::set<std::uint8_t> values;
+};
+
+void claimChannel(
+    std::uint32_t texel, LabPbrOverrideChannel channel, std::uint8_t value,
+    const std::string &group, TextureImage &output,
+    std::map<std::uint64_t, ChannelClaim> &claims) {
+  const auto channel_index = static_cast<std::uint8_t>(channel);
+  const std::uint64_t key =
+      static_cast<std::uint64_t>(texel) * 4u + channel_index;
+  auto [it, inserted] =
+      claims.try_emplace(key, ChannelClaim{value, {group}, {value}});
+  it->second.groups.insert(group);
+  it->second.values.insert(value);
+  if (inserted || it->second.value == value) {
+    output.rgba[static_cast<std::size_t>(texel) * 4u + channel_index] =
+        value;
+  }
+}
+
+} // namespace
+
+bool LabPbrUvCoverage::valid() const noexcept {
+  return width > 0 && height > 0;
+}
+
+const std::vector<std::uint32_t> *
+LabPbrUvCoverage::find(std::string_view group_name) const {
+  const auto found = group_texels.find(std::string(group_name));
+  return found == group_texels.end() ? nullptr : &found->second;
+}
+
+std::uint8_t encodeLabPbrEmission(float emission) noexcept {
+  return encodeUnit(emission, 254.0f);
+}
+
+std::uint8_t encodeLabPbrRoughness(float roughness) noexcept {
+  if (!std::isfinite(roughness)) {
+    roughness = 1.0f;
+  }
+  return encodeUnit(1.0f - std::clamp(roughness, 0.0f, 1.0f), 255.0f);
+}
+
+std::uint8_t encodeLabPbrPorosity(float porosity) noexcept {
+  return encodeUnit(porosity, 64.0f);
+}
+
+std::uint8_t encodeLabPbrSubsurface(float subsurface) noexcept {
+  return static_cast<std::uint8_t>(
+      65u + encodeUnit(subsurface, 190.0f));
+}
+
+bool validGroupLabPbrOverride(const GroupLabPbrOverride &override_value,
+                              std::string *error) {
+  const auto invalid_unit = [](float value) {
+    return !std::isfinite(value) || value < 0.0f || value > 1.0f;
+  };
+  const char *message = nullptr;
+  if (override_value.group_name.empty()) {
+    message = "group name is empty";
+  } else if (override_value.emission_enabled &&
+             invalid_unit(override_value.emission)) {
+    message = "emission must be finite and in [0,1]";
+  } else if (override_value.roughness_enabled &&
+             invalid_unit(override_value.roughness)) {
+    message = "roughness must be finite and in [0,1]";
+  } else if (override_value.porosity_enabled &&
+             override_value.subsurface_scattering &&
+             invalid_unit(override_value.subsurface)) {
+    message = "subsurface scattering must be finite and in [0,1]";
+  } else if (override_value.porosity_enabled &&
+             !override_value.subsurface_scattering &&
+             invalid_unit(override_value.porosity)) {
+    message = "porosity must be finite and in [0,1]";
+  } else if (override_value.metal_enabled && override_value.metal &&
+             override_value.metal_code < 230u) {
+    message = "metal code must be in [230,255]";
+  } else if (override_value.metal_enabled && !override_value.metal &&
+             override_value.dielectric_f0 > 229u) {
+    message = "dielectric F0 byte must be in [0,229]";
+  }
+  if (error != nullptr) {
+    *error = message == nullptr ? std::string{} : std::string(message);
+  }
+  return message == nullptr;
+}
+
+LabPbrUvCoverage
+rasterizeLabPbrUvCoverage(const StaticIndexedModelMesh &mesh, int width,
+                          int height) {
+  LabPbrUvCoverage result;
+  if (width <= 0 || height <= 0) {
+    return result;
+  }
+  const std::size_t texel_count =
+      static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+  if (texel_count >
+      static_cast<std::size_t>(
+          (std::numeric_limits<std::uint32_t>::max)())) {
+    return result;
+  }
+  result.width = width;
+  result.height = height;
+  std::map<std::string, std::set<std::uint32_t>> covered;
+  constexpr double kInsideEpsilon = 1.0e-9;
+
+  for (const StaticModelFace &face : mesh.faces) {
+    if (!face.textured || face.bone_index >= mesh.bone_names.size() ||
+        face.first_index > mesh.indices.size() ||
+        face.index_count > mesh.indices.size() - face.first_index) {
+      continue;
+    }
+    auto &group = covered[mesh.bone_names[face.bone_index]];
+    for (std::uint32_t local = 0; local + 2u < face.index_count;
+         local += 3u) {
+      const std::uint32_t ia = mesh.indices[face.first_index + local];
+      const std::uint32_t ib = mesh.indices[face.first_index + local + 1u];
+      const std::uint32_t ic = mesh.indices[face.first_index + local + 2u];
+      if (ia >= mesh.vertices.size() || ib >= mesh.vertices.size() ||
+          ic >= mesh.vertices.size()) {
+        continue;
+      }
+      const auto &a = mesh.vertices[ia];
+      const auto &b = mesh.vertices[ib];
+      const auto &c = mesh.vertices[ic];
+      const double ax = static_cast<double>(a.u) * width;
+      const double ay = static_cast<double>(a.v) * height;
+      const double bx = static_cast<double>(b.u) * width;
+      const double by = static_cast<double>(b.v) * height;
+      const double cx = static_cast<double>(c.u) * width;
+      const double cy = static_cast<double>(c.v) * height;
+      const double area = edge(ax, ay, bx, by, cx, cy);
+      if (!std::isfinite(area) || std::abs(area) <= kInsideEpsilon) {
+        continue;
+      }
+      const int min_x =
+          std::clamp(static_cast<int>(std::floor(
+                         (std::min)({ax, bx, cx}))),
+                     0, width - 1);
+      const int max_x =
+          std::clamp(static_cast<int>(std::ceil(
+                         (std::max)({ax, bx, cx}))) -
+                         1,
+                     0, width - 1);
+      const int min_y =
+          std::clamp(static_cast<int>(std::floor(
+                         (std::min)({ay, by, cy}))),
+                     0, height - 1);
+      const int max_y =
+          std::clamp(static_cast<int>(std::ceil(
+                         (std::max)({ay, by, cy}))) -
+                         1,
+                     0, height - 1);
+      for (int y = min_y; y <= max_y; ++y) {
+        for (int x = min_x; x <= max_x; ++x) {
+          const double px = static_cast<double>(x) + 0.5;
+          const double py = static_cast<double>(y) + 0.5;
+          const double e0 = edge(ax, ay, bx, by, px, py);
+          const double e1 = edge(bx, by, cx, cy, px, py);
+          const double e2 = edge(cx, cy, ax, ay, px, py);
+          const bool inside =
+              area > 0.0
+                  ? e0 >= -kInsideEpsilon && e1 >= -kInsideEpsilon &&
+                        e2 >= -kInsideEpsilon
+                  : e0 <= kInsideEpsilon && e1 <= kInsideEpsilon &&
+                        e2 <= kInsideEpsilon;
+          if (inside) {
+            const auto texel =
+                static_cast<std::size_t>(y) *
+                    static_cast<std::size_t>(width) +
+                static_cast<std::size_t>(x);
+            group.insert(static_cast<std::uint32_t>(texel));
+          }
+        }
+      }
+    }
+  }
+
+  for (auto &[group, texels] : covered) {
+    result.group_texels.emplace(
+        std::move(group),
+        std::vector<std::uint32_t>(texels.begin(), texels.end()));
+  }
+  return result;
+}
+
+LabPbrCompositionResult composeLabPbrSpecular(
+    int width, int height, const TextureImage *imported_specular,
+    const LabPbrUvCoverage &coverage,
+    const std::map<std::string, GroupLabPbrOverride> &overrides) {
+  LabPbrCompositionResult result;
+  if (width <= 0 || height <= 0 || coverage.width != width ||
+      coverage.height != height) {
+    result.errors.emplace_back("invalid or mismatched UV coverage dimensions");
+    return result;
+  }
+  const std::size_t texel_count =
+      static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+  if (texel_count >
+          (std::numeric_limits<std::size_t>::max)() / 4u ||
+      texel_count >
+          static_cast<std::size_t>(
+              (std::numeric_limits<std::uint32_t>::max)())) {
+    result.errors.emplace_back("specular atlas dimensions overflow");
+    return result;
+  }
+  result.specular.width = width;
+  result.specular.height = height;
+  result.specular.source_channels = 4;
+  result.specular.rgba.resize(texel_count * 4u);
+  for (std::size_t texel = 0; texel < texel_count; ++texel) {
+    result.specular.rgba[texel * 4u + 0u] = 0u;
+    result.specular.rgba[texel * 4u + 1u] = 10u;
+    result.specular.rgba[texel * 4u + 2u] = 0u;
+    result.specular.rgba[texel * 4u + 3u] = 0u;
+  }
+  if (imported_specular != nullptr && imported_specular->valid()) {
+    if (imported_specular->width != width ||
+        imported_specular->height != height) {
+      result.errors.emplace_back(
+          "imported specular dimensions do not match atlas");
+      return result;
+    }
+    result.specular.rgba = imported_specular->rgba;
+  }
+
+  std::map<std::uint64_t, ChannelClaim> claims;
+  for (const auto &[group_name, override_value] : overrides) {
+    std::string validation_error;
+    if (!validGroupLabPbrOverride(override_value, &validation_error)) {
+      result.errors.push_back(group_name + ": " + validation_error);
+      continue;
+    }
+    const auto *texels = coverage.find(group_name);
+    if (texels == nullptr || texels->empty()) {
+      result.warnings.push_back(group_name +
+                                ": no textured UV texels are covered");
+      continue;
+    }
+    for (const std::uint32_t texel : *texels) {
+      if (texel >= texel_count) {
+        result.errors.push_back(group_name +
+                                ": UV coverage contains invalid texel");
+        break;
+      }
+      if (override_value.roughness_enabled) {
+        claimChannel(texel, LabPbrOverrideChannel::Roughness,
+                     encodeLabPbrRoughness(override_value.roughness),
+                     group_name, result.specular, claims);
+      }
+      if (override_value.metal_enabled) {
+        claimChannel(texel, LabPbrOverrideChannel::Metal,
+                     override_value.metal ? override_value.metal_code
+                                          : override_value.dielectric_f0,
+                     group_name, result.specular, claims);
+      }
+      if (override_value.porosity_enabled) {
+        claimChannel(texel, LabPbrOverrideChannel::Porosity,
+                     override_value.subsurface_scattering
+                         ? encodeLabPbrSubsurface(
+                               override_value.subsurface)
+                         : encodeLabPbrPorosity(override_value.porosity),
+                     group_name, result.specular, claims);
+      }
+      if (override_value.emission_enabled) {
+        claimChannel(texel, LabPbrOverrideChannel::Emission,
+                     encodeLabPbrEmission(override_value.emission),
+                     group_name, result.specular, claims);
+      }
+    }
+  }
+
+  for (const auto &[key, claim] : claims) {
+    if (claim.values.size() <= 1u) {
+      continue;
+    }
+    LabPbrUvConflict conflict;
+    conflict.texel_index = static_cast<std::uint32_t>(key / 4u);
+    conflict.channel =
+        static_cast<LabPbrOverrideChannel>(key % 4u);
+    conflict.groups.assign(claim.groups.begin(), claim.groups.end());
+    conflict.encoded_values.assign(claim.values.begin(), claim.values.end());
+    result.conflicts.push_back(std::move(conflict));
+  }
+  return result;
+}
+
+bool buildAuthoredResolvedMaterial(
+    const TextureImage &base, const ResolvedMaterialTable &source,
+    const TextureImage *authored_normal,
+    const TextureImage *authored_specular, ResolvedMaterialTable &out,
+    std::string *error) {
+  if (!base.valid() ||
+      (authored_specular != nullptr &&
+       (!authored_specular->valid() ||
+        authored_specular->width != base.width ||
+        authored_specular->height != base.height ||
+        authored_specular->source_channels != 4))) {
+    if (error != nullptr) {
+      *error = "authored specular image does not match the base atlas";
+    }
+    return false;
+  }
+  const TextureImage *normal = authored_normal;
+  if (normal == nullptr && source.normal_map_active) {
+    normal = &source.normal_image;
+  }
+  const TextureImage *specular = authored_specular;
+  if (specular == nullptr && source.specular_map_active) {
+    specular = &source.specular_image;
+  }
+  if (normal != nullptr &&
+      (!normal->valid() || normal->width != base.width ||
+       normal->height != base.height || normal->source_channels < 3)) {
+    if (error != nullptr) {
+      *error = "normal image does not match the base atlas or lacks RGB";
+    }
+    return false;
+  }
+
+  ResolvedMaterialTable material = source;
+  material.width = base.width;
+  material.height = base.height;
+  if (authored_normal != nullptr || authored_specular != nullptr) {
+    material.format = LabPbrFormat::LabPbr13;
+  }
+  material.normal_map_active = normal != nullptr;
+  material.normal_image = normal == nullptr ? TextureImage{} : *normal;
+  material.specular_map_active = specular != nullptr;
+  material.specular_image =
+      specular == nullptr ? TextureImage{} : *specular;
+  const std::size_t texel_count =
+      static_cast<std::size_t>(base.width) *
+      static_cast<std::size_t>(base.height);
+  material.texels.resize(texel_count);
+  for (std::size_t texel = 0; texel < texel_count; ++texel) {
+    std::array<std::uint8_t, 4> base_rgba{};
+    std::array<std::uint8_t, 4> normal_rgba{};
+    std::array<std::uint8_t, 4> specular_rgba{};
+    std::copy_n(base.rgba.begin() +
+                    static_cast<std::ptrdiff_t>(texel * 4u),
+                4u, base_rgba.begin());
+    if (specular != nullptr) {
+      std::copy_n(specular->rgba.begin() +
+                      static_cast<std::ptrdiff_t>(texel * 4u),
+                  4u, specular_rgba.begin());
+    }
+    if (normal != nullptr) {
+      std::copy_n(normal->rgba.begin() +
+                      static_cast<std::ptrdiff_t>(texel * 4u),
+                  4u, normal_rgba.begin());
+    }
+    material.texels[texel] =
+        decodeLabPbrTexel(base_rgba,
+                          normal == nullptr ? nullptr : &normal_rgba,
+                          specular == nullptr ? nullptr : &specular_rgba, 4);
+  }
+  out = std::move(material);
+  if (error != nullptr) {
+    error->clear();
+  }
+  return true;
+}
+
+std::string sha256Hex(std::span<const std::uint8_t> bytes) {
+  const auto digest = sha256(bytes);
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string result;
+  result.reserve(digest.size() * 2u);
+  for (const std::uint8_t byte : digest) {
+    result.push_back(kHex[byte >> 4u]);
+    result.push_back(kHex[byte & 0x0fu]);
+  }
+  return result;
+}
+
+bool importReadOnlyIrisNormal(const std::filesystem::path &path,
+                              int expected_width, int expected_height,
+                              ReadOnlyIrisNormalAsset &out,
+                              std::string *error) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    if (error != nullptr) {
+      *error = "failed to open Iris normal image";
+    }
+    return false;
+  }
+  std::vector<std::uint8_t> bytes(
+      (std::istreambuf_iterator<char>(input)),
+      std::istreambuf_iterator<char>());
+  if (bytes.empty()) {
+    if (error != nullptr) {
+      *error = "Iris normal image is empty";
+    }
+    return false;
+  }
+  TextureImage decoded;
+  std::string decode_error;
+  if (bytes.size() >
+          static_cast<std::size_t>((std::numeric_limits<int>::max)()) ||
+      !loadTextureImageFromMemory(bytes.data(), static_cast<int>(bytes.size()),
+                                  decoded, &decode_error)) {
+    if (error != nullptr) {
+      *error = decode_error.empty() ? "failed to decode Iris normal image"
+                                    : decode_error;
+    }
+    return false;
+  }
+  if (decoded.source_channels != 4) {
+    if (error != nullptr) {
+      *error = "Iris normal image must be RGBA";
+    }
+    return false;
+  }
+  if (decoded.width != expected_width ||
+      decoded.height != expected_height) {
+    if (error != nullptr) {
+      *error = "Iris normal dimensions do not match the base atlas";
+    }
+    return false;
+  }
+
+  ReadOnlyIrisNormalAsset imported;
+  imported.source_path = path;
+  imported.original_file_bytes = std::move(bytes);
+  imported.sha256 = sha256Hex(imported.original_file_bytes);
+  imported.decoded = std::move(decoded);
+  imported.decoded.path = path.string();
+  out = std::move(imported);
+  if (error != nullptr) {
+    error->clear();
+  }
+  return true;
+}
+
+bool encodePngRgba8(int width, int height,
+                    std::span<const std::uint8_t> rgba,
+                    std::vector<std::uint8_t> &png, std::string *error) {
+  if (width <= 0 || height <= 0) {
+    if (error != nullptr) {
+      *error = "PNG dimensions must be positive";
+    }
+    return false;
+  }
+  const std::size_t row_bytes = static_cast<std::size_t>(width) * 4u;
+  const std::size_t expected = row_bytes * static_cast<std::size_t>(height);
+  if (row_bytes / 4u != static_cast<std::size_t>(width) ||
+      expected / static_cast<std::size_t>(height) != row_bytes ||
+      rgba.size() != expected) {
+    if (error != nullptr) {
+      *error = "PNG RGBA byte count does not match dimensions";
+    }
+    return false;
+  }
+  const std::size_t height_size = static_cast<std::size_t>(height);
+  if (expected >
+      (std::numeric_limits<std::size_t>::max)() - height_size) {
+    if (error != nullptr) {
+      *error = "PNG scanline dimensions overflow";
+    }
+    return false;
+  }
+  const std::size_t scanline_size = expected + height_size;
+  const std::size_t block_count =
+      scanline_size / 65535u + (scanline_size % 65535u != 0u ? 1u : 0u);
+  const std::size_t maximum_size =
+      (std::numeric_limits<std::size_t>::max)();
+  if (scanline_size > maximum_size - 6u ||
+      block_count > (maximum_size - scanline_size - 6u) / 5u ||
+      scanline_size + block_count * 5u + 6u >
+          static_cast<std::size_t>(
+              (std::numeric_limits<std::uint32_t>::max)())) {
+    if (error != nullptr) {
+      *error = "PNG IDAT payload exceeds the 32-bit chunk limit";
+    }
+    return false;
+  }
+
+  std::vector<std::uint8_t> scanlines;
+  scanlines.reserve(scanline_size);
+  for (int y = 0; y < height; ++y) {
+    scanlines.push_back(0u);
+    const auto row = rgba.subspan(static_cast<std::size_t>(y) * row_bytes,
+                                  row_bytes);
+    scanlines.insert(scanlines.end(), row.begin(), row.end());
+  }
+
+  std::vector<std::uint8_t> zlib;
+  zlib.reserve(scanline_size + block_count * 5u + 6u);
+  zlib.push_back(0x78u);
+  zlib.push_back(0x01u);
+  std::size_t offset = 0;
+  while (offset < scanlines.size()) {
+    const std::size_t block_size =
+        (std::min)(std::size_t{65535u}, scanlines.size() - offset);
+    const bool final = offset + block_size == scanlines.size();
+    zlib.push_back(final ? 0x01u : 0x00u);
+    const auto length = static_cast<std::uint16_t>(block_size);
+    const auto inverse = static_cast<std::uint16_t>(~length);
+    zlib.push_back(static_cast<std::uint8_t>(length));
+    zlib.push_back(static_cast<std::uint8_t>(length >> 8u));
+    zlib.push_back(static_cast<std::uint8_t>(inverse));
+    zlib.push_back(static_cast<std::uint8_t>(inverse >> 8u));
+    zlib.insert(zlib.end(), scanlines.begin() +
+                                static_cast<std::ptrdiff_t>(offset),
+                scanlines.begin() +
+                    static_cast<std::ptrdiff_t>(offset + block_size));
+    offset += block_size;
+  }
+  appendBigEndian32(zlib, adler32(scanlines));
+
+  png.clear();
+  static constexpr std::array<std::uint8_t, 8> kSignature{
+      0x89u, 0x50u, 0x4eu, 0x47u, 0x0du, 0x0au, 0x1au, 0x0au};
+  png.insert(png.end(), kSignature.begin(), kSignature.end());
+  std::array<std::uint8_t, 13> ihdr{};
+  ihdr[0] = static_cast<std::uint8_t>(
+      static_cast<std::uint32_t>(width) >> 24u);
+  ihdr[1] = static_cast<std::uint8_t>(
+      static_cast<std::uint32_t>(width) >> 16u);
+  ihdr[2] =
+      static_cast<std::uint8_t>(static_cast<std::uint32_t>(width) >> 8u);
+  ihdr[3] = static_cast<std::uint8_t>(width);
+  ihdr[4] = static_cast<std::uint8_t>(
+      static_cast<std::uint32_t>(height) >> 24u);
+  ihdr[5] = static_cast<std::uint8_t>(
+      static_cast<std::uint32_t>(height) >> 16u);
+  ihdr[6] =
+      static_cast<std::uint8_t>(static_cast<std::uint32_t>(height) >> 8u);
+  ihdr[7] = static_cast<std::uint8_t>(height);
+  ihdr[8] = 8u;
+  ihdr[9] = 6u;
+  appendPngChunk(png, "IHDR", ihdr);
+  appendPngChunk(png, "IDAT", zlib);
+  appendPngChunk(png, "IEND", {});
+  if (error != nullptr) {
+    error->clear();
+  }
+  return true;
+}
+
+} // namespace xpbd::gfx

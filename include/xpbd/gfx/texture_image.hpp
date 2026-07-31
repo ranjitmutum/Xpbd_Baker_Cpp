@@ -11,6 +11,7 @@ namespace xpbd::gfx {
 struct TextureImage {
     int width = 0;
     int height = 0;
+    int source_channels = 0;
     std::vector<std::uint8_t> rgba;
     std::string path;
 
@@ -20,7 +21,7 @@ struct TextureImage {
     }
 
     void clear() {
-        width = height = 0;
+        width = height = source_channels = 0;
         rgba.clear();
         path.clear();
     }

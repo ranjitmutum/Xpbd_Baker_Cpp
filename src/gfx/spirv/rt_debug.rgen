@@ -1,0 +1,1793 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT topLevelAS;
+layout(set = 0, binding = 1, rgba16f) uniform image2D outputImage;
+layout(set = 0, binding = 3, std430) readonly buffer IndexBuffer {
+  uint indices[];
+};
+layout(set = 0, binding = 10, r32f) uniform image2D outputDepth;
+layout(set = 0, binding = 14) uniform sampler2D environmentTexture;
+
+struct EnvironmentAliasEntry {
+  float acceptance;
+  uint aliasIndex;
+  float probability;
+  float padding;
+};
+
+layout(set = 0, binding = 15, std430) readonly buffer EnvironmentBuffer {
+  uvec4 environmentInfo;
+  vec4 environmentParameters;
+  vec4 environmentSunDirectionMoonMean;
+  vec4 environmentMoonDirectionAngularRadius;
+  vec4 environmentMoonPhaseLibration;
+  vec4 environmentSunColorStrength;
+  EnvironmentAliasEntry environmentAlias[];
+};
+
+struct EmissiveTriangleEntry {
+  vec4 p0Probability;
+  vec4 p1Acceptance;
+  vec4 p2Area;
+  vec4 emissionLuminance;
+  uvec4 metadata;
+};
+
+layout(set = 0, binding = 16, std430) readonly buffer EmissiveTriangleBuffer {
+  // Primitive count, positive-emitter count, layout revision, reserved.
+  uvec4 emissiveInfo;
+  EmissiveTriangleEntry emissiveTriangles[];
+};
+layout(set = 0, binding = 17, std430) readonly buffer PositionBuffer {
+  float positions[];
+};
+layout(set = 0, binding = 18, std430) readonly buffer PreviousPositionBuffer {
+  float previousPositions[];
+};
+struct InstanceMotionRecord {
+  mat4 currentTransform;
+  mat4 previousTransform;
+  uvec4 metadata;
+};
+layout(set = 0, binding = 19, std430) readonly buffer InstanceMotionBuffer {
+  InstanceMotionRecord instanceMotion[];
+};
+layout(set = 0, binding = 20, std430) readonly buffer MotionFrameBuffer {
+  mat4 previousViewProj;
+  uvec4 motionInfo;
+};
+layout(set = 0, binding = 21, rgba16f) uniform image2DArray outputAov;
+layout(set = 0, binding = 22, rgba32f) uniform image2D outputStatistics;
+layout(set = 0, binding = 23, rg32f) uniform image2D outputRrMotion;
+layout(set = 0, binding = 24, r32f)
+    uniform image2D outputRrSpecularHitDistance;
+layout(set = 0, binding = 25, rgba16f)
+    uniform image2D outputRrDiffuseAlbedo;
+layout(set = 0, binding = 26, rgba16f)
+    uniform image2D outputRrSpecularAlbedo;
+layout(set = 0, binding = 27, rgba16f)
+    uniform image2D outputRrNormalRoughness;
+
+const int kAovGeometry = 0;
+const int kAovShading = 1;
+const int kAovDiffuseAlbedo = 2;
+const int kAovSpecularAlbedo = 3;
+const int kAovDiffuseRadiance = 4;
+const int kAovSpecularRadiance = 5;
+const int kAovMotion = 6;
+const int kAovEmission = 7;
+const int kAovTransparency = 8;
+const int kAovSpecularHitDistance = 9;
+
+layout(push_constant) uniform PC {
+  mat4 invViewProj;
+  mat4 viewProj;
+  vec4 cameraEnvironment;
+  uvec4 sizeMode;
+  uvec4 sampling;
+  vec4 lightDirectionAmbient;
+  vec4 lightColorIntensity;
+  uvec4 depthLimits;
+  vec4 integrator;
+  vec4 cameraJitter;
+} pc;
+
+struct PrimaryPayload {
+  vec3 baseColor;
+  float t;
+  vec3 shadingNormal;
+  float roughness;
+  vec3 geometricNormal;
+  float ior;
+  vec3 f0;
+  float transmission;
+  vec3 emission;
+  float opacity;
+  uvec4 status;
+  // xy barycentrics, z uintBitsToFloat(instance id), w reserved.
+  vec4 hitData;
+};
+
+const uint kMaterialBlend = 1u << 2u;
+const uint kSunBackgroundVisible = 1u << 4u;
+const uint kMoonBackgroundVisible = 1u << 5u;
+const uint kSunLightingEnabled = 1u << 6u;
+const uint kMoonLightingEnabled = 1u << 7u;
+const uint kSunCastsShadows = 1u << 8u;
+const uint kMoonCastsShadows = 1u << 9u;
+const uint kMoonSurfaceDetail = 1u << 10u;
+const uint kMoonManualPhase = 1u << 11u;
+
+layout(location = 0) rayPayloadEXT PrimaryPayload payload;
+layout(location = 1) rayPayloadEXT float shadowVisibility;
+
+struct EnvironmentSample {
+  vec3 direction;
+  float pdf;
+  bool valid;
+};
+
+struct MeshLightSample {
+  vec3 direction;
+  float pdf;
+  vec3 radiance;
+  float distance;
+  bool valid;
+};
+
+uint hashPathTraceWord(uint value) {
+  value ^= value >> 16u;
+  value *= 0x7feb352du;
+  value ^= value >> 15u;
+  value *= 0x846ca68bu;
+  value ^= value >> 16u;
+  return value;
+}
+
+uint randomBits(uvec2 pixel, uint sampleIndex, uint dimension, uint seed) {
+  uint state = hashPathTraceWord(seed ^ 0x9e3779b9u);
+  state = hashPathTraceWord(state ^ pixel.x);
+  state = hashPathTraceWord(state ^ (pixel.y + 0x85ebca6bu));
+  state = hashPathTraceWord(state ^ (sampleIndex + 0xc2b2ae35u));
+  return hashPathTraceWord(state ^ (dimension + 0x27d4eb2fu));
+}
+
+float random01(uvec2 pixel, uint sampleIndex, uint dimension, uint seed) {
+  return float(randomBits(pixel, sampleIndex, dimension, seed) >> 8u) *
+         (1.0 / 16777216.0);
+}
+
+bool finite3(vec3 value) {
+  return all(equal(value, value)) &&
+         all(lessThanEqual(abs(value), vec3(65504.0)));
+}
+
+bool finite4(vec4 value) {
+  return all(equal(value, value)) &&
+         all(lessThanEqual(abs(value), vec4(65504.0)));
+}
+
+vec3 safeNormalize(vec3 value, vec3 fallback) {
+  float lengthSquared = dot(value, value);
+  return finite3(value) && lengthSquared > 1.0e-12
+             ? value * inversesqrt(lengthSquared)
+             : fallback;
+}
+
+float max3(vec3 value) {
+  return max(value.x, max(value.y, value.z));
+}
+
+float luminance(vec3 value) {
+  return dot(value, vec3(0.2126, 0.7152, 0.0722));
+}
+
+bool integratorFlag(uint bit) {
+  return (pc.sampling.w & (1u << bit)) != 0u;
+}
+
+vec3 clampContribution(vec3 value, float limit) {
+  if (!(limit > 0.0)) {
+    return value;
+  }
+  float peak = max3(max(value, vec3(0.0)));
+  return peak > limit ? value * (limit / peak) : value;
+}
+
+float powerHeuristic(float sampledPdf, float otherPdf) {
+  float a = max(sampledPdf, 0.0);
+  float b = max(otherPdf, 0.0);
+  float scale = max(a, b);
+  if (!(scale > 0.0)) {
+    return 0.0;
+  }
+  a /= scale;
+  b /= scale;
+  float aSquared = a * a;
+  float bSquared = b * b;
+  return aSquared / max(aSquared + bSquared, 1.0e-20);
+}
+
+vec3 sampleUniformSphere(float sampleU, float sampleV) {
+  float y = 1.0 - 2.0 * clamp(sampleU, 0.0, 0.99999994);
+  float radius = sqrt(max(0.0, 1.0 - y * y));
+  float angle = 6.28318530718 * clamp(sampleV, 0.0, 0.99999994);
+  return vec3(radius * cos(angle), y, radius * sin(angle));
+}
+
+vec3 cosineHemisphere(vec3 normal, float sampleU, float sampleV) {
+  float radius = sqrt(clamp(sampleU, 0.0, 0.99999994));
+  float angle = 6.28318530718 * clamp(sampleV, 0.0, 0.99999994);
+  vec3 up = abs(normal.z) < 0.999 ? vec3(0.0, 0.0, 1.0)
+                                 : vec3(0.0, 1.0, 0.0);
+  vec3 tangent = safeNormalize(cross(up, normal), vec3(1.0, 0.0, 0.0));
+  vec3 bitangent = cross(normal, tangent);
+  return safeNormalize(
+      tangent * (radius * cos(angle)) +
+          bitangent * (radius * sin(angle)) +
+          normal * sqrt(max(0.0, 1.0 - sampleU)),
+      normal);
+}
+
+float ggxDistribution(float normalDotHalf, float roughness) {
+  float noH = clamp(normalDotHalf, 0.0, 1.0);
+  if (!(noH > 0.0)) {
+    return 0.0;
+  }
+  float alpha = clamp(roughness, 0.02, 1.0);
+  float alphaSquared = alpha * alpha;
+  float denominator =
+      noH * noH * (alphaSquared - 1.0) + 1.0;
+  return alphaSquared /
+         max(3.14159265358979323846 * denominator * denominator,
+             1.0e-12);
+}
+
+float smithGgxG1(float normalDotDirection, float roughness) {
+  float cosine = clamp(normalDotDirection, 0.0, 1.0);
+  if (!(cosine > 0.0)) {
+    return 0.0;
+  }
+  float alpha = clamp(roughness, 0.02, 1.0);
+  float root = sqrt(alpha * alpha +
+                    (1.0 - alpha * alpha) * cosine * cosine);
+  return 2.0 * cosine / max(cosine + root, 1.0e-8);
+}
+
+vec3 fresnelSchlick(vec3 f0, float cosine) {
+  float factor = pow(1.0 - clamp(cosine, 0.0, 1.0), 5.0);
+  return clamp(f0, vec3(0.0), vec3(1.0)) +
+         (vec3(1.0) - clamp(f0, vec3(0.0), vec3(1.0))) *
+             factor;
+}
+
+float dielectricFresnel(float cosineIncident, float etaIncident,
+                        float etaTransmitted) {
+  float cosI = clamp(abs(cosineIncident), 0.0, 1.0);
+  float sinT = etaIncident / etaTransmitted *
+               sqrt(max(0.0, 1.0 - cosI * cosI));
+  if (sinT >= 1.0) {
+    return 1.0;
+  }
+  float cosT = sqrt(max(0.0, 1.0 - sinT * sinT));
+  float s = (etaTransmitted * cosI - etaIncident * cosT) /
+            max(etaTransmitted * cosI + etaIncident * cosT, 1.0e-8);
+  float p = (etaIncident * cosI - etaTransmitted * cosT) /
+            max(etaIncident * cosI + etaTransmitted * cosT, 1.0e-8);
+  return clamp(0.5 * (s * s + p * p), 0.0, 1.0);
+}
+
+void lobeProbabilities(vec3 baseColor, vec3 f0, bool metal,
+                       float transmission, out vec3 probabilities) {
+  float f0Importance = clamp(max3(f0), 0.0, 0.99);
+  float diffuseImportance =
+      metal ? 0.0
+            : (1.0 - transmission) * (1.0 - f0Importance) *
+                  max(luminance(baseColor), 0.05);
+  float glossyImportance = max(f0Importance, 0.02);
+  float transmissionImportance =
+      metal ? 0.0
+            : transmission * (1.0 - f0Importance) *
+                  max(luminance(baseColor), 0.05);
+  float total =
+      diffuseImportance + glossyImportance + transmissionImportance;
+  probabilities =
+      total > 1.0e-8
+          ? vec3(diffuseImportance, glossyImportance,
+                 transmissionImportance) /
+                total
+          : vec3(0.0, 1.0, 0.0);
+}
+
+void evaluateBsdfComponents(
+    vec3 baseColor, vec3 f0, float roughness, float transmission,
+    bool metal, vec3 normal, vec3 view, vec3 light,
+    out vec3 diffuse, out vec3 specular, out float pdf) {
+  pdf = 0.0;
+  diffuse = vec3(0.0);
+  specular = vec3(0.0);
+  float noV = dot(normal, view);
+  float noL = dot(normal, light);
+  if (!(noV > 0.0) || !(noL > 0.0)) {
+    return;
+  }
+  vec3 halfVector = safeNormalize(view + light, normal);
+  float noH = max(dot(normal, halfVector), 0.0);
+  float voH = max(dot(view, halfVector), 0.0);
+  if (!(noH > 0.0) || !(voH > 0.0)) {
+    return;
+  }
+  float distribution = ggxDistribution(noH, roughness);
+  float geometry =
+      smithGgxG1(noV, roughness) * smithGgxG1(noL, roughness);
+  vec3 fresnel = fresnelSchlick(f0, voH);
+  specular =
+      fresnel * distribution * geometry /
+      max(4.0 * noV * noL, 1.0e-8);
+  diffuse =
+      metal ? vec3(0.0)
+            : baseColor * (1.0 - transmission) *
+                  (1.0 - max3(fresnel)) *
+                  (1.0 / 3.14159265358979323846);
+  vec3 probabilities;
+  lobeProbabilities(baseColor, f0, metal, transmission,
+                    probabilities);
+  float diffusePdf = noL * (1.0 / 3.14159265358979323846);
+  float glossyPdf =
+      distribution * noH / max(4.0 * voH, 1.0e-8);
+  pdf = probabilities.x * diffusePdf +
+        probabilities.y * glossyPdf;
+}
+
+vec3 evaluateBsdf(vec3 baseColor, vec3 f0, float roughness,
+                  float transmission, bool metal, vec3 normal,
+                  vec3 view, vec3 light, out float pdf) {
+  vec3 diffuse;
+  vec3 specular;
+  evaluateBsdfComponents(
+      baseColor, f0, roughness, transmission, metal, normal, view,
+      light, diffuse, specular, pdf);
+  return diffuse + specular;
+}
+
+vec3 sampleGgx(vec3 normal, vec3 view, float roughness,
+               float sampleU, float sampleV, out bool valid) {
+  float alpha = clamp(roughness, 0.02, 1.0);
+  float alphaSquared = alpha * alpha;
+  float phi = 6.28318530718 * clamp(sampleV, 0.0, 0.99999994);
+  float cosine = sqrt(max(
+      0.0, (1.0 - sampleU) /
+               (1.0 + (alphaSquared - 1.0) * sampleU)));
+  float sine = sqrt(max(0.0, 1.0 - cosine * cosine));
+  vec3 up = abs(normal.z) < 0.999 ? vec3(0.0, 0.0, 1.0)
+                                 : vec3(0.0, 1.0, 0.0);
+  vec3 tangent = safeNormalize(cross(up, normal), vec3(1.0, 0.0, 0.0));
+  vec3 bitangent = cross(normal, tangent);
+  vec3 halfVector = safeNormalize(
+      tangent * (sine * cos(phi)) +
+          bitangent * (sine * sin(phi)) + normal * cosine,
+      normal);
+  float voH = dot(view, halfVector);
+  vec3 light =
+      safeNormalize(2.0 * voH * halfVector - view, vec3(0.0));
+  valid = voH > 0.0 && dot(normal, light) > 0.0 &&
+          finite3(light);
+  return light;
+}
+
+float shadingNormalCorrection(vec3 geometricNormal, vec3 shadingNormal,
+                              vec3 view, vec3 light) {
+  float viewGeometric = dot(view, geometricNormal);
+  float viewShading = dot(view, shadingNormal);
+  float lightGeometric = dot(light, geometricNormal);
+  float lightShading = dot(light, shadingNormal);
+  if (viewGeometric * viewShading <= 0.0 ||
+      lightGeometric * lightShading <= 0.0 ||
+      abs(lightGeometric * viewShading) <= 1.0e-8) {
+    return 0.0;
+  }
+  return clamp(
+      abs((lightShading * viewGeometric) /
+          (lightGeometric * viewShading)),
+      0.0, 16.0);
+}
+
+vec3 analyticEnvironment(vec3 direction) {
+  float strength = max(pc.cameraEnvironment.w, 0.0);
+  if (!(strength > 0.0)) {
+    return vec3(0.0);
+  }
+  float elevation = clamp(direction.y * 0.5 + 0.5, 0.0, 1.0);
+  vec3 horizon = vec3(0.42, 0.55, 0.72);
+  vec3 zenith = vec3(0.08, 0.20, 0.48);
+  vec3 sky = mix(horizon, zenith, pow(elevation, 0.65));
+  vec3 lightDirection =
+      safeNormalize(pc.lightDirectionAmbient.xyz, vec3(0.0, 1.0, 0.0));
+  float sun = pow(max(dot(direction, lightDirection), 0.0), 512.0);
+  return strength * (sky + sun * vec3(5.0, 4.2, 3.1));
+}
+
+bool hdrEnvironmentEnabled() {
+  return (pc.sampling.w & (1u << 24u)) != 0u;
+}
+
+bool hdrEnvironmentValid() {
+  return hdrEnvironmentEnabled() &&
+         (environmentInfo.x & 1u) != 0u &&
+         environmentInfo.y > 0u && environmentInfo.z > 0u &&
+         environmentInfo.w ==
+             environmentInfo.y * environmentInfo.z;
+}
+
+bool proceduralMoonEnabled(bool background) {
+  uint requiredFlag =
+      background ? kMoonBackgroundVisible : kMoonLightingEnabled;
+  return hdrEnvironmentValid() &&
+         (environmentInfo.x & 8u) != 0u &&
+         (environmentInfo.x & requiredFlag) != 0u &&
+         environmentMoonDirectionAngularRadius.w > 0.0 &&
+         environmentSunDirectionMoonMean.w > 0.0;
+}
+
+vec3 environmentCacheDirection(vec3 direction) {
+  vec3 unitDirection =
+      safeNormalize(direction, vec3(0.0, 1.0, 0.0));
+  float cosine = cos(environmentParameters.z);
+  float sine = sin(environmentParameters.z);
+  return vec3(unitDirection.x * cosine - unitDirection.z * sine,
+              unitDirection.y,
+              unitDirection.z * cosine + unitDirection.x * sine);
+}
+
+vec2 environmentUv(vec3 direction) {
+  vec3 unitDirection =
+      safeNormalize(direction, vec3(0.0, 1.0, 0.0));
+  float phi =
+      atan(unitDirection.x, unitDirection.z) - environmentParameters.z;
+  float u = fract(phi * (1.0 / 6.28318530718));
+  float v = acos(clamp(unitDirection.y, -1.0, 1.0)) *
+            (1.0 / 3.14159265358979323846);
+  return vec2(u, clamp(v, 0.0, 0.99999994));
+}
+
+float moonValueNoise(vec3 position) {
+  ivec3 cell = ivec3(floor(position));
+  vec3 fraction = fract(position);
+  vec3 smoothFraction =
+      fraction * fraction * (3.0 - 2.0 * fraction);
+  float values[8];
+  for (int z = 0; z <= 1; ++z) {
+    for (int y = 0; y <= 1; ++y) {
+      for (int x = 0; x <= 1; ++x) {
+        ivec3 point = cell + ivec3(x, y, z);
+        uint packed =
+            uint(point.x) * 0x9e3779b9u ^
+            uint(point.y) * 0x85ebca6bu ^
+            uint(point.z) * 0xc2b2ae35u;
+        values[x + 2 * y + 4 * z] =
+            float(hashPathTraceWord(packed)) *
+            (1.0 / 4294967296.0);
+      }
+    }
+  }
+  float x00 = mix(values[0], values[1], smoothFraction.x);
+  float x10 = mix(values[2], values[3], smoothFraction.x);
+  float x01 = mix(values[4], values[5], smoothFraction.x);
+  float x11 = mix(values[6], values[7], smoothFraction.x);
+  return mix(mix(x00, x10, smoothFraction.y),
+             mix(x01, x11, smoothFraction.y), smoothFraction.z);
+}
+
+float moonFbm(vec3 position) {
+  float value = 0.0;
+  float weight = 0.5;
+  for (int octave = 0; octave < 4; ++octave) {
+    value += moonValueNoise(position) * weight;
+    position = position * 2.03 + vec3(7.1, 3.7, 5.9);
+    weight *= 0.5;
+  }
+  return value;
+}
+
+vec3 rotateLunarSurface(vec3 normal) {
+  float latitude = environmentMoonPhaseLibration.z;
+  float longitude = environmentMoonPhaseLibration.w;
+  float cosLatitude = cos(latitude);
+  float sinLatitude = sin(latitude);
+  normal.yz =
+      mat2(cosLatitude, -sinLatitude,
+           sinLatitude, cosLatitude) * normal.yz;
+  float cosLongitude = cos(longitude);
+  float sinLongitude = sin(longitude);
+  normal.xz =
+      mat2(cosLongitude, -sinLongitude,
+           sinLongitude, cosLongitude) * normal.xz;
+  return normal;
+}
+
+float lunarAlbedo(vec3 surfaceNormal) {
+  if ((environmentInfo.x & kMoonSurfaceDetail) == 0u) {
+    return 0.10;
+  }
+  vec3 mapped = rotateLunarSurface(surfaceNormal);
+  float terrain = moonFbm(mapped * 18.0);
+  float maria =
+      moonFbm(mapped * 5.0 + vec3(17.0, 3.0, 11.0));
+  return clamp(
+      0.075 + terrain * 0.055 -
+          smoothstep(0.58, 0.78, maria) * 0.035,
+      0.045, 0.16);
+}
+
+vec3 proceduralMoonRadiance(vec3 direction, bool background) {
+  if (!proceduralMoonEnabled(background)) {
+    return vec3(0.0);
+  }
+  vec3 cacheDirection = environmentCacheDirection(direction);
+  vec3 moonDirection = safeNormalize(
+      environmentMoonDirectionAngularRadius.xyz,
+      vec3(0.0, 1.0, 0.0));
+  float angularRadius =
+      max(environmentMoonDirectionAngularRadius.w, 1.0e-6);
+  if (dot(cacheDirection, moonDirection) < cos(angularRadius)) {
+    return vec3(0.0);
+  }
+  float sineRadius = max(sin(angularRadius), 1.0e-6);
+  vec3 tangentX = cross(vec3(0.0, 1.0, 0.0), moonDirection);
+  if (dot(tangentX, tangentX) < 1.0e-6) {
+    tangentX = cross(vec3(1.0, 0.0, 0.0), moonDirection);
+  }
+  tangentX = safeNormalize(tangentX, vec3(1.0, 0.0, 0.0));
+  vec3 tangentY =
+      safeNormalize(cross(moonDirection, tangentX),
+                    vec3(0.0, 1.0, 0.0));
+  float diskX = dot(cacheDirection, tangentX) / sineRadius;
+  float diskY = dot(cacheDirection, tangentY) / sineRadius;
+  float radialSquared =
+      clamp(diskX * diskX + diskY * diskY, 0.0, 1.0);
+  vec3 surfaceNormal = safeNormalize(
+      tangentX * diskX + tangentY * diskY -
+          moonDirection * sqrt(max(1.0 - radialSquared, 0.0)),
+      -moonDirection);
+  vec3 sunDirection = safeNormalize(
+      environmentSunDirectionMoonMean.xyz,
+      vec3(0.0, 1.0, 0.0));
+  if ((environmentInfo.x & kMoonManualPhase) != 0u) {
+    float phaseAngle =
+        clamp(environmentMoonPhaseLibration.y, 0.0,
+              3.14159265358979323846);
+    sunDirection = safeNormalize(
+        -moonDirection * cos(phaseAngle) +
+            tangentX * sin(phaseAngle),
+        sunDirection);
+  }
+  float directLight = max(dot(surfaceNormal, sunDirection), 0.0);
+  float earthshine =
+      0.0025 * (1.0 - environmentMoonPhaseLibration.x);
+  float albedo = lunarAlbedo(surfaceNormal);
+  const vec3 solarIrradiance = vec3(
+      1.474000, 1.850400, 1.911980);
+  vec3 rawRadiance =
+      solarIrradiance * (albedo / 3.14159265358979323846) *
+      (directLight + earthshine);
+
+  float phaseAngle =
+      clamp(environmentMoonPhaseLibration.y, 0.0,
+            3.14159265358979323846);
+  float lambertPhase =
+      (sin(phaseAngle) +
+       (3.14159265358979323846 - phaseAngle) *
+           cos(phaseAngle)) *
+      (1.0 / 3.14159265358979323846);
+  float meanRawLuminance =
+      luminance(solarIrradiance) *
+      (0.10 / 3.14159265358979323846) *
+      ((2.0 / 3.0) * max(lambertPhase, 0.0) + earthshine);
+  float attenuation =
+      clamp(environmentSunDirectionMoonMean.w /
+                max(meanRawLuminance, 1.0e-8),
+            0.0, 1.0);
+  vec3 radiance = rawRadiance * attenuation;
+  return finite3(radiance) ? min(radiance, vec3(65504.0))
+                           : vec3(0.0);
+}
+
+vec3 proceduralSunRadiance(vec3 direction, bool background) {
+  uint requiredFlag =
+      background ? kSunBackgroundVisible : kSunLightingEnabled;
+  if (!hdrEnvironmentValid() ||
+      (environmentInfo.x & requiredFlag) == 0u ||
+      !(environmentParameters.w > 0.0) ||
+      !(environmentSunColorStrength.w > 0.0)) {
+    return vec3(0.0);
+  }
+  vec3 cacheDirection = environmentCacheDirection(direction);
+  vec3 sunDirection = safeNormalize(
+      environmentSunDirectionMoonMean.xyz,
+      vec3(0.0, 1.0, 0.0));
+  // A Sun below the horizon must not leak through the analytic ground blend.
+  float horizonVisibility = smoothstep(-0.05, 0.02, sunDirection.y);
+  if (!(horizonVisibility > 0.0)) {
+    return vec3(0.0);
+  }
+  float angularRadius = max(environmentParameters.w, 1.0e-6);
+  float cosine = dot(cacheDirection, sunDirection);
+  float edgeCosine = cos(angularRadius);
+  if (cosine < edgeCosine) {
+    return vec3(0.0);
+  }
+  float angularDistance = acos(clamp(cosine, -1.0, 1.0));
+  float radial = angularDistance / angularRadius;
+  // The smooth edge keeps the disk circular while avoiding a hard pixel seam.
+  float disk = 1.0 - smoothstep(0.94, 1.0, radial);
+  vec3 solarRadiance =
+      max(environmentSunColorStrength.rgb, vec3(0.0)) *
+      (700.0 * environmentSunColorStrength.w) * disk *
+      horizonVisibility;
+  return finite3(solarRadiance) ? min(solarRadiance, vec3(65504.0))
+                                : vec3(0.0);
+}
+
+vec3 hdrEnvironmentTexture(vec3 direction, bool background) {
+  if (!hdrEnvironmentValid()) {
+    return vec3(0.0);
+  }
+  vec3 radiance =
+      max(texture(environmentTexture, environmentUv(direction)).rgb,
+          vec3(0.0)) +
+      proceduralSunRadiance(direction, background) +
+      proceduralMoonRadiance(direction, background);
+  return finite3(radiance) ? min(radiance, vec3(65504.0))
+                           : vec3(0.0);
+}
+
+vec3 lightingEnvironment(vec3 direction) {
+  if (hdrEnvironmentEnabled()) {
+    if (!hdrEnvironmentValid() ||
+        (environmentInfo.x & 4u) == 0u ||
+        !(environmentParameters.x > 0.0)) {
+      return vec3(0.0);
+    }
+    return min(hdrEnvironmentTexture(direction, false) *
+                   environmentParameters.x,
+               vec3(65504.0));
+  }
+  return analyticEnvironment(direction);
+}
+
+vec3 backgroundEnvironment(vec3 direction) {
+  if (hdrEnvironmentEnabled()) {
+    if (!hdrEnvironmentValid() ||
+        (environmentInfo.x & 2u) == 0u ||
+        !(environmentParameters.y > 0.0)) {
+      return vec3(0.0);
+    }
+    return min(hdrEnvironmentTexture(direction, true) *
+                   environmentParameters.y,
+               vec3(65504.0));
+  }
+  return analyticEnvironment(direction);
+}
+
+bool environmentBackgroundVisible() {
+  return hdrEnvironmentEnabled()
+             ? hdrEnvironmentValid() &&
+                   (environmentInfo.x & 2u) != 0u &&
+                   environmentParameters.y > 0.0
+             : pc.cameraEnvironment.w > 0.0;
+}
+
+float analyticEnvironmentPdf(vec3 direction) {
+  return pc.cameraEnvironment.w > 0.0 && finite3(direction)
+             ? 0.07957747154594767
+             : 0.0;
+}
+
+float hdrEnvironmentPdf(vec3 direction) {
+  if (!hdrEnvironmentValid() ||
+      (environmentInfo.x & 4u) == 0u ||
+      !(environmentParameters.x > 0.0)) {
+    return 0.0;
+  }
+  vec2 uv = environmentUv(direction);
+  uint x = min(uint(uv.x * float(environmentInfo.y)),
+               environmentInfo.y - 1u);
+  uint y = min(uint(uv.y * float(environmentInfo.z)),
+               environmentInfo.z - 1u);
+  uint index = y * environmentInfo.y + x;
+  float theta0 = 3.14159265358979323846 *
+                 float(y) / float(environmentInfo.z);
+  float theta1 = 3.14159265358979323846 *
+                 float(y + 1u) / float(environmentInfo.z);
+  float solidAngle =
+      (6.28318530718 / float(environmentInfo.y)) *
+      (cos(theta0) - cos(theta1));
+  return solidAngle > 0.0
+             ? max(environmentAlias[index].probability, 0.0) /
+                   solidAngle
+             : 0.0;
+}
+
+float environmentPdf(vec3 direction) {
+  if (!integratorFlag(29u)) {
+    return length(lightingEnvironment(direction)) > 0.0
+               ? 0.07957747154594767
+               : 0.0;
+  }
+  return hdrEnvironmentEnabled() ? hdrEnvironmentPdf(direction)
+                                 : analyticEnvironmentPdf(direction);
+}
+
+bool environmentSampleCastsShadow(vec3 direction) {
+  if (!hdrEnvironmentValid()) {
+    return true;
+  }
+  vec3 cacheDirection = environmentCacheDirection(direction);
+  if ((environmentInfo.x & kSunLightingEnabled) != 0u &&
+      environmentParameters.w > 0.0 &&
+      dot(cacheDirection,
+          safeNormalize(environmentSunDirectionMoonMean.xyz,
+                        vec3(0.0, 1.0, 0.0))) >=
+          cos(environmentParameters.w)) {
+    return (environmentInfo.x & kSunCastsShadows) != 0u;
+  }
+  if ((environmentInfo.x & kMoonLightingEnabled) != 0u &&
+      environmentMoonDirectionAngularRadius.w > 0.0 &&
+      dot(cacheDirection,
+          safeNormalize(environmentMoonDirectionAngularRadius.xyz,
+                        vec3(0.0, 1.0, 0.0))) >=
+          cos(environmentMoonDirectionAngularRadius.w)) {
+    return (environmentInfo.x & kMoonCastsShadows) != 0u;
+  }
+  return true;
+}
+
+EnvironmentSample sampleEnvironment(float columnSample, float coinSample,
+                                    float jitterU, float jitterV) {
+  EnvironmentSample result;
+  result.direction = vec3(0.0, 1.0, 0.0);
+  result.pdf = 0.0;
+  result.valid = false;
+  if (!integratorFlag(29u)) {
+    result.direction = sampleUniformSphere(columnSample, coinSample);
+    result.pdf = environmentPdf(result.direction);
+    result.valid = result.pdf > 0.0;
+    return result;
+  }
+  if (!hdrEnvironmentEnabled()) {
+    result.direction = sampleUniformSphere(columnSample, coinSample);
+    result.pdf = analyticEnvironmentPdf(result.direction);
+    result.valid = result.pdf > 0.0;
+    return result;
+  }
+  if (!hdrEnvironmentValid() ||
+      (environmentInfo.x & 4u) == 0u ||
+      !(environmentParameters.x > 0.0)) {
+    return result;
+  }
+  float scaled =
+      clamp(columnSample, 0.0, 0.99999994) *
+      float(environmentInfo.w);
+  uint column = min(uint(scaled), environmentInfo.w - 1u);
+  EnvironmentAliasEntry columnEntry = environmentAlias[column];
+  uint index =
+      clamp(coinSample, 0.0, 0.99999994) <
+              clamp(columnEntry.acceptance, 0.0, 1.0)
+          ? column
+          : min(columnEntry.aliasIndex, environmentInfo.w - 1u);
+  uint x = index % environmentInfo.y;
+  uint y = index / environmentInfo.y;
+  float u = (float(x) + clamp(jitterU, 0.0, 0.99999994)) /
+            float(environmentInfo.y);
+  float v = (float(y) + clamp(jitterV, 0.0, 0.99999994)) /
+            float(environmentInfo.z);
+  float phi =
+      6.28318530718 * u + environmentParameters.z;
+  float theta = 3.14159265358979323846 * v;
+  float sinTheta = sin(theta);
+  result.direction =
+      vec3(sinTheta * sin(phi), cos(theta), sinTheta * cos(phi));
+  float theta0 = 3.14159265358979323846 *
+                 float(y) / float(environmentInfo.z);
+  float theta1 = 3.14159265358979323846 *
+                 float(y + 1u) / float(environmentInfo.z);
+  float solidAngle =
+      (6.28318530718 / float(environmentInfo.y)) *
+      (cos(theta0) - cos(theta1));
+  result.pdf =
+      solidAngle > 0.0
+          ? max(environmentAlias[index].probability, 0.0) /
+                solidAngle
+          : 0.0;
+  result.valid = result.pdf > 0.0 && finite3(result.direction);
+  return result;
+}
+
+bool meshLightsValid() {
+  return integratorFlag(30u) && emissiveInfo.x > 0u &&
+         emissiveInfo.y > 0u && emissiveInfo.z == 1u;
+}
+
+vec3 emissiveTriangleNormal(EmissiveTriangleEntry entry) {
+  return safeNormalize(
+      cross(entry.p1Acceptance.xyz - entry.p0Probability.xyz,
+            entry.p2Area.xyz - entry.p0Probability.xyz),
+      vec3(0.0, 1.0, 0.0));
+}
+
+float meshLightPdf(uint primitive, vec3 source, vec3 lightPoint) {
+  if (!meshLightsValid() || primitive >= emissiveInfo.x) {
+    return 0.0;
+  }
+  EmissiveTriangleEntry entry = emissiveTriangles[primitive];
+  float selectionPdf = max(entry.p0Probability.w, 0.0);
+  float area = max(entry.p2Area.w, 0.0);
+  if (entry.metadata.y == 0u || !(selectionPdf > 0.0) ||
+      !(area > 0.0)) {
+    return 0.0;
+  }
+  vec3 toLight = lightPoint - source;
+  float distanceSquared = dot(toLight, toLight);
+  if (!(distanceSquared > 1.0e-10)) {
+    return 0.0;
+  }
+  vec3 lightDirection = toLight * inversesqrt(distanceSquared);
+  float lightCosine = abs(dot(
+      emissiveTriangleNormal(entry), -lightDirection));
+  return lightCosine > 1.0e-6
+             ? selectionPdf * distanceSquared /
+                   (area * lightCosine)
+             : 0.0;
+}
+
+MeshLightSample sampleMeshLight(
+    vec3 source, float columnSample, float coinSample,
+    float triangleSampleU, float triangleSampleV) {
+  MeshLightSample result;
+  result.direction = vec3(0.0, 1.0, 0.0);
+  result.pdf = 0.0;
+  result.radiance = vec3(0.0);
+  result.distance = 0.0;
+  result.valid = false;
+  if (!meshLightsValid()) {
+    return result;
+  }
+  float scaled =
+      clamp(columnSample, 0.0, 0.99999994) * float(emissiveInfo.x);
+  uint column = min(uint(scaled), emissiveInfo.x - 1u);
+  EmissiveTriangleEntry columnEntry = emissiveTriangles[column];
+  uint selected =
+      clamp(coinSample, 0.0, 0.99999994) <
+              clamp(columnEntry.p1Acceptance.w, 0.0, 1.0)
+          ? column
+          : min(columnEntry.metadata.x, emissiveInfo.x - 1u);
+  EmissiveTriangleEntry entry = emissiveTriangles[selected];
+  if (entry.metadata.y == 0u || !(entry.p0Probability.w > 0.0) ||
+      !(entry.p2Area.w > 0.0)) {
+    return result;
+  }
+  float root = sqrt(clamp(triangleSampleU, 0.0, 0.99999994));
+  float b0 = 1.0 - root;
+  float b1 = root * (1.0 - clamp(triangleSampleV, 0.0, 0.99999994));
+  float b2 = root * clamp(triangleSampleV, 0.0, 0.99999994);
+  vec3 lightPoint =
+      entry.p0Probability.xyz * b0 + entry.p1Acceptance.xyz * b1 +
+      entry.p2Area.xyz * b2;
+  vec3 toLight = lightPoint - source;
+  float distanceSquared = dot(toLight, toLight);
+  if (!(distanceSquared > 1.0e-10)) {
+    return result;
+  }
+  result.distance = sqrt(distanceSquared);
+  result.direction = toLight / result.distance;
+  float lightCosine = abs(dot(
+      emissiveTriangleNormal(entry), -result.direction));
+  result.pdf =
+      lightCosine > 1.0e-6
+          ? entry.p0Probability.w * distanceSquared /
+                (entry.p2Area.w * lightCosine)
+          : 0.0;
+  result.radiance = max(entry.emissionLuminance.rgb, vec3(0.0));
+  result.valid = result.pdf > 0.0 && max3(result.radiance) > 0.0 &&
+                 finite3(result.direction) && finite3(result.radiance);
+  return result;
+}
+
+float projectedDepth(vec3 worldPosition) {
+  vec4 clip = pc.viewProj * vec4(worldPosition, 1.0);
+  if (!finite4(clip) || abs(clip.w) <= 1.0e-7) {
+    return 1.0;
+  }
+  float depth = clip.z / clip.w;
+  return depth == depth && abs(depth) <= 65504.0
+             ? clamp(depth, 0.0, 1.0)
+             : 1.0;
+}
+
+void tracePrimary(vec3 origin, vec3 direction) {
+  payload.baseColor = vec3(0.0);
+  payload.t = -1.0;
+  payload.shadingNormal = vec3(0.0, 1.0, 0.0);
+  payload.roughness = 1.0;
+  payload.geometricNormal = vec3(0.0, 1.0, 0.0);
+  payload.ior = 1.5;
+  payload.f0 = vec3(0.04);
+  payload.transmission = 0.0;
+  payload.emission = vec3(0.0);
+  payload.opacity = 0.0;
+  payload.status = uvec4(0u);
+  payload.hitData = vec4(0.0);
+  traceRayEXT(topLevelAS, gl_RayFlagsNoneEXT, 0xff, 0, 1, 0, origin,
+              0.001, direction, 10000.0, 0);
+}
+
+vec3 packedPosition(uint vertex, bool previous) {
+  uint base = vertex * 3u;
+  return previous
+             ? vec3(previousPositions[base + 0u],
+                    previousPositions[base + 1u],
+                    previousPositions[base + 2u])
+             : vec3(positions[base + 0u], positions[base + 1u],
+                    positions[base + 2u]);
+}
+
+vec4 motionVector(vec2 currentUv, vec3 previousWorld, bool valid) {
+  if (!valid || motionInfo.x == 0u) {
+    return vec4(0.0, 0.0, 1.0, 0.0);
+  }
+  vec4 previousClip = previousViewProj * vec4(previousWorld, 1.0);
+  if (!finite4(previousClip) || !(previousClip.w > 1.0e-6)) {
+    return vec4(0.0, 0.0, 1.0, 0.0);
+  }
+  vec2 previousUv = previousClip.xy / previousClip.w * 0.5 + 0.5;
+  bool inside = all(greaterThanEqual(previousUv, vec2(0.0))) &&
+                all(lessThanEqual(previousUv, vec2(1.0)));
+  if (!inside) {
+    return vec4(0.0, 0.0, 1.0, 0.0);
+  }
+  vec2 motionPixels =
+      (previousUv - currentUv) * vec2(pc.sizeMode.xy);
+  return vec4(motionPixels, 0.0, 1.0);
+}
+
+vec4 surfaceMotion(uint primitive, uint instanceId, vec2 barycentrics,
+                   vec2 currentUv) {
+  if (motionInfo.y == 0u ||
+      instanceMotion[instanceId].metadata.x == 0u) {
+    return vec4(0.0, 0.0, 1.0, 0.0);
+  }
+  uint i0 = indices[primitive * 3u + 0u];
+  uint i1 = indices[primitive * 3u + 1u];
+  uint i2 = indices[primitive * 3u + 2u];
+  float w0 = 1.0 - barycentrics.x - barycentrics.y;
+  vec3 previousLocal =
+      packedPosition(i0, true) * w0 +
+      packedPosition(i1, true) * barycentrics.x +
+      packedPosition(i2, true) * barycentrics.y;
+  vec3 previousWorld =
+      (instanceMotion[instanceId].previousTransform *
+       vec4(previousLocal, 1.0)).xyz;
+  return motionVector(currentUv, previousWorld, true);
+}
+
+// NVIDIA DLSS-RR Programming Guide 4.2.1. Convert material F0 into the
+// environment-integrated specular-albedo guide expected by RR.
+vec3 rrSpecularAlbedo(vec3 specularColor, float linearRoughness,
+                      float noV) {
+  noV = abs(noV);
+  float alpha = clamp(linearRoughness, 0.0, 1.0);
+  alpha *= alpha;
+  float noV2 = noV * noV;
+  float noV3 = noV2 * noV;
+  float alpha2 = alpha * alpha;
+  float alpha3 = alpha2 * alpha;
+
+  float biasNumerator =
+      (0.99044 - 1.28514 * noV) +
+      alpha * (1.29678 - 0.755907 * noV);
+  float biasDenominator =
+      (1.0 + 2.92338 * noV + 59.4188 * noV3) +
+      alpha * (20.3225 - 27.0302 * noV + 222.592 * noV3) +
+      alpha3 * (121.563 + 626.13 * noV + 316.627 * noV3);
+  float scaleNumerator =
+      (0.0365463 + 3.32707 * noV) +
+      alpha * (9.0632 - 9.04756 * noV);
+  float scaleDenominator =
+      (1.0 + 3.59685 * noV2 - 1.36772 * noV3) +
+      alpha * (9.04401 - 16.3174 * noV2 + 9.22949 * noV3) +
+      alpha3 * (5.56589 + 19.7886 * noV2 - 20.2123 * noV3);
+
+  float bias = biasNumerator / max(biasDenominator, 1.0e-6);
+  float scale = scaleNumerator / max(scaleDenominator, 1.0e-6);
+  bias *= clamp(specularColor.g * 50.0, 0.0, 1.0);
+  return specularColor * max(scale, 0.0) + vec3(max(bias, 0.0));
+}
+
+struct PrimaryAovProbe {
+  vec4 geometry;
+  vec4 shading;
+  vec4 diffuseAlbedo;
+  vec4 specularAlbedo;
+  vec4 motion;
+  vec4 emission;
+  vec4 transparency;
+  float deviceDepth;
+  float hitDistance;
+  float specularHitDistance;
+  bool opaqueHit;
+};
+
+PrimaryAovProbe probePrimaryAov(vec3 cameraOrigin, vec3 direction,
+                                vec2 currentUv) {
+  PrimaryAovProbe result;
+  result.geometry = vec4(0.0, 0.0, 1.0, 0.0);
+  result.shading = vec4(0.0, 0.0, 1.0, 1.0);
+  result.diffuseAlbedo = vec4(0.0);
+  result.specularAlbedo = vec4(0.0);
+  result.motion = vec4(0.0, 0.0, 1.0, 0.0);
+  result.emission = vec4(0.0);
+  result.transparency = vec4(0.0);
+  result.deviceDepth = 1.0;
+  result.hitDistance = 0.0;
+  result.specularHitDistance = 0.0;
+  result.opaqueHit = false;
+
+  vec3 origin = cameraOrigin;
+  float remaining = 1.0;
+  for (uint layer = 0u; layer < 24u; ++layer) {
+    tracePrimary(origin, direction);
+    if (payload.status.x == 0u || !(payload.t >= 0.0)) {
+      break;
+    }
+    float opacity = clamp(payload.opacity, 0.0, 1.0);
+    bool blend = (payload.status.z & kMaterialBlend) != 0u &&
+                 opacity < 0.995;
+    vec3 hitPosition = origin + direction * payload.t;
+    if (blend) {
+      vec3 transparentSignal =
+          max(payload.baseColor, vec3(0.0)) +
+          max(payload.emission, vec3(0.0)) *
+              max(pc.integrator.z, 0.0);
+      result.transparency.rgb +=
+          remaining * opacity * transparentSignal;
+      result.transparency.a += remaining * opacity;
+      remaining *= 1.0 - opacity;
+      if (remaining <= 0.01) {
+        break;
+      }
+      origin = hitPosition + direction * 0.001;
+      continue;
+    }
+
+    result.opaqueHit = true;
+    vec3 geometricNormal = safeNormalize(
+        payload.geometricNormal, vec3(0.0, 1.0, 0.0));
+    vec3 shadingNormal =
+        safeNormalize(payload.shadingNormal, geometricNormal);
+    if (dot(shadingNormal, geometricNormal) < 0.0) {
+      shadingNormal = -shadingNormal;
+    }
+    float hitDistance = max(payload.t, 0.0);
+    vec4 centerFarWorldH =
+        pc.invViewProj * vec4(0.0, 0.0, 1.0, 1.0);
+    vec3 centerFarWorld =
+        centerFarWorldH.xyz / max(abs(centerFarWorldH.w), 1.0e-6);
+    vec3 cameraForward = safeNormalize(
+        centerFarWorld - cameraOrigin, vec3(0.0, 0.0, -1.0));
+    float viewZ =
+        hitDistance * max(dot(direction, cameraForward), 0.0);
+    result.hitDistance = hitDistance;
+    result.geometry = vec4(geometricNormal, viewZ);
+    result.shading =
+        vec4(shadingNormal, clamp(payload.roughness, 0.02, 1.0));
+    bool metal = payload.status.y != 0u;
+    result.diffuseAlbedo =
+        vec4(metal ? vec3(0.0)
+                   : clamp(payload.baseColor, vec3(0.0), vec3(1.0)),
+             1.0);
+    float linearRoughness = clamp(payload.roughness, 0.02, 1.0);
+    result.specularAlbedo =
+        vec4(rrSpecularAlbedo(
+                 clamp(payload.f0, vec3(0.0), vec3(0.99)),
+                 linearRoughness,
+                 dot(shadingNormal, -direction)),
+             0.0);
+    result.emission =
+        vec4(max(payload.emission, vec3(0.0)) *
+                 max(pc.integrator.z, 0.0),
+             1.0);
+    result.deviceDepth = projectedDepth(hitPosition);
+    uint primitive = payload.status.w - 1u;
+    uint instanceId = floatBitsToUint(payload.hitData.z);
+    result.motion =
+        surfaceMotion(primitive, instanceId, payload.hitData.xy, currentUv);
+    if (integratorFlag(31u)) {
+      vec3 reflectedDirection =
+          safeNormalize(reflect(direction, shadingNormal),
+                        reflect(direction, geometricNormal));
+      vec3 reflectedOrigin =
+          hitPosition +
+          geometricNormal *
+              (dot(reflectedDirection, geometricNormal) >= 0.0
+                   ? 0.001
+                   : -0.001);
+      tracePrimary(reflectedOrigin, reflectedDirection);
+      if (payload.status.x != 0u && payload.t >= 0.0) {
+        vec3 reflectedHitPosition =
+            reflectedOrigin + reflectedDirection * payload.t;
+        result.specularHitDistance =
+            length(reflectedHitPosition - hitPosition);
+      }
+    }
+    result.specularAlbedo.w = result.specularHitDistance;
+    break;
+  }
+  if (!result.opaqueHit) {
+    result.motion =
+        motionVector(currentUv, cameraOrigin + direction * 10000.0, true);
+  }
+  result.transparency =
+      clamp(result.transparency, vec4(0.0), vec4(65504.0));
+  return result;
+}
+
+void storeSurfaceAovs(ivec2 pixel, PrimaryAovProbe probe) {
+  imageStore(outputAov, ivec3(pixel, kAovGeometry), probe.geometry);
+  imageStore(outputAov, ivec3(pixel, kAovShading), probe.shading);
+  imageStore(outputAov, ivec3(pixel, kAovDiffuseAlbedo),
+             probe.diffuseAlbedo);
+  imageStore(outputAov, ivec3(pixel, kAovSpecularAlbedo),
+             probe.specularAlbedo);
+  imageStore(outputAov, ivec3(pixel, kAovMotion), probe.motion);
+  imageStore(outputAov, ivec3(pixel, kAovEmission), probe.emission);
+  imageStore(outputAov, ivec3(pixel, kAovTransparency),
+             probe.transparency);
+  imageStore(outputAov, ivec3(pixel, kAovSpecularHitDistance),
+             vec4(probe.specularHitDistance));
+  imageStore(outputRrMotion, pixel, probe.motion);
+  imageStore(outputRrSpecularHitDistance, pixel,
+             vec4(probe.specularHitDistance));
+  imageStore(outputRrDiffuseAlbedo, pixel, probe.diffuseAlbedo);
+  imageStore(outputRrSpecularAlbedo, pixel, probe.specularAlbedo);
+  imageStore(outputRrNormalRoughness, pixel, probe.shading);
+}
+
+void main() {
+  uvec2 pixel = gl_LaunchIDEXT.xy;
+  if (pixel.x >= pc.sizeMode.x || pixel.y >= pc.sizeMode.y) {
+    return;
+  }
+
+  vec3 cameraOrigin = pc.cameraEnvironment.xyz;
+  bool temporalReconstruction = pc.cameraJitter.z > 0.5;
+  vec2 temporalPixelOffset =
+      // Streamline receives +jitter. The inverse projection is unjittered,
+      // so subtract it here to match NVIDIA's clip-space jitter convention.
+      vec2(0.5) -
+      clamp(pc.cameraJitter.xy, vec2(-0.5), vec2(0.5));
+  vec2 primaryUv =
+      (vec2(pixel) +
+       (temporalReconstruction ? temporalPixelOffset : vec2(0.5))) /
+      vec2(pc.sizeMode.xy);
+  vec2 centerNdc =
+      vec2(primaryUv.x * 2.0 - 1.0, 1.0 - primaryUv.y * 2.0);
+  vec4 centerFarWorldH =
+      pc.invViewProj * vec4(centerNdc, 1.0, 1.0);
+  vec3 centerFarWorld =
+      centerFarWorldH.xyz / max(abs(centerFarWorldH.w), 1.0e-6);
+  vec3 centerDirection =
+      safeNormalize(centerFarWorld - cameraOrigin,
+                    vec3(0.0, 0.0, -1.0));
+  PrimaryAovProbe aovProbe =
+      probePrimaryAov(cameraOrigin, centerDirection, primaryUv);
+  storeSurfaceAovs(ivec2(pixel), aovProbe);
+  uint debugMode = pc.sizeMode.z;
+  uint materialDebug = (pc.sampling.w >> 16u) & 0xffu;
+  if (debugMode != 0u || materialDebug != 0u) {
+    vec2 uv = primaryUv;
+    vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    vec4 farWorldH = pc.invViewProj * vec4(ndc, 1.0, 1.0);
+    vec3 farWorld =
+        farWorldH.xyz / max(abs(farWorldH.w), 1.0e-6);
+    vec3 direction =
+        safeNormalize(farWorld - cameraOrigin, vec3(0.0, 0.0, -1.0));
+    tracePrimary(cameraOrigin, direction);
+
+    float depth = 1.0;
+    float alpha = 0.0;
+    if (payload.status.x != 0u && payload.t >= 0.0) {
+      depth = projectedDepth(cameraOrigin + direction * payload.t);
+      alpha = 1.0;
+    }
+    vec3 debugColor =
+        finite3(payload.baseColor)
+            ? max(payload.baseColor, vec3(0.0))
+            : vec3(0.0);
+    imageStore(outputImage, ivec2(pixel), vec4(debugColor, alpha));
+    imageStore(outputDepth, ivec2(pixel), vec4(aovProbe.deviceDepth));
+    imageStore(outputAov, ivec3(pixel, kAovDiffuseRadiance),
+               vec4(0.0, 0.0, 0.0,
+                    aovProbe.hitDistance));
+    imageStore(outputAov, ivec3(pixel, kAovSpecularRadiance),
+               vec4(0.0, 0.0, 0.0,
+                    aovProbe.hitDistance));
+    imageStore(outputStatistics, ivec2(pixel),
+               vec4(0.0, aovProbe.opaqueHit ? 1.0 : 0.0, 1.0,
+                    aovProbe.geometry.w));
+    return;
+  }
+
+  uint dispatchSamples = max(pc.sampling.y, 1u);
+  uint maxBounces = clamp(pc.sizeMode.w, 1u, 64u);
+  bool rrEnabled = (pc.sampling.w & 1u) != 0u;
+  uint rrStart = clamp((pc.sampling.w >> 1u) & 0x7fu, 1u,
+                       maxBounces);
+  bool analyticLightsEnabled = integratorFlag(25u);
+  bool emissiveSurfacesEnabled = integratorFlag(26u);
+  bool neeEnabled = integratorFlag(27u);
+  bool misEnabled = integratorFlag(28u);
+  uint lightSamples =
+      clamp(uint(round(pc.integrator.w)), 1u, 16u);
+  vec3 radianceSum = vec3(0.0);
+  vec3 diffuseRadianceSum = vec3(0.0);
+  vec3 specularRadianceSum = vec3(0.0);
+  float alphaSum = 0.0;
+  float luminanceSum = 0.0;
+  float luminanceSquaredSum = 0.0;
+  float pathLengthSum = 0.0;
+
+  for (uint localSample = 0u; localSample < dispatchSamples;
+       ++localSample) {
+    uint sampleIndex = pc.sampling.x + localSample;
+    vec2 jitter =
+        temporalReconstruction
+            ? temporalPixelOffset
+            : vec2(
+                  random01(pixel, sampleIndex, 0u, pc.sampling.z),
+                  random01(pixel, sampleIndex, 1u, pc.sampling.z));
+    vec2 uv = (vec2(pixel) + jitter) / vec2(pc.sizeMode.xy);
+    vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    vec4 farWorldH = pc.invViewProj * vec4(ndc, 1.0, 1.0);
+    vec3 farWorld =
+        farWorldH.xyz / max(abs(farWorldH.w), 1.0e-6);
+    vec3 origin = cameraOrigin;
+    vec3 direction =
+        safeNormalize(farWorld - origin, vec3(0.0, 0.0, -1.0));
+    vec3 throughput = vec3(1.0);
+    vec3 sampleRadiance = vec3(0.0);
+    vec3 sampleDiffuseRadiance = vec3(0.0);
+    vec3 sampleSpecularRadiance = vec3(0.0);
+    bool primaryHit = false;
+    uint primaryPathClass = 0u;
+    float samplePathLength = 0.0;
+    uint diffuseBounces = 0u;
+    uint glossyBounces = 0u;
+    uint transmissionBounces = 0u;
+    uint transparentBounces = 0u;
+    float previousBsdfPdf = 0.0;
+    bool previousWasDelta = true;
+
+    uint bounce = 0u;
+    while (bounce < maxBounces) {
+      tracePrimary(origin, direction);
+      if (payload.status.x == 0u || !(payload.t >= 0.0)) {
+        vec3 missRadiance =
+            bounce == 0u ? backgroundEnvironment(direction)
+                         : lightingEnvironment(direction);
+        float environmentWeight =
+            bounce == 0u || previousWasDelta || !misEnabled
+                ? 1.0
+                : powerHeuristic(
+                      previousBsdfPdf, environmentPdf(direction));
+        vec3 missContribution =
+            throughput * missRadiance * environmentWeight;
+        vec3 clampedMiss = clampContribution(
+            missContribution,
+            bounce == 0u ? 0.0 : pc.integrator.y);
+        sampleRadiance += clampedMiss;
+        if (bounce > 0u) {
+          if (primaryPathClass == 1u) {
+            sampleDiffuseRadiance += clampedMiss;
+          } else {
+            sampleSpecularRadiance += clampedMiss;
+          }
+        }
+        break;
+      }
+
+      vec3 hitPosition = origin + direction * payload.t;
+      samplePathLength += 1.0;
+      uint dimension = 2u + bounce * 12u;
+      float hitOpacity = clamp(
+          finite3(vec3(payload.opacity)) ? payload.opacity : 1.0,
+          0.0, 1.0);
+      bool blendMaterial = (payload.status.z & kMaterialBlend) != 0u;
+      if (blendMaterial && hitOpacity < 1.0) {
+        float alphaSample = random01(
+            pixel, sampleIndex,
+            dimension + 8u + transparentBounces * 17u,
+            pc.sampling.z);
+        if (alphaSample >= hitOpacity) {
+          if (transparentBounces >= pc.depthLimits.w) {
+            break;
+          }
+          ++transparentBounces;
+          ++bounce;
+          // Stochastic alpha coverage: an unaccepted layer contributes no
+          // shading and continues along the same ray to reveal layers behind.
+          origin = hitPosition + direction * 0.001;
+          continue;
+        }
+      }
+      vec3 authoredGeometric = safeNormalize(
+          payload.geometricNormal, vec3(0.0, 1.0, 0.0));
+      bool frontFace = dot(direction, authoredGeometric) < 0.0;
+      vec3 geometricNormal =
+          frontFace ? authoredGeometric : -authoredGeometric;
+      vec3 normal = safeNormalize(payload.shadingNormal,
+                                  geometricNormal);
+      if (dot(normal, geometricNormal) < 0.0) {
+        normal = -normal;
+      }
+      vec3 view = -direction;
+      if (!(dot(normal, view) > 1.0e-5)) {
+        normal = geometricNormal;
+      }
+      vec3 baseColor =
+          finite3(payload.baseColor)
+              ? clamp(payload.baseColor, vec3(0.0), vec3(1.0))
+              : vec3(0.0);
+      vec3 f0 =
+          finite3(payload.f0)
+              ? clamp(payload.f0, vec3(0.0), vec3(0.99))
+              : vec3(0.04);
+      float roughness = clamp(payload.roughness, 0.02, 1.0);
+      float transmission = clamp(payload.transmission, 0.0, 1.0);
+      float ior = clamp(payload.ior, 1.0001, 99.0);
+      bool metal = payload.status.y != 0u;
+      vec3 emission =
+          finite3(payload.emission)
+              ? max(payload.emission, vec3(0.0))
+              : vec3(0.0);
+      emission *=
+          emissiveSurfacesEnabled ? max(pc.integrator.z, 0.0) : 0.0;
+
+      if (bounce == 0u) {
+        primaryHit = true;
+      }
+      float emissionWeight = 1.0;
+      if (bounce > 0u && !previousWasDelta && misEnabled &&
+          payload.status.w > 0u && meshLightsValid()) {
+        float lightPdf = meshLightPdf(
+            payload.status.w - 1u, origin, hitPosition);
+        if (lightPdf > 0.0) {
+          emissionWeight =
+              powerHeuristic(previousBsdfPdf, lightPdf);
+        }
+      }
+      vec3 emissionContribution = clampContribution(
+          throughput * emission * emissionWeight, pc.integrator.y);
+      sampleRadiance += emissionContribution;
+      if (bounce > 0u) {
+        if (primaryPathClass == 1u) {
+          sampleDiffuseRadiance += emissionContribution;
+        } else {
+          sampleSpecularRadiance += emissionContribution;
+        }
+      }
+
+      vec3 lightDirection = safeNormalize(
+          pc.lightDirectionAmbient.xyz, vec3(0.0, 1.0, 0.0));
+      float nDotL = max(dot(normal, lightDirection), 0.0);
+      if (neeEnabled && analyticLightsEnabled && nDotL > 0.0 &&
+          pc.lightColorIntensity.w > 0.0) {
+        vec3 directSum = vec3(0.0);
+        vec3 directDiffuseSum = vec3(0.0);
+        vec3 directSpecularSum = vec3(0.0);
+        for (uint lightSample = 0u; lightSample < lightSamples;
+             ++lightSample) {
+        shadowVisibility = random01(
+            pixel, sampleIndex,
+            dimension + 9u + lightSample * 8u, pc.sampling.z);
+        traceRayEXT(
+            topLevelAS,
+            gl_RayFlagsTerminateOnFirstHitEXT |
+                gl_RayFlagsSkipClosestHitShaderEXT,
+            0xff, 0, 1, 1, hitPosition + geometricNormal * 0.001,
+            0.001, lightDirection, 10000.0, 1);
+        float directPdf = 0.0;
+        vec3 directDiffuseBsdf;
+        vec3 directSpecularBsdf;
+        evaluateBsdfComponents(
+            baseColor, f0, roughness, transmission, metal, normal,
+            view, lightDirection, directDiffuseBsdf,
+            directSpecularBsdf, directPdf);
+        float correction = shadingNormalCorrection(
+            geometricNormal, normal, view, lightDirection);
+        vec3 directScale =
+            throughput * pc.lightColorIntensity.rgb *
+            (pc.lightColorIntensity.w * nDotL *
+             clamp(shadowVisibility, 0.0, 1.0) * correction);
+        directDiffuseSum += directScale * directDiffuseBsdf;
+        directSpecularSum += directScale * directSpecularBsdf;
+        directSum +=
+            directScale * (directDiffuseBsdf + directSpecularBsdf);
+        }
+        vec3 directContribution = clampContribution(
+            directSum / float(lightSamples), pc.integrator.x);
+        sampleRadiance += directContribution;
+        if (bounce == 0u) {
+          sampleDiffuseRadiance += clampContribution(
+              directDiffuseSum / float(lightSamples), pc.integrator.x);
+          sampleSpecularRadiance += clampContribution(
+              directSpecularSum / float(lightSamples), pc.integrator.x);
+        } else if (primaryPathClass == 1u) {
+          sampleDiffuseRadiance += directContribution;
+        } else {
+          sampleSpecularRadiance += directContribution;
+        }
+      }
+
+      vec3 environmentDirectSum = vec3(0.0);
+      vec3 environmentDiffuseSum = vec3(0.0);
+      vec3 environmentSpecularSum = vec3(0.0);
+      for (uint lightSample = 0u;
+           neeEnabled && lightSample < lightSamples; ++lightSample) {
+      uint lightDimension = dimension + lightSample * 8u;
+      EnvironmentSample environmentSample = sampleEnvironment(
+          random01(pixel, sampleIndex, lightDimension + 4u, pc.sampling.z),
+          random01(pixel, sampleIndex, lightDimension + 5u, pc.sampling.z),
+          random01(pixel, sampleIndex, lightDimension + 6u, pc.sampling.z),
+          random01(pixel, sampleIndex, lightDimension + 7u, pc.sampling.z));
+      vec3 environmentDirection = environmentSample.direction;
+      float environmentPdf = environmentSample.pdf;
+      float environmentNoL =
+          max(dot(normal, environmentDirection), 0.0);
+      if (environmentSample.valid && environmentPdf > 0.0 &&
+          environmentNoL > 0.0) {
+        shadowVisibility = 1.0;
+        if (environmentSampleCastsShadow(environmentDirection)) {
+          shadowVisibility = random01(
+              pixel, sampleIndex, lightDimension + 3u, pc.sampling.z);
+          traceRayEXT(
+              topLevelAS,
+              gl_RayFlagsTerminateOnFirstHitEXT |
+                  gl_RayFlagsSkipClosestHitShaderEXT,
+              0xff, 0, 1, 1, hitPosition + geometricNormal * 0.001,
+              0.001, environmentDirection, 10000.0, 1);
+        }
+        float environmentBsdfPdf = 0.0;
+        vec3 environmentDiffuseBsdf;
+        vec3 environmentSpecularBsdf;
+        evaluateBsdfComponents(
+            baseColor, f0, roughness, transmission, metal, normal,
+            view, environmentDirection, environmentDiffuseBsdf,
+            environmentSpecularBsdf, environmentBsdfPdf);
+        float correction = shadingNormalCorrection(
+            geometricNormal, normal, view, environmentDirection);
+        float misWeight =
+            misEnabled
+                ? powerHeuristic(environmentPdf, environmentBsdfPdf)
+                : 1.0;
+        vec3 environmentScale =
+            throughput * lightingEnvironment(environmentDirection) *
+            (environmentNoL * clamp(shadowVisibility, 0.0, 1.0) *
+             correction * misWeight / environmentPdf);
+        environmentDiffuseSum +=
+            environmentScale * environmentDiffuseBsdf;
+        environmentSpecularSum +=
+            environmentScale * environmentSpecularBsdf;
+        environmentDirectSum +=
+            environmentScale *
+            (environmentDiffuseBsdf + environmentSpecularBsdf);
+      }
+      }
+      vec3 environmentContribution = clampContribution(
+          environmentDirectSum / float(lightSamples), pc.integrator.x);
+      sampleRadiance += environmentContribution;
+      if (bounce == 0u) {
+        sampleDiffuseRadiance += clampContribution(
+            environmentDiffuseSum / float(lightSamples), pc.integrator.x);
+        sampleSpecularRadiance += clampContribution(
+            environmentSpecularSum / float(lightSamples), pc.integrator.x);
+      } else if (primaryPathClass == 1u) {
+        sampleDiffuseRadiance += environmentContribution;
+      } else {
+        sampleSpecularRadiance += environmentContribution;
+      }
+
+      vec3 meshDirectSum = vec3(0.0);
+      vec3 meshDiffuseSum = vec3(0.0);
+      vec3 meshSpecularSum = vec3(0.0);
+      for (uint lightSample = 0u;
+           neeEnabled && emissiveSurfacesEnabled &&
+               lightSample < lightSamples;
+           ++lightSample) {
+        uint lightDimension = dimension + 12u + lightSample * 8u;
+        MeshLightSample meshSample = sampleMeshLight(
+            hitPosition + geometricNormal * 0.001,
+            random01(pixel, sampleIndex, lightDimension + 0u, pc.sampling.z),
+            random01(pixel, sampleIndex, lightDimension + 1u, pc.sampling.z),
+            random01(pixel, sampleIndex, lightDimension + 2u, pc.sampling.z),
+            random01(pixel, sampleIndex, lightDimension + 3u, pc.sampling.z));
+        float meshNoL = max(dot(normal, meshSample.direction), 0.0);
+        if (!meshSample.valid || !(meshNoL > 0.0) ||
+            !(meshSample.distance > 0.003)) {
+          continue;
+        }
+        shadowVisibility = random01(
+            pixel, sampleIndex, lightDimension + 4u, pc.sampling.z);
+        traceRayEXT(
+            topLevelAS,
+            gl_RayFlagsTerminateOnFirstHitEXT |
+                gl_RayFlagsSkipClosestHitShaderEXT,
+            0xff, 0, 1, 1,
+            hitPosition + geometricNormal * 0.001, 0.001,
+            meshSample.direction, meshSample.distance - 0.002, 1);
+        float meshBsdfPdf = 0.0;
+        vec3 meshDiffuseBsdf;
+        vec3 meshSpecularBsdf;
+        evaluateBsdfComponents(
+            baseColor, f0, roughness, transmission, metal, normal,
+            view, meshSample.direction, meshDiffuseBsdf,
+            meshSpecularBsdf, meshBsdfPdf);
+        float correction = shadingNormalCorrection(
+            geometricNormal, normal, view, meshSample.direction);
+        float misWeight =
+            misEnabled
+                ? powerHeuristic(meshSample.pdf, meshBsdfPdf)
+                : 1.0;
+        vec3 meshScale =
+            throughput * meshSample.radiance *
+            (max(pc.integrator.z, 0.0) * meshNoL *
+             clamp(shadowVisibility, 0.0, 1.0) * correction *
+             misWeight / meshSample.pdf);
+        meshDiffuseSum += meshScale * meshDiffuseBsdf;
+        meshSpecularSum += meshScale * meshSpecularBsdf;
+        meshDirectSum +=
+            meshScale * (meshDiffuseBsdf + meshSpecularBsdf);
+      }
+      vec3 meshContribution = clampContribution(
+          meshDirectSum / float(lightSamples), pc.integrator.x);
+      sampleRadiance += meshContribution;
+      if (bounce == 0u) {
+        sampleDiffuseRadiance += clampContribution(
+            meshDiffuseSum / float(lightSamples), pc.integrator.x);
+        sampleSpecularRadiance += clampContribution(
+            meshSpecularSum / float(lightSamples), pc.integrator.x);
+      } else if (primaryPathClass == 1u) {
+        sampleDiffuseRadiance += meshContribution;
+      } else {
+        sampleSpecularRadiance += meshContribution;
+      }
+
+      vec3 probabilities;
+      lobeProbabilities(baseColor, f0, metal, transmission,
+                        probabilities);
+      float lobeSample =
+          random01(pixel, sampleIndex, dimension, pc.sampling.z);
+      float sampleU =
+          random01(pixel, sampleIndex, dimension + 1u, pc.sampling.z);
+      float sampleV =
+          random01(pixel, sampleIndex, dimension + 2u, pc.sampling.z);
+      vec3 nextDirection = vec3(0.0);
+      vec3 sampleWeight = vec3(0.0);
+      float nextBsdfPdf = 0.0;
+      bool nextWasDelta = false;
+
+      if (lobeSample < probabilities.x) {
+        if (diffuseBounces >= pc.depthLimits.x) {
+          break;
+        }
+        ++diffuseBounces;
+        if (bounce == 0u) {
+          primaryPathClass = 1u;
+        }
+        nextDirection = cosineHemisphere(normal, sampleU, sampleV);
+        float pdf = 0.0;
+        vec3 value = evaluateBsdf(
+            baseColor, f0, roughness, transmission, metal, normal,
+            view, nextDirection, pdf);
+        if (!(pdf > 0.0)) {
+          break;
+        }
+        nextBsdfPdf = pdf;
+        sampleWeight =
+            value * max(dot(normal, nextDirection), 0.0) / pdf;
+      } else if (lobeSample < probabilities.x + probabilities.y) {
+        if (glossyBounces >= pc.depthLimits.y) {
+          break;
+        }
+        ++glossyBounces;
+        if (bounce == 0u) {
+          primaryPathClass = 2u;
+        }
+        bool validGlossy = false;
+        nextDirection = sampleGgx(
+            normal, view, roughness, sampleU, sampleV, validGlossy);
+        if (!validGlossy) {
+          break;
+        }
+        float pdf = 0.0;
+        vec3 value = evaluateBsdf(
+            baseColor, f0, roughness, transmission, metal, normal,
+            view, nextDirection, pdf);
+        if (!(pdf > 0.0)) {
+          break;
+        }
+        nextBsdfPdf = pdf;
+        sampleWeight =
+            value * max(dot(normal, nextDirection), 0.0) / pdf;
+      } else {
+        if (!(probabilities.z > 0.0) ||
+            transmissionBounces >= pc.depthLimits.z) {
+          break;
+        }
+        ++transmissionBounces;
+        if (bounce == 0u) {
+          primaryPathClass = 2u;
+        }
+        nextWasDelta = true;
+        float etaIncident = frontFace ? 1.0 : ior;
+        float etaTransmitted = frontFace ? ior : 1.0;
+        float eta = etaIncident / etaTransmitted;
+        float cosI = clamp(dot(normal, view), 0.0, 1.0);
+        float sinTSquared =
+            eta * eta * max(0.0, 1.0 - cosI * cosI);
+        if (sinTSquared >= 1.0) {
+          nextDirection =
+              safeNormalize(2.0 * cosI * normal - view,
+                            geometricNormal);
+          float reflectedShare =
+              max3(fresnelSchlick(f0, cosI));
+          sampleWeight =
+              baseColor * transmission * (1.0 - reflectedShare) /
+              probabilities.z;
+        } else {
+          float cosT = sqrt(max(0.0, 1.0 - sinTSquared));
+          nextDirection = safeNormalize(
+              -eta * view + (eta * cosI - cosT) * normal,
+              -geometricNormal);
+          float fresnel = dielectricFresnel(
+              cosI, etaIncident, etaTransmitted);
+          sampleWeight =
+              baseColor * transmission * (1.0 - fresnel) /
+              probabilities.z;
+        }
+      }
+
+      float correction = shadingNormalCorrection(
+          geometricNormal, normal, view, nextDirection);
+      throughput *= sampleWeight * correction;
+      if (!finite3(throughput) || !finite3(nextDirection) ||
+          max3(throughput) <= 1.0e-5) {
+        break;
+      }
+      previousBsdfPdf = nextBsdfPdf;
+      previousWasDelta = nextWasDelta;
+      uint completedBounces = bounce + 1u;
+      if (rrEnabled && completedBounces >= rrStart &&
+          completedBounces < maxBounces) {
+        float continuation =
+            clamp(max3(throughput), 0.05, 0.95);
+        float rrSample = random01(
+            pixel, sampleIndex, dimension + 3u, pc.sampling.z);
+        if (rrSample >= continuation) {
+          break;
+        }
+        throughput /= continuation;
+      }
+      origin =
+          hitPosition +
+          geometricNormal *
+              (dot(nextDirection, geometricNormal) >= 0.0
+                   ? 0.001
+                   : -0.001);
+      direction = nextDirection;
+      ++bounce;
+    }
+
+    if (!finite3(sampleRadiance)) {
+      sampleRadiance = vec3(0.0);
+    }
+    if (!finite3(sampleDiffuseRadiance)) {
+      sampleDiffuseRadiance = vec3(0.0);
+    }
+    if (!finite3(sampleSpecularRadiance)) {
+      sampleSpecularRadiance = vec3(0.0);
+    }
+    radianceSum += max(sampleRadiance, vec3(0.0));
+    diffuseRadianceSum += max(sampleDiffuseRadiance, vec3(0.0));
+    specularRadianceSum += max(sampleSpecularRadiance, vec3(0.0));
+    float sampleLuminance = luminance(max(sampleRadiance, vec3(0.0)));
+    luminanceSum += sampleLuminance;
+    luminanceSquaredSum += sampleLuminance * sampleLuminance;
+    pathLengthSum += samplePathLength;
+    alphaSum +=
+        (primaryHit || environmentBackgroundVisible()) ? 1.0 : 0.0;
+  }
+
+  float previousSamples = float(pc.sampling.x);
+  float totalSamples = previousSamples + float(dispatchSamples);
+  vec4 previousOutput =
+      pc.sampling.x > 0u
+          ? imageLoad(outputImage, ivec2(pixel))
+          : vec4(0.0);
+  vec4 accumulated = vec4(radianceSum, alphaSum);
+  if (pc.sampling.x > 0u) {
+    // The target stores straight RGBA for DLSS and still-image export, while
+    // progressive accumulation remains coverage-premultiplied.
+    vec4 previousPremultiplied = previousOutput;
+    previousPremultiplied.rgb *=
+        clamp(previousOutput.a, 0.0, 1.0);
+    accumulated += previousPremultiplied * previousSamples;
+  }
+  vec4 outputValue = accumulated / max(totalSamples, 1.0);
+  if (outputValue.a > 1.0e-6) {
+    outputValue.rgb /= outputValue.a;
+  } else {
+    outputValue.rgb = vec3(0.0);
+  }
+  if (!finite3(outputValue.rgb) || !(outputValue.a == outputValue.a)) {
+    outputValue = vec4(0.0);
+  }
+  outputValue = clamp(outputValue, vec4(0.0), vec4(65504.0));
+  imageStore(outputImage, ivec2(pixel), outputValue);
+  imageStore(outputDepth, ivec2(pixel), vec4(aovProbe.deviceDepth));
+
+  vec3 previousDiffuse =
+      pc.sampling.x > 0u
+          ? imageLoad(outputAov,
+                      ivec3(pixel, kAovDiffuseRadiance)).rgb
+          : vec3(0.0);
+  vec3 previousSpecular =
+      pc.sampling.x > 0u
+          ? imageLoad(outputAov,
+                      ivec3(pixel, kAovSpecularRadiance)).rgb
+          : vec3(0.0);
+  vec3 diffuseRadiance =
+      (previousDiffuse * previousSamples + diffuseRadianceSum) /
+      max(totalSamples, 1.0);
+  vec3 specularRadiance =
+      (previousSpecular * previousSamples + specularRadianceSum) /
+      max(totalSamples, 1.0);
+  imageStore(
+      outputAov, ivec3(pixel, kAovDiffuseRadiance),
+      vec4(clamp(diffuseRadiance, vec3(0.0), vec3(65504.0)),
+           aovProbe.hitDistance));
+  imageStore(
+      outputAov, ivec3(pixel, kAovSpecularRadiance),
+      vec4(clamp(specularRadiance, vec3(0.0), vec3(65504.0)),
+           aovProbe.hitDistance));
+
+  vec4 previousStatistics =
+      pc.sampling.x > 0u
+          ? imageLoad(outputStatistics, ivec2(pixel))
+          : vec4(0.0);
+  float dispatchCount = float(dispatchSamples);
+  float dispatchMean =
+      luminanceSum / max(dispatchCount, 1.0);
+  float dispatchM2 = max(
+      luminanceSquaredSum -
+          luminanceSum * luminanceSum / max(dispatchCount, 1.0),
+      0.0);
+  float previousMean = luminance(previousOutput.rgb);
+  float previousM2 =
+      max(previousStatistics.x, 0.0) * previousSamples;
+  float delta = dispatchMean - previousMean;
+  float combinedM2 =
+      previousM2 + dispatchM2 +
+      (previousSamples > 0.0
+           ? delta * delta * previousSamples * dispatchCount /
+                 max(totalSamples, 1.0)
+           : 0.0);
+  float variance = combinedM2 / max(totalSamples, 1.0);
+  float averagePathLength =
+      (previousStatistics.y * previousSamples + pathLengthSum) /
+      max(totalSamples, 1.0);
+  imageStore(
+      outputStatistics, ivec2(pixel),
+      vec4(max(variance, 0.0), max(averagePathLength, 0.0),
+           totalSamples, aovProbe.geometry.w));
+}

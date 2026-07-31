@@ -4,10 +4,52 @@
 
 namespace xpbd::gfx {
 
+enum class RtAccelerationBuildReason : std::uint32_t {
+  None = 0,
+  InitialBuild,
+  TopologyChanged,
+  StorageReallocated,
+  MissingTopLevel,
+  InstanceTransformsChanged,
+  StableGeometryRefit,
+  OtherFullBuild,
+};
+
+[[nodiscard]] constexpr const char *
+rtAccelerationBuildReasonName(RtAccelerationBuildReason reason) noexcept {
+  switch (reason) {
+  case RtAccelerationBuildReason::None:
+    return "none";
+  case RtAccelerationBuildReason::InitialBuild:
+    return "initial";
+  case RtAccelerationBuildReason::TopologyChanged:
+    return "topology";
+  case RtAccelerationBuildReason::StorageReallocated:
+    return "storage";
+  case RtAccelerationBuildReason::MissingTopLevel:
+    return "missing TLAS";
+  case RtAccelerationBuildReason::InstanceTransformsChanged:
+    return "instance transforms";
+  case RtAccelerationBuildReason::StableGeometryRefit:
+    return "stable refit";
+  case RtAccelerationBuildReason::OtherFullBuild:
+    return "full build";
+  }
+  return "unknown";
+}
+
 struct FrameStats {
   float frame_ms = 0.0f;
   float ema_frame_ms = 16.0f;
   float fps = 0.0f;
+  // Application-rendered cadence and the actual number of frames reported by
+  // Streamline after each present. The UI derives presented FPS from these
+  // values instead of assuming that requested FG is active.
+  bool dlss_frame_generation_supported = false;
+  bool dlss_frame_generation_requested = false;
+  bool dlss_frame_generation_active = false;
+  bool reflex_supported = false;
+  std::uint32_t dlss_frames_actually_presented = 1;
   float mesh_ms = 0.0f;
   float pick_ms = 0.0f;
   std::uint32_t pick_queries = 0;
@@ -54,6 +96,23 @@ struct FrameStats {
   std::uint64_t mesh_line_offset_bytes = 0;
   int buffer_reallocations = 0;
   std::uint64_t total_buffer_reallocations = 0;
+
+  // NVIDIA RT path selection (0 = Raster, 1 = RayTracing). See RenderPath.
+  int active_render_path = 0;
+  bool ray_tracing_supported = false;
+  bool ray_tracing_requested = false;
+  std::uint32_t rt_blas_count = 0;
+  std::uint32_t rt_tlas_count = 0;
+  std::uint32_t rt_instance_count = 0;
+  std::uint32_t rt_primitive_count = 0;
+  std::uint64_t rt_as_storage_bytes = 0;
+  std::uint64_t rt_scratch_bytes = 0;
+  std::uint64_t rt_attribute_bytes = 0;
+  std::uint64_t rt_allocated_bytes = 0;
+  std::uint64_t rt_full_builds = 0;
+  std::uint64_t rt_refits = 0;
+  RtAccelerationBuildReason rt_last_build_reason =
+      RtAccelerationBuildReason::None;
 };
 
 }

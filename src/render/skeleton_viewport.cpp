@@ -689,34 +689,8 @@ SkeletonDrawList SkeletonViewport::projectPoses(
     list.bounds_max = {max_x, max_y, max_z};
   }
 
-  for (const auto &bone : geometry_->bones) {
-    if (!show_bones_) {
-      break;
-    }
-    auto sit = screen.find(bone.name);
-    if (sit == screen.end()) {
-      continue;
-    }
-    if (bone.has_parent && !bone.parent.empty()) {
-      auto pit = screen.find(bone.parent);
-      if (pit != screen.end()) {
-        ProjectedSegment seg;
-        seg.x0 = pit->second[0];
-        seg.y0 = pit->second[1];
-        seg.x1 = sit->second[0];
-        seg.y1 = sit->second[1];
-        seg.depth = 0.5f * (pit->second[2] + sit->second[2]);
-        seg.depth0 = pit->second[2];
-        seg.depth1 = sit->second[2];
-        seg.role = roleFor(bone.name, baked_style);
-        seg.name = bone.name;
-
-        seg.thickness = (seg.role == JointRole::Default) ? 1.4f : 2.2f;
-        list.segments.push_back(seg);
-      }
-    }
-  }
-
+  // Bone pivot-to-parent connection segments are deliberately omitted from
+  // every preview path. Joint markers and explicit selection outlines remain.
   for (const auto &bone : geometry_->bones) {
     if (!show_bones_) {
       break;

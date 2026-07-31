@@ -2,6 +2,7 @@
 
 #include "xpbd/baker/bone_pose_calculator.hpp"
 #include "xpbd/baker/cube_geometry.hpp"
+#include "xpbd/gfx/labpbr_material.hpp"
 
 #include <algorithm>
 #include <array>
@@ -50,8 +51,45 @@ constexpr int kCubeFaces[6][4] = {
 
 struct FaceTexelUV {
   float u0 = 0, v0 = 0, u1 = 0, v1 = 0;
+  int rotation_quarter_turns = 0;
   bool present = false;
 };
+
+std::array<std::array<float, 2>, 4>
+faceCornerTexels(const FaceTexelUV &face_uv) {
+  const std::array<std::array<float, 2>, 4> base = {{
+      {{face_uv.u0, face_uv.v0}},
+      {{face_uv.u1, face_uv.v0}},
+      {{face_uv.u1, face_uv.v1}},
+      {{face_uv.u0, face_uv.v1}},
+  }};
+  std::array<std::array<float, 2>, 4> result{};
+  const int quarter_turns =
+      ((face_uv.rotation_quarter_turns % 4) + 4) % 4;
+  for (int corner = 0; corner < 4; ++corner) {
+    const int source = (corner + 4 - quarter_turns) % 4;
+    result[static_cast<std::size_t>(corner)] =
+        base[static_cast<std::size_t>(source)];
+  }
+  return result;
+}
+
+bool skipCoincidentOppositeFace(const loader::Cube &cube,
+                                int face_i) noexcept {
+  const double size_x = std::abs(cube.size[0]) + 2.0 * cube.inflate;
+  const double size_y = std::abs(cube.size[1]) + 2.0 * cube.inflate;
+  const double size_z = std::abs(cube.size[2]) + 2.0 * cube.inflate;
+  constexpr double kFlatEpsilon = 1.0e-6;
+  // A zero-thickness Bedrock cube produces two coincident quads. Keep the
+  // positive-axis face; RT is explicitly two-sided, so the other side remains
+  // visible without a second coplanar primitive (which would z-fight).
+  return (size_x <= kFlatEpsilon &&
+          face_i == static_cast<int>(StaticModelFaceDirection::West)) ||
+         (size_y <= kFlatEpsilon &&
+          face_i == static_cast<int>(StaticModelFaceDirection::Down)) ||
+         (size_z <= kFlatEpsilon &&
+          face_i == static_cast<int>(StaticModelFaceDirection::North));
+}
 
 struct Rgba {
   float r, g, b, a;
@@ -512,15 +550,35 @@ void lerp3(const float a[3], const float b[3], float t, float o[3]) {
 
 FaceTexelUV resolveCubeFaceUV(const loader::Cube &cube, int face_i) {
   FaceTexelUV out;
-  auto fromLoader = [](const loader::FaceUV &f) -> FaceTexelUV {
+  auto fromLoader = [](const loader::FaceUV &f, float default_u,
+                       float default_v,
+                       bool reverse_bedrock_top_bottom = false)
+      -> FaceTexelUV {
     FaceTexelUV r;
     if (!f.present) {
       return r;
     }
     r.u0 = static_cast<float>(f.u);
     r.v0 = static_cast<float>(f.v);
-    r.u1 = static_cast<float>(f.u + f.size_u);
-    r.v1 = static_cast<float>(f.v + f.size_v);
+    const float size_u = f.size_explicit
+                             ? static_cast<float>(f.size_u)
+                             : default_u;
+    const float size_v = f.size_explicit
+                             ? static_cast<float>(f.size_v)
+                             : default_v;
+    r.u1 = r.u0 + size_u;
+    r.v1 = r.v0 + size_v;
+    // Bedrock serializes Up/Down from the opposite rectangle corner. This is
+    // the same conversion Blockbench performs when importing geometry: both
+    // axes are reversed before any uv_rotation is applied. Without it,
+    // alpha-masked wedges (for example Baishui's Umberlla fabric) taper toward
+    // the wrong end and appear as missing transparent panels.
+    if (reverse_bedrock_top_bottom) {
+      std::swap(r.u0, r.u1);
+      std::swap(r.v0, r.v1);
+    }
+    r.rotation_quarter_turns =
+        ((f.rotation_degrees % 360) + 360) % 360 / 90;
     r.present = true;
     return r;
   };
@@ -528,17 +586,29 @@ FaceTexelUV resolveCubeFaceUV(const loader::Cube &cube, int face_i) {
   if (cube.uv_mode == loader::CubeUVMode::PerFace) {
     switch (static_cast<StaticModelFaceDirection>(face_i)) {
     case StaticModelFaceDirection::West:
-      return fromLoader(cube.uv_west);
+      return fromLoader(cube.uv_west,
+                        static_cast<float>(std::abs(cube.size[2])),
+                        static_cast<float>(std::abs(cube.size[1])));
     case StaticModelFaceDirection::East:
-      return fromLoader(cube.uv_east);
+      return fromLoader(cube.uv_east,
+                        static_cast<float>(std::abs(cube.size[2])),
+                        static_cast<float>(std::abs(cube.size[1])));
     case StaticModelFaceDirection::Down:
-      return fromLoader(cube.uv_down);
+      return fromLoader(cube.uv_down,
+                        static_cast<float>(std::abs(cube.size[0])),
+                        static_cast<float>(std::abs(cube.size[2])), true);
     case StaticModelFaceDirection::Up:
-      return fromLoader(cube.uv_up);
+      return fromLoader(cube.uv_up,
+                        static_cast<float>(std::abs(cube.size[0])),
+                        static_cast<float>(std::abs(cube.size[2])), true);
     case StaticModelFaceDirection::North:
-      return fromLoader(cube.uv_north);
+      return fromLoader(cube.uv_north,
+                        static_cast<float>(std::abs(cube.size[0])),
+                        static_cast<float>(std::abs(cube.size[1])));
     case StaticModelFaceDirection::South:
-      return fromLoader(cube.uv_south);
+      return fromLoader(cube.uv_south,
+                        static_cast<float>(std::abs(cube.size[0])),
+                        static_cast<float>(std::abs(cube.size[1])));
     }
     return out;
   }
@@ -624,12 +694,7 @@ void pushTexturedFace(std::vector<MeshVertex> &solid,
   const int seg = textured ? 8 : 1;
 
 
-  const float corner_uv[4][2] = {
-      {face_uv.u0, face_uv.v0},
-      {face_uv.u1, face_uv.v0},
-      {face_uv.u1, face_uv.v1},
-      {face_uv.u0, face_uv.v1},
-  };
+  const auto corner_uv = faceCornerTexels(face_uv);
 
   auto emitTri = [&](std::vector<MeshVertex> &dst, const float a[3],
                      const float b[3], const float c[3], Rgba ca, Rgba cb,
@@ -827,7 +892,16 @@ void ViewportMeshBuilder::buildStaticIndexedModel(
       const auto &cube = bone.cubes[cube_i];
       const auto bind = baker::CubeGeometry::bindVertices(cube);
       for (int face_i = 0; face_i < 6; ++face_i) {
+        if (skipCoincidentOppositeFace(cube, face_i)) {
+          continue;
+        }
         const FaceTexelUV face_uv = resolveCubeFaceUV(cube, face_i);
+        // Bedrock per-face UV objects are also the face-presence mask:
+        // omitted entries must not generate fallback white geometry.
+        if (cube.uv_mode == loader::CubeUVMode::PerFace &&
+            !face_uv.present) {
+          continue;
+        }
         const bool textured = face_uv.present;
         const int *face_indices =
             textured ? kTexturedFaceCorners[face_i] : kCubeFaces[face_i];
@@ -865,11 +939,22 @@ void ViewportMeshBuilder::buildStaticIndexedModel(
         const auto first_vertex =
             static_cast<std::uint32_t>(out.vertices.size());
         const auto first_index = static_cast<std::uint32_t>(out.indices.size());
-        const float u0 = textured ? face_uv.u0 / tex_w : 0.0f;
-        const float v0 = textured ? face_uv.v0 / tex_h : 0.0f;
-        const float u1 = textured ? face_uv.u1 / tex_w : 0.0f;
-        const float v1 = textured ? face_uv.v1 / tex_h : 0.0f;
-        const float uvs[4][2] = {{u0, v0}, {u1, v0}, {u1, v1}, {u0, v1}};
+        const auto face_uv_corners = faceCornerTexels(face_uv);
+        float uvs[4][2]{};
+        for (int corner = 0; corner < 4; ++corner) {
+          uvs[corner][0] = textured
+                               ? face_uv_corners[corner][0] / tex_w
+                               : 0.0f;
+          uvs[corner][1] = textured
+                               ? face_uv_corners[corner][1] / tex_h
+                               : 0.0f;
+        }
+        const TangentFrame tangent = computeTangentFrame(
+            {positions[0][0], positions[0][1], positions[0][2]},
+            {positions[1][0], positions[1][1], positions[1][2]},
+            {positions[2][0], positions[2][1], positions[2][2]},
+            {nx, ny, nz}, {uvs[0][0], uvs[0][1]},
+            {uvs[1][0], uvs[1][1]}, {uvs[2][0], uvs[2][1]});
         for (int corner = 0; corner < 4; ++corner) {
           StaticModelVertex vertex{};
           vertex.px = positions[corner][0];
@@ -880,6 +965,10 @@ void ViewportMeshBuilder::buildStaticIndexedModel(
           vertex.nz = nz;
           vertex.u = uvs[corner][0];
           vertex.v = uvs[corner][1];
+          vertex.tx = tangent.tangent[0];
+          vertex.ty = tangent.tangent[1];
+          vertex.tz = tangent.tangent[2];
+          vertex.tangent_handedness = tangent.handedness;
           vertex.bone_index = bone_index;
           out.vertices.push_back(vertex);
         }
@@ -998,7 +1087,14 @@ void ViewportMeshBuilder::buildFromPoses(
           }
         }
         for (int face_i = 0; face_i < 6; ++face_i) {
+          if (skipCoincidentOppositeFace(cube, face_i)) {
+            continue;
+          }
           const FaceTexelUV face_uv = resolveCubeFaceUV(cube, face_i);
+          if (cube.uv_mode == loader::CubeUVMode::PerFace &&
+              !face_uv.present) {
+            continue;
+          }
           const bool face_textured = textured && face_uv.present;
 
 
@@ -1045,29 +1141,10 @@ void ViewportMeshBuilder::buildFromPoses(
 
 
 
-    if (bone.has_parent && !bone.parent.empty()) {
-      auto pit = poses.find(bone.parent);
-      if (pit != poses.end() && !isHidden(bone.parent)) {
-        float ax = static_cast<float>(pit->second.world_position[0]);
-        float ay = static_cast<float>(pit->second.world_position[1]);
-        float az = static_cast<float>(pit->second.world_position[2]);
-        float bx = static_cast<float>(pose_it->second.world_position[0]);
-        float by = static_cast<float>(pose_it->second.world_position[1]);
-        float bz = static_cast<float>(pose_it->second.world_position[2]);
-        if (mcbe_coords_) {
-          applyMcbe(ax, ay, az);
-          applyMcbe(bx, by, bz);
-        }
-        const float hw = (role == render::JointRole::Default)
-                             ? bone_half * 0.45f
-                             : bone_half * 0.75f;
-        pushThickLine(out.solid, ax, ay, az, bx, by, bz, hw,
-                      roleBoneColor(role));
-        ++out.line_segment_count;
-      }
-    }
-
-
+    // Parent-pivot connection segments are intentionally not rendered.
+    // They obscured detailed models and are not selection feedback. The
+    // white/yellow cube outlines remain in out.lines and continue through
+    // the DLSS scene pipeline.
     if (role != render::JointRole::Default) {
       float cx = static_cast<float>(pose_it->second.world_position[0]);
       float cy = static_cast<float>(pose_it->second.world_position[1]);

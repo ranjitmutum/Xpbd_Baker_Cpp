@@ -1,5 +1,8 @@
 #pragma once
 
+#include "xpbd/gfx/frame_stats.hpp"
+#include "xpbd/gfx/ray_tracing.hpp"
+
 struct nk_context;
 
 namespace xpbd::app {
@@ -35,6 +38,8 @@ void applyDarkStyle(nk_context *ctx, float scale);
 
 UiFrameResult composeNuklearUi(nk_context *ctx, int win_w, int win_h,
                                float ui_scale, const char *backend_name,
-                               const char *device_name);
+                               const char *device_name,
+                               const gfx::FrameStats &stats,
+                               const gfx::RayTracingCapability *rt_cap = nullptr);
 
 }

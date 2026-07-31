@@ -34,8 +34,6 @@ def main() -> None:
     mapping = {
         "tableEn": "en.json",
         "tableZhCn": "zh-CN.json",
-        "tableZhHk": "zh-HK.json",
-        "tableZhTw": "zh-TW.json",
     }
     for fn, name in mapping.items():
         if f"{fn}()" not in src:

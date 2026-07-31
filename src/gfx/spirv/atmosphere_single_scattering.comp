@@ -1,0 +1,32 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#include "src/gfx/spirv/atmosphere_common.glsl"
+
+layout(set = 0, binding = 1) uniform sampler2D transmittance_texture;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image3D
+    delta_rayleigh_output;
+layout(set = 0, binding = 5, rgba16f) uniform writeonly image3D
+    delta_mie_output;
+layout(set = 0, binding = 6, rgba16f) uniform writeonly image3D
+    scattering_output;
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+void main() {
+  const ivec3 pixel = ivec3(gl_GlobalInvocationID.xyz);
+  const ivec3 dimensions =
+      ivec3(SCATTERING_TEXTURE_NU_SIZE * SCATTERING_TEXTURE_MU_S_SIZE,
+            SCATTERING_TEXTURE_MU_SIZE, SCATTERING_TEXTURE_R_SIZE);
+  if (any(greaterThanEqual(pixel, dimensions))) {
+    return;
+  }
+  vec3 rayleigh;
+  vec3 mie;
+  ComputeSingleScatteringTexture(
+      ATMOSPHERE, transmittance_texture, vec3(pixel) + vec3(0.5),
+      rayleigh, mie);
+  imageStore(delta_rayleigh_output, pixel, vec4(rayleigh, 1.0));
+  imageStore(delta_mie_output, pixel, vec4(mie, 1.0));
+  imageStore(scattering_output, pixel, vec4(rayleigh, mie.r));
+}

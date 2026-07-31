@@ -1,8 +1,11 @@
 #include "xpbd/app/app_session.hpp"
 #include "xpbd/app/i18n.hpp"
+#include "xpbd/app/native_dialog.hpp"
 #include "xpbd/app/nuklear_ui.hpp"
 #include "xpbd/gfx/backend_select.hpp"
 #include "xpbd/gfx/gpu_backend.hpp"
+#include "xpbd/gfx/preview_scene.hpp"
+#include "xpbd/gfx/rtxpt_bridge.hpp"
 #include "xpbd/gfx/static_model_draw_plan.hpp"
 #include "xpbd/gfx/viewport_mesh.hpp"
 #include "xpbd/log.hpp"
@@ -15,6 +18,17 @@
 #define SDL_MAIN_HANDLED
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <SDL3/SDL_system.h>
+#endif
 
 #define NK_INCLUDE_FIXED_TYPES
 #define NK_INCLUDE_STANDARD_IO
@@ -92,6 +106,26 @@ static char *xpbdNkDtoa(char *dst, double value) {
 #include <vector>
 
 namespace {
+
+#if defined(_WIN32)
+struct PclWindowsMessageHookContext {
+  xpbd::gfx::IGpuBackend *backend = nullptr;
+};
+
+bool SDLCALL pclWindowsMessageHook(void *userdata, MSG *message) {
+  auto *context =
+      static_cast<PclWindowsMessageHookContext *>(userdata);
+  if (context != nullptr && context->backend != nullptr &&
+      message != nullptr) {
+    const std::uint32_t ping_message =
+        context->backend->latencyPingMessage();
+    if (ping_message != 0u && message->message == ping_message) {
+      context->backend->markLatencyPing();
+    }
+  }
+  return true;
+}
+#endif
 
 
 struct NkVertex {
@@ -233,11 +267,20 @@ int app_main(int argc, char **argv) {
     return 1;
   }
 
+  std::filesystem::path executable_base_path;
+  if (const char *base = SDL_GetBasePath()) {
+    // SDL3 owns and releases this cached const path during SDL_Quit().
+    executable_base_path = std::filesystem::path(base);
+  }
+  const std::filesystem::path preview_scene_asset_root =
+      executable_base_path.empty()
+          ? std::filesystem::path("assets") / "preview_scenes"
+          : executable_base_path / "assets" / "preview_scenes";
+
   {
     std::string log_path = "xpbd_baker.log";
-    if (const char *base = SDL_GetBasePath()) {
-      // SDL3 owns and releases this cached const path during SDL_Quit().
-      log_path = std::string(base) + "xpbd_baker.log";
+    if (!executable_base_path.empty()) {
+      log_path = (executable_base_path / "xpbd_baker.log").string();
     }
     xpbd::log::init(log_path);
   }
@@ -268,6 +311,40 @@ int app_main(int argc, char **argv) {
                    backend->name(), backend->deviceName(),
                    xpbd::gfx::preferenceName(backend_req.pref),
                    backend_req.force ? 1 : 0);
+
+  // Wire native file dialogs to the app window and pause the GPU while open.
+  {
+    xpbd::app::NativeDialogHooks hooks{};
+#if defined(_WIN32)
+    void *hwnd = SDL_GetPointerProperty(SDL_GetWindowProperties(window),
+                                        SDL_PROP_WINDOW_WIN32_HWND_POINTER,
+                                        nullptr);
+    hooks.owner_window = hwnd;
+#endif
+    // Static pointer: dialogs run on the UI thread while backend is alive.
+    static xpbd::gfx::IGpuBackend *s_backend_for_dialog = nullptr;
+    s_backend_for_dialog = backend.get();
+    hooks.prepare = []() {
+      if (s_backend_for_dialog) {
+        s_backend_for_dialog->prepareForSystemDialog();
+      }
+    };
+    hooks.finish = []() {
+      if (s_backend_for_dialog) {
+        s_backend_for_dialog->resumeAfterSystemDialog();
+      }
+    };
+    xpbd::app::setNativeDialogHooks(hooks);
+  }
+
+  {
+    const auto rtxpt = xpbd::gfx::queryRtxptStatus();
+    xpbd::log::infof("Preview RT: build=%d tree=%d runtime=%d ver=%s — %s",
+                     rtxpt.build_enabled ? 1 : 0, rtxpt.tree_available ? 1 : 0,
+                     rtxpt.runtime_ready ? 1 : 0,
+                     rtxpt.version.empty() ? "-" : rtxpt.version.c_str(),
+                     rtxpt.detail.c_str());
+  }
   const char *legacy_uv_env = std::getenv("XPBD_VULKAN_LEGACY_UV");
   const bool use_static_model = xpbd::gfx::useStaticModelViewport(
       backend->supportsStaticModel(),
@@ -374,6 +451,10 @@ int app_main(int argc, char **argv) {
 
   xpbd::gfx::ViewportGpuScene scene;
   xpbd::gfx::ViewportMeshBuilder static_mesh_builder;
+  xpbd::gfx::ViewportRasterScene raster_scene;
+  std::string logged_preview_skybox_source;
+  const bool vulkan_raster_path =
+      backend->kind() == xpbd::gfx::BackendKind::Vulkan;
   xpbd::gfx::StaticIndexedModelMesh static_model;
   xpbd::gfx::StaticModelFrameData static_model_frame;
   xpbd::gfx::StaticModelGenerationCache static_cpu_generations;
@@ -382,6 +463,9 @@ int app_main(int argc, char **argv) {
 
 
   float disp_fps = 60.0f;
+  float disp_original_fps = 60.0f;
+  float disp_dlss_fg_fps = 0.0f;
+  bool disp_dlss_fg_active = false;
   float disp_frame_ms = 16.0f;
   float disp_ema_ms = 16.0f;
   float disp_mesh_ms = 0.0f;
@@ -431,11 +515,649 @@ int app_main(int argc, char **argv) {
   int accum_gpu_timestamp_frames = 0;
   int accum_frames = 0;
   auto sample_window_start = std::chrono::steady_clock::now();
+  const auto app_start_time = sample_window_start;
 
   bool running = true;
   auto last = std::chrono::steady_clock::now();
   auto &session = xpbd::app::AppSession::instance();
+  session.setApplicationDirectory(executable_base_path);
+  if (const char *startup_model = std::getenv("XPBD_MODEL");
+      startup_model != nullptr && startup_model[0] != '\0') {
+    session.loadModel(std::filesystem::path(startup_model));
+    if (session.last_error.empty()) {
+      xpbd::log::infof("Startup model: %s", startup_model);
+    } else {
+      xpbd::log::warnf("Startup model failed: %s (%s)", startup_model,
+                       session.last_error.c_str());
+    }
+  }
+  if (const char *startup_animation = std::getenv("XPBD_ANIMATION");
+      startup_animation != nullptr && startup_animation[0] != '\0') {
+    session.loadAnimation(std::filesystem::path(startup_animation));
+    if (session.last_error.empty()) {
+      xpbd::log::infof("Startup animation: %s", startup_animation);
+    } else {
+      xpbd::log::warnf("Startup animation failed: %s (%s)",
+                       startup_animation, session.last_error.c_str());
+    }
+  }
+  if (const char *startup_texture = std::getenv("XPBD_TEXTURE");
+      startup_texture != nullptr && startup_texture[0] != '\0') {
+    if (session.loadTexture(std::filesystem::path(startup_texture))) {
+      xpbd::log::infof("Startup texture: %s", startup_texture);
+    } else {
+      xpbd::log::warnf("Startup texture failed: %s (%s)", startup_texture,
+                       session.last_error.c_str());
+    }
+  }
+  if (const char *startup_specular =
+          std::getenv("XPBD_LABPBR_SPECULAR");
+      startup_specular != nullptr && startup_specular[0] != '\0') {
+    if (session.importLabPbrSpecular(
+            std::filesystem::path(startup_specular))) {
+      xpbd::log::infof("Startup LabPBR specular: %s",
+                       startup_specular);
+    } else {
+      xpbd::log::warnf(
+          "Startup LabPBR specular failed: %s (%s)",
+          startup_specular, session.last_error.c_str());
+    }
+  }
+  if (const char *startup_normal = std::getenv("XPBD_IRIS_NORMAL");
+      startup_normal != nullptr && startup_normal[0] != '\0') {
+    if (session.importLabPbrNormal(
+            std::filesystem::path(startup_normal))) {
+      xpbd::log::infof("Startup Iris normal: %s", startup_normal);
+    } else {
+      xpbd::log::warnf("Startup Iris normal failed: %s (%s)",
+                       startup_normal, session.last_error.c_str());
+    }
+  }
+  if (const char *material_debug = std::getenv("XPBD_LABPBR_DEBUG");
+      material_debug != nullptr && material_debug[0] != '\0') {
+    session.labpbr_debug_view =
+        xpbd::gfx::labPbrDebugViewFromName(material_debug);
+    xpbd::log::infof(
+        "LabPBR debug view: %s",
+        xpbd::gfx::labPbrDebugViewName(session.labpbr_debug_view));
+  }
+  if (const char *rt_debug = std::getenv("XPBD_RT_DEBUG");
+      rt_debug != nullptr && rt_debug[0] != '\0') {
+    session.rt_debug_view = xpbd::gfx::rtDebugViewFromName(rt_debug);
+    xpbd::log::infof("RT debug view: %s",
+                     xpbd::gfx::rtDebugViewName(session.rt_debug_view));
+  }
+  if (const char *startup_rt = std::getenv("XPBD_RT")) {
+    session.enable_ray_tracing =
+        std::strcmp(startup_rt, "1") == 0 ||
+        std::strcmp(startup_rt, "true") == 0 ||
+        std::strcmp(startup_rt, "TRUE") == 0;
+  }
+  auto apply_path_trace_uint = [](const char *name,
+                                  std::uint32_t &target) {
+    const char *text = std::getenv(name);
+    if (text == nullptr || text[0] == '\0') {
+      return;
+    }
+    const char *end = text + std::strlen(text);
+    std::uint32_t parsed_value = 0;
+    const auto parsed = std::from_chars(text, end, parsed_value);
+    if (parsed.ec == std::errc{} && parsed.ptr == end) {
+      target = parsed_value;
+    } else {
+      xpbd::log::warnf("Ignoring invalid %s=%s", name, text);
+    }
+  };
+  apply_path_trace_uint("XPBD_PT_SPP",
+                        session.path_trace_settings.samples_per_frame);
+  apply_path_trace_uint("XPBD_PT_MAX_SAMPLES",
+                        session.path_trace_settings.maximum_samples);
+  apply_path_trace_uint("XPBD_PT_BOUNCES",
+                        session.path_trace_settings.max_bounces);
+  apply_path_trace_uint(
+      "XPBD_PT_DIFFUSE_BOUNCES",
+      session.path_trace_settings.max_diffuse_bounces);
+  apply_path_trace_uint(
+      "XPBD_PT_GLOSSY_BOUNCES",
+      session.path_trace_settings.max_glossy_bounces);
+  apply_path_trace_uint(
+      "XPBD_PT_TRANSMISSION_BOUNCES",
+      session.path_trace_settings.max_transmission_bounces);
+  apply_path_trace_uint(
+      "XPBD_PT_TRANSPARENT_BOUNCES",
+      session.path_trace_settings.max_transparent_bounces);
+  apply_path_trace_uint(
+      "XPBD_PT_RR_START",
+      session.path_trace_settings.russian_roulette_start);
+  std::uint32_t russian_roulette =
+      session.path_trace_settings.russian_roulette ? 1u : 0u;
+  apply_path_trace_uint("XPBD_PT_RR", russian_roulette);
+  session.path_trace_settings.russian_roulette =
+      russian_roulette != 0u;
+  apply_path_trace_uint("XPBD_PT_SEED",
+                        session.path_trace_settings.seed);
+  if (const char *fixed_seed = std::getenv("XPBD_PT_SEED");
+      fixed_seed != nullptr && fixed_seed[0] != '\0') {
+    session.path_trace_settings.automatic_seed = false;
+  }
+  auto apply_path_trace_bool = [](const char *name, bool &target) {
+    const char *text = std::getenv(name);
+    if (text == nullptr || text[0] == '\0') {
+      return;
+    }
+    if (std::strcmp(text, "1") == 0 ||
+        std::strcmp(text, "true") == 0 ||
+        std::strcmp(text, "TRUE") == 0) {
+      target = true;
+    } else if (std::strcmp(text, "0") == 0 ||
+               std::strcmp(text, "false") == 0 ||
+               std::strcmp(text, "FALSE") == 0) {
+      target = false;
+    } else {
+      xpbd::log::warnf("Ignoring invalid %s=%s", name, text);
+    }
+  };
+  apply_path_trace_bool(
+      "XPBD_PT_NVIDIA_RT_CORE",
+      session.path_trace_settings.nvidia_rt_core_acceleration);
+  apply_path_trace_bool("XPBD_PT_ANALYTIC_LIGHTS",
+                        session.path_trace_settings.analytic_lights);
+  apply_path_trace_bool("XPBD_PT_EMISSIVE_SURFACES",
+                        session.path_trace_settings.emissive_surfaces);
+  apply_path_trace_bool("XPBD_PT_NEE",
+                        session.path_trace_settings.next_event_estimation);
+  apply_path_trace_bool(
+      "XPBD_PT_MIS",
+      session.path_trace_settings.multiple_importance_sampling);
+  apply_path_trace_bool(
+      "XPBD_PT_ENV_IMPORTANCE",
+      session.path_trace_settings.environment_importance_sampling);
+  apply_path_trace_uint(
+      "XPBD_PT_LIGHT_SAMPLES",
+      session.path_trace_settings.light_samples_per_path);
+  auto apply_path_trace_float = [](const char *name, float &target) {
+    const char *text = std::getenv(name);
+    if (text == nullptr || text[0] == '\0') {
+      return;
+    }
+    char *end = nullptr;
+    const float parsed = std::strtof(text, &end);
+    if (end != text && end != nullptr && end[0] == '\0' &&
+        std::isfinite(parsed)) {
+      target = parsed;
+    } else {
+      xpbd::log::warnf("Ignoring invalid %s=%s", name, text);
+    }
+  };
+  apply_path_trace_float("XPBD_PT_EXPOSURE_EV",
+                         session.path_trace_settings.display_exposure_ev);
+  apply_path_trace_float(
+      "XPBD_PT_EMISSIVE_MULTIPLIER",
+      session.path_trace_settings.emissive_multiplier);
+  apply_path_trace_float("XPBD_PT_DIRECT_CLAMP",
+                         session.path_trace_settings.direct_clamp);
+  apply_path_trace_float("XPBD_PT_INDIRECT_CLAMP",
+                         session.path_trace_settings.indirect_clamp);
+  apply_path_trace_float(
+      "XPBD_PT_PREVIEW_SCALE",
+      session.path_trace_settings.preview_resolution_scale);
+  if (const char *denoiser = std::getenv("XPBD_PT_DENOISER");
+      denoiser != nullptr && denoiser[0] != '\0') {
+    if (std::strcmp(denoiser, "auto") == 0) {
+      session.path_trace_settings.requested_denoiser =
+          xpbd::gfx::PathTraceDenoiser::Auto;
+    } else if (std::strcmp(denoiser, "raw") == 0 ||
+               std::strcmp(denoiser, "off") == 0) {
+      session.path_trace_settings.requested_denoiser =
+          xpbd::gfx::PathTraceDenoiser::Raw;
+    } else if (std::strcmp(denoiser, "nrd_reblur") == 0 ||
+               std::strcmp(denoiser, "reblur") == 0 ||
+               std::strcmp(denoiser, "nrd_relax") == 0 ||
+               std::strcmp(denoiser, "relax") == 0) {
+      session.path_trace_settings.requested_denoiser =
+          xpbd::gfx::PathTraceDenoiser::Raw;
+      xpbd::log::warnf(
+          "XPBD_PT_DENOISER=%s names a retired NRD mode; using raw",
+          denoiser);
+    } else if (std::strcmp(denoiser, "dlss_rr") == 0 ||
+               std::strcmp(denoiser, "rr") == 0) {
+      session.path_trace_settings.requested_denoiser =
+          xpbd::gfx::PathTraceDenoiser::DlssRayReconstruction;
+    } else {
+      xpbd::log::warnf("Ignoring invalid XPBD_PT_DENOISER=%s",
+                       denoiser);
+    }
+  }
+  if (const char *upscale = std::getenv("XPBD_PT_UPSCALE");
+      upscale != nullptr && upscale[0] != '\0') {
+    if (std::strcmp(upscale, "off") == 0 ||
+        std::strcmp(upscale, "native") == 0) {
+      session.path_trace_settings.requested_upscale =
+          xpbd::gfx::PathTraceUpscale::Off;
+    } else if (std::strcmp(upscale, "auto") == 0) {
+      session.path_trace_settings.requested_upscale =
+          xpbd::gfx::PathTraceUpscale::Quality;
+      xpbd::log::warn(
+          "XPBD_PT_UPSCALE=auto is deprecated; using quality");
+    } else if (std::strcmp(upscale, "dlaa") == 0) {
+      session.path_trace_settings.requested_upscale =
+          xpbd::gfx::PathTraceUpscale::Dlaa;
+    } else if (std::strcmp(upscale, "ultra_quality") == 0) {
+      session.path_trace_settings.requested_upscale =
+          xpbd::gfx::PathTraceUpscale::Quality;
+      xpbd::log::warn(
+          "XPBD_PT_UPSCALE=ultra_quality is deprecated; using quality");
+    } else if (std::strcmp(upscale, "quality") == 0) {
+      session.path_trace_settings.requested_upscale =
+          xpbd::gfx::PathTraceUpscale::Quality;
+    } else if (std::strcmp(upscale, "balanced") == 0) {
+      session.path_trace_settings.requested_upscale =
+          xpbd::gfx::PathTraceUpscale::Balanced;
+    } else if (std::strcmp(upscale, "performance") == 0) {
+      session.path_trace_settings.requested_upscale =
+          xpbd::gfx::PathTraceUpscale::Performance;
+    } else if (std::strcmp(upscale, "ultra_performance") == 0) {
+      session.path_trace_settings.requested_upscale =
+          xpbd::gfx::PathTraceUpscale::UltraPerformance;
+    } else {
+      xpbd::log::warnf("Ignoring invalid XPBD_PT_UPSCALE=%s",
+                       upscale);
+    }
+  }
+  if (const char *environment = std::getenv("XPBD_PT_ENVIRONMENT");
+      environment != nullptr && environment[0] != '\0') {
+    char *end = nullptr;
+    const float parsed = std::strtof(environment, &end);
+    if (end != environment && end != nullptr && end[0] == '\0' &&
+        std::isfinite(parsed)) {
+      session.path_trace_settings.analytic_environment_strength = parsed;
+    } else {
+      xpbd::log::warnf("Ignoring invalid XPBD_PT_ENVIRONMENT=%s",
+                       environment);
+    }
+  }
+  session.path_trace_settings = xpbd::gfx::normalizePathTraceSettings(
+      session.path_trace_settings);
+  xpbd::log::infof(
+      "Path tracing settings: spp=%u max_samples=%u bounces=%u "
+      "diffuse=%u glossy=%u transmission=%u transparent=%u rr=%d "
+      "rr_start=%u seed=%u auto_seed=%d environment=%.3f "
+      "exposure_ev=%.3f rt_core=%d nee=%d mis=%d env_importance=%d "
+      "light_samples=%u emissive=%.3f clamp=%.3f/%.3f scale=%.3f "
+      "denoiser=%u upscale=%u frame_generation=%u reflex=%u",
+      session.path_trace_settings.samples_per_frame,
+      session.path_trace_settings.maximum_samples,
+      session.path_trace_settings.max_bounces,
+      session.path_trace_settings.max_diffuse_bounces,
+      session.path_trace_settings.max_glossy_bounces,
+      session.path_trace_settings.max_transmission_bounces,
+      session.path_trace_settings.max_transparent_bounces,
+      session.path_trace_settings.russian_roulette ? 1 : 0,
+      session.path_trace_settings.russian_roulette_start,
+      session.path_trace_settings.seed,
+      session.path_trace_settings.automatic_seed ? 1 : 0,
+      session.path_trace_settings.analytic_environment_strength,
+      session.path_trace_settings.display_exposure_ev,
+      session.path_trace_settings.nvidia_rt_core_acceleration ? 1 : 0,
+      session.path_trace_settings.next_event_estimation ? 1 : 0,
+      session.path_trace_settings.multiple_importance_sampling ? 1 : 0,
+      session.path_trace_settings.environment_importance_sampling ? 1 : 0,
+      session.path_trace_settings.light_samples_per_path,
+      session.path_trace_settings.emissive_multiplier,
+      session.path_trace_settings.direct_clamp,
+      session.path_trace_settings.indirect_clamp,
+      session.path_trace_settings.preview_resolution_scale,
+      static_cast<unsigned>(
+          session.path_trace_settings.requested_denoiser),
+      static_cast<unsigned>(
+          session.path_trace_settings.requested_upscale),
+      static_cast<unsigned>(
+          session.path_trace_settings.requested_frame_generation),
+      static_cast<unsigned>(
+          session.path_trace_settings.requested_reflex_mode));
+  if (const char *startup_hdri = std::getenv("XPBD_HDRI");
+      startup_hdri != nullptr && startup_hdri[0] != '\0') {
+    if (session.loadWorldHdr(std::filesystem::path(startup_hdri))) {
+      xpbd::log::infof(
+          "Startup World HDRI: %s (%ux%u checksum=%s)",
+          session.world_environment.hdr.source_identity.c_str(),
+          session.world_environment.hdr.radiance.width,
+          session.world_environment.hdr.radiance.height,
+          session.world_environment.hdr.checksum.c_str());
+    } else {
+      xpbd::log::warnf("Startup World HDRI failed: %s (%s)",
+                       startup_hdri, session.last_error.c_str());
+    }
+  }
+  auto apply_world_float = [&](const char *name, float &target,
+                               float minimum, float maximum) {
+    const char *text = std::getenv(name);
+    if (text == nullptr || text[0] == '\0') {
+      return;
+    }
+    char *end = nullptr;
+    const float parsed = std::strtof(text, &end);
+    if (end != text && end != nullptr && end[0] == '\0' &&
+        std::isfinite(parsed)) {
+      target = std::clamp(parsed, minimum, maximum);
+    } else {
+      xpbd::log::warnf("Ignoring invalid %s=%s", name, text);
+    }
+  };
+  apply_world_float("XPBD_SKY_STRENGTH_EV",
+                    session.world_environment.global_lighting_strength_ev,
+                    -10.0f, 10.0f);
+  if (const char *legacy_strength = std::getenv("XPBD_HDRI_STRENGTH");
+      legacy_strength != nullptr && legacy_strength[0] != '\0') {
+    char *end = nullptr;
+    const float parsed = std::strtof(legacy_strength, &end);
+    if (end != legacy_strength && end != nullptr && end[0] == '\0' &&
+        std::isfinite(parsed) && parsed > 0.0f) {
+      session.world_environment.global_lighting_strength_ev =
+          std::clamp(std::log2(parsed), -10.0f, 10.0f);
+    } else {
+      xpbd::log::warnf("Ignoring invalid XPBD_HDRI_STRENGTH=%s",
+                       legacy_strength);
+    }
+  }
+  apply_world_float("XPBD_HDRI_BACKGROUND_EXPOSURE",
+                    session.world_environment.background_exposure, -10.0f,
+                    10.0f);
+  float hdri_rotation_degrees =
+      session.world_environment.rotation_radians *
+      (180.0f / 3.14159265358979323846f);
+  apply_world_float("XPBD_HDRI_ROTATION_DEGREES", hdri_rotation_degrees,
+                    -360000.0f, 360000.0f);
+  session.world_environment.rotation_radians =
+      hdri_rotation_degrees * (3.14159265358979323846f / 180.0f);
+  auto apply_world_bool = [&](const char *name, bool &target) {
+    const char *text = std::getenv(name);
+    if (text == nullptr || text[0] == '\0') {
+      return;
+    }
+    if (std::strcmp(text, "1") == 0 ||
+        std::strcmp(text, "true") == 0 ||
+        std::strcmp(text, "TRUE") == 0) {
+      target = true;
+    } else if (std::strcmp(text, "0") == 0 ||
+               std::strcmp(text, "false") == 0 ||
+               std::strcmp(text, "FALSE") == 0) {
+      target = false;
+    } else {
+      xpbd::log::warnf("Ignoring invalid %s=%s", name, text);
+    }
+  };
+  apply_world_bool("XPBD_HDRI_BACKGROUND_VISIBLE",
+                   session.world_environment.background_visible);
+  apply_world_bool("XPBD_HDRI_LIGHTING",
+                   session.world_environment.environment_lighting);
+  bool startup_procedural_sky = false;
+  apply_world_bool("XPBD_SKY_PROCEDURAL", startup_procedural_sky);
+  apply_world_bool("XPBD_SKY_TIME_PLAYING",
+                   session.world_environment.time.playing);
+  apply_world_float("XPBD_SKY_TIME_SPEED",
+                    session.world_environment.time.time_speed,
+                    -86400.0f, 86400.0f);
+  auto &startup_clouds = session.world_environment.clouds;
+  apply_world_bool("XPBD_CLOUDS", startup_clouds.enabled);
+  apply_world_float("XPBD_CLOUD_COVERAGE", startup_clouds.coverage, 0.0f,
+                    1.0f);
+  apply_world_float("XPBD_CLOUD_DENSITY", startup_clouds.density, 0.0001f,
+                    8.0f);
+  apply_world_float("XPBD_CLOUD_BASE_KM", startup_clouds.base_altitude_km,
+                    0.1f, 20.0f);
+  apply_world_float("XPBD_CLOUD_THICKNESS_KM", startup_clouds.thickness_km,
+                    0.1f, 20.0f);
+  apply_world_float("XPBD_CLOUD_WIND_X", startup_clouds.wind_direction[0],
+                    -1000.0f, 1000.0f);
+  apply_world_float("XPBD_CLOUD_WIND_Z", startup_clouds.wind_direction[1],
+                    -1000.0f, 1000.0f);
+  apply_world_float("XPBD_CLOUD_OFFSET_X_KM",
+                    startup_clouds.weather_offset_km[0], -1.0e6f, 1.0e6f);
+  apply_world_float("XPBD_CLOUD_OFFSET_Z_KM",
+                    startup_clouds.weather_offset_km[1], -1.0e6f, 1.0e6f);
+  apply_world_float("XPBD_CLOUD_TIME_SECONDS", startup_clouds.time_seconds,
+                    -1.0e7f, 1.0e7f);
+  apply_world_float("XPBD_CLOUD_RENDER_RATIO", startup_clouds.render_ratio,
+                    0.25f, 1.0f);
+  apply_world_bool("XPBD_CLOUD_REPROJECTION",
+                   startup_clouds.reprojection);
+  apply_world_float("XPBD_CLOUD_HISTORY_WEIGHT",
+                    startup_clouds.history_weight, 0.0f, 0.999f);
+  apply_world_float("XPBD_CLOUD_SHADOW_STRENGTH",
+                    startup_clouds.shadow_strength, 0.0f, 1.0f);
+  apply_world_float("XPBD_CLOUD_LIGHTING_STRENGTH",
+                    startup_clouds.lighting_strength, 0.0f, 8.0f);
+  apply_path_trace_uint("XPBD_CLOUD_SHADOW_RESOLUTION",
+                        startup_clouds.shadow_resolution);
+  startup_clouds.shadow_resolution =
+      std::clamp(startup_clouds.shadow_resolution, 64u, 4096u);
+  apply_path_trace_uint("XPBD_CLOUD_SEED", startup_clouds.seed);
+  apply_path_trace_uint("XPBD_CLOUD_RAY_STEPS", startup_clouds.ray_steps);
+  apply_path_trace_uint("XPBD_CLOUD_LIGHT_STEPS",
+                        startup_clouds.light_steps);
+  apply_path_trace_uint("XPBD_CLOUD_TEMPORAL_FRAME",
+                        startup_clouds.temporal_frame);
+  if (startup_clouds.enabled) {
+    xpbd::log::infof(
+        "Startup volumetric clouds: valid=%s coverage=%.3f density=%.3f "
+        "layer=%.3f+%.3fkm wind=%.3f/%.3f offset=%.3f/%.3fkm "
+        "time=%.3fs seed=%u steps=%u/%u temporal=%u ratio=%.2f "
+        "reprojection=%d history=%.3f shadow=%u",
+        startup_clouds.valid() ? "true" : "false", startup_clouds.coverage,
+        startup_clouds.density, startup_clouds.base_altitude_km,
+        startup_clouds.thickness_km, startup_clouds.wind_direction[0],
+        startup_clouds.wind_direction[1],
+        startup_clouds.weather_offset_km[0],
+        startup_clouds.weather_offset_km[1], startup_clouds.time_seconds,
+        startup_clouds.seed, startup_clouds.ray_steps,
+        startup_clouds.light_steps, startup_clouds.temporal_frame,
+        startup_clouds.render_ratio,
+        startup_clouds.reprojection ? 1 : 0,
+        startup_clouds.history_weight,
+        startup_clouds.shadow_resolution);
+  }
+  if (startup_procedural_sky) {
+    int reference_utc_hour = 0;
+    if (const char *hour_text = std::getenv("XPBD_SKY_UTC_HOUR");
+        hour_text != nullptr && hour_text[0] != '\0') {
+      const char *hour_end = hour_text + std::strlen(hour_text);
+      int parsed_hour = 0;
+      const auto parsed =
+          std::from_chars(hour_text, hour_end, parsed_hour);
+      if (parsed.ec == std::errc{} && parsed.ptr == hour_end &&
+          parsed_hour >= 0 && parsed_hour <= 23) {
+        reference_utc_hour = parsed_hour;
+      } else {
+        xpbd::log::warnf("Ignoring invalid XPBD_SKY_UTC_HOUR=%s",
+                         hour_text);
+      }
+    }
+    const xpbd::gfx::UtcDateTime reference_utc{
+        2024, 1, 1, reference_utc_hour, 0, 0.0};
+    const xpbd::gfx::ObserverLocation reference_observer{
+        31.2304, 121.4737, 5.0, 0.0};
+    std::string celestial_error;
+    xpbd::gfx::CelestialState celestial;
+    if (xpbd::gfx::computeCelestialState(
+            reference_utc, reference_observer, celestial, &celestial_error)) {
+      session.world_environment.celestial = celestial;
+      session.world_environment.atmosphere =
+          xpbd::gfx::defaultEarthAtmosphereConfig();
+      session.world_environment.procedural_resources_ready = true;
+      session.world_environment.sky_rendering =
+          xpbd::gfx::SkyRendering::ProceduralDayNight;
+      session.world_environment.generation =
+          session.world_environment.generation <
+                  (std::numeric_limits<std::uint64_t>::max)()
+              ? session.world_environment.generation + 1u
+              : session.world_environment.generation;
+      xpbd::log::infof(
+          "Startup procedural sky requested with frozen Phase 6 "
+          "UTC/Shanghai diagnostic state (UTC hour=%d, twilight=%s, "
+          "Sun altitude=%.3f, Moon azimuth=%.3f, Moon altitude=%.3f, "
+          "Moon phase=%.6f)",
+          reference_utc_hour,
+          xpbd::gfx::twilightPhaseName(celestial.twilight),
+          celestial.sun.geometric_altitude_degrees,
+          celestial.moon.azimuth_degrees,
+          celestial.moon.geometric_altitude_degrees,
+          celestial.moon_illuminated_fraction);
+    } else {
+      xpbd::log::warnf("Startup procedural sky failed: %s",
+                       celestial_error.c_str());
+    }
+  }
+  if (const char *startup_scene = std::getenv("XPBD_PREVIEW_SCENE")) {
+    int scene_index = -1;
+    const char *scene_end = startup_scene + std::strlen(startup_scene);
+    const auto parsed =
+        std::from_chars(startup_scene, scene_end, scene_index);
+    if (parsed.ec == std::errc{} && parsed.ptr == scene_end &&
+        scene_index >= 0 && scene_index < xpbd::gfx::kPreviewSceneCount) {
+      const auto preset = xpbd::gfx::previewSceneIdFromIndex(scene_index);
+      if (preset == xpbd::gfx::PreviewSceneId::None) {
+        session.selectScene(xpbd::app::SceneSelectionKind::Empty);
+      } else {
+        session.selectPresetScene(preset);
+      }
+    }
+  }
+  if (const char *startup_dynamic = std::getenv("XPBD_PREVIEW_DYNAMIC")) {
+    session.dynamic_preview_scene =
+        std::strcmp(startup_dynamic, "1") == 0 ||
+        std::strcmp(startup_dynamic, "true") == 0 ||
+        std::strcmp(startup_dynamic, "TRUE") == 0;
+  }
+  if (const char *startup_show_bones = std::getenv("XPBD_SHOW_BONES")) {
+    session.show_bones =
+        std::strcmp(startup_show_bones, "1") == 0 ||
+        std::strcmp(startup_show_bones, "true") == 0 ||
+        std::strcmp(startup_show_bones, "TRUE") == 0;
+    xpbd::log::infof("Startup bone visualization: %s",
+                     session.show_bones ? "on" : "off");
+  }
+  bool startup_camera_overridden = false;
+  auto apply_camera_override = [&](const char *name, float &target,
+                                   float minimum, float maximum) {
+    const char *text = std::getenv(name);
+    if (text == nullptr || text[0] == '\0') {
+      return;
+    }
+    char *end = nullptr;
+    const float parsed = std::strtof(text, &end);
+    if (end != text && end != nullptr && end[0] == '\0' &&
+        std::isfinite(parsed)) {
+      target = (std::max)(minimum, (std::min)(maximum, parsed));
+      startup_camera_overridden = true;
+    }
+  };
+  apply_camera_override("XPBD_CAMERA_YAW", session.camera.yaw_deg, -360.0f,
+                        360.0f);
+  apply_camera_override("XPBD_CAMERA_PITCH", session.camera.pitch_deg, -89.0f,
+                        89.0f);
+  apply_camera_override("XPBD_CAMERA_DISTANCE", session.camera.distance, 2.0f,
+                        500.0f);
+  apply_camera_override("XPBD_CAMERA_PAN_X", session.camera.pan_x, -100000.0f,
+                        100000.0f);
+  apply_camera_override("XPBD_CAMERA_PAN_Y", session.camera.pan_y, -100000.0f,
+                        100000.0f);
+  apply_camera_override("XPBD_CAMERA_PAN_Z", session.camera.pan_z, -100000.0f,
+                         100000.0f);
+  apply_camera_override("XPBD_CAMERA_FOV_Y", session.camera.fov_y_deg, 1.0f,
+                         120.0f);
+  if (startup_camera_overridden) {
+    session.camera_needs_fit = false;
+    xpbd::log::infof("Startup camera override: yaw=%.2f pitch=%.2f "
+                     "distance=%.2f pan=%.2f/%.2f/%.2f fov_y=%.2f",
+                     session.camera.yaw_deg, session.camera.pitch_deg,
+                     session.camera.distance, session.camera.pan_x,
+                     session.camera.pan_y, session.camera.pan_z,
+                     session.camera.fov_y_deg);
+  }
+  if (const char *startup_autoplay = std::getenv("XPBD_AUTOPLAY");
+      startup_autoplay != nullptr &&
+      (std::strcmp(startup_autoplay, "1") == 0 ||
+       std::strcmp(startup_autoplay, "true") == 0 ||
+       std::strcmp(startup_autoplay, "TRUE") == 0)) {
+    if (session.canPreview()) {
+      session.togglePreviewPlayback();
+      xpbd::log::info("Startup animation autoplay enabled");
+    } else {
+      xpbd::log::warn(
+          "Startup autoplay requested without a previewable model+animation");
+    }
+  }
+  bool startup_still_render = false;
+  apply_path_trace_bool("XPBD_STILL_RENDER", startup_still_render);
+  if (startup_still_render) {
+    auto &settings = session.still_render_job.settings;
+    apply_path_trace_uint("XPBD_STILL_WIDTH", settings.width);
+    apply_path_trace_uint("XPBD_STILL_HEIGHT", settings.height);
+    apply_path_trace_uint("XPBD_STILL_SAMPLES", settings.target_samples);
+    apply_path_trace_uint("XPBD_STILL_SPP", settings.samples_per_submit);
+    apply_path_trace_bool("XPBD_STILL_TRANSPARENT",
+                          settings.transparent_background);
+    if (const char *filename = std::getenv("XPBD_STILL_FILENAME");
+        filename != nullptr && filename[0] != '\0') {
+      settings.filename = filename;
+    }
+    if (const char *format = std::getenv("XPBD_STILL_FORMAT");
+        format != nullptr && format[0] != '\0') {
+      if (std::strcmp(format, "exr") == 0 ||
+          std::strcmp(format, "EXR") == 0) {
+        settings.format = xpbd::gfx::StillImageFormat::Exr;
+      } else if (std::strcmp(format, "png") == 0 ||
+                 std::strcmp(format, "PNG") == 0) {
+        settings.format = xpbd::gfx::StillImageFormat::Png;
+      } else {
+        xpbd::log::warnf("Ignoring invalid XPBD_STILL_FORMAT=%s", format);
+      }
+    }
+    if (session.queueStillRender()) {
+      xpbd::log::infof(
+          "Startup still render queued: %ux%u samples=%u spp=%u format=%s "
+          "transparent=%d output=%s",
+          settings.width, settings.height, settings.target_samples,
+          settings.samples_per_submit,
+          settings.format == xpbd::gfx::StillImageFormat::Exr ? "exr"
+                                                               : "png",
+          settings.transparent_background ? 1 : 0,
+          session.still_render_job.status.output_path.c_str());
+    } else {
+      xpbd::log::warnf("Startup still render failed to queue: %s",
+                       session.last_error.c_str());
+    }
+  }
   std::uint64_t render_frame_number = 0;
+  std::uint64_t unattended_frame_limit = 0;
+  if (const char *text = std::getenv("XPBD_UNATTENDED_FRAMES");
+      text != nullptr && text[0] != '\0') {
+    const char *end = text + std::strlen(text);
+    const auto parsed =
+        std::from_chars(text, end, unattended_frame_limit);
+    if (parsed.ec != std::errc{} || parsed.ptr != end) {
+      xpbd::log::warnf("Ignoring invalid XPBD_UNATTENDED_FRAMES=%s",
+                       text);
+      unattended_frame_limit = 0;
+    } else if (unattended_frame_limit > 0) {
+      xpbd::log::infof("Unattended frame limit: %llu",
+                       static_cast<unsigned long long>(
+                           unattended_frame_limit));
+    }
+  }
+  bool unattended_resize_gate = false;
+  apply_path_trace_bool(
+      "XPBD_UNATTENDED_RESIZE_GATE", unattended_resize_gate);
+  int unattended_initial_width = 0;
+  int unattended_initial_height = 0;
+  if (unattended_resize_gate) {
+    SDL_GetWindowSize(
+        window, &unattended_initial_width, &unattended_initial_height);
+    xpbd::log::infof(
+        "Unattended preview resize gate enabled: initial=%dx%d",
+        unattended_initial_width, unattended_initial_height);
+  }
   std::uint64_t result_commit_frame_number = 0;
   std::uint32_t completion_diagnostic_frames = 0;
   auto previous_bake_state = session.bake_state;
@@ -448,11 +1170,94 @@ int app_main(int argc, char **argv) {
   float hover_pick_viewport_h = 0.0f;
   std::uint64_t hover_pick_scene_token = 0;
   auto hover_pick_last_query = std::chrono::steady_clock::time_point{};
+  struct WindowedGeometry {
+    int x = 0;
+    int y = 0;
+    int width = kWinW;
+    int height = kWinH;
+    bool maximized = false;
+    bool valid = false;
+  } windowed_geometry;
+
+  const auto toggle_borderless_fullscreen = [&]() {
+    const bool entering =
+        (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) == 0;
+    if (entering) {
+      windowed_geometry.valid =
+          SDL_GetWindowPosition(window, &windowed_geometry.x,
+                                &windowed_geometry.y) &&
+          SDL_GetWindowSize(window, &windowed_geometry.width,
+                            &windowed_geometry.height);
+      windowed_geometry.maximized =
+          (SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED) != 0;
+    }
+
+    // DLSS-G must be disabled and all tagged resources retired before a
+    // window-mode/swapchain transition.
+    backend->prepareForSystemDialog();
+    bool changed = true;
+    if (entering) {
+      changed = SDL_SetWindowFullscreenMode(window, nullptr) &&
+                SDL_SetWindowFullscreen(window, true);
+    } else {
+      changed = SDL_SetWindowFullscreen(window, false);
+    }
+    if (changed) {
+      changed = SDL_SyncWindow(window);
+    }
+    if (changed && !entering && windowed_geometry.valid) {
+      if (windowed_geometry.maximized) {
+        changed = SDL_MaximizeWindow(window);
+      } else {
+        changed =
+            SDL_SetWindowSize(window, windowed_geometry.width,
+                              windowed_geometry.height) &&
+            SDL_SetWindowPosition(window, windowed_geometry.x,
+                                  windowed_geometry.y);
+      }
+      if (changed) {
+        changed = SDL_SyncWindow(window);
+      }
+    }
+
+    int pixel_width = 0;
+    int pixel_height = 0;
+    SDL_GetWindowSizeInPixels(window, &pixel_width, &pixel_height);
+    backend->resumeAfterSystemDialog();
+    if (pixel_width > 0 && pixel_height > 0) {
+      backend->resize(pixel_width, pixel_height);
+    }
+    if (!changed) {
+      xpbd::log::warnf(
+          "F11 borderless fullscreen transition failed: %s",
+          SDL_GetError() != nullptr ? SDL_GetError() : "unknown error");
+    } else {
+      xpbd::log::infof(
+          "F11 borderless fullscreen: %s (%dx%d)",
+          entering ? "on" : "off", pixel_width, pixel_height);
+    }
+  };
+
+#if defined(_WIN32)
+  PclWindowsMessageHookContext pcl_message_hook_context{backend.get()};
+  SDL_SetWindowsMessageHook(
+      pclWindowsMessageHook, &pcl_message_hook_context);
+#endif
 
   while (running) {
     const auto now = std::chrono::steady_clock::now();
     const float dt = std::chrono::duration<float>(now - last).count();
     last = now;
+    const bool latency_frame_started =
+        !backend->presentationSuspended();
+    if (latency_frame_started) {
+      backend->beginLatencyFrame(
+          static_cast<std::uint32_t>(render_frame_number),
+          session.path_trace_settings.requested_reflex_mode,
+          session.enable_ray_tracing &&
+              session.path_trace_settings.requested_frame_generation ==
+                  xpbd::gfx::PathTraceFrameGeneration::On);
+    }
     const float frame_ms = dt * 1000.0f;
     if (frame_ms > 0.0f && frame_ms < 1000.0f) {
       constexpr float kAlpha = 0.12f;
@@ -463,13 +1268,47 @@ int app_main(int argc, char **argv) {
     frame_stats.ema_frame_ms = ema_ms;
     frame_stats.fps = ema_ms > 0.01f ? 1000.0f / ema_ms : 0.0f;
 
+    // Streamline 2.12 supports VSync with Frame Generation only on D3D12.
+    // Vulkan FG is opt-in, and the explicit request therefore also makes the
+    // mutually exclusive VSync setting visibly Off before swapchain rebuild.
+    const bool vulkan_frame_generation_requested =
+        backend->kind() == xpbd::gfx::BackendKind::Vulkan &&
+        session.enable_ray_tracing &&
+        session.path_trace_settings.requested_frame_generation ==
+            xpbd::gfx::PathTraceFrameGeneration::On &&
+        backend->pathTracePostProcessCapabilities()
+            .dlss_frame_generation;
+    if (vulkan_frame_generation_requested && session.vsync_enabled) {
+      session.vsync_enabled = false;
+      session.vsync_dirty = true;
+      xpbd::log::info(
+          "Vulkan VSync disabled for requested DLSS Frame Generation");
+    }
     if (session.vsync_dirty) {
       backend->setVSync(session.vsync_enabled);
       session.vsync_dirty = false;
     }
 
+    // NVIDIA RT: clamp persisted preference when hardware cannot do RT.
+    {
+      const auto rt_cap = backend->rayTracingCapability();
+      const bool rt_ok =
+          rt_cap.supported && rt_cap.device_extensions_enabled;
+      session.enable_ray_tracing =
+          xpbd::gfx::clampRayTracingPreference(session.enable_ray_tracing,
+                                               rt_ok);
+      session.path_trace_post_process_capabilities =
+          backend->pathTracePostProcessCapabilities();
+      session.path_trace_post_process_status =
+          backend->pathTracePostProcessStatus();
+    }
+
 
     session.debug_fps = disp_fps;
+    session.debug_original_fps = disp_original_fps;
+    session.debug_dlss_fg_fps = disp_dlss_fg_fps;
+    session.debug_dlss_frame_generation_active =
+        disp_dlss_fg_active;
     session.debug_frame_ms = disp_frame_ms;
     session.debug_ema_frame_ms = disp_ema_ms;
     session.debug_mesh_ms = disp_mesh_ms;
@@ -542,6 +1381,10 @@ int app_main(int argc, char **argv) {
       }
       if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_ESCAPE) {
         session.closeBoneContext();
+      }
+      if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_F11 &&
+          !ev.key.repeat) {
+        toggle_borderless_fullscreen();
       }
       if (ev.type == SDL_EVENT_WINDOW_RESIZED ||
           ev.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) {
@@ -742,14 +1585,23 @@ int app_main(int argc, char **argv) {
     const float scale_y =
         win_h > 0 ? static_cast<float>(fb_h) / static_cast<float>(win_h) : 1.0f;
 
-    if (session.playback_state == xpbd::app::PlaybackState::Playing &&
+    session.synchronizeStillRenderState();
+    if (!session.stillRenderActive() &&
+        session.playback_state == xpbd::app::PlaybackState::Playing &&
         !session.bake_busy.load()) {
       session.advancePreview(dt);
     }
+    if (!session.stillRenderActive() && !session.bake_busy.load()) {
+      session.advanceWorldSkyTime(dt);
+    }
+    if (latency_frame_started) {
+      backend->endLatencySimulation();
+    }
 
-    const auto ui_result =
-        xpbd::app::composeNuklearUi(&ctx, win_w, win_h, 1.0f, backend->name(),
-                                    backend->deviceName());
+    const auto rt_cap_ui = backend->rayTracingCapability();
+    const auto ui_result = xpbd::app::composeNuklearUi(
+        &ctx, win_w, win_h, 1.0f, backend->name(), backend->deviceName(),
+        frame_stats, &rt_cap_ui);
     if (session.bake_state == xpbd::app::BakeState::Completed &&
         previous_bake_state != xpbd::app::BakeState::Completed) {
       result_commit_frame_number = render_frame_number;
@@ -767,7 +1619,20 @@ int app_main(int argc, char **argv) {
 
 
     const auto t_mesh0 = std::chrono::steady_clock::now();
-    if (session.camera_needs_fit && !session.geometry.bones.empty()) {
+    const auto *still_snapshot =
+        session.stillRenderActive() &&
+                session.still_render_job.snapshot.has_value()
+            ? &*session.still_render_job.snapshot
+            : nullptr;
+    const bool render_loaded_scene =
+        still_snapshot != nullptr
+            ? (still_snapshot->scene_selection.kind ==
+                   xpbd::app::SceneSelectionKind::Loaded ||
+               still_snapshot->scene_selection.kind ==
+                   xpbd::app::SceneSelectionKind::UserBuilt)
+            : session.sceneRendersLoadedContent();
+    if (render_loaded_scene && session.camera_needs_fit &&
+        !session.geometry.bones.empty()) {
       session.fitCameraToModel();
     }
 
@@ -783,14 +1648,16 @@ int app_main(int argc, char **argv) {
     const auto *preview_frame = session.currentPreviewFrame();
     const auto *model_texture =
         session.model_texture.valid() ? &session.model_texture : nullptr;
-    if (use_static_model) {
+    if (use_static_model && render_loaded_scene) {
       static_mesh_builder.setBoneMapper(&session.bone_mapper);
       static_mesh_builder.setSelectedBone(session.selected_bone_name);
       static_mesh_builder.setHoveredBone(session.hovered_bone_name);
       static_mesh_builder.setHiddenBones(&session.hidden_bone_names);
       static_mesh_builder.setTexture(model_texture);
       static_mesh_builder.setShowBones(session.show_bones);
-      static_mesh_builder.setShowGround(session.show_ground);
+      // Preview scenes own ground/grid; disable legacy ground plane when active.
+      static_mesh_builder.setShowGround(!vulkan_raster_path &&
+                                        session.show_ground);
       static_mesh_builder.setMcbeCoords(session.use_mcbe_coords);
 
       const std::uint64_t model_generation = session.modelGeneration();
@@ -816,23 +1683,84 @@ int app_main(int argc, char **argv) {
       } else {
         static_mesh_builder.buildStaticRestFrame(static_model_frame);
       }
-    } else {
+    } else if (!use_static_model && render_loaded_scene) {
       xpbd::gfx::buildSessionViewportScene(
           session.geometry, session.bone_mapper, session.selected_bone_name,
           preview_animation, preview_reference_time, preview_frame != nullptr,
           preview_frame, model_texture, session.show_bones,
-          session.use_mcbe_coords, scene, session.show_ground,
-          &session.hidden_bone_names, session.hovered_bone_name);
+          session.use_mcbe_coords, scene,
+          !vulkan_raster_path && session.show_ground, &session.hidden_bone_names,
+          session.hovered_bone_name);
+    } else if (!use_static_model) {
+      scene = {};
+    }
+
+    float raster_scene_time =
+          std::chrono::duration<float>(std::chrono::steady_clock::now() -
+                                       app_start_time)
+              .count();
+    if (still_snapshot != nullptr && still_snapshot->camera_frozen) {
+      raster_scene_time = still_snapshot->raster_scene_time_seconds;
+    }
+    if (vulkan_raster_path) {
+      const auto raster_preview_scene =
+          still_snapshot != nullptr ? still_snapshot->preview_scene_id
+                                    : session.preview_scene_id;
+      const bool raster_show_grid =
+          still_snapshot != nullptr ? still_snapshot->show_preview_grid
+                                    : session.show_preview_grid;
+      const bool raster_show_axes =
+          still_snapshot != nullptr ? still_snapshot->show_preview_axes
+                                    : session.show_preview_axes;
+      const bool raster_dynamic =
+          still_snapshot != nullptr ? still_snapshot->dynamic_preview_scene
+                                    : session.dynamic_preview_scene;
+      xpbd::gfx::buildViewportRasterScene(
+          raster_preview_scene, raster_show_grid, raster_show_axes,
+          raster_dynamic, raster_scene_time, raster_scene,
+          preview_scene_asset_root);
+      if (raster_scene.skybox.valid() &&
+          raster_scene.skybox.source_identity !=
+              logged_preview_skybox_source) {
+        logged_preview_skybox_source =
+            raster_scene.skybox.source_identity;
+        if (raster_scene.skybox.cc0_asset) {
+          xpbd::log::infof("Preview scene CC0 skybox loaded: %s",
+                           logged_preview_skybox_source.c_str());
+        } else {
+          xpbd::log::warnf("Preview scene is using skybox fallback: %s",
+                           logged_preview_skybox_source.c_str());
+        }
+      }
     }
     const auto t_mesh1 = std::chrono::steady_clock::now();
     frame_stats.mesh_ms =
         std::chrono::duration<float, std::milli>(t_mesh1 - t_mesh0).count();
 
+    const auto framebuffer_viewport =
+        xpbd::gfx::logicalViewportToFramebuffer(
+            ui_result.layout.vp_x, ui_result.layout.vp_y,
+            ui_result.layout.vp_w, ui_result.layout.vp_h, scale_x, scale_y,
+            fb_w, fb_h);
     float view[16], proj[16];
-    const float aspect = ui_result.layout.vp_h > 1.0f
-                             ? (ui_result.layout.vp_w / ui_result.layout.vp_h)
-                             : 1.0f;
+    const float aspect =
+        framebuffer_viewport.h > 0
+            ? static_cast<float>(framebuffer_viewport.w) /
+                  static_cast<float>(framebuffer_viewport.h)
+            : 1.0f;
     session.camera.matrices(aspect, view, proj);
+    if (session.freezeQueuedStillRenderCamera(
+            view, proj, raster_scene_time)) {
+      still_snapshot = &*session.still_render_job.snapshot;
+    }
+    const float *render_view =
+        still_snapshot != nullptr && still_snapshot->camera_frozen
+            ? still_snapshot->view_matrix.data()
+            : view;
+    const float *render_proj =
+        still_snapshot != nullptr && still_snapshot->camera_frozen
+            ? still_snapshot->proj_matrix.data()
+            : proj;
 
 
 
@@ -886,30 +1814,26 @@ int app_main(int argc, char **argv) {
     xpbd::gfx::FrameInput frame{};
     frame.fb_width = fb_w;
     frame.fb_height = fb_h;
-    frame.viewport.x =
-        static_cast<int>(std::lround(ui_result.layout.vp_x * scale_x));
-    frame.viewport.y =
-        static_cast<int>(std::lround(ui_result.layout.vp_y * scale_y));
-    frame.viewport.w =
-        static_cast<int>(std::lround(ui_result.layout.vp_w * scale_x));
-    frame.viewport.h =
-        static_cast<int>(std::lround(ui_result.layout.vp_h * scale_y));
-
-    if (frame.viewport.w < 1) {
-      frame.viewport.w = 1;
-    }
-    if (frame.viewport.h < 1) {
-      frame.viewport.h = 1;
-    }
-    frame.view_matrix = view;
-    frame.proj_matrix = proj;
-    frame.scene = use_static_model ? &static_model_frame.overlays : &scene;
-    if (use_static_model) {
+    frame.viewport = framebuffer_viewport;
+    frame.view_matrix = render_view;
+    frame.proj_matrix = render_proj;
+    frame.scene = render_loaded_scene
+                      ? (use_static_model ? &static_model_frame.overlays
+                                          : &scene)
+                      : nullptr;
+    if (use_static_model && render_loaded_scene) {
       frame.static_model = &static_model;
       frame.static_model_frame = &static_model_frame;
       frame.static_model_texture = model_texture;
-      frame.static_model_generation = session.modelGeneration();
-      frame.static_texture_generation = session.textureGeneration();
+      frame.static_model_material =
+          session.resolved_material.valid() ? &session.resolved_material
+                                            : nullptr;
+      frame.static_model_generation =
+          still_snapshot != nullptr ? still_snapshot->model_generation
+                                    : session.modelGeneration();
+      frame.static_texture_generation =
+          still_snapshot != nullptr ? still_snapshot->material_generation
+                                    : session.materialGeneration();
     }
     frame.diagnostics.active = completion_diagnostic_frames > 0;
     frame.diagnostics.render_frame = render_frame_number;
@@ -928,16 +1852,98 @@ int app_main(int argc, char **argv) {
     frame.diagnostics.animation_generation = session.animationGeneration();
     frame.diagnostics.physics_generation = session.physicsGeneration();
     frame.diagnostics.texture_generation = session.textureGeneration();
+    frame.material_debug_view = session.labpbr_debug_view;
+    frame.rt_debug_view = session.rt_debug_view;
+    frame.path_trace_settings = session.path_trace_settings;
+    frame.world_environment =
+        still_snapshot != nullptr ? &still_snapshot->world_environment
+                                  : &session.world_environment;
+    xpbd::gfx::StillRenderFrameRequest still_request{};
+    if (still_snapshot != nullptr && still_snapshot->camera_frozen) {
+      const auto &job = session.still_render_job;
+      still_request.job_id = job.status.job_id;
+      still_request.width = job.settings.width;
+      still_request.height = job.settings.height;
+      still_request.target_samples = job.settings.target_samples;
+      still_request.samples_per_submit =
+          job.settings.samples_per_submit;
+      still_request.format = job.settings.format;
+      still_request.transparent_background =
+          job.settings.transparent_background;
+      still_request.cancel_requested = job.cancel_requested;
+      still_request.output_path = job.status.output_path;
+      still_request.view_matrix = still_snapshot->view_matrix.data();
+      still_request.proj_matrix = still_snapshot->proj_matrix.data();
+      still_request.path_trace_settings =
+          still_snapshot->path_trace_settings;
+      still_request.material_debug_view =
+          still_snapshot->material_debug_view;
+      still_request.rt_debug_view = still_snapshot->rt_debug_view;
+      still_request.status = &session.still_render_job.status;
+      frame.still_render = &still_request;
+    }
     frame.ui = &ui_draw;
-    frame.clear_r = 26.0f / 255.0f;
-    frame.clear_g = 28.0f / 255.0f;
-    frame.clear_b = 34.0f / 255.0f;
+    // Prefer advanced lighting only when enabled and no modal dialog is open.
+    frame.prefer_ray_tracing =
+        session.enable_ray_tracing && !xpbd::app::nativeDialogOpen() &&
+        !backend->presentationSuspended();
+    if (vulkan_raster_path) {
+      frame.raster_scene = &raster_scene;
+      frame.clear_r = raster_scene.lighting.clear_r;
+      frame.clear_g = raster_scene.lighting.clear_g;
+      frame.clear_b = raster_scene.lighting.clear_b;
+    } else {
+      frame.clear_r = 26.0f / 255.0f;
+      frame.clear_g = 28.0f / 255.0f;
+      frame.clear_b = 34.0f / 255.0f;
+    }
 
     backend->render(frame);
     if (completion_diagnostic_frames > 0) {
       --completion_diagnostic_frames;
     }
     ++render_frame_number;
+    if (unattended_resize_gate) {
+      auto resize_window = [&](int width, int height) {
+        if (!SDL_SetWindowSize(window, width, height)) {
+          xpbd::log::warnf(
+              "Unattended preview resize failed at frame %llu: %s",
+              static_cast<unsigned long long>(render_frame_number),
+              SDL_GetError());
+        } else {
+          xpbd::log::infof(
+              "Unattended preview resize: frame=%llu window=%dx%d",
+              static_cast<unsigned long long>(render_frame_number), width,
+              height);
+        }
+      };
+      if (render_frame_number == 120u) {
+        resize_window(1000, 700);
+      } else if (render_frame_number == 260u) {
+        resize_window(1400, 900);
+      } else if (render_frame_number == 400u) {
+        resize_window(
+            (std::max)(unattended_initial_width, 1),
+            (std::max)(unattended_initial_height, 1));
+      } else if (render_frame_number == 520u) {
+        if (SDL_MinimizeWindow(window)) {
+          xpbd::log::info(
+              "Unattended preview resize: window minimized");
+        }
+      } else if (render_frame_number == 560u) {
+        if (SDL_RestoreWindow(window)) {
+          xpbd::log::info(
+              "Unattended preview resize: window restored");
+        }
+      }
+    }
+    if (unattended_frame_limit > 0 &&
+        render_frame_number >= unattended_frame_limit) {
+      xpbd::log::infof(
+          "Unattended frame limit reached after %llu frames",
+          static_cast<unsigned long long>(render_frame_number));
+      running = false;
+    }
     const auto backend_stats = backend->stats();
     frame_stats.gpu_ms = backend_stats.gpu_ms;
     frame_stats.upload_ms = backend_stats.upload_ms;
@@ -975,6 +1981,29 @@ int app_main(int argc, char **argv) {
     frame_stats.draw_calls = backend_stats.draw_calls;
     frame_stats.cube_count = backend_stats.cube_count;
     frame_stats.line_count = backend_stats.line_count;
+    frame_stats.active_render_path = backend_stats.active_render_path;
+    frame_stats.ray_tracing_supported = backend_stats.ray_tracing_supported;
+    frame_stats.ray_tracing_requested = backend_stats.ray_tracing_requested;
+    frame_stats.dlss_frame_generation_supported =
+        backend_stats.dlss_frame_generation_supported;
+    frame_stats.dlss_frame_generation_requested =
+        backend_stats.dlss_frame_generation_requested;
+    frame_stats.dlss_frame_generation_active =
+        backend_stats.dlss_frame_generation_active;
+    frame_stats.reflex_supported = backend_stats.reflex_supported;
+    frame_stats.dlss_frames_actually_presented =
+        backend_stats.dlss_frames_actually_presented;
+    frame_stats.rt_blas_count = backend_stats.rt_blas_count;
+    frame_stats.rt_tlas_count = backend_stats.rt_tlas_count;
+    frame_stats.rt_instance_count = backend_stats.rt_instance_count;
+    frame_stats.rt_primitive_count = backend_stats.rt_primitive_count;
+    frame_stats.rt_as_storage_bytes = backend_stats.rt_as_storage_bytes;
+    frame_stats.rt_scratch_bytes = backend_stats.rt_scratch_bytes;
+    frame_stats.rt_attribute_bytes = backend_stats.rt_attribute_bytes;
+    frame_stats.rt_allocated_bytes = backend_stats.rt_allocated_bytes;
+    frame_stats.rt_full_builds = backend_stats.rt_full_builds;
+    frame_stats.rt_refits = backend_stats.rt_refits;
+    frame_stats.rt_last_build_reason = backend_stats.rt_last_build_reason;
 
 
 
@@ -1092,6 +2121,16 @@ int app_main(int argc, char **argv) {
           disp_cubes = frame_stats.cube_count;
         }
 
+        disp_original_fps = disp_fps;
+        disp_dlss_fg_active =
+            frame_stats.dlss_frame_generation_active;
+        disp_dlss_fg_fps =
+            disp_dlss_fg_active
+                ? disp_original_fps * static_cast<float>(
+                      (std::max)(
+                          1u,
+                          frame_stats.dlss_frames_actually_presented))
+                : 0.0f;
 
         disp_static_resource_rebuilds = frame_stats.static_resource_rebuilds;
         disp_total_buffer_reallocations =
@@ -1130,11 +2169,26 @@ int app_main(int argc, char **argv) {
     {
       char title[220];
       if (session.show_debug_hud) {
-        std::snprintf(title, sizeof(title),
-                      "XPBD Bone Baker | %s | %.0f FPS | %.1f ms | cubes %d%s",
-                      backend->name(), static_cast<double>(disp_fps),
-                      disp_frame_ms, disp_cubes,
-                      session.vsync_enabled ? "" : " | VSync off");
+        if (disp_dlss_fg_active) {
+          std::snprintf(
+              title, sizeof(title),
+              "XPBD Bone Baker | %s | Original %.0f / DLSS-FG %.0f FPS | "
+              "%.1f ms | cubes %d%s",
+              backend->name(),
+              static_cast<double>(disp_original_fps),
+              static_cast<double>(disp_dlss_fg_fps),
+              disp_frame_ms, disp_cubes,
+              session.vsync_enabled ? "" : " | VSync off");
+        } else {
+          std::snprintf(
+              title, sizeof(title),
+              "XPBD Bone Baker | %s | Original %.0f FPS | %.1f ms | "
+              "cubes %d%s",
+              backend->name(),
+              static_cast<double>(disp_original_fps),
+              disp_frame_ms, disp_cubes,
+              session.vsync_enabled ? "" : " | VSync off");
+        }
       } else {
         std::snprintf(title, sizeof(title),
                       "XPBD Bone Baker - Bedrock Physics Baking Tool | %s",
@@ -1149,6 +2203,9 @@ int app_main(int argc, char **argv) {
   nk_free(&ctx);
   SDL_StopTextInput(window);
   session.shutdownBakeWorker();
+#if defined(_WIN32)
+  SDL_SetWindowsMessageHook(nullptr, nullptr);
+#endif
   if (horizontal_resize_cursor != nullptr) {
     if (default_cursor != nullptr) {
       SDL_SetCursor(default_cursor);
@@ -1163,14 +2220,11 @@ int app_main(int argc, char **argv) {
 }
 
 #if defined(_WIN32)
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-
-
+// GUI subsystem entry: let SDL parse the process command line so flags like
+// -vk reach parseBackendRequest. Relying on __argc/__argv alone
+// is brittle for WIN32_EXECUTABLE targets launched via start/explorer.
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
-  return app_main(__argc, __argv);
+  return SDL_RunApp(0, nullptr, app_main, nullptr);
 }
 #else
 int main(int argc, char **argv) { return app_main(argc, argv); }
