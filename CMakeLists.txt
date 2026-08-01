@@ -498,6 +498,13 @@ if(XPBD_BUILD_APP)
     add_executable(xpbd_baker_app
         src/app/main_sdl3.cpp
         src/app/nuklear_ui.cpp
+        src/app/nuklear_ui_widgets.cpp
+        src/app/nuklear_bone_panel.cpp
+        src/app/nuklear_labpbr_panel.cpp
+        src/app/nuklear_render_panel.cpp
+        src/app/nuklear_world_panel.cpp
+        src/app/nuklear_bake_panel.cpp
+        src/app/nuklear_status_panel.cpp
         src/app/nuklear_still_settings_panel.cpp
         src/app/app_session.cpp
         src/app/native_dialog.cpp
