@@ -126,9 +126,9 @@
       "target_env": "vulkan1.0",
       "spv": "src/gfx/spirv/pt_composite.frag.spv",
       "inc": "src/gfx/spirv/pt_composite.frag.spv.inc",
-      "source_sha256": "227b77e17714d90bfc55a082b76949363ffbcb556c5a4bbd52ba6594004afd8e",
-      "spv_sha256": "a68bb890cb23f3a98f129c497549e6d98bdc45cafee0d50139d0911885223ba2",
-      "inc_sha256": "1f9b37b30bbacce1b2d3d66b03668f006179a76e97fe947c692e91fd4e1228c1"
+      "source_sha256": "489de024843632f5f7582a1020d0912006fd71c1979a2c2c9f1927a27cd91074",
+      "spv_sha256": "f9d4f83cd5f79cbbc75b0c819a17464d48c82e823fbc08849b2a5cbb3fae28f2",
+      "inc_sha256": "d95a6153f7afd623cdd2bcea83ddf4ee29b2a4b2a24b624e4ea6f9bcac27c868"
     },
     {
       "source": "src/gfx/spirv/pt_composite.vert",

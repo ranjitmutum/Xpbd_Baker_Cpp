@@ -45,7 +45,9 @@ static_assert(sizeof(PathTracePushConstants) == 224);
 struct CompositePushConstants {
   // exposure multiplier, white balance K, bloom, tone-map enum.
   float display[4]{1.0f, 6500.0f, 0.0f, 0.0f};
-  // bit 0: transparent background.
+  // flags.x bits: transparent background, reconstructed color, sRGB output.
+  // flags.yz: pixel-space temporal jitter bit-cast from float for depth
+  // de-jittering after temporal reconstruction.
   std::uint32_t flags[4]{};
 };
 static_assert(sizeof(CompositePushConstants) == 32u);
@@ -3451,6 +3453,10 @@ void VulkanPathTracer::recordComposite(
       (settings.transparent_background ? 1u : 0u) |
       (use_reconstructed ? 2u : 0u) |
       (params.output_requires_srgb_encoding ? 4u : 0u);
+  composite_push.flags[1] = std::bit_cast<std::uint32_t>(
+      use_reconstructed ? params.camera_jitter[0] : 0.0f);
+  composite_push.flags[2] = std::bit_cast<std::uint32_t>(
+      use_reconstructed ? params.camera_jitter[1] : 0.0f);
   vkCmdPushConstants(cmd, composite_pipe_layout_,
                      VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                      sizeof(composite_push), &composite_push);

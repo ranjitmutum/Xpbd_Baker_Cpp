@@ -293,6 +293,73 @@ void testPathTracePbrSourceContracts() {
          "preview display transform remains exposure-WB-bloom-tone-map-sRGB");
 }
 
+void testSelectionOutlineTemporalContract() {
+  const std::string backend =
+      readTestSource("src/gfx/vulkan_backend.cpp");
+  const std::string path_tracer =
+      readTestSource("src/gfx/vulkan_path_tracer.cpp");
+  const std::string composite =
+      readTestSource("src/gfx/spirv/pt_composite.frag");
+  expect(!backend.empty() && !path_tracer.empty() && !composite.empty(),
+         "selection-outline temporal source fixtures are readable");
+
+  const std::string compact_backend = compactTestSource(backend);
+  const std::string compact_path_tracer = compactTestSource(path_tracer);
+  const std::string compact_composite = compactTestSource(composite);
+  expect(
+      compact_path_tracer.find(
+          "composite_push.flags[1]=std::bit_cast<std::uint32_t>("
+          "use_reconstructed?params.camera_jitter[0]:0.0f);") !=
+              std::string::npos &&
+          compact_path_tracer.find(
+              "composite_push.flags[2]=std::bit_cast<std::uint32_t>("
+              "use_reconstructed?params.camera_jitter[1]:0.0f);") !=
+              std::string::npos,
+      "reconstructed composite receives the current pixel-space jitter");
+  expect(
+      compact_composite.find(
+          "if((composite_push.flags.x&2u)!=0u){") != std::string::npos &&
+          compact_composite.find(
+              "vec2jitterPixels=uintBitsToFloat("
+              "composite_push.flags.yz);") != std::string::npos &&
+          compact_composite.find(
+              "depthUv+=jitterPixels/"
+              "vec2(textureSize(uPathDepth,0));") != std::string::npos &&
+          compact_composite.find("texture(uPathDepth,depthUv)") !=
+              std::string::npos,
+      "post-DLSS depth lookup reverses primary-ray jitter in render pixels");
+
+  expect(
+      compact_backend.find(
+          "VkPipelinemesh_pipeline_overlay_lines_=VK_NULL_HANDLE;") !=
+              std::string::npos &&
+          compact_backend.find("rs.depthBiasEnable=VK_TRUE;") !=
+              std::string::npos &&
+          compact_backend.find(
+              "ds.depthWriteEnable=(ui||mesh_trans||overlay_lines)?"
+              "VK_FALSE:VK_TRUE;") != std::string::npos &&
+          compact_backend.find(
+              "ds.depthCompareOp=overlay_lines?"
+              "VK_COMPARE_OP_LESS_OR_EQUAL:VK_COMPARE_OP_LESS;") !=
+              std::string::npos,
+      "selection overlays use tolerant non-writing depth without disabling "
+      "foreground occlusion");
+
+  const auto composite_position =
+      backend.find("path_tracer.recordComposite(");
+  const auto overlay_position =
+      backend.find("mesh_pipeline_overlay_lines_", composite_position);
+  const auto grid_position =
+      backend.find("mesh_pipeline_lines_", overlay_position);
+  expect(composite_position != std::string::npos &&
+             overlay_position != std::string::npos &&
+             grid_position != std::string::npos &&
+             composite_position < overlay_position &&
+             overlay_position < grid_position,
+         "selection overlay remains post-reconstruction and grid keeps its "
+         "original depth pipeline");
+}
+
 void testLogicalFramebufferViewportContract() {
   using xpbd::gfx::logicalViewportToFramebuffer;
   const auto mixed_dpi = logicalViewportToFramebuffer(
@@ -3843,6 +3910,7 @@ int main() {
   testPathTraceOptionalOutputMaskContract();
   testRtNearestHitReference();
   testPathTracePbrSourceContracts();
+  testSelectionOutlineTemporalContract();
   testPathTraceSamplingAndAccumulation();
   testPathTraceAdjustableSettingsContract();
   testPathTraceBsdfAndDepth();

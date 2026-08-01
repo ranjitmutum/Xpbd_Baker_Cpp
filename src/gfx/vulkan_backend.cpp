@@ -3634,7 +3634,7 @@ public:
                       VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
       if (draw_mesh && !frame.scene->lines.empty()) {
         vkCmdBindPipeline(fs.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                          mesh_pipeline_lines_);
+                          mesh_pipeline_overlay_lines_);
         vkCmdPushConstants(fs.cmd, mesh_layout_, kMeshPcStages, 0,
                            sizeof(mesh_pc), &mesh_pc);
         const VkDeviceSize off = mesh_upload.lines.offset_bytes;
@@ -4444,6 +4444,7 @@ private:
   VkPipeline mesh_pipeline_ = VK_NULL_HANDLE;
   VkPipeline mesh_pipeline_trans_ = VK_NULL_HANDLE;
   VkPipeline mesh_pipeline_lines_ = VK_NULL_HANDLE;
+  VkPipeline mesh_pipeline_overlay_lines_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout static_desc_layout_ = VK_NULL_HANDLE;
   VkDescriptorPool static_desc_pool_ = VK_NULL_HANDLE;
   VkPipelineLayout static_mesh_layout_ = VK_NULL_HANDLE;
@@ -4841,6 +4842,10 @@ private:
       vkDestroyPipeline(device_, mesh_pipeline_lines_, nullptr);
       mesh_pipeline_lines_ = VK_NULL_HANDLE;
     }
+    if (mesh_pipeline_overlay_lines_) {
+      vkDestroyPipeline(device_, mesh_pipeline_overlay_lines_, nullptr);
+      mesh_pipeline_overlay_lines_ = VK_NULL_HANDLE;
+    }
     if (mesh_pipeline_) {
       vkDestroyPipeline(device_, mesh_pipeline_, nullptr);
       mesh_pipeline_ = VK_NULL_HANDLE;
@@ -4903,6 +4908,7 @@ private:
     const bool base = ui_layout_ && mesh_layout_ && static_mesh_layout_ &&
                       skybox_layout_ && ui_pipeline_ && mesh_pipeline_ &&
                       mesh_pipeline_trans_ && mesh_pipeline_lines_ &&
+                      mesh_pipeline_overlay_lines_ &&
                       static_mesh_pipeline_ && static_mesh_pipeline_blend_ &&
                       skybox_pipeline_;
     if (!base) {
@@ -10385,7 +10391,8 @@ bool VulkanBackend::createPipelines() {
 
   auto makePipe = [&](VkShaderModule vs, VkShaderModule fs,
                       VkPipelineLayout layout, bool ui, bool static_mesh,
-                      bool lines, bool mesh_trans, VkPipeline *out) -> bool {
+                      bool lines, bool mesh_trans, bool overlay_lines,
+                      VkPipeline *out) -> bool {
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -10449,6 +10456,14 @@ bool VulkanBackend::createPipelines() {
     rs.cullMode = VK_CULL_MODE_NONE;
     rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rs.lineWidth = 1.0f;
+    if (overlay_lines) {
+      // Selection outlines sit just outside their source cubes. Pull them a
+      // minimal amount toward the camera to tolerate depth quantization while
+      // retaining occlusion by genuinely foreground geometry.
+      rs.depthBiasEnable = VK_TRUE;
+      rs.depthBiasConstantFactor = -1.0f;
+      rs.depthBiasSlopeFactor = -1.0f;
+    }
 
     VkPipelineMultisampleStateCreateInfo ms{
         VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
@@ -10457,8 +10472,10 @@ bool VulkanBackend::createPipelines() {
     VkPipelineDepthStencilStateCreateInfo ds{
         VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     ds.depthTestEnable = ui ? VK_FALSE : VK_TRUE;
-    ds.depthWriteEnable = (ui || mesh_trans) ? VK_FALSE : VK_TRUE;
-    ds.depthCompareOp = VK_COMPARE_OP_LESS;
+    ds.depthWriteEnable = (ui || mesh_trans || overlay_lines) ? VK_FALSE
+                                                              : VK_TRUE;
+    ds.depthCompareOp = overlay_lines ? VK_COMPARE_OP_LESS_OR_EQUAL
+                                      : VK_COMPARE_OP_LESS;
 
     VkPipelineColorBlendAttachmentState blend{};
     blend.colorWriteMask = 0xF;
@@ -10510,18 +10527,23 @@ bool VulkanBackend::createPipelines() {
     return true;
   };
 
-  if (!makePipe(ui_vs, ui_fs, ui_layout_, true, false, false, false,
+  if (!makePipe(ui_vs, ui_fs, ui_layout_, true, false, false, false, false,
                 &ui_pipeline_) ||
       !makePipe(mesh_vs, mesh_fs, mesh_layout_, false, false, false, false,
+                false,
                 &mesh_pipeline_) ||
       !makePipe(mesh_vs, mesh_fs, mesh_layout_, false, false, false, true,
+                false,
                 &mesh_pipeline_trans_) ||
       !makePipe(mesh_vs, mesh_fs, mesh_layout_, false, false, true, false,
+                false,
                 &mesh_pipeline_lines_) ||
+      !makePipe(mesh_vs, mesh_fs, mesh_layout_, false, false, true, false,
+                true, &mesh_pipeline_overlay_lines_) ||
       !makePipe(static_mesh_vs, static_mesh_fs, static_mesh_layout_, false,
-                true, false, false, &static_mesh_pipeline_) ||
+                true, false, false, false, &static_mesh_pipeline_) ||
       !makePipe(static_mesh_vs, static_mesh_fs, static_mesh_layout_, false,
-                true, false, true, &static_mesh_pipeline_blend_)) {
+                true, false, true, false, &static_mesh_pipeline_blend_)) {
     return fail("Vulkan graphics-pipeline bundle creation failed");
   }
 
@@ -10581,13 +10603,13 @@ bool VulkanBackend::createPipelines() {
 
     const bool rt_ok =
         makePipe(mesh_rt_vs, mesh_rt_fs, mesh_rt_layout_, false, false, false,
-                 false, &mesh_rt_pipeline_) &&
+                 false, false, &mesh_rt_pipeline_) &&
         makePipe(mesh_rt_vs, mesh_rt_fs, mesh_rt_layout_, false, false, false,
-                 true, &mesh_rt_pipeline_trans_) &&
+                 true, false, &mesh_rt_pipeline_trans_) &&
         makePipe(static_rt_vs, static_rt_fs, static_rt_layout_, false, true,
-                 false, false, &static_rt_pipeline_) &&
+                 false, false, false, &static_rt_pipeline_) &&
         makePipe(static_rt_vs, static_rt_fs, static_rt_layout_, false, true,
-                 false, true, &static_rt_pipeline_blend_);
+                 false, true, false, &static_rt_pipeline_blend_);
     vkDestroyShaderModule(device_, mesh_rt_vs, nullptr);
     vkDestroyShaderModule(device_, mesh_rt_fs, nullptr);
     vkDestroyShaderModule(device_, static_rt_vs, nullptr);

@@ -39,7 +39,15 @@ vec4 samplePathColor(vec2 uv) {
 void main() {
   vec4 color = samplePathColor(vUV);
   color.a = clamp(color.a, 0.0, 1.0);
-  float depth = clamp(texture(uPathDepth, vUV).r, 0.0, 1.0);
+  vec2 depthUv = vUV;
+  if ((composite_push.flags.x & 2u) != 0u) {
+    // Temporal primary rays use pixelCenter-jitter. Reconstructed color is
+    // back in unjittered output space, so query raw render-resolution depth
+    // with the inverse (+jitter) offset before later raster overlays test it.
+    vec2 jitterPixels = uintBitsToFloat(composite_push.flags.yz);
+    depthUv += jitterPixels / vec2(textureSize(uPathDepth, 0));
+  }
+  float depth = clamp(texture(uPathDepth, depthUv).r, 0.0, 1.0);
   bool transparentBackground =
       (composite_push.flags.x & 1u) != 0u && depth >= 0.999999;
   if (color.a < 0.001 || transparentBackground) {
