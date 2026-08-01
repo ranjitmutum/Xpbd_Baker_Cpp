@@ -315,8 +315,8 @@ void lobeProbabilities(vec3 baseColor, vec3 f0, bool metal,
 }
 
 void evaluateBsdfComponents(
-    vec3 baseColor, vec3 f0, float roughness, float transmission,
-    bool metal, vec3 normal, vec3 view, vec3 light,
+    vec3 baseColor, vec3 f0, vec3 reflectionTint, float roughness,
+    float transmission, bool metal, vec3 normal, vec3 view, vec3 light,
     out vec3 diffuse, out vec3 specular, out float pdf) {
   pdf = 0.0;
   diffuse = vec3(0.0);
@@ -337,7 +337,7 @@ void evaluateBsdfComponents(
       smithGgxG1(noV, roughness) * smithGgxG1(noL, roughness);
   vec3 fresnel = fresnelSchlick(f0, voH);
   specular =
-      fresnel * distribution * geometry /
+      reflectionTint * fresnel * distribution * geometry /
       max(4.0 * noV * noL, 1.0e-8);
   diffuse =
       metal ? vec3(0.0)
@@ -354,13 +354,14 @@ void evaluateBsdfComponents(
         probabilities.y * glossyPdf;
 }
 
-vec3 evaluateBsdf(vec3 baseColor, vec3 f0, float roughness,
-                  float transmission, bool metal, vec3 normal,
+vec3 evaluateBsdf(vec3 baseColor, vec3 f0, vec3 reflectionTint,
+                  float roughness, float transmission, bool metal, vec3 normal,
                   vec3 view, vec3 light, out float pdf) {
   vec3 diffuse;
   vec3 specular;
   evaluateBsdfComponents(
-      baseColor, f0, roughness, transmission, metal, normal, view,
+      baseColor, f0, reflectionTint, roughness, transmission, metal,
+      normal, view,
       light, diffuse, specular, pdf);
   return diffuse + specular;
 }
@@ -1099,17 +1100,23 @@ PrimaryAovProbe probePrimaryAov(vec3 cameraOrigin, vec3 direction,
     result.geometry = vec4(geometricNormal, viewZ);
     result.shading =
         vec4(shadingNormal, clamp(payload.roughness, 0.02, 1.0));
-    bool metal = payload.status.y != 0u;
+    bool metal = (payload.status.y & 1u) != 0u;
+    bool predefinedMetal = (payload.status.y & 2u) != 0u;
+    vec3 reflectionTint =
+        predefinedMetal
+            ? clamp(payload.baseColor, vec3(0.0), vec3(1.0))
+            : vec3(1.0);
     result.diffuseAlbedo =
         vec4(metal ? vec3(0.0)
                    : clamp(payload.baseColor, vec3(0.0), vec3(1.0)),
              1.0);
     float linearRoughness = clamp(payload.roughness, 0.02, 1.0);
     result.specularAlbedo =
-        vec4(rrSpecularAlbedo(
-                 clamp(payload.f0, vec3(0.0), vec3(0.99)),
-                 linearRoughness,
-                 dot(shadingNormal, -direction)),
+        vec4(reflectionTint *
+                 rrSpecularAlbedo(
+                     clamp(payload.f0, vec3(0.0), vec3(0.99)),
+                     linearRoughness,
+                     dot(shadingNormal, -direction)),
              0.0);
     result.emission =
         vec4(max(payload.emission, vec3(0.0)) *
@@ -1413,7 +1420,10 @@ void main() {
       float roughness = clamp(payload.roughness, 0.02, 1.0);
       float transmission = clamp(payload.transmission, 0.0, 1.0);
       float ior = clamp(payload.ior, 1.0001, 99.0);
-      bool metal = payload.status.y != 0u;
+      bool metal = (payload.status.y & 1u) != 0u;
+      bool predefinedMetal = (payload.status.y & 2u) != 0u;
+      vec3 reflectionTint =
+          predefinedMetal ? baseColor : vec3(1.0);
       vec3 emission =
           finite3(payload.emission)
               ? max(payload.emission, vec3(0.0))
@@ -1472,8 +1482,8 @@ void main() {
         vec3 directDiffuseBsdf;
         vec3 directSpecularBsdf;
         evaluateBsdfComponents(
-            baseColor, f0, roughness, transmission, metal, normal,
-            view, lightDirection, directDiffuseBsdf,
+            baseColor, f0, reflectionTint, roughness, transmission, metal,
+            normal, view, lightDirection, directDiffuseBsdf,
             directSpecularBsdf, directPdf);
         float correction = shadingNormalCorrection(
             geometricNormal, normal, view, lightDirection);
@@ -1533,8 +1543,8 @@ void main() {
         vec3 environmentDiffuseBsdf;
         vec3 environmentSpecularBsdf;
         evaluateBsdfComponents(
-            baseColor, f0, roughness, transmission, metal, normal,
-            view, environmentDirection, environmentDiffuseBsdf,
+            baseColor, f0, reflectionTint, roughness, transmission, metal,
+            normal, view, environmentDirection, environmentDiffuseBsdf,
             environmentSpecularBsdf, environmentBsdfPdf);
         float correction = shadingNormalCorrection(
             geometricNormal, normal, view, environmentDirection);
@@ -1601,8 +1611,8 @@ void main() {
         vec3 meshDiffuseBsdf;
         vec3 meshSpecularBsdf;
         evaluateBsdfComponents(
-            baseColor, f0, roughness, transmission, metal, normal,
-            view, meshSample.direction, meshDiffuseBsdf,
+            baseColor, f0, reflectionTint, roughness, transmission, metal,
+            normal, view, meshSample.direction, meshDiffuseBsdf,
             meshSpecularBsdf, meshBsdfPdf);
         float correction = shadingNormalCorrection(
             geometricNormal, normal, view, meshSample.direction);
@@ -1689,8 +1699,8 @@ void main() {
         nextDirection = cosineHemisphere(normal, sampleU, sampleV);
         float pdf = 0.0;
         vec3 value = evaluateBsdf(
-            baseColor, f0, roughness, transmission, metal, normal,
-            view, nextDirection, pdf);
+            baseColor, f0, reflectionTint, roughness, transmission, metal,
+            normal, view, nextDirection, pdf);
         if (!(pdf > 0.0)) {
           break;
         }
@@ -1713,8 +1723,8 @@ void main() {
         }
         float pdf = 0.0;
         vec3 value = evaluateBsdf(
-            baseColor, f0, roughness, transmission, metal, normal,
-            view, nextDirection, pdf);
+            baseColor, f0, reflectionTint, roughness, transmission, metal,
+            normal, view, nextDirection, pdf);
         if (!(pdf > 0.0)) {
           break;
         }

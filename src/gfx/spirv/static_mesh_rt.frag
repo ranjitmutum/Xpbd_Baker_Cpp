@@ -42,9 +42,11 @@ float decodeLabPbrEmission(float packed) {
                                   : packed * (255.0 / 254.0);
 }
 
-vec3 decodeLabPbrF0(float packed, vec3 baseColor, out bool metal) {
+vec3 decodeLabPbrF0(float packed, vec3 baseColor, out bool metal,
+                    out bool predefinedMetal) {
   uint code = uint(round(packed * 255.0));
   metal = code >= 230u;
+  predefinedMetal = code >= 230u && code <= 237u;
   if (!metal) {
     return vec3(packed);
   }
@@ -167,8 +169,10 @@ void main() {
       specular_map_active ? 1.0 - specular_sample.r : 1.0;
   float linear_roughness = perceptual_roughness * perceptual_roughness;
   bool metal = false;
+  bool predefined_metal = false;
   vec3 f0 = specular_map_active
-                ? decodeLabPbrF0(specular_sample.g, color.rgb, metal)
+                ? decodeLabPbrF0(specular_sample.g, color.rgb, metal,
+                                 predefined_metal)
                 : vec3(0.04);
   float emission = specular_map_active
                        ? decodeLabPbrEmission(specular_sample.a)
@@ -196,7 +200,9 @@ void main() {
     float specular_power = mix(96.0, 4.0, linear_roughness);
     float specular = pow(max(nd, 0.0), specular_power) * shadow;
     vec3 diffuse = metal ? vec3(0.0) : color.rgb * shade * light;
-    vec3 reflected = f0 * specular * intensity * light;
+    vec3 reflection_tint = predefined_metal ? color.rgb : vec3(1.0);
+    vec3 reflected =
+        reflection_tint * f0 * specular * intensity * light;
     FragColor =
         vec4(max(diffuse + reflected + emissive, vec3(0.0)), color.a);
     return;

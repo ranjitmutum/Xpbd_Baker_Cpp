@@ -61,6 +61,10 @@ struct ResolvedMaterialTexel {
   float linear_roughness = 1.0f;
   float dielectric_f0 = 0.04f;
   std::array<float, 3> f0_color{0.04f, 0.04f, 0.04f};
+  // LabPBR predefined metals keep their optical F0 and use linear albedo to
+  // tint the complete reflected lobe. Custom metals already encode albedo in
+  // F0, so their tint remains neutral to avoid applying the color twice.
+  std::array<float, 3> metal_reflection_tint{1.0f, 1.0f, 1.0f};
   LabPbrMetalKind metal_kind = LabPbrMetalKind::Dielectric;
   std::uint8_t metal_code = 0;
 

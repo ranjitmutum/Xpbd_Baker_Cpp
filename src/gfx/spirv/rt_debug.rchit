@@ -131,9 +131,11 @@ float decodeLabPbrEmission(float packed) {
                                   : packed * (255.0 / 254.0);
 }
 
-vec3 decodeLabPbrF0(float packed, vec3 baseColor, out bool metal) {
+vec3 decodeLabPbrF0(float packed, vec3 baseColor, out bool metal,
+                    out bool predefinedMetal) {
   uint code = uint(round(packed * 255.0));
   metal = code >= 230u;
+  predefinedMetal = code >= 230u && code <= 237u;
   if (!metal) {
     return vec3(packed);
   }
@@ -326,11 +328,13 @@ void main() {
   float linearRoughness = 1.0;
   vec3 f0 = vec3(0.04);
   bool metal = false;
+  bool predefinedMetal = false;
   vec3 emission = vec3(0.0);
   if (specularMapActive) {
     vec4 specularSample = sampleSpecularBaseLevel(uv);
     linearRoughness = decodeLabPbrMicrofacetAlpha(specularSample.r);
-    f0 = decodeLabPbrF0(specularSample.g, baseColor.rgb, metal);
+    f0 = decodeLabPbrF0(specularSample.g, baseColor.rgb, metal,
+                        predefinedMetal);
     emission =
         baseColor.rgb * decodeLabPbrEmission(specularSample.a);
   }
@@ -352,7 +356,9 @@ void main() {
   payload.transmission = clamp(transmission, 0.0, 1.0);
   payload.emission = max(emission, vec3(0.0));
   payload.opacity = baseColor.a;
-  payload.status.y = metal ? 1u : 0u;
+  // status.y bit 0: metal, bit 1: predefined metal whose complete reflected
+  // lobe must be tinted by linear albedo (custom metals already use it as F0).
+  payload.status.y = (metal ? 1u : 0u) | (predefinedMetal ? 2u : 0u);
 
   if (mode == 7u) {
     payload.baseColor = baseColor.rgb;

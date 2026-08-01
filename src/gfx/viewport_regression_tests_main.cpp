@@ -91,6 +91,10 @@ std::string compactTestSource(std::string_view text) {
 }
 
 void testPathTracePbrSourceContracts() {
+  const std::string forward =
+      readTestSource("src/gfx/spirv/static_mesh.frag");
+  const std::string forward_rt =
+      readTestSource("src/gfx/spirv/static_mesh_rt.frag");
   const std::string closest_hit =
       readTestSource("src/gfx/spirv/rt_debug.rchit");
   const std::string any_hit =
@@ -108,9 +112,10 @@ void testPathTracePbrSourceContracts() {
   const std::string rt_pipeline =
       readTestSource("src/gfx/vulkan_rt_pipeline.cpp");
 
-  expect(!closest_hit.empty() && !any_hit.empty() && !raygen.empty() &&
-             !compute.empty() && !composite.empty() && !backend.empty() &&
-             !path_tracer.empty() && !rt_pipeline.empty(),
+  expect(!forward.empty() && !forward_rt.empty() && !closest_hit.empty() &&
+             !any_hit.empty() && !raygen.empty() && !compute.empty() &&
+             !composite.empty() && !backend.empty() && !path_tracer.empty() &&
+             !rt_pipeline.empty(),
          "PBR source-contract fixtures are readable");
   expect(closest_hit.find("sampleAlbedoBaseLevel") != std::string::npos &&
              closest_hit.find("sampleNormalBaseLevel") != std::string::npos &&
@@ -168,7 +173,36 @@ void testPathTracePbrSourceContracts() {
          "Raster and path tracing keep every pixel-atlas channel "
          "nearest-filtered");
 
+  const std::string compact_forward = compactTestSource(forward);
+  const std::string compact_forward_rt = compactTestSource(forward_rt);
+  const std::string compact_closest_hit = compactTestSource(closest_hit);
   const std::string compact_raygen = compactTestSource(raygen);
+  const std::string compact_compute = compactTestSource(compute);
+  const std::array<std::string_view, 2> forward_tint_contract{{
+      "predefinedMetal=code>=230u&&code<=237u;",
+      "reflection_tint*f0*specular*intensity*light",
+  }};
+  bool forward_tint_matches = true;
+  for (const std::string_view contract : forward_tint_contract) {
+    forward_tint_matches &=
+        compact_forward.find(contract) != std::string::npos &&
+        compact_forward_rt.find(contract) != std::string::npos;
+  }
+  expect(forward_tint_matches &&
+             compact_closest_hit.find(
+                 "(predefinedMetal?2u:0u)") != std::string::npos &&
+             compact_raygen.find(
+                 "reflectionTint*fresnel*distribution*geometry") !=
+                 std::string::npos &&
+             compact_raygen.find(
+                 "reflectionTint*rrSpecularAlbedo") != std::string::npos &&
+             compact_compute.find(
+                 "predefinedMetal?baseColor.rgb:vec3(1.0)") !=
+                 std::string::npos &&
+             compact_compute.find(
+                 "reflectionTint*rrSpecularAlbedo") != std::string::npos,
+         "all Raster/PT paths tint predefined-metal reflection and RR guides");
+
   const std::array<std::string_view, 15> raygen_descriptor_contract{{
       "layout(set=0,binding=0)uniformaccelerationStructureEXTtopLevelAS;",
       "layout(set=0,binding=1,rgba16f)uniformimage2DoutputImage;",
@@ -785,6 +819,11 @@ void testLabPbrDecode() {
          "metal code 230 selects predefined metal");
   expect(iron.f0_color[0] > 0.5f && iron.f0_color[0] < 0.7f,
          "iron F0 is derived from official optical constants");
+  for (std::size_t channel = 0; channel < 3u; ++channel) {
+    expectNear(iron.metal_reflection_tint[channel],
+               iron.base_color_linear[channel], 1.0e-6f,
+               "predefined metal uses linear albedo as reflection tint");
+  }
   expectNear(iron.subsurface_scattering, 1.0f, 1.0e-6f,
              "specular blue 255 decodes full SSS");
 
@@ -794,6 +833,10 @@ void testLabPbrDecode() {
          "metal code 255 selects custom metal");
   expectNear(custom.f0_color[0], custom.base_color_linear[0], 1.0e-6f,
              "custom metal uses linear base color as F0");
+  for (const float tint : custom.metal_reflection_tint) {
+    expectNear(tint, 1.0f, 1.0e-6f,
+               "custom metal does not apply albedo tint twice");
+  }
 }
 
 void testLabPbrDiscoveryAndFallback() {

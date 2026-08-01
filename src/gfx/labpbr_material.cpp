@@ -369,6 +369,9 @@ ResolvedMaterialTexel decodeLabPbrTexel(
                               : LabPbrMetalKind::Predefined;
       result.f0_color =
           hardcodedMetalF0(reflectance, result.base_color_linear);
+      if (reflectance >= 230u && reflectance <= 237u) {
+        result.metal_reflection_tint = result.base_color_linear;
+      }
     }
 
     const std::uint8_t volume = (*specular_rgba)[2];
