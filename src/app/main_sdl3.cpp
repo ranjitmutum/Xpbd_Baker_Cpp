@@ -2117,15 +2117,26 @@ int app_main(int argc, char **argv) {
             ui_result.layout.vp_w, ui_result.layout.vp_h, scale_x, scale_y,
             fb_w, fb_h);
     float view[16], proj[16];
-    const float aspect =
+    const float viewport_aspect =
         framebuffer_viewport.h > 0
             ? static_cast<float>(framebuffer_viewport.w) /
                   static_cast<float>(framebuffer_viewport.h)
             : 1.0f;
-    session.camera.matrices(aspect, view, proj);
-    if (session.freezeQueuedStillRenderCamera(
-            view, proj, raster_scene_time)) {
-      still_snapshot = &*session.still_render_job.snapshot;
+    session.camera.matrices(viewport_aspect, view, proj);
+    if (session.still_render_job.status.state ==
+        xpbd::gfx::StillRenderJobState::Queued) {
+      const auto &still_settings = session.still_render_job.settings;
+      const float still_aspect =
+          still_settings.height > 0u
+              ? static_cast<float>(still_settings.width) /
+                    static_cast<float>(still_settings.height)
+              : 1.0f;
+      float still_view[16], still_proj[16];
+      session.camera.matrices(still_aspect, still_view, still_proj);
+      if (session.freezeQueuedStillRenderCamera(
+              still_view, still_proj, raster_scene_time)) {
+        still_snapshot = &*session.still_render_job.snapshot;
+      }
     }
     const float *render_view =
         still_snapshot != nullptr && still_snapshot->camera_frozen
