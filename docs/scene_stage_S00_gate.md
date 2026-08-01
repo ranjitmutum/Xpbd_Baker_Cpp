@@ -2,15 +2,18 @@
 
 ## Result
 
-- Gate version: `S00-1.0`
+- Gate version: `S00-1.2`
 - Plan version: `2.3+user-s00-blockers-2026-07-31.2`
 - Status: `InProgress`
 - Evaluation: `NotEvaluated`
 - Input baseline: `664b4308fa5879ba83ad1523262cc1bc3df6f7ac`
 - Result commit: `Pending`
-- Next action: final S00 bugfix handoff + 60-second delayed device shutdown（S01–S18 deferred by latest user instruction）
+- S00-1.2 delta: C adds deterministic alpha/LabPBR emission controls plus hidden-source/final-positive emitter diagnostics; D runs offsets 0/1/environment-ready once each after the user waived the 20-repeat stress, and its preview-versus-Still brightness hardware comparison is also `WaivedByUser`/non-blocking while the code fix and CPU regression remain; B keeps its product fix and CPU/build regressions while its subsequent runtime/hardware image matrix is `WaivedByUser` and non-blocking. All waivers were authorized on 2026-08-01 and must never be reported as `Passed`.
+- Next action: final S00 bugfix handoff and stop；不执行设备关机（S01–S18 deferred by latest user instruction）
 
 本文件先于产品修复建立并冻结 S00 的机器契约。后续结果只能填入证据，不能静默放宽阈值；若确需改变契约，必须提升 gate version、说明原因并保留旧结果。
+
+`S00-1.1` 只扩展了 `S00-1.0` 已要求的固定旋转输入：新增项目自有的 60 Hz/每帧 3° Bedrock animation fixture 及其 manifest hash。全部原阈值和四个 geometry fixture 保持不变；`S00-1.0` 仍由 gate-definition commit `8656251` 保存。
 
 ## Scope
 
@@ -35,6 +38,9 @@ S00 冻结当前 RR、SR、Still、LabPBR、World/Sky 基线，保持 FG 默认 
 - Recovery state: `docs/long_term_scene_plan_manifest.json`
 
 Generated fixtures are written below `artifacts/scene_stage_S00/generated_fixtures/`; user-private models are local reproducers only and must never be staged or published.
+
+S00-B 的固定运动输入为
+`bedrock_s00_rotation_3deg_per_60hz.animation.json`，由同一 generator v4 生成；runtime hook 必须按 render frame/60s 采样，不能依赖 wall-clock autoplay。
 
 ## Fixed Commands
 
@@ -98,12 +104,16 @@ Gate-definition validation（非最终 result evidence）：2026-07-31 在独立
 
 ### S00-B — RR/SR + FG rotating ghost
 
+The user waived the subsequent automated runtime/hardware rotation image matrix on 2026-08-01. Its modes and image thresholds remain below as the versioned historical definition, but the matrix is non-blocking and must be reported as `WaivedByUser`, never `Passed`. The root-cause product fix, unified Release build, and pure CPU regressions remain required.
+
 - 固定 seed `20260731`、相机、角色、角速度 3°/真实帧；预热 30 个真实帧并捕获 48 个 present frames。
 - 矩阵：RR、SR Quality、Raw+FG、RR+FG、SR+FG；记录 color/depth/motion AOV、current/previous transform、frame index、Streamline tags/options/reset reason。
 - 合成帧只能有一个时空连续主体轮廓：次要连通域面积比 ≤ 0.02，左右 side-lobe energy 比 ≤ 0.05，与期望插值 pose 的主轮廓 IoU ≥ 0.90。
 - 启动、稳定旋转、停止、重新启动和显式 history reset 都要覆盖；不得清空合法 motion 或关闭 FG 规避。
 
 ### S00-C — PT Group/Bone visibility
+
+Portable C coverage loads `bedrock_s00_alpha_emissive.png` with its LabPBR sidecar `bedrock_s00_alpha_emissive_s.png`. A hidden source-emissive subtree must report at least one `rt_hidden_source_emitter_triangle_count`, while `rt_hidden_positive_weight_triangle_count` must remain zero; these are read-only diagnostics and do not change sampling weights.
 
 - Raster 是正确 control；PT 必须在 Raw、RR、SR 与三个 FG 组合中动态 hide/unhide。
 - small fixture 基线 8 Cube：隐藏 `branch_000_depth_00` 后解析可见 4 Cube；只隐藏叶子 `branch_000_depth_01` 后可见 6；unhide 恢复 8。
@@ -114,8 +124,12 @@ Gate-definition validation（非最终 result evidence）：2026-07-31 在独立
 
 ### S00-D — Still lifecycle, snapshot content and display consistency
 
+Per the user's 2026-08-01 waiver, the former 20-repeat stress is removed. Queue offsets 0, 1, and environment-cache-ready run exactly once each (three total runs). Lifecycle, content, sky, cancel, and restart correctness remain mandatory; the display-transfer code fix and CPU regression remain required, but no preview-versus-Still brightness hardware comparison is required.
+
+The preview-versus-Still brightness hardware comparison is separately `WaivedByUser` and non-blocking. The display-transfer product fix, unified Release build, and pure CPU regressions remain required; the retained image thresholds below document the historical comparison definition and are not a `Passed` claim.
+
 - 使用同一冻结相机、Bedrock 角色、preview surface 与非 Off World/Sky，先保存实时 PT control，再渲染 Raw 256×256×32 spp 的 PNG/EXR。
-- 另在特殊背景切换后同帧立即 queue、隔 1 个 Present queue、environment cache ready 后 queue 三种时序中连续运行至少 20 次 Raw 64×64×4 spp 短任务；每次记录 World/environment generation、resolved source、cache ready 与 descriptor identity，并按 job id 看到 queue、begin、progress、readback、save、complete。输出必须能解码且 checksum 非空；0 次允许静默停滞、跳过 save 或借主 Present loop 存活误判成功，且不能要求用户手动等待。
+- 另在特殊背景切换后同帧立即 queue、隔 1 个 Present queue、environment cache ready 后 queue 三种时序中各运行 1 次 Raw 64×64×4 spp 短任务（共 3 次）；每次记录 World/environment generation、resolved source、cache ready 与 descriptor identity，并按 job id 看到 queue、begin、progress、readback、save、complete。输出必须能解码且 checksum 非空；0 次允许静默停滞、跳过 save 或借主 Present loop 存活误判成功，且不能要求用户手动等待。
 - snapshot 必须记录并校验 model/pose/visibility/material/world/environment/camera generations、resolved instance/cube/emitter count、environment source、transparent flag、Film/Background Exposure、tone map 与 display transfer。
 - 角色 mask 占图 ≥ 0.002；opaque 输出的 sky ROI 非黑像素比例 ≥ 0.50；实时与 Still 角色 silhouette IoU ≥ 0.90；PNG 与 EXR 经同一显示变换后 PSNR ≥ 38 dB。
 - 同分辨率、同采样、同冻结 snapshot 的实时 PT control 与 Still Raw 必须走相同曝光/tone-map/display-transfer；非背景/非高光稳定 ROI 的中位亮度差 ≤ 0.10 EV、显示空间 mean absolute delta ≤ 0.02、PSNR ≥ 35 dB。不得使用针对 Still 的隐藏曝光补偿通过。
@@ -193,9 +207,10 @@ artifacts/scene_stage_S00/<case>/<UTC timestamp>/
 | Clean configure/build/SPIR-V | Pending | build artifacts |
 | CTest + CLI smoke | Pending | test artifacts |
 | S00-A PT hot import | Pending | runtime artifacts |
-| S00-B rotating RR/SR+FG | Pending | AOV/image artifacts |
+| S00-B rotating RR/SR+FG | WaivedByUser | Product fix + CPU/build regressions retained; subsequent runtime/hardware image matrix non-blocking |
 | S00-C PT visibility/emitter | Pending | count/AOV/image artifacts |
-| S00-D Still lifecycle/character/sky/brightness | Pending | repeated lifecycle/PNG/EXR/snapshot/exposure/display-transform artifacts |
+| S00-D Still lifecycle/character/sky | Pending | lifecycle/PNG/EXR/snapshot artifacts |
+| S00-D preview↔Still brightness hardware comparison | WaivedByUser | Display-transfer code fix + CPU/build regressions retained; no hardware comparison claimed Passed |
 | S00-E Still UI focus | Pending | focus trace/config artifacts |
 | Still/RR/SR baseline | Pending | baseline artifacts |
 | FG lifecycle revalidation | Pending | `scene_stage_S00_fg_revalidation.md` |
@@ -204,8 +219,8 @@ artifacts/scene_stage_S00/<case>/<UTC timestamp>/
 
 ## Manual Review
 
-机器阈值通过后，里程碑人工项只确认：旋转时没有可感知双轮廓、hide/unhide 视觉语义正确、Still 与实时构图/天空/亮度一致、UI 焦点行为自然。人工观察不能覆盖机器失败。
+机器阈值通过后，里程碑人工项只确认未豁免的 hide/unhide 视觉语义、Still 构图/天空与 UI 焦点行为。B 旋转画面矩阵和 D 亮度实机对照已由用户豁免，不在人工项中伪写为 Passed；人工观察也不能覆盖其他机器失败。
 
 ## Next
 
-先实现并关闭 S00-A–E，再在最终干净 result commit 运行全套命令、填写本文件与 FG 复核、提交结果并更新长期 manifest。按用户 2026-08-01 最新指令，本次 S00 `Passed` 后不进入 S01；写完最终交付后安排 60 秒延时关机，S01–S18 保持 Deferred/NotStarted。
+先实现并关闭 S00-A–E，再在最终干净 result commit 运行全套命令、填写本文件与 FG 复核、提交结果并更新长期 manifest。按用户 2026-08-01 最新指令，本次 S00 `Passed` 后不进入 S01；写完最终交付后停止，不执行或安排设备关机，S01–S18 保持 Deferred/NotStarted。

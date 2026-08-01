@@ -9,10 +9,13 @@
 #include "xpbd/gfx/viewport_mesh.hpp"
 #include "xpbd/log.hpp"
 
+#include <algorithm>
 #include <bit>
 #include <charconv>
+#include <chrono>
 #include <cstdio>
 #include <system_error>
+#include <thread>
 
 
 #define SDL_MAIN_HANDLED
@@ -545,20 +548,29 @@ int app_main(int argc, char **argv) {
                        startup_animation, session.last_error.c_str());
     }
   }
+  bool startup_texture_requested = false;
+  bool startup_texture_loaded = false;
   if (const char *startup_texture = std::getenv("XPBD_TEXTURE");
       startup_texture != nullptr && startup_texture[0] != '\0') {
-    if (session.loadTexture(std::filesystem::path(startup_texture))) {
+    startup_texture_requested = true;
+    startup_texture_loaded =
+        session.loadTexture(std::filesystem::path(startup_texture));
+    if (startup_texture_loaded) {
       xpbd::log::infof("Startup texture: %s", startup_texture);
     } else {
       xpbd::log::warnf("Startup texture failed: %s (%s)", startup_texture,
                        session.last_error.c_str());
     }
   }
+  bool startup_labpbr_specular_requested = false;
+  bool startup_labpbr_specular_loaded = false;
   if (const char *startup_specular =
           std::getenv("XPBD_LABPBR_SPECULAR");
       startup_specular != nullptr && startup_specular[0] != '\0') {
-    if (session.importLabPbrSpecular(
-            std::filesystem::path(startup_specular))) {
+    startup_labpbr_specular_requested = true;
+    startup_labpbr_specular_loaded = session.importLabPbrSpecular(
+        std::filesystem::path(startup_specular));
+    if (startup_labpbr_specular_loaded) {
       xpbd::log::infof("Startup LabPBR specular: %s",
                        startup_specular);
     } else {
@@ -1101,8 +1113,72 @@ int app_main(int argc, char **argv) {
           "Startup autoplay requested without a previewable model+animation");
     }
   }
+  int app_exit_code = 0;
+  struct S00DeferredStillQueue {
+    enum class Mode : std::uint8_t {
+      Unset = 0,
+      Immediate,
+      AfterOnePresent,
+      Ready,
+    };
+
+    Mode mode = Mode::Unset;
+    bool configured = false;
+    bool queued = false;
+    bool failed = false;
+    std::uint64_t armed_frame = 0;
+    std::uint64_t initial_present_success_count = 0;
+    std::chrono::steady_clock::time_point armed_at{};
+
+    [[nodiscard]] bool deferred() const noexcept {
+      return mode == Mode::AfterOnePresent || mode == Mode::Ready;
+    }
+    [[nodiscard]] const char *modeName() const noexcept {
+      switch (mode) {
+      case Mode::Immediate:
+        return "0";
+      case Mode::AfterOnePresent:
+        return "1";
+      case Mode::Ready:
+        return "ready";
+      case Mode::Unset:
+      default:
+        return "unset";
+      }
+    }
+  } s00_deferred_still_queue;
+  if (const char *offset = std::getenv("XPBD_S00_STILL_QUEUE_OFFSET");
+      offset != nullptr && offset[0] != '\0') {
+    s00_deferred_still_queue.configured = true;
+    if (std::strcmp(offset, "0") == 0) {
+      s00_deferred_still_queue.mode =
+          S00DeferredStillQueue::Mode::Immediate;
+    } else if (std::strcmp(offset, "1") == 0) {
+      s00_deferred_still_queue.mode =
+          S00DeferredStillQueue::Mode::AfterOnePresent;
+    } else if (std::strcmp(offset, "ready") == 0) {
+      s00_deferred_still_queue.mode = S00DeferredStillQueue::Mode::Ready;
+    } else {
+      xpbd::log::errorf(
+          "S00_STILL_QUEUE_FAILED reason=invalid_offset value=%s "
+          "accepted=0,1,ready",
+          offset);
+      s00_deferred_still_queue.failed = true;
+      app_exit_code = 24;
+      running = false;
+    }
+  }
+
   bool startup_still_render = false;
   apply_path_trace_bool("XPBD_STILL_RENDER", startup_still_render);
+  if (s00_deferred_still_queue.configured && !startup_still_render &&
+      !s00_deferred_still_queue.failed) {
+    xpbd::log::error(
+        "S00_STILL_QUEUE_FAILED reason=startup_still_not_requested");
+    s00_deferred_still_queue.failed = true;
+    app_exit_code = 25;
+    running = false;
+  }
   if (startup_still_render) {
     auto &settings = session.still_render_job.settings;
     apply_path_trace_uint("XPBD_STILL_WIDTH", settings.width);
@@ -1127,6 +1203,9 @@ int app_main(int argc, char **argv) {
         xpbd::log::warnf("Ignoring invalid XPBD_STILL_FORMAT=%s", format);
       }
     }
+  }
+  const auto queue_startup_still_render = [&]() -> bool {
+    auto &settings = session.still_render_job.settings;
     if (session.queueStillRender()) {
       xpbd::log::infof(
           "Startup still render queued: %ux%u samples=%u spp=%u format=%s "
@@ -1137,11 +1216,67 @@ int app_main(int argc, char **argv) {
                                                                : "png",
           settings.transparent_background ? 1 : 0,
           session.still_render_job.status.output_path.c_str());
+      return true;
     } else {
       xpbd::log::warnf("Startup still render failed to queue: %s",
                        session.last_error.c_str());
+      return false;
     }
+  };
+  if (startup_still_render && !s00_deferred_still_queue.failed &&
+      !s00_deferred_still_queue.deferred()) {
+    const bool queued = queue_startup_still_render();
+    if (s00_deferred_still_queue.configured) {
+      s00_deferred_still_queue.queued = queued;
+      if (queued) {
+        xpbd::log::infof(
+            "S00_STILL_QUEUE_COMMIT mode=0 frame=0 trigger=immediate "
+            "model_generation=%llu material_generation=%llu "
+            "world_generation=%llu preview_scene=%d job_id=%llu",
+            static_cast<unsigned long long>(session.modelGeneration()),
+            static_cast<unsigned long long>(session.materialGeneration()),
+            static_cast<unsigned long long>(
+                session.world_environment.generation),
+            static_cast<int>(session.preview_scene_id),
+            static_cast<unsigned long long>(
+                session.still_render_job.status.job_id));
+      } else {
+        xpbd::log::errorf(
+            "S00_STILL_QUEUE_FAILED reason=immediate_queue_rejected "
+            "error=%s",
+            session.last_error.c_str());
+        s00_deferred_still_queue.failed = true;
+        app_exit_code = 26;
+        running = false;
+      }
+    }
+  } else if (startup_still_render &&
+             s00_deferred_still_queue.deferred() &&
+             !s00_deferred_still_queue.failed) {
+    s00_deferred_still_queue.armed_frame = 0u;
+    s00_deferred_still_queue.armed_at = std::chrono::steady_clock::now();
+    xpbd::log::infof(
+        "S00_STILL_QUEUE_ARMED mode=%s frame_budget=600 "
+        "wall_budget_seconds=30 model_generation=%llu "
+        "material_generation=%llu world_generation=%llu preview_scene=%d",
+        s00_deferred_still_queue.modeName(),
+        static_cast<unsigned long long>(session.modelGeneration()),
+        static_cast<unsigned long long>(session.materialGeneration()),
+        static_cast<unsigned long long>(session.world_environment.generation),
+        static_cast<int>(session.preview_scene_id));
   }
+  bool s00_exit_after_still = false;
+  apply_path_trace_bool("XPBD_S00_EXIT_AFTER_STILL",
+                        s00_exit_after_still);
+  bool s00_expect_still_cancel = false;
+  if (s00_exit_after_still) {
+    apply_path_trace_bool("XPBD_S00_EXPECT_STILL_CANCEL",
+                          s00_expect_still_cancel);
+    xpbd::log::infof(
+        "S00_STILL_EXIT_ARMED expected_cancel=%d",
+        s00_expect_still_cancel ? 1 : 0);
+  }
+  std::uint64_t s00_still_observed_job_id = 0;
   std::uint64_t render_frame_number = 0;
   std::uint64_t unattended_frame_limit = 0;
   if (const char *text = std::getenv("XPBD_UNATTENDED_FRAMES");
@@ -1157,6 +1292,159 @@ int app_main(int argc, char **argv) {
       xpbd::log::infof("Unattended frame limit: %llu",
                        static_cast<unsigned long long>(
                            unattended_frame_limit));
+    }
+  }
+  std::filesystem::path s00_hot_import_model;
+  bool s00_hot_import_enabled = false;
+  bool s00_hot_import_started = false;
+  bool s00_hot_import_committed = false;
+  bool s00_hot_import_rt_ready = false;
+  bool s00_hot_import_post_present = false;
+  std::uint64_t s00_pre_import_rt_present_frames = 0;
+  std::uint64_t s00_import_commit_frame = 0;
+  std::uint64_t s00_rt_ready_frame = 0;
+  std::uint64_t s00_post_import_present_frames = 0;
+  std::uint64_t s00_pre_import_fg_active_frames = 0;
+  std::uint64_t s00_post_import_fg_active_frames = 0;
+  std::uint64_t s00_fg_phase_start_frame = 0;
+  auto s00_fg_phase_start_time = std::chrono::steady_clock::now();
+  bool s00_hot_import_requires_fg = false;
+  constexpr std::uint64_t kS00RequiredFgActiveFrames = 5u;
+  constexpr std::uint64_t kS00FgGateFrameBudget = 600u;
+  constexpr auto kS00FgGateWallBudget = std::chrono::seconds(15);
+  std::uint32_t s00_dialog_hold_ms = 0u;
+  apply_path_trace_uint("XPBD_S00_DIALOG_HOLD_MS", s00_dialog_hold_ms);
+  if (s00_dialog_hold_ms > 60000u) {
+    xpbd::log::warnf(
+        "Clamping XPBD_S00_DIALOG_HOLD_MS from %u to 60000",
+        s00_dialog_hold_ms);
+    s00_dialog_hold_ms = 60000u;
+  }
+  if (const char *path = std::getenv("XPBD_S00_HOT_IMPORT_MODEL");
+      path != nullptr && path[0] != '\0') {
+    s00_hot_import_model = std::filesystem::path(path);
+    s00_hot_import_enabled = true;
+    s00_hot_import_requires_fg =
+        session.path_trace_settings.requested_frame_generation ==
+        xpbd::gfx::PathTraceFrameGeneration::On;
+    s00_fg_phase_start_frame = render_frame_number;
+    s00_fg_phase_start_time = std::chrono::steady_clock::now();
+    xpbd::log::infof(
+        "S00_HOT_IMPORT_ARMED path=%s required_rt_presents=30 "
+        "required_fg_active_frames=%llu fg_required=%d dialog_hold_ms=%u",
+        s00_hot_import_model.string().c_str(),
+        static_cast<unsigned long long>(kS00RequiredFgActiveFrames),
+        s00_hot_import_requires_fg ? 1 : 0, s00_dialog_hold_ms);
+    if (!std::filesystem::is_regular_file(s00_hot_import_model)) {
+      xpbd::log::errorf("S00_IMPORT_FAILED reason=missing_file path=%s",
+                        s00_hot_import_model.string().c_str());
+      app_exit_code = 2;
+      running = false;
+    }
+  }
+  struct S00VisibilityGate {
+    enum class Stage : std::uint8_t {
+      Disabled = 0,
+      AwaitRtReady,
+      Hidden,
+      Restored,
+      Complete,
+      Failed,
+    };
+
+    Stage stage = Stage::Disabled;
+    std::string target;
+    std::uint64_t ready_presents = 0;
+    std::uint64_t hidden_presents = 0;
+    std::uint64_t restored_presents = 0;
+    std::uint64_t action_frame = 0;
+    std::uint64_t initial_visibility_generation = 0;
+    std::uint64_t hidden_visibility_generation = 0;
+    xpbd::gfx::FrameStats baseline_stats{};
+    bool hidden_stats_verified = false;
+    bool restored_stats_verified = false;
+    bool material_control_required = false;
+    bool material_control_loaded = false;
+
+    [[nodiscard]] bool enabled() const noexcept {
+      return stage != Stage::Disabled;
+    }
+    [[nodiscard]] bool complete() const noexcept {
+      return stage == Stage::Complete;
+    }
+  } s00_visibility_gate;
+  if (const char *target = std::getenv("XPBD_S00_VISIBILITY_TARGET");
+      target != nullptr && target[0] != '\0') {
+    s00_visibility_gate.stage = S00VisibilityGate::Stage::AwaitRtReady;
+    s00_visibility_gate.target = target;
+    s00_visibility_gate.material_control_required =
+        startup_texture_requested && startup_labpbr_specular_requested;
+    s00_visibility_gate.material_control_loaded =
+        startup_texture_loaded && startup_labpbr_specular_loaded;
+    const bool target_known = std::any_of(
+        session.geometry.bones.begin(), session.geometry.bones.end(),
+        [&](const xpbd::loader::Bone &bone) {
+          return bone.name == s00_visibility_gate.target;
+        });
+    const bool conflicts_with_other_gate =
+        s00_hot_import_enabled || startup_still_render ||
+        s00_exit_after_still;
+    if (conflicts_with_other_gate) {
+      xpbd::log::errorf(
+          "S00_VISIBILITY_FAILED reason=incompatible_s00_hook "
+          "hot_import=%d startup_still=%d exit_after_still=%d",
+          s00_hot_import_enabled ? 1 : 0, startup_still_render ? 1 : 0,
+          s00_exit_after_still ? 1 : 0);
+      s00_visibility_gate.stage = S00VisibilityGate::Stage::Failed;
+      app_exit_code = 10;
+      running = false;
+    } else if (!target_known) {
+      xpbd::log::errorf(
+          "S00_VISIBILITY_FAILED reason=missing_target target=%s bones=%zu",
+          s00_visibility_gate.target.c_str(), session.geometry.bones.size());
+      s00_visibility_gate.stage = S00VisibilityGate::Stage::Failed;
+      app_exit_code = 11;
+      running = false;
+    } else if (!session.isBoneVisible(s00_visibility_gate.target)) {
+      xpbd::log::errorf(
+          "S00_VISIBILITY_FAILED reason=target_initially_hidden target=%s",
+          s00_visibility_gate.target.c_str());
+      s00_visibility_gate.stage = S00VisibilityGate::Stage::Failed;
+      app_exit_code = 12;
+      running = false;
+    } else if (s00_visibility_gate.material_control_required &&
+               !s00_visibility_gate.material_control_loaded) {
+      xpbd::log::errorf(
+          "S00_VISIBILITY_FAILED reason=material_control_load_failed "
+          "target=%s texture_loaded=%d specular_loaded=%d",
+          s00_visibility_gate.target.c_str(),
+          startup_texture_loaded ? 1 : 0,
+          startup_labpbr_specular_loaded ? 1 : 0);
+      s00_visibility_gate.stage = S00VisibilityGate::Stage::Failed;
+      app_exit_code = 24;
+      running = false;
+    } else if (!session.enable_ray_tracing) {
+      xpbd::log::errorf(
+          "S00_VISIBILITY_FAILED reason=pt_not_requested target=%s",
+          s00_visibility_gate.target.c_str());
+      s00_visibility_gate.stage = S00VisibilityGate::Stage::Failed;
+      app_exit_code = 13;
+      running = false;
+    } else {
+      s00_visibility_gate.initial_visibility_generation =
+          session.viewportVisibilityGeneration();
+      xpbd::log::infof(
+          "S00_VISIBILITY_ARMED target=%s required_ready_presents=30 "
+          "required_hidden_presents=30 required_restored_presents=30 "
+          "model_generation=%llu visibility_generation=%llu bones=%zu "
+          "material_control_required=%d material_control_loaded=%d",
+          s00_visibility_gate.target.c_str(),
+          static_cast<unsigned long long>(session.modelGeneration()),
+          static_cast<unsigned long long>(
+              s00_visibility_gate.initial_visibility_generation),
+          session.geometry.bones.size(),
+          s00_visibility_gate.material_control_required ? 1 : 0,
+          s00_visibility_gate.material_control_loaded ? 1 : 0);
     }
   }
   bool unattended_resize_gate = false;
@@ -1406,6 +1694,7 @@ int app_main(int argc, char **argv) {
         running = false;
       }
       if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_ESCAPE) {
+        nk_edit_unfocus(&ctx);
         session.closeBoneContext();
       }
       if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_F11 &&
@@ -1612,6 +1901,65 @@ int app_main(int argc, char **argv) {
         win_h > 0 ? static_cast<float>(fb_h) / static_cast<float>(win_h) : 1.0f;
 
     session.synchronizeStillRenderState();
+    bool s00_still_terminal_exit = false;
+    if (s00_exit_after_still) {
+      const auto &still_status = session.still_render_job.status;
+      if (s00_still_observed_job_id == 0u &&
+          still_status.job_id != 0u &&
+          still_status.state != xpbd::gfx::StillRenderJobState::Idle) {
+        s00_still_observed_job_id = still_status.job_id;
+        xpbd::log::infof(
+            "S00_STILL_JOB_OBSERVED job_id=%llu",
+            static_cast<unsigned long long>(s00_still_observed_job_id));
+      }
+      if (s00_still_observed_job_id != 0u &&
+          still_status.job_id == s00_still_observed_job_id) {
+        switch (still_status.state) {
+        case xpbd::gfx::StillRenderJobState::Completed:
+          xpbd::log::infof(
+              "S00_STILL_CLEAN_EXIT result=completed job_id=%llu "
+              "samples=%u/%u output=%s",
+              static_cast<unsigned long long>(still_status.job_id),
+              still_status.accumulated_samples,
+              still_status.target_samples,
+              still_status.output_path.c_str());
+          s00_still_terminal_exit = true;
+          break;
+        case xpbd::gfx::StillRenderJobState::Cancelled:
+          if (s00_expect_still_cancel) {
+            xpbd::log::infof(
+                "S00_STILL_CLEAN_EXIT result=expected_cancelled "
+                "job_id=%llu samples=%u/%u",
+                static_cast<unsigned long long>(still_status.job_id),
+                still_status.accumulated_samples,
+                still_status.target_samples);
+          } else {
+            xpbd::log::errorf(
+                "S00_STILL_FAILED_EXIT reason=unexpected_cancelled "
+                "job_id=%llu samples=%u/%u",
+                static_cast<unsigned long long>(still_status.job_id),
+                still_status.accumulated_samples,
+                still_status.target_samples);
+            app_exit_code = 6;
+          }
+          s00_still_terminal_exit = true;
+          break;
+        case xpbd::gfx::StillRenderJobState::Failed:
+          xpbd::log::errorf(
+              "S00_STILL_FAILED_EXIT reason=failed job_id=%llu "
+              "samples=%u/%u error=%s",
+              static_cast<unsigned long long>(still_status.job_id),
+              still_status.accumulated_samples,
+              still_status.target_samples,
+              still_status.error.c_str());
+          app_exit_code = 5;
+          s00_still_terminal_exit = true;
+          break;
+        default:
+          break;
+        }
+      }
+    }
     if (!session.stillRenderActive() &&
         session.playback_state == xpbd::app::PlaybackState::Playing &&
         !session.bake_busy.load()) {
@@ -1622,6 +1970,9 @@ int app_main(int argc, char **argv) {
     }
     if (latency_frame_started) {
       backend->endLatencySimulation();
+    }
+    if (s00_still_terminal_exit) {
+      break;
     }
 
     const auto rt_cap_ui = backend->rayTracingCapability();
@@ -1652,10 +2003,8 @@ int app_main(int argc, char **argv) {
             : nullptr;
     const bool render_loaded_scene =
         still_snapshot != nullptr
-            ? (still_snapshot->scene_selection.kind ==
-                   xpbd::app::SceneSelectionKind::Loaded ||
-               still_snapshot->scene_selection.kind ==
-                   xpbd::app::SceneSelectionKind::UserBuilt)
+            ? still_snapshot->scene_selection.rendersLoadedContent(
+                  session.hasLoadedSceneContent())
             : session.sceneRendersLoadedContent();
     if (render_loaded_scene && session.camera_needs_fit &&
         !session.geometry.bones.empty()) {
@@ -1720,7 +2069,6 @@ int app_main(int argc, char **argv) {
     } else if (!use_static_model) {
       scene = {};
     }
-
     float raster_scene_time =
           std::chrono::duration<float>(std::chrono::steady_clock::now() -
                                        app_start_time)
@@ -1905,6 +2253,8 @@ int app_main(int argc, char **argv) {
       still_request.material_debug_view =
           still_snapshot->material_debug_view;
       still_request.rt_debug_view = still_snapshot->rt_debug_view;
+      still_request.preview_skybox =
+          raster_scene.skybox.valid() ? &raster_scene.skybox : nullptr;
       still_request.status = &session.still_render_job.status;
       frame.still_render = &still_request;
     }
@@ -2074,6 +2424,9 @@ int app_main(int argc, char **argv) {
     frame_stats.cube_count = backend_stats.cube_count;
     frame_stats.line_count = backend_stats.line_count;
     frame_stats.active_render_path = backend_stats.active_render_path;
+    frame_stats.present_succeeded = backend_stats.present_succeeded;
+    frame_stats.present_success_count =
+        backend_stats.present_success_count;
     frame_stats.ray_tracing_supported = backend_stats.ray_tracing_supported;
     frame_stats.ray_tracing_requested = backend_stats.ray_tracing_requested;
     frame_stats.dlss_frame_generation_supported =
@@ -2088,6 +2441,12 @@ int app_main(int argc, char **argv) {
     frame_stats.rt_blas_count = backend_stats.rt_blas_count;
     frame_stats.rt_tlas_count = backend_stats.rt_tlas_count;
     frame_stats.rt_instance_count = backend_stats.rt_instance_count;
+    frame_stats.rt_visible_instance_mask_count =
+        backend_stats.rt_visible_instance_mask_count;
+    frame_stats.rt_hidden_instance_mask_count =
+        backend_stats.rt_hidden_instance_mask_count;
+    frame_stats.rt_positive_emitter_count =
+        backend_stats.rt_positive_emitter_count;
     frame_stats.rt_primitive_count = backend_stats.rt_primitive_count;
     frame_stats.rt_as_storage_bytes = backend_stats.rt_as_storage_bytes;
     frame_stats.rt_scratch_bytes = backend_stats.rt_scratch_bytes;
@@ -2109,6 +2468,724 @@ int app_main(int argc, char **argv) {
     frame_stats.rt_aov_write_mask = backend_stats.rt_aov_write_mask;
     frame_stats.rt_last_build_reason = backend_stats.rt_last_build_reason;
     frame_stats.rt_last_tlas_reason = backend_stats.rt_last_tlas_reason;
+
+    if (s00_deferred_still_queue.deferred() &&
+        !s00_deferred_still_queue.queued &&
+        !s00_deferred_still_queue.failed && app_exit_code == 0) {
+      constexpr std::uint64_t kS00StillQueueFrameBudget = 600u;
+      constexpr auto kS00StillQueueWallBudget = std::chrono::seconds(30);
+      const std::uint64_t waited_frames =
+          render_frame_number - s00_deferred_still_queue.armed_frame;
+      const auto waited_time =
+          std::chrono::steady_clock::now() -
+          s00_deferred_still_queue.armed_at;
+      const bool present_ready =
+          backend_stats.present_succeeded &&
+          backend_stats.present_success_count >
+              s00_deferred_still_queue.initial_present_success_count;
+      const bool rt_ready =
+          session.enable_ray_tracing &&
+          backend_stats.active_render_path == 1 &&
+          backend_stats.rt_tlas_count > 0u &&
+          backend_stats.rt_primitive_count > 0u;
+      const bool skybox_required =
+          xpbd::gfx::previewSceneUsesSkybox(session.preview_scene_id);
+      const bool skybox_ready =
+          !skybox_required ||
+          (raster_scene.skybox.valid() &&
+           raster_scene.skybox.generation != 0u &&
+           !raster_scene.skybox.source_identity.empty());
+      const bool surface_required =
+          xpbd::gfx::previewSceneHasSurfaceMesh(session.preview_scene_id);
+      const std::size_t surface_vertices =
+          raster_scene.environment.solid.size() +
+          raster_scene.environment.transparent.size();
+      const bool surface_ready =
+          !surface_required ||
+          (raster_scene.show_environment && surface_vertices > 0u &&
+           raster_scene.geometry_generation != 0u &&
+           raster_scene.topology_generation != 0u);
+      const bool trigger_ready =
+          s00_deferred_still_queue.mode ==
+                  S00DeferredStillQueue::Mode::AfterOnePresent
+              ? present_ready
+              : present_ready && rt_ready && skybox_ready && surface_ready;
+
+      xpbd::log::infof(
+          "S00_STILL_QUEUE_HEARTBEAT mode=%s frame=%llu waited_frames=%llu "
+          "present_ready=%d present_succeeded=%d present_success_count=%llu "
+          "rt_ready=%d render_path=%d blas=%u tlas=%u instances=%u "
+          "primitives=%u skybox_required=%d skybox_ready=%d "
+          "skybox_generation=%llu skybox_face_size=%d skybox_source=%s "
+          "surface_required=%d surface_ready=%d surface_vertices=%zu "
+          "scene_geometry_generation=%llu scene_topology_generation=%llu "
+          "model_generation=%llu material_generation=%llu "
+          "visibility_generation=%llu world_generation=%llu "
+          "world_lighting_generation=%llu world_display_generation=%llu "
+          "world_target_generation=%llu preview_scene=%d",
+          s00_deferred_still_queue.modeName(),
+          static_cast<unsigned long long>(render_frame_number),
+          static_cast<unsigned long long>(waited_frames),
+          present_ready ? 1 : 0,
+          backend_stats.present_succeeded ? 1 : 0,
+          static_cast<unsigned long long>(
+              backend_stats.present_success_count),
+          rt_ready ? 1 : 0, backend_stats.active_render_path,
+          backend_stats.rt_blas_count, backend_stats.rt_tlas_count,
+          backend_stats.rt_instance_count, backend_stats.rt_primitive_count,
+          skybox_required ? 1 : 0, skybox_ready ? 1 : 0,
+          static_cast<unsigned long long>(raster_scene.skybox.generation),
+          raster_scene.skybox.face_size,
+          raster_scene.skybox.source_identity.empty()
+              ? "none"
+              : raster_scene.skybox.source_identity.c_str(),
+          surface_required ? 1 : 0, surface_ready ? 1 : 0,
+          surface_vertices,
+          static_cast<unsigned long long>(
+              raster_scene.geometry_generation),
+          static_cast<unsigned long long>(
+              raster_scene.topology_generation),
+          static_cast<unsigned long long>(session.modelGeneration()),
+          static_cast<unsigned long long>(session.materialGeneration()),
+          static_cast<unsigned long long>(
+              session.viewportVisibilityGeneration()),
+          static_cast<unsigned long long>(
+              session.world_environment.generation),
+          static_cast<unsigned long long>(
+              session.world_environment.lighting_generation),
+          static_cast<unsigned long long>(
+              session.world_environment.display_generation),
+          static_cast<unsigned long long>(
+              session.world_environment.target_generation),
+          static_cast<int>(session.preview_scene_id));
+
+      if (trigger_ready) {
+        if (queue_startup_still_render()) {
+          s00_deferred_still_queue.queued = true;
+          xpbd::log::infof(
+              "S00_STILL_QUEUE_COMMIT mode=%s frame=%llu "
+              "trigger=%s present_success_count=%llu render_path=%d "
+              "tlas=%u primitives=%u skybox_generation=%llu "
+              "scene_geometry_generation=%llu "
+              "scene_topology_generation=%llu model_generation=%llu "
+              "material_generation=%llu visibility_generation=%llu "
+              "world_generation=%llu preview_scene=%d job_id=%llu",
+              s00_deferred_still_queue.modeName(),
+              static_cast<unsigned long long>(render_frame_number),
+              s00_deferred_still_queue.mode ==
+                      S00DeferredStillQueue::Mode::AfterOnePresent
+                  ? "successful_present"
+                  : "rt_and_background_ready",
+              static_cast<unsigned long long>(
+                  backend_stats.present_success_count),
+              backend_stats.active_render_path,
+              backend_stats.rt_tlas_count,
+              backend_stats.rt_primitive_count,
+              static_cast<unsigned long long>(
+                  raster_scene.skybox.generation),
+              static_cast<unsigned long long>(
+                  raster_scene.geometry_generation),
+              static_cast<unsigned long long>(
+                  raster_scene.topology_generation),
+              static_cast<unsigned long long>(session.modelGeneration()),
+              static_cast<unsigned long long>(
+                  session.materialGeneration()),
+              static_cast<unsigned long long>(
+                  session.viewportVisibilityGeneration()),
+              static_cast<unsigned long long>(
+                  session.world_environment.generation),
+              static_cast<int>(session.preview_scene_id),
+              static_cast<unsigned long long>(
+                  session.still_render_job.status.job_id));
+        } else {
+          xpbd::log::errorf(
+              "S00_STILL_QUEUE_FAILED reason=deferred_queue_rejected "
+              "mode=%s frame=%llu error=%s",
+              s00_deferred_still_queue.modeName(),
+              static_cast<unsigned long long>(render_frame_number),
+              session.last_error.c_str());
+          s00_deferred_still_queue.failed = true;
+          app_exit_code = 27;
+          running = false;
+        }
+      } else if (waited_frames >= kS00StillQueueFrameBudget ||
+                 waited_time >= kS00StillQueueWallBudget) {
+        xpbd::log::errorf(
+            "S00_STILL_QUEUE_FAILED reason=readiness_timeout mode=%s "
+            "frame=%llu waited_frames=%llu present_ready=%d rt_ready=%d "
+            "skybox_ready=%d surface_ready=%d render_path=%d tlas=%u "
+            "primitives=%u preview_scene=%d",
+            s00_deferred_still_queue.modeName(),
+            static_cast<unsigned long long>(render_frame_number),
+            static_cast<unsigned long long>(waited_frames),
+            present_ready ? 1 : 0, rt_ready ? 1 : 0,
+            skybox_ready ? 1 : 0, surface_ready ? 1 : 0,
+            backend_stats.active_render_path,
+            backend_stats.rt_tlas_count,
+            backend_stats.rt_primitive_count,
+            static_cast<int>(session.preview_scene_id));
+        s00_deferred_still_queue.failed = true;
+        app_exit_code = 28;
+        running = false;
+      }
+    }
+
+    if (s00_hot_import_enabled && app_exit_code == 0) {
+      const bool s00_fg_present_active =
+          backend_stats.dlss_frame_generation_active &&
+          backend_stats.dlss_frames_actually_presented > 1u;
+      const std::uint64_t s00_fg_phase_frames =
+          render_frame_number >= s00_fg_phase_start_frame
+              ? render_frame_number - s00_fg_phase_start_frame
+              : 0u;
+      const auto s00_fg_phase_elapsed =
+          std::chrono::steady_clock::now() - s00_fg_phase_start_time;
+      const bool s00_fg_phase_timed_out =
+          s00_fg_phase_frames >= kS00FgGateFrameBudget ||
+          s00_fg_phase_elapsed >= kS00FgGateWallBudget;
+      const char *stage = !s00_hot_import_started
+                              ? "pre_import"
+                              : (!s00_hot_import_rt_ready ? "rt_rebuild"
+                                                         : "post_import");
+      xpbd::log::infof(
+          "S00_PRESENT_HEARTBEAT frame=%llu stage=%s render_path=%d "
+          "blas=%u tlas=%u instances=%u primitives=%u fg_required=%d "
+          "fg_active=%d fg_presented=%u fg_streak=%llu",
+          static_cast<unsigned long long>(render_frame_number), stage,
+          backend_stats.active_render_path, backend_stats.rt_blas_count,
+          backend_stats.rt_tlas_count, backend_stats.rt_instance_count,
+          backend_stats.rt_primitive_count,
+          s00_hot_import_requires_fg ? 1 : 0,
+          backend_stats.dlss_frame_generation_active ? 1 : 0,
+          backend_stats.dlss_frames_actually_presented,
+          static_cast<unsigned long long>(
+              s00_hot_import_started
+                  ? s00_post_import_fg_active_frames
+                  : s00_pre_import_fg_active_frames));
+
+      if (!s00_hot_import_started) {
+        const bool rt_present_ready =
+            session.enable_ray_tracing &&
+            backend_stats.active_render_path == 1 &&
+            backend_stats.rt_tlas_count > 0u;
+        if (rt_present_ready) {
+          ++s00_pre_import_rt_present_frames;
+        } else {
+          s00_pre_import_rt_present_frames = 0;
+        }
+        if (s00_hot_import_requires_fg && rt_present_ready &&
+            s00_fg_present_active) {
+          ++s00_pre_import_fg_active_frames;
+        } else if (s00_hot_import_requires_fg) {
+          s00_pre_import_fg_active_frames = 0;
+        }
+        const bool fg_pre_import_ready =
+            !s00_hot_import_requires_fg ||
+            s00_pre_import_fg_active_frames >=
+                kS00RequiredFgActiveFrames;
+        if (s00_pre_import_rt_present_frames >= 30u &&
+            fg_pre_import_ready) {
+          s00_hot_import_started = true;
+          xpbd::log::infof("S00_DIALOG_CYCLE_BEGIN frame=%llu",
+                           static_cast<unsigned long long>(
+                               render_frame_number));
+          backend->prepareForSystemDialog();
+          const auto dialog_hold_begin = std::chrono::steady_clock::now();
+          if (s00_dialog_hold_ms > 0u) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(s00_dialog_hold_ms));
+          }
+          backend->resumeAfterSystemDialog();
+          const auto actual_dialog_hold_ms =
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - dialog_hold_begin)
+                  .count();
+          xpbd::log::infof(
+              "S00_DIALOG_CYCLE_END frame=%llu requested_hold_ms=%u "
+              "actual_hold_ms=%lld",
+              static_cast<unsigned long long>(render_frame_number),
+              s00_dialog_hold_ms,
+              static_cast<long long>(actual_dialog_hold_ms));
+          const std::uint64_t previous_generation = session.modelGeneration();
+          xpbd::log::infof(
+              "S00_IMPORT_BEGIN frame=%llu previous_generation=%llu path=%s",
+              static_cast<unsigned long long>(render_frame_number),
+              static_cast<unsigned long long>(previous_generation),
+              s00_hot_import_model.string().c_str());
+          const auto import_begin = std::chrono::steady_clock::now();
+          session.loadModel(s00_hot_import_model);
+          const double import_seconds = std::chrono::duration<double>(
+                                            std::chrono::steady_clock::now() -
+                                            import_begin)
+                                            .count();
+          if (!session.last_error.empty() ||
+              session.modelGeneration() == previous_generation) {
+            xpbd::log::errorf(
+                "S00_IMPORT_FAILED frame=%llu duration_seconds=%.6f "
+                "generation=%llu error=%s",
+                static_cast<unsigned long long>(render_frame_number),
+                import_seconds,
+                static_cast<unsigned long long>(session.modelGeneration()),
+                session.last_error.c_str());
+            app_exit_code = 3;
+            running = false;
+          } else {
+            std::size_t cube_count = 0;
+            for (const auto &bone : session.geometry.bones) {
+              cube_count += bone.cubes.size();
+            }
+            s00_hot_import_committed = true;
+            s00_import_commit_frame = render_frame_number;
+            s00_fg_phase_start_frame = render_frame_number;
+            s00_fg_phase_start_time = std::chrono::steady_clock::now();
+            s00_post_import_fg_active_frames = 0u;
+            xpbd::log::infof(
+                "S00_IMPORT_COMMIT frame=%llu duration_seconds=%.6f "
+                "generation=%llu bones=%zu cubes=%zu",
+                static_cast<unsigned long long>(render_frame_number),
+                import_seconds,
+                static_cast<unsigned long long>(session.modelGeneration()),
+                session.geometry.bones.size(), cube_count);
+          }
+        } else if (s00_hot_import_requires_fg &&
+                   s00_fg_phase_timed_out) {
+          xpbd::log::errorf(
+              "S00_FG_GATE_FAILED stage=pre_import frame=%llu "
+              "phase_frames=%llu fg_active=%d fg_presented=%u streak=%llu",
+              static_cast<unsigned long long>(render_frame_number),
+              static_cast<unsigned long long>(s00_fg_phase_frames),
+              backend_stats.dlss_frame_generation_active ? 1 : 0,
+              backend_stats.dlss_frames_actually_presented,
+              static_cast<unsigned long long>(
+                  s00_pre_import_fg_active_frames));
+          app_exit_code = 7;
+          running = false;
+        }
+      } else if (s00_hot_import_committed &&
+                 !s00_hot_import_rt_ready &&
+                 render_frame_number > s00_import_commit_frame &&
+                 backend_stats.active_render_path == 1 &&
+                 backend_stats.rt_tlas_count > 0u &&
+                 backend_stats.rt_primitive_count > 0u) {
+        s00_hot_import_rt_ready = true;
+        s00_rt_ready_frame = render_frame_number;
+        s00_fg_phase_start_frame = render_frame_number;
+        s00_fg_phase_start_time = std::chrono::steady_clock::now();
+        s00_post_import_fg_active_frames = 0u;
+        xpbd::log::infof(
+            "S00_IMPORT_RT_READY frame=%llu generation=%llu blas=%u tlas=%u "
+            "instances=%u primitives=%u as_bytes=%llu",
+            static_cast<unsigned long long>(render_frame_number),
+            static_cast<unsigned long long>(session.modelGeneration()),
+            backend_stats.rt_blas_count, backend_stats.rt_tlas_count,
+            backend_stats.rt_instance_count, backend_stats.rt_primitive_count,
+            static_cast<unsigned long long>(
+                backend_stats.rt_allocated_bytes));
+      } else if (s00_hot_import_rt_ready &&
+                 render_frame_number > s00_rt_ready_frame) {
+        ++s00_post_import_present_frames;
+        if (s00_hot_import_requires_fg && s00_fg_present_active) {
+          ++s00_post_import_fg_active_frames;
+        } else if (s00_hot_import_requires_fg) {
+          s00_post_import_fg_active_frames = 0u;
+        }
+        const bool fg_post_import_ready =
+            !s00_hot_import_requires_fg ||
+            s00_post_import_fg_active_frames >=
+                kS00RequiredFgActiveFrames;
+        if (s00_post_import_present_frames >= 30u &&
+            fg_post_import_ready) {
+          s00_hot_import_post_present = true;
+          xpbd::log::infof(
+              "S00_POST_IMPORT_PRESENT frame=%llu count=%llu "
+              "fg_streak=%llu",
+              static_cast<unsigned long long>(render_frame_number),
+              static_cast<unsigned long long>(
+                  s00_post_import_present_frames),
+              static_cast<unsigned long long>(
+                  s00_post_import_fg_active_frames));
+          running = false;
+        } else if (s00_hot_import_requires_fg &&
+                   s00_fg_phase_timed_out) {
+          xpbd::log::errorf(
+              "S00_FG_GATE_FAILED stage=post_import frame=%llu "
+              "phase_frames=%llu fg_active=%d fg_presented=%u streak=%llu",
+              static_cast<unsigned long long>(render_frame_number),
+              static_cast<unsigned long long>(s00_fg_phase_frames),
+              backend_stats.dlss_frame_generation_active ? 1 : 0,
+              backend_stats.dlss_frames_actually_presented,
+              static_cast<unsigned long long>(
+                  s00_post_import_fg_active_frames));
+          app_exit_code = 8;
+          running = false;
+        }
+      } else if (s00_hot_import_requires_fg &&
+                 s00_hot_import_committed &&
+                 s00_fg_phase_timed_out) {
+        xpbd::log::errorf(
+            "S00_FG_GATE_FAILED stage=rt_rebuild frame=%llu "
+            "phase_frames=%llu blas=%u tlas=%u primitives=%u",
+            static_cast<unsigned long long>(render_frame_number),
+            static_cast<unsigned long long>(s00_fg_phase_frames),
+            backend_stats.rt_blas_count, backend_stats.rt_tlas_count,
+            backend_stats.rt_primitive_count);
+        app_exit_code = 9;
+        running = false;
+      }
+    }
+
+    if (s00_visibility_gate.enabled() &&
+        s00_visibility_gate.stage != S00VisibilityGate::Stage::Failed &&
+        !s00_visibility_gate.complete() && app_exit_code == 0) {
+      const bool rt_present_ready =
+          session.enable_ray_tracing &&
+          backend_stats.active_render_path == 1 &&
+          backend_stats.rt_tlas_count > 0u &&
+          backend_stats.rt_primitive_count > 0u;
+      const auto stage_name = [&]() -> const char * {
+        switch (s00_visibility_gate.stage) {
+        case S00VisibilityGate::Stage::AwaitRtReady:
+          return "await_rt_ready";
+        case S00VisibilityGate::Stage::Hidden:
+          return "hidden";
+        case S00VisibilityGate::Stage::Restored:
+          return "restored";
+        case S00VisibilityGate::Stage::Complete:
+          return "complete";
+        case S00VisibilityGate::Stage::Failed:
+          return "failed";
+        case S00VisibilityGate::Stage::Disabled:
+        default:
+          return "disabled";
+        }
+      };
+      const auto fail_visibility_gate = [&](const char *reason,
+                                            int exit_code) {
+        xpbd::log::errorf(
+            "S00_VISIBILITY_FAILED reason=%s target=%s frame=%llu "
+            "stage=%s model_generation=%llu visibility_generation=%llu "
+            "visible_masks=%u hidden_masks=%u positive_emitters=%u "
+            "hidden_source_emitters=%u hidden_positive_weight=%u "
+            "blend_indices=%u "
+            "blas=%u tlas=%u full_builds=%llu refits=%llu "
+            "tlas_full_builds=%llu tlas_updates=%llu "
+            "emitter_rebuilds=%llu",
+            reason, s00_visibility_gate.target.c_str(),
+            static_cast<unsigned long long>(render_frame_number),
+            stage_name(),
+            static_cast<unsigned long long>(session.modelGeneration()),
+            static_cast<unsigned long long>(
+                session.viewportVisibilityGeneration()),
+            backend_stats.rt_visible_instance_mask_count,
+            backend_stats.rt_hidden_instance_mask_count,
+            backend_stats.rt_positive_emitter_count,
+            backend_stats.rt_hidden_source_emitter_triangle_count,
+            backend_stats.rt_hidden_positive_weight_triangle_count,
+            backend_stats.static_blend_index_count,
+            backend_stats.rt_blas_count, backend_stats.rt_tlas_count,
+            static_cast<unsigned long long>(backend_stats.rt_full_builds),
+            static_cast<unsigned long long>(backend_stats.rt_refits),
+            static_cast<unsigned long long>(
+                backend_stats.rt_tlas_full_builds),
+            static_cast<unsigned long long>(backend_stats.rt_tlas_updates),
+            static_cast<unsigned long long>(
+                backend_stats.rt_emitter_distribution_rebuilds));
+        s00_visibility_gate.stage = S00VisibilityGate::Stage::Failed;
+        app_exit_code = exit_code;
+        running = false;
+      };
+
+      xpbd::log::infof(
+          "S00_VISIBILITY_HEARTBEAT frame=%llu stage=%s rt_ready=%d "
+          "ready_count=%llu hidden_count=%llu restored_count=%llu "
+          "model_generation=%llu visibility_generation=%llu "
+          "visible_masks=%u hidden_masks=%u positive_emitters=%u "
+          "hidden_source_emitters=%u hidden_positive_weight=%u "
+          "blend_indices=%u "
+          "blas=%u tlas=%u full_builds=%llu refits=%llu "
+          "tlas_full_builds=%llu tlas_updates=%llu emitter_rebuilds=%llu",
+          static_cast<unsigned long long>(render_frame_number), stage_name(),
+          rt_present_ready ? 1 : 0,
+          static_cast<unsigned long long>(
+              s00_visibility_gate.ready_presents),
+          static_cast<unsigned long long>(
+              s00_visibility_gate.hidden_presents),
+          static_cast<unsigned long long>(
+              s00_visibility_gate.restored_presents),
+          static_cast<unsigned long long>(session.modelGeneration()),
+          static_cast<unsigned long long>(
+              session.viewportVisibilityGeneration()),
+          backend_stats.rt_visible_instance_mask_count,
+          backend_stats.rt_hidden_instance_mask_count,
+          backend_stats.rt_positive_emitter_count,
+          backend_stats.rt_hidden_source_emitter_triangle_count,
+          backend_stats.rt_hidden_positive_weight_triangle_count,
+          backend_stats.static_blend_index_count,
+          backend_stats.rt_blas_count, backend_stats.rt_tlas_count,
+          static_cast<unsigned long long>(backend_stats.rt_full_builds),
+          static_cast<unsigned long long>(backend_stats.rt_refits),
+          static_cast<unsigned long long>(
+              backend_stats.rt_tlas_full_builds),
+          static_cast<unsigned long long>(backend_stats.rt_tlas_updates),
+          static_cast<unsigned long long>(
+              backend_stats.rt_emitter_distribution_rebuilds));
+
+      switch (s00_visibility_gate.stage) {
+      case S00VisibilityGate::Stage::AwaitRtReady:
+        if (rt_present_ready) {
+          ++s00_visibility_gate.ready_presents;
+        } else {
+          s00_visibility_gate.ready_presents = 0u;
+        }
+        if (s00_visibility_gate.ready_presents >= 30u) {
+          const std::uint32_t mask_total =
+              backend_stats.rt_visible_instance_mask_count +
+              backend_stats.rt_hidden_instance_mask_count;
+          if (mask_total == 0u) {
+            fail_visibility_gate("missing_active_tlas_mask_stats", 14);
+            break;
+          }
+          if (s00_visibility_gate.material_control_required &&
+              backend_stats.static_blend_index_count == 0u) {
+            fail_visibility_gate("missing_alpha_blend_material_control", 25);
+            break;
+          }
+          if (s00_visibility_gate.material_control_required &&
+              backend_stats.rt_positive_emitter_count == 0u) {
+            fail_visibility_gate("missing_positive_emitter_control", 26);
+            break;
+          }
+          if (s00_visibility_gate.material_control_required &&
+              (backend_stats.rt_hidden_source_emitter_triangle_count != 0u ||
+               backend_stats.rt_hidden_positive_weight_triangle_count != 0u)) {
+            fail_visibility_gate("baseline_hidden_emitter_audit_not_zero", 27);
+            break;
+          }
+          s00_visibility_gate.baseline_stats = backend_stats;
+          s00_visibility_gate.initial_visibility_generation =
+              session.viewportVisibilityGeneration();
+          session.setBoneVisible(s00_visibility_gate.target, false);
+          if (session.isBoneVisible(s00_visibility_gate.target) ||
+              session.viewportVisibilityGeneration() <=
+                  s00_visibility_gate.initial_visibility_generation) {
+            fail_visibility_gate("hide_request_not_committed", 15);
+            break;
+          }
+          s00_visibility_gate.hidden_visibility_generation =
+              session.viewportVisibilityGeneration();
+          s00_visibility_gate.action_frame = render_frame_number;
+          s00_visibility_gate.stage = S00VisibilityGate::Stage::Hidden;
+          xpbd::log::infof(
+              "S00_VISIBILITY_HIDE_COMMIT target=%s frame=%llu "
+              "model_generation=%llu visibility_generation_before=%llu "
+              "visibility_generation_after=%llu status=%s "
+              "baseline_visible_masks=%u baseline_hidden_masks=%u "
+              "baseline_positive_emitters=%u "
+              "baseline_hidden_source_emitters=%u "
+              "baseline_hidden_positive_weight=%u baseline_blend_indices=%u "
+              "baseline_full_builds=%llu "
+              "baseline_tlas_updates=%llu baseline_emitter_rebuilds=%llu",
+              s00_visibility_gate.target.c_str(),
+              static_cast<unsigned long long>(render_frame_number),
+              static_cast<unsigned long long>(session.modelGeneration()),
+              static_cast<unsigned long long>(
+                  s00_visibility_gate.initial_visibility_generation),
+              static_cast<unsigned long long>(
+                  s00_visibility_gate.hidden_visibility_generation),
+              session.status.c_str(),
+              backend_stats.rt_visible_instance_mask_count,
+              backend_stats.rt_hidden_instance_mask_count,
+              backend_stats.rt_positive_emitter_count,
+              backend_stats.rt_hidden_source_emitter_triangle_count,
+              backend_stats.rt_hidden_positive_weight_triangle_count,
+              backend_stats.static_blend_index_count,
+              static_cast<unsigned long long>(backend_stats.rt_full_builds),
+              static_cast<unsigned long long>(
+                  backend_stats.rt_tlas_updates),
+              static_cast<unsigned long long>(
+                  backend_stats.rt_emitter_distribution_rebuilds));
+        }
+        break;
+      case S00VisibilityGate::Stage::Hidden:
+        if (!rt_present_ready ||
+            render_frame_number <= s00_visibility_gate.action_frame) {
+          break;
+        }
+        if (!s00_visibility_gate.hidden_stats_verified) {
+          const auto &baseline = s00_visibility_gate.baseline_stats;
+          const std::uint32_t baseline_mask_total =
+              baseline.rt_visible_instance_mask_count +
+              baseline.rt_hidden_instance_mask_count;
+          const std::uint32_t current_mask_total =
+              backend_stats.rt_visible_instance_mask_count +
+              backend_stats.rt_hidden_instance_mask_count;
+          if (backend_stats.rt_hidden_instance_mask_count <=
+                  baseline.rt_hidden_instance_mask_count ||
+              current_mask_total != baseline_mask_total) {
+            fail_visibility_gate("hidden_tlas_masks_not_observed", 16);
+            break;
+          }
+          if (backend_stats.rt_full_builds != baseline.rt_full_builds) {
+            fail_visibility_gate("hide_rebuilt_blas", 17);
+            break;
+          }
+          if (s00_visibility_gate.material_control_required &&
+              backend_stats.rt_hidden_source_emitter_triangle_count == 0u) {
+            fail_visibility_gate("hidden_source_emitter_control_not_observed",
+                                 28);
+            break;
+          }
+          if (s00_visibility_gate.material_control_required &&
+              backend_stats.rt_hidden_positive_weight_triangle_count != 0u) {
+            fail_visibility_gate("hidden_emitter_positive_weight_survived",
+                                 29);
+            break;
+          }
+          s00_visibility_gate.hidden_stats_verified = true;
+          xpbd::log::infof(
+              "S00_VISIBILITY_HIDDEN_OBSERVED target=%s frame=%llu "
+              "visible_masks=%u hidden_masks=%u positive_emitters=%u "
+              "hidden_source_emitters=%u hidden_positive_weight=%u "
+              "blend_indices=%u "
+              "full_builds=%llu tlas_updates=%llu emitter_rebuilds=%llu",
+              s00_visibility_gate.target.c_str(),
+              static_cast<unsigned long long>(render_frame_number),
+              backend_stats.rt_visible_instance_mask_count,
+              backend_stats.rt_hidden_instance_mask_count,
+              backend_stats.rt_positive_emitter_count,
+              backend_stats.rt_hidden_source_emitter_triangle_count,
+              backend_stats.rt_hidden_positive_weight_triangle_count,
+              backend_stats.static_blend_index_count,
+              static_cast<unsigned long long>(backend_stats.rt_full_builds),
+              static_cast<unsigned long long>(
+                  backend_stats.rt_tlas_updates),
+              static_cast<unsigned long long>(
+                  backend_stats.rt_emitter_distribution_rebuilds));
+        }
+        ++s00_visibility_gate.hidden_presents;
+        if (s00_visibility_gate.hidden_presents >= 30u) {
+          session.setBoneVisible(s00_visibility_gate.target, true);
+          if (!session.isBoneVisible(s00_visibility_gate.target) ||
+              session.viewportVisibilityGeneration() <=
+                  s00_visibility_gate.hidden_visibility_generation) {
+            fail_visibility_gate("restore_request_not_committed", 18);
+            break;
+          }
+          s00_visibility_gate.action_frame = render_frame_number;
+          s00_visibility_gate.stage = S00VisibilityGate::Stage::Restored;
+          xpbd::log::infof(
+              "S00_VISIBILITY_RESTORE_COMMIT target=%s frame=%llu "
+              "model_generation=%llu visibility_generation_before=%llu "
+              "visibility_generation_after=%llu status=%s",
+              s00_visibility_gate.target.c_str(),
+              static_cast<unsigned long long>(render_frame_number),
+              static_cast<unsigned long long>(session.modelGeneration()),
+              static_cast<unsigned long long>(
+                  s00_visibility_gate.hidden_visibility_generation),
+              static_cast<unsigned long long>(
+                  session.viewportVisibilityGeneration()),
+              session.status.c_str());
+        }
+        break;
+      case S00VisibilityGate::Stage::Restored:
+        if (!rt_present_ready ||
+            render_frame_number <= s00_visibility_gate.action_frame) {
+          break;
+        }
+        if (!s00_visibility_gate.restored_stats_verified) {
+          const auto &baseline = s00_visibility_gate.baseline_stats;
+          if (backend_stats.rt_visible_instance_mask_count !=
+                  baseline.rt_visible_instance_mask_count ||
+              backend_stats.rt_hidden_instance_mask_count !=
+                  baseline.rt_hidden_instance_mask_count) {
+            fail_visibility_gate("restored_tlas_masks_not_observed", 19);
+            break;
+          }
+          if (backend_stats.rt_full_builds != baseline.rt_full_builds) {
+            fail_visibility_gate("restore_rebuilt_blas", 20);
+            break;
+          }
+          if (s00_visibility_gate.material_control_required &&
+              (backend_stats.rt_hidden_source_emitter_triangle_count != 0u ||
+               backend_stats.rt_hidden_positive_weight_triangle_count != 0u)) {
+            fail_visibility_gate("restored_hidden_emitter_audit_not_zero", 30);
+            break;
+          }
+          s00_visibility_gate.restored_stats_verified = true;
+          xpbd::log::infof(
+              "S00_VISIBILITY_RESTORED_OBSERVED target=%s frame=%llu "
+              "visible_masks=%u hidden_masks=%u positive_emitters=%u "
+              "hidden_source_emitters=%u hidden_positive_weight=%u "
+              "blend_indices=%u "
+              "full_builds=%llu tlas_updates=%llu emitter_rebuilds=%llu",
+              s00_visibility_gate.target.c_str(),
+              static_cast<unsigned long long>(render_frame_number),
+              backend_stats.rt_visible_instance_mask_count,
+              backend_stats.rt_hidden_instance_mask_count,
+              backend_stats.rt_positive_emitter_count,
+              backend_stats.rt_hidden_source_emitter_triangle_count,
+              backend_stats.rt_hidden_positive_weight_triangle_count,
+              backend_stats.static_blend_index_count,
+              static_cast<unsigned long long>(backend_stats.rt_full_builds),
+              static_cast<unsigned long long>(
+                  backend_stats.rt_tlas_updates),
+              static_cast<unsigned long long>(
+                  backend_stats.rt_emitter_distribution_rebuilds));
+        }
+        ++s00_visibility_gate.restored_presents;
+        if (s00_visibility_gate.restored_presents >= 30u) {
+          const auto &baseline = s00_visibility_gate.baseline_stats;
+          if (backend_stats.rt_tlas_updates <=
+              baseline.rt_tlas_updates) {
+            fail_visibility_gate("no_tlas_update_observed", 21);
+            break;
+          }
+          if (backend_stats.rt_emitter_distribution_rebuilds <=
+              baseline.rt_emitter_distribution_rebuilds) {
+            fail_visibility_gate("no_emitter_visibility_rebuild_observed",
+                                 22);
+            break;
+          }
+          s00_visibility_gate.stage = S00VisibilityGate::Stage::Complete;
+          xpbd::log::infof(
+              "S00_VISIBILITY_COMPLETE target=%s frame=%llu "
+              "model_generation=%llu visibility_generation=%llu "
+              "visible_masks=%u hidden_masks=%u positive_emitters=%u "
+              "hidden_source_emitters=%u hidden_positive_weight=%u "
+              "blend_indices=%u "
+              "blas=%u tlas=%u full_builds=%llu refits=%llu "
+              "tlas_full_builds=%llu tlas_updates=%llu "
+              "emitter_rebuilds=%llu",
+              s00_visibility_gate.target.c_str(),
+              static_cast<unsigned long long>(render_frame_number),
+              static_cast<unsigned long long>(session.modelGeneration()),
+              static_cast<unsigned long long>(
+                  session.viewportVisibilityGeneration()),
+              backend_stats.rt_visible_instance_mask_count,
+              backend_stats.rt_hidden_instance_mask_count,
+              backend_stats.rt_positive_emitter_count,
+              backend_stats.rt_hidden_source_emitter_triangle_count,
+              backend_stats.rt_hidden_positive_weight_triangle_count,
+              backend_stats.static_blend_index_count,
+              backend_stats.rt_blas_count, backend_stats.rt_tlas_count,
+              static_cast<unsigned long long>(
+                  backend_stats.rt_full_builds),
+              static_cast<unsigned long long>(backend_stats.rt_refits),
+              static_cast<unsigned long long>(
+                  backend_stats.rt_tlas_full_builds),
+              static_cast<unsigned long long>(
+                  backend_stats.rt_tlas_updates),
+              static_cast<unsigned long long>(
+                  backend_stats.rt_emitter_distribution_rebuilds));
+          running = false;
+        }
+        break;
+      case S00VisibilityGate::Stage::Disabled:
+      case S00VisibilityGate::Stage::Complete:
+      case S00VisibilityGate::Stage::Failed:
+        break;
+      }
+    }
 
 
 
@@ -2317,11 +3394,61 @@ int app_main(int argc, char **argv) {
     }
     SDL_DestroyCursor(horizontal_resize_cursor);
   }
+  if (s00_hot_import_enabled) {
+    if (!s00_hot_import_post_present && app_exit_code == 0) {
+      app_exit_code = 4;
+      xpbd::log::error(
+          "S00_IMPORT_FAILED reason=gate_ended_before_post_import_present");
+    }
+    xpbd::log::infof("S00_CLEAN_EXIT result=%s exit_code=%d",
+                     app_exit_code == 0 ? "passed" : "failed",
+                     app_exit_code);
+  }
+  if (s00_visibility_gate.enabled()) {
+    if (!s00_visibility_gate.complete() &&
+        s00_visibility_gate.stage != S00VisibilityGate::Stage::Failed &&
+        app_exit_code == 0) {
+      app_exit_code = 23;
+      xpbd::log::errorf(
+          "S00_VISIBILITY_FAILED reason=gate_ended_before_completion "
+          "target=%s ready_count=%llu hidden_count=%llu restored_count=%llu",
+          s00_visibility_gate.target.c_str(),
+          static_cast<unsigned long long>(
+              s00_visibility_gate.ready_presents),
+          static_cast<unsigned long long>(
+              s00_visibility_gate.hidden_presents),
+          static_cast<unsigned long long>(
+              s00_visibility_gate.restored_presents));
+    }
+    xpbd::log::infof(
+        "S00_VISIBILITY_CLEAN_EXIT result=%s target=%s exit_code=%d",
+        s00_visibility_gate.complete() && app_exit_code == 0 ? "passed"
+                                                             : "failed",
+        s00_visibility_gate.target.c_str(), app_exit_code);
+  }
+  if (s00_deferred_still_queue.configured) {
+    if (!s00_deferred_still_queue.queued &&
+        !s00_deferred_still_queue.failed && app_exit_code == 0) {
+      app_exit_code = 29;
+      xpbd::log::errorf(
+          "S00_STILL_QUEUE_FAILED reason=gate_ended_before_queue mode=%s "
+          "frame=%llu",
+          s00_deferred_still_queue.modeName(),
+          static_cast<unsigned long long>(render_frame_number));
+    }
+    xpbd::log::infof(
+        "S00_STILL_QUEUE_CLEAN_EXIT result=%s mode=%s queued=%d "
+        "exit_code=%d",
+        s00_deferred_still_queue.queued && app_exit_code == 0 ? "passed"
+                                                              : "failed",
+        s00_deferred_still_queue.modeName(),
+        s00_deferred_still_queue.queued ? 1 : 0, app_exit_code);
+  }
   backend->shutdown();
   SDL_DestroyWindow(window);
   SDL_Quit();
   xpbd::log::shutdown();
-  return 0;
+  return app_exit_code;
 }
 
 #if defined(_WIN32)

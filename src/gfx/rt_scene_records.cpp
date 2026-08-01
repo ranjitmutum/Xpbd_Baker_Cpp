@@ -309,6 +309,8 @@ bool updateRigidRtInstanceTransforms(
       instance.previous_transform = instance.current_transform;
     }
     instance.current_transform = next;
+    instance.visibility_mask = rtInstanceVisibilityMask(
+        bone_states[instance.source_bone_index].tint[3]);
     instance.history_valid = true;
   }
   return true;

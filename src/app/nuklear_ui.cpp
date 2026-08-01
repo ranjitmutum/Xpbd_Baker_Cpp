@@ -1,5 +1,7 @@
 #include "xpbd/app/nuklear_ui.hpp"
 
+#include "nuklear_still_settings_panel.hpp"
+
 #include "xpbd/app/app_session.hpp"
 #include "xpbd/app/i18n.hpp"
 #include "xpbd/baker/output_timeline_resampler.hpp"
@@ -1638,68 +1640,21 @@ void drawRendererEditor(nk_context *ctx, const Geom &g, AppSession &session,
   const bool still_active = session.stillRenderActive();
   const bool still_controls_disabled =
       still_active || session.bake_busy.load();
-  std::array<char, 128> filename_buffer{};
-  const std::size_t filename_bytes =
-      (std::min)(still_job.settings.filename.size(),
-                 filename_buffer.size() - 1u);
-  std::copy_n(still_job.settings.filename.data(), filename_bytes,
-              filename_buffer.data());
-  int filename_length = static_cast<int>(filename_bytes);
-  if (still_controls_disabled) {
-    nk_widget_disable_begin(ctx);
-  }
-  nk_layout_row_dynamic(ctx, g.btn, 2);
-  nk_label(ctx, tr("still_filename"), NK_TEXT_LEFT);
-  const nk_flags edit_result = nk_edit_string(
-      ctx, NK_EDIT_FIELD | NK_EDIT_SIG_ENTER, filename_buffer.data(),
-      &filename_length, static_cast<int>(filename_buffer.size() - 1u),
-      nk_filter_default);
-  if (!still_controls_disabled &&
-      (edit_result & (NK_EDIT_ACTIVE | NK_EDIT_COMMITED))) {
-    still_job.settings.filename.assign(
-        filename_buffer.data(),
-        static_cast<std::size_t>((std::max)(0, filename_length)));
-  }
-  int still_width = static_cast<int>(still_job.settings.width);
-  if (intProperty(ctx, g, tr("still_width"), still_width, 64, 4'096,
-                  1, still_controls_disabled)) {
-    still_job.settings.width =
-        static_cast<std::uint32_t>(still_width);
-  }
-  int still_height = static_cast<int>(still_job.settings.height);
-  if (intProperty(ctx, g, tr("still_height"), still_height, 64, 4'096,
-                  1, still_controls_disabled)) {
-    still_job.settings.height =
-        static_cast<std::uint32_t>(still_height);
-  }
-  int still_samples =
-      static_cast<int>(still_job.settings.target_samples);
-  if (intProperty(ctx, g, tr("still_target_samples"), still_samples, 32,
-                  65'536, 1, still_controls_disabled)) {
-    still_job.settings.target_samples =
-        static_cast<std::uint32_t>(still_samples);
-  }
-  int still_submit =
-      static_cast<int>(still_job.settings.samples_per_submit);
-  if (intProperty(ctx, g, tr("still_samples_per_submit"), still_submit, 1,
-                  32, 1, still_controls_disabled)) {
-    still_job.settings.samples_per_submit =
-        static_cast<std::uint32_t>(still_submit);
-  }
-  std::vector<const char *> still_formats{tr("still_format_png"),
-                                          tr("still_format_exr")};
-  int still_format = static_cast<int>(still_job.settings.format);
-  if (combo(ctx, g, tr("still_format"), still_formats, still_format,
-            still_controls_disabled)) {
-    still_job.settings.format =
-        static_cast<gfx::StillImageFormat>(still_format);
-  }
-  (void)check(ctx, g, tr("still_transparent_background"),
-              still_job.settings.transparent_background,
-              still_controls_disabled);
-  if (still_controls_disabled) {
-    nk_widget_disable_end(ctx);
-  }
+  const StillSettingsPanelLabels still_labels{
+      tr("still_filename"),
+      tr("still_width"),
+      tr("still_height"),
+      tr("still_target_samples"),
+      tr("still_samples_per_submit"),
+      tr("still_format"),
+      tr("still_format_png"),
+      tr("still_format_exr"),
+      tr("still_transparent_background"),
+  };
+  const StillSettingsPanelGeometry still_geometry{g.s, g.btn, g.row};
+  (void)composeStillRenderSettingsPanel(
+      ctx, still_job.settings, still_labels, still_geometry,
+      still_controls_disabled);
   const std::string output_directory =
       session.stillRenderOutputDirectory().string();
   char output_line[512]{};

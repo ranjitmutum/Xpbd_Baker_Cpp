@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generator_version": 2,
+  "generator_version": 4,
   "generator": "tools/scene_tests/generate_s00_bedrock_fixtures.py",
   "seed": 20260731,
   "source": "project-owned deterministic generator",
@@ -67,6 +67,70 @@
       "cube_count": 10368,
       "byte_count": 3350033,
       "sha256": "FDFC87B514E043533A7C05D36EA4476574E36A53854A9407443124C637501689",
+      "source": "project-owned deterministic generator",
+      "license_spdx": "Apache-2.0"
+    }
+  ],
+  "animations": [
+    {
+      "file": "bedrock_s00_rotation_3deg_per_60hz.animation.json",
+      "identifier": "animation.xpbd_s00_rotation_3deg_per_60hz",
+      "role": "rotating_fg_motion_control",
+      "format_version": "1.8.0",
+      "seed": 20260731,
+      "target_bone": "branch_000_depth_00",
+      "nominal_fps": 60,
+      "degrees_per_frame": 3.0,
+      "axis": "y",
+      "animation_length_seconds": 2.0,
+      "byte_count": 526,
+      "sha256": "E01D37FD7D6E7FDF1BB1D0617C571EC3AB68C9ED7B10EDAFB0B7BD09F135878F",
+      "source": "project-owned deterministic generator",
+      "license_spdx": "Apache-2.0"
+    }
+  ],
+  "materials": [
+    {
+      "file": "bedrock_s00_alpha_emissive.png",
+      "material_set": "bedrock_s00_alpha_emissive",
+      "role": "alpha_blended_base_color_control",
+      "semantic": "base_color_rgba8",
+      "format": "PNG",
+      "width": 16,
+      "height": 16,
+      "pixel_format": "RGBA8",
+      "uniform_rgba": [
+        224,
+        96,
+        32,
+        128
+      ],
+      "paired_file": "bedrock_s00_alpha_emissive_s.png",
+      "alpha_semantic": "fixed_alpha_128_blended",
+      "byte_count": 1108,
+      "sha256": "D5D8793A0EB17A670A03A2C7718925B443D30F9AF6657BE217DECC3D1789D34E",
+      "source": "project-owned deterministic generator",
+      "license_spdx": "Apache-2.0"
+    },
+    {
+      "file": "bedrock_s00_alpha_emissive_s.png",
+      "material_set": "bedrock_s00_alpha_emissive",
+      "role": "labpbr_full_emission_control",
+      "semantic": "labpbr_specular_rgba8",
+      "format": "PNG",
+      "width": 16,
+      "height": 16,
+      "pixel_format": "RGBA8",
+      "uniform_rgba": [
+        0,
+        0,
+        0,
+        254
+      ],
+      "paired_file": "bedrock_s00_alpha_emissive.png",
+      "alpha_semantic": "labpbr_emission_strength_1",
+      "byte_count": 1108,
+      "sha256": "89DC50EF4306BB89DEA6A054792C1C23E52AA135DE9B6DB35D7FE7752E329BB7",
       "source": "project-owned deterministic generator",
       "license_spdx": "Apache-2.0"
     }

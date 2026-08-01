@@ -82,6 +82,7 @@
         "xpbd_baker_app",
         "xpbd_cli",
         "xpbd_viewport_regression_tests",
+        "xpbd_nuklear_focus_regression_tests",
         "xpbd_app_session_regression_tests",
         "xpbd_check_spirv"
       ]

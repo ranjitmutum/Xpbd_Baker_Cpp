@@ -157,6 +157,7 @@ struct StillRenderFrameRequest {
   PathTraceSettings path_trace_settings{};
   LabPbrDebugView material_debug_view = LabPbrDebugView::Shaded;
   RtDebugView rt_debug_view = RtDebugView::Off;
+  const PreviewSkybox *preview_skybox = nullptr;
   StillRenderStatus *status = nullptr;
 };
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 namespace xpbd::gfx {
 
 enum class FrameGenerationRuntimeState {
@@ -91,6 +93,41 @@ enum class FrameGenerationTransitionResult {
     return !options_on && !valid_inputs_tagged;
   }
   return state == FrameGenerationRuntimeState::ShuttingDown;
+}
+
+// DLSS-G may only become Active after the options and both per-frame SDK
+// submissions all refer to the frame that is about to be presented.  Keeping
+// this predicate pure makes stale-tag/constant transition bugs testable
+// without loading Streamline.
+[[nodiscard]] constexpr bool frameGenerationCurrentFrameInputsReady(
+    bool options_on, bool options_key_valid, bool valid_inputs_tagged,
+    std::uint32_t current_frame_index,
+    std::uint32_t constants_frame_index,
+    std::uint32_t tag_frame_index) noexcept {
+  return options_on && options_key_valid && valid_inputs_tagged &&
+         constants_frame_index == current_frame_index &&
+         tag_frame_index == current_frame_index;
+}
+
+// Tagging a new valid frame does not make an already confirmed Active proxy
+// less active.  The post-Present state query is the only authority that may
+// move Active back to ProxyArmed.
+[[nodiscard]] constexpr FrameGenerationRuntimeState
+frameGenerationStateAfterValidInputTagging(
+    FrameGenerationRuntimeState current) noexcept {
+  return current == FrameGenerationRuntimeState::Active
+             ? FrameGenerationRuntimeState::Active
+             : FrameGenerationRuntimeState::ProxyArmed;
+}
+
+// A transient invalid preview frame may pause an armed/active proxy, but input
+// cleanup is also used inside disable and shutdown transactions.  Those
+// lifecycle states must never be overwritten by ProxyArmed.
+[[nodiscard]] constexpr bool
+frameGenerationInputClearMayArmProxy(
+    FrameGenerationRuntimeState current) noexcept {
+  return current == FrameGenerationRuntimeState::ProxyArmed ||
+         current == FrameGenerationRuntimeState::Active;
 }
 
 } // namespace xpbd::gfx

@@ -303,6 +303,11 @@ struct StreamlineVulkanRuntime::Impl {
   std::uint32_t frame_generation_tag_frame_index = 0u;
   std::uint64_t frame_generation_generation = 0u;
   bool force_history_reset = true;
+  // A transient invalid guide frame pauses DLSS-G without destroying its
+  // proxy swapchain.  The first valid frame after the pause must rewrite
+  // common constants with reset=true even when SR/RR already used the same
+  // frame token.
+  bool frame_generation_resume_reset_pending = false;
 
 #if XPBD_WITH_STREAMLINE && defined(_WIN32)
   struct Image {
@@ -2689,7 +2694,8 @@ bool StreamlineVulkanRuntime::recordFrameGenerationInputs(
     return false;
   }
 
-  if (impl_->constants_frame_index != frame.frame_index) {
+  const bool resume_reset = impl_->frame_generation_resume_reset_pending;
+  if (impl_->constants_frame_index != frame.frame_index || resume_reset) {
     StreamlineDlssFrame constants_frame{};
     constants_frame.view = frame.view;
     constants_frame.projection = frame.projection;
@@ -2703,7 +2709,7 @@ bool StreamlineVulkanRuntime::recordFrameGenerationInputs(
     constants_frame.frame_index = frame.frame_index;
     constants_frame.jitter_x = frame.jitter_x;
     constants_frame.jitter_y = frame.jitter_y;
-    constants_frame.reset_history = frame.reset_history;
+    constants_frame.reset_history = frame.reset_history || resume_reset;
     const sl::Constants constants =
         makeDlssConstants(constants_frame);
     const sl::ViewportHandle constants_viewport{0u};
@@ -2882,11 +2888,14 @@ bool StreamlineVulkanRuntime::recordFrameGenerationInputs(
   ++impl_->frame_generation.tag_generation;
   impl_->frame_generation_tag_frame_index = frame.frame_index;
   impl_->frame_generation.valid_inputs_tagged = true;
+  impl_->frame_generation_resume_reset_pending = false;
   impl_->frame_generation_recovery_required = false;
   impl_->frame_generation_status =
       "DLSS Frame Generation inputs ready for present";
-  setFrameGenerationState(*impl_, FrameGenerationRuntimeState::ProxyArmed,
-                          frame.frame_index, "valid inputs tagged");
+  setFrameGenerationState(
+      *impl_, frameGenerationStateAfterValidInputTagging(
+                  impl_->frame_generation.state),
+      frame.frame_index, "valid inputs tagged");
   return true;
 #else
   (void)frame;
@@ -2910,19 +2919,47 @@ void StreamlineVulkanRuntime::clearFrameGenerationInputs(
   (void)viewport_y;
   (void)viewport_width;
   (void)viewport_height;
-  if (!impl_->initialized || !impl_->frame_generation_supported ||
-      impl_->sl_set_tag_for_frame == nullptr) {
-    return;
-  }
-  // A preview splitter changes only the tagged subrect, not the window or
-  // swapchain. Null-tag temporary invalid inputs while keeping the proxy mode
-  // unchanged; NVIDIA reserves the heavier eOff + swapchain-recreate path for
-  // actual window/fullscreen resolution changes.
-  sl::FrameToken *token = frameTokenFor(*impl_, frame_index);
-  if (token == nullptr) {
+  if (!impl_->initialized || !impl_->frame_generation_supported) {
     return;
   }
   const sl::ViewportHandle viewport{0u};
+  // Invalid guide frames keep the proxy swapchain but must not leave the
+  // interpolation feature enabled. Pause options before clearing tags so the
+  // SDK cannot interpolate a current backbuffer from stale guide resources.
+  bool pause_options_ok = true;
+  if (impl_->frame_generation_options_enabled) {
+    if (impl_->sl_dlss_g_set_options != nullptr) {
+      sl::DLSSGOptions options = impl_->frame_generation_options;
+      options.mode = sl::DLSSGMode::eOff;
+      const sl::Result options_result =
+          impl_->sl_dlss_g_set_options(viewport, options);
+      if (options_result == sl::Result::eOk) {
+        impl_->frame_generation_options = options;
+        ++impl_->frame_generation.options_generation;
+      } else {
+        pause_options_ok = false;
+        impl_->frame_generation_recovery_required = true;
+        xpbd::log::warnf(
+            "Streamline DLSS Frame Generation transient pause failed: %s",
+            sl::getResultAsStr(options_result));
+      }
+    } else {
+      pause_options_ok = false;
+      impl_->frame_generation_recovery_required = true;
+      xpbd::log::warn(
+          "Streamline DLSS Frame Generation transient pause is unavailable");
+    }
+  }
+  impl_->frame_generation_options_enabled = false;
+  impl_->frame_generation_options_key.valid = false;
+  impl_->frame_generation_resume_reset_pending = true;
+  impl_->force_history_reset = true;
+  impl_->constants_frame_index =
+      (std::numeric_limits<std::uint32_t>::max)();
+  impl_->frame_generation_tag_frame_index = frame_index;
+
+  sl::FrameToken *token = frameTokenFor(*impl_, frame_index);
+  bool null_tags_ok = false;
   // A true null-tag clears both the resource pointer and the extent. Keeping
   // the previous Backbuffer subrect here makes Streamline treat an invalid
   // frame as a valid subregion and can leave stale interpolation state alive.
@@ -2940,14 +2977,26 @@ void StreamlineVulkanRuntime::clearFrameGenerationInputs(
   }};
   sl::CommandBuffer *sl_command_buffer =
       reinterpret_cast<sl::CommandBuffer *>(command_buffer);
-  const sl::Result result = impl_->sl_set_tag_for_frame(
-      *token, viewport, tags.data(),
-      static_cast<std::uint32_t>(tags.size()),
-      sl_command_buffer);
-  if (result != sl::Result::eOk) {
+  sl::Result tag_result = sl::Result::eErrorIO;
+  if (token != nullptr && impl_->sl_set_tag_for_frame != nullptr) {
+    tag_result = impl_->sl_set_tag_for_frame(
+        *token, viewport, tags.data(),
+        static_cast<std::uint32_t>(tags.size()), sl_command_buffer);
+    null_tags_ok = tag_result == sl::Result::eOk;
+  }
+  if (!null_tags_ok) {
     impl_->frame_generation_status =
-        std::string("DLSS Frame Generation null-tag update failed: ") +
-        sl::getResultAsStr(result);
+        token == nullptr
+            ? "DLSS Frame Generation paused; frame token unavailable for "
+              "null tags"
+            : impl_->sl_set_tag_for_frame == nullptr
+                ? "DLSS Frame Generation paused; null-tag API unavailable"
+            : std::string("DLSS Frame Generation null-tag update failed: ") +
+                  sl::getResultAsStr(tag_result);
+    impl_->frame_generation_recovery_required = true;
+  } else if (!pause_options_ok) {
+    impl_->frame_generation_status =
+        "DLSS Frame Generation tags cleared; transient pause failed";
   } else {
     impl_->frame_generation_status =
         "DLSS Frame Generation paused until stable inputs resume";
@@ -2957,6 +3006,14 @@ void StreamlineVulkanRuntime::clearFrameGenerationInputs(
   impl_->frame_generation_state_ok = false;
   impl_->frame_generation_active = false;
   impl_->frames_actually_presented = 1u;
+  if (impl_->frame_generation_feature_loaded &&
+      impl_->swapchain_ownership ==
+          SwapchainOwnership::StreamlineFrameGenerationProxy &&
+      frameGenerationInputClearMayArmProxy(
+          impl_->frame_generation.state)) {
+    setFrameGenerationState(*impl_, FrameGenerationRuntimeState::ProxyArmed,
+                            frame_index, "invalid inputs paused");
+  }
 #else
   (void)command_buffer;
   (void)frame_index;
@@ -3015,12 +3072,32 @@ updateFrameGenerationStateAfterPresent(
   if (api_result != FrameGenerationTransitionResult::NoAction) {
     return api_result;
   }
-  if (!impl_->frame_generation_options_enabled ||
-      !impl_->frame_generation_supported ||
-      impl_->sl_dlss_g_get_state == nullptr) {
+  const bool current_frame_inputs_ready =
+      frameGenerationCurrentFrameInputsReady(
+          impl_->frame_generation_options_enabled,
+          impl_->frame_generation_options_key.valid,
+          impl_->frame_generation.tag_generation != 0u,
+          impl_->current_frame_index, impl_->constants_frame_index,
+          impl_->frame_generation_tag_frame_index);
+  if (!current_frame_inputs_ready ||
+       !impl_->frame_generation_supported ||
+       impl_->sl_dlss_g_get_state == nullptr) {
     impl_->frame_generation_active = false;
     impl_->frame_generation_state_ok = false;
     impl_->frames_actually_presented = 1u;
+    if (!current_frame_inputs_ready) {
+      impl_->frame_generation_status =
+          "DLSS Frame Generation paused; current-frame options, constants, "
+          "or tags are incomplete";
+      if (impl_->frame_generation_feature_loaded &&
+          impl_->swapchain_ownership ==
+              SwapchainOwnership::StreamlineFrameGenerationProxy) {
+        setFrameGenerationState(
+            *impl_, FrameGenerationRuntimeState::ProxyArmed,
+            impl_->current_frame_index,
+            "current-frame inputs are incomplete after present");
+      }
+    }
     return FrameGenerationTransitionResult::NoAction;
   }
   const sl::ViewportHandle viewport{0u};
@@ -3061,16 +3138,17 @@ updateFrameGenerationStateAfterPresent(
       impl_->frame_generation_active
           ? "DLSS Frame Generation active"
           : "DLSS Frame Generation enabled; waiting for generated presents";
-  impl_->frame_generation.state =
-      impl_->frame_generation_active
-          ? FrameGenerationRuntimeState::Active
-          : FrameGenerationRuntimeState::ProxyArmed;
   impl_->frame_generation_state_ok = true;
-  impl_->frame_generation.state_ok = true;
   impl_->frame_generation_present_frame_index =
       impl_->current_frame_index;
-  impl_->frame_generation.present_frame_index =
-      impl_->current_frame_index;
+  setFrameGenerationState(
+      *impl_, impl_->frame_generation_active
+                  ? FrameGenerationRuntimeState::Active
+                  : FrameGenerationRuntimeState::ProxyArmed,
+      impl_->current_frame_index,
+      impl_->frame_generation_active
+          ? "generated present confirmed"
+          : "waiting for generated present");
   return FrameGenerationTransitionResult::NoAction;
 #else
   impl_->frame_generation_active = false;

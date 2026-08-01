@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -144,6 +145,82 @@ void testDefaultEmptyScene() {
   expect(session.world_environment.sky_rendering ==
              xpbd::gfx::SkyRendering::Off,
          "new session defaults to Sky Rendering Off");
+}
+
+void testStillRenderSceneSelectionContentMatrix() {
+  using xpbd::app::SceneSelectionKind;
+  xpbd::app::StillRenderSnapshot snapshot;
+
+  snapshot.scene_selection.kind = SceneSelectionKind::Empty;
+  expect(!snapshot.scene_selection.rendersLoadedContent(true),
+         "Still Empty Scene excludes retained model content");
+
+  snapshot.scene_selection.kind = SceneSelectionKind::Loaded;
+  expect(snapshot.scene_selection.rendersLoadedContent(true),
+         "Still Loaded Scene includes retained model content");
+
+  snapshot.scene_selection.kind = SceneSelectionKind::UserBuilt;
+  expect(snapshot.scene_selection.rendersLoadedContent(true),
+         "Still User-Built Scene includes retained model content");
+
+  snapshot.scene_selection.kind = SceneSelectionKind::Preset;
+  expect(snapshot.scene_selection.rendersLoadedContent(true),
+         "Still Preset Scene includes retained model content over its background");
+
+  expect(!snapshot.scene_selection.rendersLoadedContent(false),
+         "Still Scene selection cannot synthesize missing model content");
+}
+
+void testBoneSubtreeVisibilityGeneration() {
+  auto &session = xpbd::app::AppSession::instance();
+  const auto original_geometry = session.geometry;
+  const auto original_hidden_bones = session.hidden_bone_names;
+  const auto original_status = session.status;
+
+  xpbd::loader::Bone root;
+  root.name = "visibility_root";
+  xpbd::loader::Bone child;
+  child.name = "visibility_child";
+  child.has_parent = true;
+  child.parent = root.name;
+  xpbd::loader::Bone sibling;
+  sibling.name = "visibility_sibling";
+  session.geometry.bones = {root, child, sibling};
+  session.hidden_bone_names.clear();
+
+  const std::uint64_t visibility_before =
+      session.viewportVisibilityGeneration();
+  const std::uint64_t appearance_before =
+      session.viewportAppearanceGeneration();
+  session.setBoneVisible(root.name, false);
+  expect(!session.isBoneVisible(root.name) &&
+             !session.isBoneVisible(child.name) &&
+             session.isBoneVisible(sibling.name),
+         "hiding a bone hides its subtree without affecting siblings");
+  expect(session.viewportVisibilityGeneration() > visibility_before &&
+             session.viewportAppearanceGeneration() > appearance_before,
+         "subtree hide advances visibility and appearance generations");
+
+  const std::uint64_t hidden_generation =
+      session.viewportVisibilityGeneration();
+  session.setBoneVisible(root.name, false);
+  expect(session.viewportVisibilityGeneration() == hidden_generation,
+         "idempotent subtree hide does not spuriously advance generation");
+
+  session.setBoneVisible(root.name, true);
+  expect(session.isBoneVisible(root.name) &&
+             session.isBoneVisible(child.name) &&
+             session.viewportVisibilityGeneration() > hidden_generation,
+         "restoring a bone restores its subtree and advances generation");
+  const std::uint64_t restored_generation =
+      session.viewportVisibilityGeneration();
+  session.setBoneVisible("visibility_missing", false);
+  expect(session.viewportVisibilityGeneration() == restored_generation,
+         "missing visibility target leaves session generations unchanged");
+
+  session.geometry = original_geometry;
+  session.hidden_bone_names = original_hidden_bones;
+  session.status = original_status;
 }
 
 void testSceneSelectionTransactionsAndPersistence() {
@@ -963,6 +1040,150 @@ void testStillRenderSnapshotAndOutput() {
              decoded_png.rgba[2] == 0u && decoded_png.rgba[3] == 0u &&
              decoded_png.rgba[7] == 255u,
          "depth-aware PNG clears a visible sky behind transparent output");
+
+  const std::array<std::uint8_t, 24> cubemap_rgba{
+      255u, 0u,   0u,   255u, // +X red
+      0u,   255u, 0u,   255u, // -X green
+      0u,   0u,   255u, 255u, // +Y blue
+      255u, 255u, 0u,   255u, // -Y yellow
+      255u, 0u,   255u, 255u, // +Z magenta
+      0u,   255u, 255u, 255u  // -Z cyan
+  };
+  xpbd::gfx::StillImageCubemapBackground cubemap_background;
+  cubemap_background.face_size = 1u;
+  cubemap_background.rgba8 = cubemap_rgba.data();
+  cubemap_background.rgba8_size = cubemap_rgba.size();
+  cubemap_background.inverse_view_projection = {
+      1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
+      0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f};
+  cubemap_background.camera_position = {0.0f, 0.0f, 0.0f};
+  const std::array<std::uint16_t, 4> empty_sky_rgba16f{};
+  const std::array<float, 1> far_depth{1.0f};
+
+  const fs::path cubemap_png_path = directory / "output" / "cubemap.png";
+  xpbd::gfx::TextureImage decoded_cubemap_png;
+  expect(xpbd::gfx::writeStillImageRgba16f(
+             cubemap_png_path, xpbd::gfx::StillImageFormat::Png, 1u, 1u,
+             empty_sky_rgba16f.data(), empty_sky_rgba16f.size(), display,
+             false, far_depth.data(), far_depth.size(), &error,
+             &cubemap_background) &&
+             xpbd::gfx::loadTextureImage(cubemap_png_path,
+                                         decoded_cubemap_png, &error) &&
+             decoded_cubemap_png.rgba ==
+                 std::vector<std::uint8_t>({255u, 0u, 255u, 255u}),
+         "opaque Still sky samples the frozen +Z preview cubemap face exactly");
+
+  const std::array<std::uint16_t, 4> half_covered_red_rgba16f{
+      0x3c00u, 0x0000u, 0x0000u, 0x3800u};
+  const fs::path half_covered_png_path =
+      directory / "output" / "cubemap-half-covered.png";
+  xpbd::gfx::TextureImage decoded_half_covered_png;
+  expect(xpbd::gfx::writeStillImageRgba16f(
+             half_covered_png_path, xpbd::gfx::StillImageFormat::Png, 1u, 1u,
+             half_covered_red_rgba16f.data(),
+             half_covered_red_rgba16f.size(), display, false,
+             far_depth.data(), far_depth.size(), &error,
+             &cubemap_background) &&
+             xpbd::gfx::loadTextureImage(half_covered_png_path,
+                                         decoded_half_covered_png, &error) &&
+             decoded_half_covered_png.rgba ==
+                 std::vector<std::uint8_t>({255u, 0u, 128u, 255u}),
+         "opaque Still preserves a half-covered foreground over preview sky");
+
+  const fs::path half_covered_transparent_png_path =
+      directory / "output" / "cubemap-half-covered-transparent.png";
+  xpbd::gfx::TextureImage decoded_half_covered_transparent_png;
+  expect(xpbd::gfx::writeStillImageRgba16f(
+             half_covered_transparent_png_path,
+             xpbd::gfx::StillImageFormat::Png, 1u, 1u,
+             half_covered_red_rgba16f.data(),
+             half_covered_red_rgba16f.size(), display, true,
+             far_depth.data(), far_depth.size(), &error,
+             &cubemap_background) &&
+             xpbd::gfx::loadTextureImage(
+                 half_covered_transparent_png_path,
+                 decoded_half_covered_transparent_png, &error) &&
+             decoded_half_covered_transparent_png.rgba ==
+                 std::vector<std::uint8_t>({255u, 0u, 0u, 128u}),
+         "transparent Still preserves far-depth foreground coverage");
+
+  const fs::path transparent_cubemap_png_path =
+      directory / "output" / "cubemap-transparent.png";
+  xpbd::gfx::TextureImage decoded_transparent_cubemap_png;
+  expect(xpbd::gfx::writeStillImageRgba16f(
+             transparent_cubemap_png_path, xpbd::gfx::StillImageFormat::Png,
+             1u, 1u, empty_sky_rgba16f.data(), empty_sky_rgba16f.size(),
+             display, true, far_depth.data(), far_depth.size(), &error,
+             &cubemap_background) &&
+             xpbd::gfx::loadTextureImage(transparent_cubemap_png_path,
+                                         decoded_transparent_cubemap_png,
+                                         &error) &&
+             decoded_transparent_cubemap_png.rgba ==
+                 std::vector<std::uint8_t>({0u, 0u, 0u, 0u}),
+         "transparent Still output clears sky instead of compositing cubemap");
+
+  const fs::path cubemap_exr_path = directory / "output" / "cubemap.exr";
+  expect(xpbd::gfx::writeStillImageRgba16f(
+             cubemap_exr_path, xpbd::gfx::StillImageFormat::Exr, 1u, 1u,
+             empty_sky_rgba16f.data(), empty_sky_rgba16f.size(), display,
+             false, far_depth.data(), far_depth.size(), &error,
+             &cubemap_background),
+         "opaque EXR composites the frozen preview cubemap");
+  std::ifstream cubemap_exr_stream(cubemap_exr_path, std::ios::binary);
+  const std::vector<std::uint8_t> cubemap_exr_bytes{
+      std::istreambuf_iterator<char>(cubemap_exr_stream),
+      std::istreambuf_iterator<char>()};
+  const auto trailing_half = [&](std::size_t channel) {
+    const std::size_t offset = cubemap_exr_bytes.size() - 8u + channel * 2u;
+    return static_cast<std::uint16_t>(cubemap_exr_bytes[offset]) |
+           static_cast<std::uint16_t>(cubemap_exr_bytes[offset + 1u]) << 8u;
+  };
+  expect(cubemap_exr_bytes.size() > 16u && trailing_half(0u) == 0x3c00u &&
+             trailing_half(1u) == 0x3c00u && trailing_half(2u) == 0x0000u &&
+             trailing_half(3u) == 0x3c00u,
+         "EXR sky stores display-linear A/B/G/R half-float channels");
+  cubemap_exr_stream.close();
+
+  const fs::path half_covered_exr_path =
+      directory / "output" / "cubemap-half-covered.exr";
+  expect(xpbd::gfx::writeStillImageRgba16f(
+             half_covered_exr_path, xpbd::gfx::StillImageFormat::Exr, 1u, 1u,
+             half_covered_red_rgba16f.data(),
+             half_covered_red_rgba16f.size(), display, false,
+             far_depth.data(), far_depth.size(), &error,
+             &cubemap_background),
+         "opaque EXR composites a half-covered foreground over preview sky");
+  std::ifstream half_covered_exr_stream(half_covered_exr_path,
+                                        std::ios::binary);
+  const std::vector<std::uint8_t> half_covered_exr_bytes{
+      std::istreambuf_iterator<char>(half_covered_exr_stream),
+      std::istreambuf_iterator<char>()};
+  const auto half_covered_trailing_half = [&](std::size_t channel) {
+    const std::size_t offset =
+        half_covered_exr_bytes.size() - 8u + channel * 2u;
+    return static_cast<std::uint16_t>(half_covered_exr_bytes[offset]) |
+           static_cast<std::uint16_t>(half_covered_exr_bytes[offset + 1u])
+               << 8u;
+  };
+  expect(half_covered_exr_bytes.size() > 16u &&
+             half_covered_trailing_half(0u) == 0x3c00u &&
+             half_covered_trailing_half(1u) == 0x3800u &&
+             half_covered_trailing_half(2u) == 0x0000u &&
+             half_covered_trailing_half(3u) == 0x3c00u,
+         "EXR half coverage blends foreground and display-linear sky");
+  half_covered_exr_stream.close();
+
+  auto invalid_cubemap_background = cubemap_background;
+  invalid_cubemap_background.rgba8_size -= 1u;
+  error.clear();
+  expect(!xpbd::gfx::writeStillImageRgba16f(
+             directory / "output" / "invalid-cubemap.png",
+             xpbd::gfx::StillImageFormat::Png, 1u, 1u,
+             empty_sky_rgba16f.data(), empty_sky_rgba16f.size(), display,
+             false, far_depth.data(), far_depth.size(), &error,
+             &invalid_cubemap_background) &&
+             error == "still image cubemap background is invalid",
+         "Still exporter rejects malformed frozen cubemap ownership");
   if (const char *evidence_directory =
           std::getenv("XPBD_STILL_TEST_EVIDENCE");
       evidence_directory != nullptr && evidence_directory[0] != '\0') {
@@ -990,6 +1211,8 @@ void testStillRenderSnapshotAndOutput() {
 
 int main(int argc, char **argv) {
   testDefaultEmptyScene();
+  testStillRenderSceneSelectionContentMatrix();
+  testBoneSubtreeVisibilityGeneration();
   testSceneSelectionTransactionsAndPersistence();
   testIndependentSkyRenderingState();
   testPathTraceSettingsPersistenceAndClassification();

@@ -83,8 +83,22 @@ struct RtInstanceRecord {
       1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
   std::array<float, 16> previous_transform{
       1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  std::uint8_t visibility_mask = 0xFFu;
   bool history_valid = false;
 };
+
+[[nodiscard]] inline constexpr std::uint8_t
+rtInstanceVisibilityMask(float alpha) noexcept {
+  return alpha > 0.0f ? 0xFFu : 0u;
+}
+
+[[nodiscard]] inline constexpr float
+rtEmitterVisibilityScale(float alpha) noexcept {
+  if (!(alpha > 0.0f)) {
+    return 0.0f;
+  }
+  return alpha < 1.0f ? alpha : 1.0f;
+}
 
 struct RtPackedGeometryRange {
   RtGeometryKind kind = RtGeometryKind::StaticScene;

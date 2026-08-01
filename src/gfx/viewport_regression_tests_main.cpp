@@ -2383,9 +2383,35 @@ void testCanonicalCubeAndRtSceneRecords() {
              records, transforms, true),
          "rigid instance transform initializes with reset history");
   expectNear(records.instances[0].current_transform[12], 2.0f, 1.0e-6f,
-             "rigid instance current transform uses bone transform");
+              "rigid instance current transform uses bone transform");
   expectNear(records.instances[0].previous_transform[12], 2.0f, 1.0e-6f,
-             "reset rigid history copies current into previous");
+              "reset rigid history copies current into previous");
+  expect(records.instances[0].visibility_mask == 0xFFu,
+         "visible rigid bone resolves to full TLAS instance mask");
+  transforms[0].tint[3] = 0.0f;
+  expect(xpbd::gfx::updateRigidRtInstanceTransforms(
+             records, transforms, false) &&
+             records.instances[0].visibility_mask == 0u,
+         "hidden rigid bone resolves to zero TLAS instance mask");
+  expectNear(xpbd::gfx::rtEmitterVisibilityScale(transforms[0].tint[3]),
+             0.0f, 0.0f,
+             "hidden rigid bone contributes no mesh-light weight");
+  const auto hidden_emitter_audit = xpbd::gfx::auditRtEmitterVisibility(
+      xpbd::gfx::rtEmitterVisibilityScale(transforms[0].tint[3]), true, 0.0);
+  expect(hidden_emitter_audit.hidden_source_emitter &&
+             !hidden_emitter_audit.hidden_positive_weight,
+         "hidden authored emitter is observed with zero final weight");
+  const auto hidden_weight_violation =
+      xpbd::gfx::auditRtEmitterVisibility(0.0f, true, 0.25);
+  expect(hidden_weight_violation.hidden_source_emitter &&
+             hidden_weight_violation.hidden_positive_weight,
+         "visibility audit exposes a hidden positive-weight violation");
+  const auto visible_emitter_audit =
+      xpbd::gfx::auditRtEmitterVisibility(1.0f, true, 0.25);
+  expect(!visible_emitter_audit.hidden_source_emitter &&
+             !visible_emitter_audit.hidden_positive_weight,
+         "visible emitter is excluded from hidden-only diagnostics");
+  transforms[0].tint[3] = 1.0f;
   transforms[0].transform[12] = 4.0f;
   expect(xpbd::gfx::updateRigidRtInstanceTransforms(
              records, transforms, false),
@@ -2393,7 +2419,11 @@ void testCanonicalCubeAndRtSceneRecords() {
   expectNear(records.instances[0].previous_transform[12], 2.0f, 1.0e-6f,
              "rigid instance keeps previous transform for motion");
   expectNear(records.instances[0].current_transform[12], 4.0f, 1.0e-6f,
-             "rigid instance installs next current transform");
+              "rigid instance installs next current transform");
+  expect(records.instances[0].visibility_mask == 0xFFu &&
+             xpbd::gfx::rtInstanceVisibilityMask(
+                 std::numeric_limits<float>::quiet_NaN()) == 0u,
+         "unhide restores full mask and invalid alpha remains hidden");
 
   xpbd::loader::Bone child;
   child.name = "child";
@@ -2620,7 +2650,10 @@ void testRayTracingCapability() {
 }
 
 void testFrameGenerationStateLegality() {
+  using xpbd::gfx::frameGenerationCurrentFrameInputsReady;
+  using xpbd::gfx::frameGenerationInputClearMayArmProxy;
   using xpbd::gfx::frameGenerationRuntimeCombinationIsLegal;
+  using xpbd::gfx::frameGenerationStateAfterValidInputTagging;
   using xpbd::gfx::FrameGenerationRuntimeState;
   using xpbd::gfx::SwapchainOwnership;
   constexpr SwapchainOwnership native = SwapchainOwnership::Native;
@@ -2671,6 +2704,46 @@ void testFrameGenerationStateLegality() {
              FrameGenerationRuntimeState::DisablingDrain, true, proxy, true,
              false),
          "DLSS-G drain rejects enabled options");
+
+  expect(frameGenerationCurrentFrameInputsReady(true, true, true, 42u, 42u,
+                                                42u),
+         "DLSS-G current frame accepts matching options/constants/tags");
+  expect(!frameGenerationCurrentFrameInputsReady(false, true, true, 42u, 42u,
+                                                 42u),
+         "DLSS-G current frame rejects disabled options");
+  expect(!frameGenerationCurrentFrameInputsReady(true, false, true, 42u, 42u,
+                                                 42u),
+         "DLSS-G current frame rejects an invalid options key");
+  expect(!frameGenerationCurrentFrameInputsReady(true, true, false, 42u, 42u,
+                                                 42u),
+         "DLSS-G current frame rejects cleared tags");
+  expect(!frameGenerationCurrentFrameInputsReady(true, true, true, 42u, 41u,
+                                                 42u),
+         "DLSS-G current frame rejects stale constants");
+  expect(!frameGenerationCurrentFrameInputsReady(true, true, true, 42u, 42u,
+                                                 41u),
+         "DLSS-G current frame rejects stale tags");
+
+  expect(frameGenerationStateAfterValidInputTagging(
+             FrameGenerationRuntimeState::Active) ==
+             FrameGenerationRuntimeState::Active,
+         "DLSS-G valid input tagging preserves confirmed Active state");
+  expect(frameGenerationStateAfterValidInputTagging(
+             FrameGenerationRuntimeState::ProxyArmed) ==
+             FrameGenerationRuntimeState::ProxyArmed,
+         "DLSS-G valid input tagging keeps an unconfirmed proxy armed");
+  expect(frameGenerationInputClearMayArmProxy(
+             FrameGenerationRuntimeState::Active),
+         "DLSS-G invalid input pauses an Active proxy back to armed");
+  expect(frameGenerationInputClearMayArmProxy(
+             FrameGenerationRuntimeState::ProxyArmed),
+         "DLSS-G invalid input may keep an armed proxy armed");
+  expect(!frameGenerationInputClearMayArmProxy(
+             FrameGenerationRuntimeState::DisablingDrain),
+         "DLSS-G input cleanup cannot overwrite a disabling transaction");
+  expect(!frameGenerationInputClearMayArmProxy(
+             FrameGenerationRuntimeState::ShuttingDown),
+         "DLSS-G input cleanup cannot overwrite shutdown state");
 }
 
 void testRtAlphaSemantics() {

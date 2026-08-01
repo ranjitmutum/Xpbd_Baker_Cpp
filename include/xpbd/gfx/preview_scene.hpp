@@ -190,8 +190,11 @@ static_assert(alignof(MeshScenePushConstants) == 16);
 // Static cubemap skybox transform (vertex + fragment pipeline layout).
 struct alignas(16) SkyboxPushConstants {
   float mvp[16]{};
+  // flags[0] bit 0: decode display-referred cubemap bytes to linear before
+  // writing to an SRGB swapchain attachment (which encodes on store).
+  std::uint32_t flags[4]{};
 };
-static_assert(sizeof(SkyboxPushConstants) == 64);
+static_assert(sizeof(SkyboxPushConstants) == 80);
 static_assert(alignof(SkyboxPushConstants) == 16);
 
 // Procedural cubemap faces: order +X, -X, +Y, -Y, +Z, -Z.

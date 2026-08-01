@@ -472,6 +472,11 @@ struct SceneSelectionState {
   // so switching away from a loaded model remains reversible.
   std::string source_identity;
   std::uint64_t generation = 1;
+
+  [[nodiscard]] constexpr bool
+  rendersLoadedContent(bool has_loaded_scene_content) const noexcept {
+    return kind != SceneSelectionKind::Empty && has_loaded_scene_content;
+  }
 };
 
 struct StillRenderSettings {
@@ -781,8 +786,7 @@ public:
     return !model_path.empty() && !geometry.bones.empty();
   }
   [[nodiscard]] bool sceneRendersLoadedContent() const noexcept {
-    return scene_selection.kind != SceneSelectionKind::Empty &&
-           hasLoadedSceneContent();
+    return scene_selection.rendersLoadedContent(hasLoadedSceneContent());
   }
   bool selectScene(SceneSelectionKind kind);
   bool selectPresetScene(gfx::PreviewSceneId preset);

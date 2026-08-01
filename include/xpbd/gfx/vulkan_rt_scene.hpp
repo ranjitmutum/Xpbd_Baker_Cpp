@@ -79,6 +79,11 @@ struct RtSceneStats {
   std::uint32_t blas_count = 0;
   std::uint32_t tlas_count = 0;
   std::uint32_t instance_count = 0;
+  std::uint32_t visible_instance_mask_count = 0;
+  std::uint32_t hidden_instance_mask_count = 0;
+  std::uint32_t positive_emitter_count = 0;
+  std::uint32_t hidden_source_emitter_triangle_count = 0;
+  std::uint32_t hidden_positive_weight_triangle_count = 0;
   std::uint32_t primitive_count = 0;
   std::uint64_t as_storage_bytes = 0;
   std::uint64_t scratch_bytes = 0;
@@ -329,6 +334,7 @@ private:
   [[nodiscard]] bool ensureTlasStorage(std::uint32_t instance_count);
   void writeInstanceData(
       const float *bone_transforms_column_major, std::size_t bone_count,
+      const float *bone_tints_rgba, std::size_t tint_count,
       const float *previous_bone_transforms_column_major,
       std::size_t previous_bone_count, bool motion_history_valid);
   void recordBlasBuild(VkCommandBuffer cmd, GeometryState &state, bool update);
@@ -391,10 +397,14 @@ private:
   std::vector<RtEmissiveTriangleGpu> emissive_records_cache_;
   std::vector<double> emissive_weights_cache_;
   std::uint32_t cached_emissive_count_ = 0;
+  std::uint32_t cached_hidden_source_emitter_triangle_count_ = 0;
+  std::uint32_t cached_hidden_positive_weight_triangle_count_ = 0;
   bool cached_positive_emission_source_ = false;
   bool emissive_distribution_valid_ = false;
   std::uint32_t last_vertex_count_ = 0;
   std::uint32_t last_index_count_ = 0;
+  std::uint32_t visible_instance_mask_count_ = 0;
+  std::uint32_t hidden_instance_mask_count_ = 0;
   std::uint32_t emissive_triangle_count_ = 0;
   bool motion_history_valid_ = false;
   VkDeviceSize tlas_build_scratch_ = 0;

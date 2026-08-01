@@ -92,6 +92,8 @@ void VulkanRtScene::shutdown() {
   scratch_primitive_flags_ = {};
   last_vertex_count_ = 0;
   last_index_count_ = 0;
+  visible_instance_mask_count_ = 0;
+  hidden_instance_mask_count_ = 0;
   emissive_triangle_count_ = 0;
   motion_history_valid_ = false;
   tlas_build_scratch_ = 0;
@@ -123,6 +125,8 @@ void VulkanRtScene::shutdown() {
   emissive_records_cache_ = {};
   emissive_weights_cache_ = {};
   cached_emissive_count_ = 0;
+  cached_hidden_source_emitter_triangle_count_ = 0;
+  cached_hidden_positive_weight_triangle_count_ = 0;
   cached_positive_emission_source_ = false;
   emissive_distribution_valid_ = false;
   bone_cache_generation_ = 0;
@@ -285,6 +289,8 @@ void VulkanRtScene::setRestGeometry(RtRestGeometry geometry) {
   // Topology changed — force full rebuild next updateGeometry().
   last_vertex_count_ = 0;
   last_index_count_ = 0;
+  visible_instance_mask_count_ = 0;
+  hidden_instance_mask_count_ = 0;
   emissive_triangle_count_ = 0;
   geometry_prepared_ = false;
   pending_ = PendingBuild::None;
@@ -297,6 +303,8 @@ void VulkanRtScene::setRestGeometry(RtRestGeometry geometry) {
   emissive_records_cache_.clear();
   emissive_weights_cache_.clear();
   cached_emissive_count_ = 0;
+  cached_hidden_source_emitter_triangle_count_ = 0;
+  cached_hidden_positive_weight_triangle_count_ = 0;
   cached_positive_emission_source_ = false;
   emissive_distribution_valid_ = false;
   bone_transform_cache_.clear();
@@ -324,6 +332,20 @@ RtSceneStats VulkanRtScene::stats() const noexcept {
   result.instance_count =
       result.tlas_count != 0u
           ? static_cast<std::uint32_t>(geometry_states_.size())
+          : 0u;
+  result.visible_instance_mask_count =
+      result.tlas_count != 0u ? visible_instance_mask_count_ : 0u;
+  result.hidden_instance_mask_count =
+      result.tlas_count != 0u ? hidden_instance_mask_count_ : 0u;
+  result.positive_emitter_count =
+      result.tlas_count != 0u ? emissive_triangle_count_ : 0u;
+  result.hidden_source_emitter_triangle_count =
+      result.tlas_count != 0u
+          ? cached_hidden_source_emitter_triangle_count_
+          : 0u;
+  result.hidden_positive_weight_triangle_count =
+      result.tlas_count != 0u
+          ? cached_hidden_positive_weight_triangle_count_
           : 0u;
   result.primitive_count = last_index_count_ / 3u;
   result.as_storage_bytes +=
@@ -606,6 +628,7 @@ bool VulkanRtScene::ensureTlasStorage(std::uint32_t instance_count) {
 
 void VulkanRtScene::writeInstanceData(
     const float *bone_transforms_column_major, std::size_t bone_count,
+    const float *bone_tints_rgba, std::size_t tint_count,
     const float *previous_bone_transforms_column_major,
     std::size_t previous_bone_count, bool motion_history_valid) {
   auto *instances =
@@ -618,6 +641,8 @@ void VulkanRtScene::writeInstanceData(
       host_instance_motion_.mapped);
   std::fill_n(metadata, geometry_states_.size(),
               std::array<std::uint32_t, 4>{});
+  visible_instance_mask_count_ = 0u;
+  hidden_instance_mask_count_ = 0u;
   for (std::size_t index = 0; index < geometry_states_.size(); ++index) {
     GeometryState &state = geometry_states_[index];
     std::array<float, 16> next_transform{
@@ -660,7 +685,19 @@ void VulkanRtScene::writeInstanceData(
     VkAccelerationStructureInstanceKHR instance{};
     instance.transform = transform;
     instance.instanceCustomIndex = state.instance_custom_index;
-    instance.mask = 0xFF;
+    instance.mask = 0xFFu;
+    if (state.blas_policy == RtBlasPolicy::RigidLocalSpace &&
+        bone_tints_rgba != nullptr && state.source_bone_index < tint_count) {
+      instance.mask = rtInstanceVisibilityMask(
+          bone_tints_rgba[static_cast<std::size_t>(state.source_bone_index) *
+                              4u +
+                          3u]);
+    }
+    if (instance.mask == 0u) {
+      ++hidden_instance_mask_count_;
+    } else {
+      ++visible_instance_mask_count_;
+    }
     instance.instanceShaderBindingTableRecordOffset = 0;
     instance.flags =
         VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
@@ -1324,11 +1361,16 @@ bool VulkanRtScene::updateGeometry(
   const bool rebuild_emissive_distribution =
       !emissive_distribution_valid_ || topology_changed ||
       materials_generation_changed || emission_generation_changed ||
+      visibility_generation_changed ||
       (cached_positive_emission_source_ &&
        (positions_generation_changed || transforms_generation_changed));
   auto &emissive_records = emissive_records_cache_;
   auto &emissive_weights = emissive_weights_cache_;
   std::uint32_t emissive_count = cached_emissive_count_;
+  std::uint32_t hidden_source_emitter_count =
+      cached_hidden_source_emitter_triangle_count_;
+  std::uint32_t hidden_positive_weight_count =
+      cached_hidden_positive_weight_triangle_count_;
   if (rebuild_emissive_distribution) {
     const auto emitter_distribution_begin =
         std::chrono::steady_clock::now();
@@ -1363,6 +1405,8 @@ bool VulkanRtScene::updateGeometry(
     const bool have_primitive_emission =
         rest_.primitive_emission.size() == model_primitive_count;
     emissive_count = 0u;
+    hidden_source_emitter_count = 0u;
+    hidden_positive_weight_count = 0u;
     bool positive_emission_source = false;
     for (std::size_t primitive = 0; primitive < model_primitive_count;
          ++primitive) {
@@ -1389,18 +1433,29 @@ bool VulkanRtScene::updateGeometry(
           edge1[0] * edge2[1] - edge1[1] * edge2[0]};
       const double area =
           0.5 * std::sqrt(cross[0] * cross[0] + cross[1] * cross[1] +
-                          cross[2] * cross[2]);
+                           cross[2] * cross[2]);
       std::array<float, 3> emission{};
+      float visibility = 1.0f;
+      bool source_emission_positive = false;
       if (have_primitive_emission) {
         const auto &source = rest_.primitive_emission[primitive];
+        const std::uint32_t source_bone = rest_.bone_indices[i0];
+        if (bone_tints_rgba != nullptr && source_bone < tint_count) {
+          visibility = rtEmitterVisibilityScale(
+              bone_tints_rgba[static_cast<std::size_t>(source_bone) * 4u +
+                              3u]);
+        }
         for (std::size_t channel = 0; channel < 3u; ++channel) {
+          source_emission_positive =
+              source_emission_positive ||
+              (std::isfinite(source[channel]) && source[channel] > 0.0f);
           const float tint =
               (world_colors[static_cast<std::size_t>(i0) * 4u + channel] +
                world_colors[static_cast<std::size_t>(i1) * 4u + channel] +
                world_colors[static_cast<std::size_t>(i2) * 4u + channel]) /
               3.0f;
-          emission[channel] =
-              std::max(source[channel] * std::max(tint, 0.0f), 0.0f);
+          emission[channel] = std::max(
+              source[channel] * std::max(tint, 0.0f) * visibility, 0.0f);
         }
       }
       const double luminance =
@@ -1419,12 +1474,21 @@ bool VulkanRtScene::updateGeometry(
           emission[0], emission[1], emission[2],
           static_cast<float>(std::max(luminance, 0.0))};
       record.metadata[2] = static_cast<std::uint32_t>(primitive);
+      double final_weight = 0.0;
       if (std::isfinite(area) && std::isfinite(luminance) &&
           area > 1.0e-12 && luminance > 0.0) {
-        emissive_weights[primitive] = area * luminance;
+        final_weight = area * luminance;
+        emissive_weights[primitive] = final_weight;
         record.metadata[1] = 1u;
         ++emissive_count;
       }
+      const RtEmitterVisibilityAudit visibility_audit =
+          auditRtEmitterVisibility(visibility, source_emission_positive,
+                                   final_weight);
+      hidden_source_emitter_count +=
+          visibility_audit.hidden_source_emitter ? 1u : 0u;
+      hidden_positive_weight_count +=
+          visibility_audit.hidden_positive_weight ? 1u : 0u;
     }
     AliasTable emissive_alias;
     const bool emissive_alias_valid =
@@ -1443,6 +1507,10 @@ bool VulkanRtScene::updateGeometry(
       emissive_count = 0u;
     }
     cached_emissive_count_ = emissive_count;
+    cached_hidden_source_emitter_triangle_count_ =
+        hidden_source_emitter_count;
+    cached_hidden_positive_weight_triangle_count_ =
+        hidden_positive_weight_count;
     cached_positive_emission_source_ = positive_emission_source;
     emissive_distribution_valid_ = true;
     ++emitter_distribution_rebuild_count_;
@@ -1788,6 +1856,7 @@ bool VulkanRtScene::updateGeometry(
   }
   writeInstanceData(
       bone_transforms_column_major, bone_count,
+      bone_tints_rgba, tint_count,
       previous_bone_transforms_column_major, previous_bone_count,
       motion_history_valid_);
 

@@ -228,36 +228,79 @@ bool VulkanPathTracer::init(VkPhysicalDevice phys, VkDevice device,
 
 bool VulkanPathTracer::requestStillCapture(
     const std::filesystem::path &path, StillImageFormat format,
-    bool transparent_background) {
+    bool transparent_background, std::uint64_t job_id,
+    const PathTraceStillBackgroundInput *background) {
   if (path.empty() || !ready() ||
       runtime_capture_state_ == PathTraceCaptureState::Requested ||
       runtime_capture_state_ ==
           PathTraceCaptureState::PendingGpuReadback) {
     return false;
   }
+  runtime_capture_background_face_size_ = 0u;
+  runtime_capture_background_rgba8_.clear();
+  runtime_capture_background_inverse_view_projection_ = {};
+  runtime_capture_background_camera_position_ = {};
+  if (background != nullptr) {
+    const std::size_t face_pixels =
+        static_cast<std::size_t>(background->face_size) *
+        background->face_size;
+    const bool valid_background =
+        background->face_size > 0u && background->rgba8 != nullptr &&
+        face_pixels <= (static_cast<std::size_t>(-1) / 24u) &&
+        background->rgba8_size == face_pixels * 24u &&
+        background->view != nullptr && background->proj != nullptr;
+    float view_projection[16]{};
+    float inverse_view[16]{};
+    if (!valid_background) {
+      return false;
+    }
+    mulMat4(background->proj, background->view, view_projection);
+    if (!invertMatrix4(view_projection,
+                       runtime_capture_background_inverse_view_projection_
+                           .data()) ||
+        !invertMatrix4(background->view, inverse_view)) {
+      return false;
+    }
+    runtime_capture_background_face_size_ = background->face_size;
+    runtime_capture_background_rgba8_.assign(
+        background->rgba8, background->rgba8 + background->rgba8_size);
+    runtime_capture_background_camera_position_ = {
+        inverse_view[12], inverse_view[13], inverse_view[14]};
+  }
   runtime_capture_path_ = path.string();
   runtime_capture_format_ = format;
   runtime_capture_transparent_background_ = transparent_background;
+  runtime_capture_job_id_ = job_id;
   runtime_capture_error_.clear();
   runtime_capture_state_ = PathTraceCaptureState::Requested;
   return true;
 }
 
 void VulkanPathTracer::cancelStillCapture() noexcept {
-  if (runtime_capture_state_ != PathTraceCaptureState::Requested &&
-      runtime_capture_state_ !=
-          PathTraceCaptureState::PendingGpuReadback) {
-    return;
-  }
-  if (pending_capture_is_runtime_) {
+  const bool active =
+      runtime_capture_state_ == PathTraceCaptureState::Requested ||
+      runtime_capture_state_ == PathTraceCaptureState::PendingGpuReadback;
+  if (active && pending_capture_is_runtime_) {
     capture_pending_ = false;
     pending_capture_path_.clear();
     pending_aov_summary_path_.clear();
     pending_capture_is_runtime_ = false;
+    pending_capture_job_id_ = 0u;
+    pending_capture_background_face_size_ = 0u;
+    pending_capture_background_rgba8_.clear();
+    pending_capture_background_inverse_view_projection_ = {};
+    pending_capture_background_camera_position_ = {};
   }
   runtime_capture_path_.clear();
   runtime_capture_error_.clear();
-  runtime_capture_state_ = PathTraceCaptureState::Cancelled;
+  runtime_capture_job_id_ = 0u;
+  runtime_capture_background_face_size_ = 0u;
+  runtime_capture_background_rgba8_.clear();
+  runtime_capture_background_inverse_view_projection_ = {};
+  runtime_capture_background_camera_position_ = {};
+  if (active) {
+    runtime_capture_state_ = PathTraceCaptureState::Cancelled;
+  }
 }
 
 void VulkanPathTracer::destroyImage() {
@@ -484,6 +527,11 @@ void VulkanPathTracer::destroyCaptureBuffer() {
   pending_capture_display_ = {};
   pending_capture_transparent_background_ = true;
   pending_capture_is_runtime_ = false;
+  pending_capture_job_id_ = 0u;
+  pending_capture_background_face_size_ = 0u;
+  pending_capture_background_rgba8_.clear();
+  pending_capture_background_inverse_view_projection_ = {};
+  pending_capture_background_camera_position_ = {};
   pending_aov_offset_ = 0;
   pending_statistics_offset_ = 0;
   pending_depth_offset_ = 0;
@@ -557,12 +605,35 @@ void VulkanPathTracer::flushPendingCapture() {
   std::string capture_error;
   if (!pending_capture_path_.empty()) {
     const std::filesystem::path output(pending_capture_path_);
+    StillImageCubemapBackground background{};
+    const StillImageCubemapBackground *background_ptr = nullptr;
+    if (pending_capture_background_face_size_ > 0u &&
+        !pending_capture_background_rgba8_.empty()) {
+      background.face_size = pending_capture_background_face_size_;
+      background.rgba8 = pending_capture_background_rgba8_.data();
+      background.rgba8_size = pending_capture_background_rgba8_.size();
+      background.inverse_view_projection =
+          pending_capture_background_inverse_view_projection_;
+      background.camera_position =
+          pending_capture_background_camera_position_;
+      if (background.valid()) {
+        background_ptr = &background;
+      }
+    }
     capture_wrote = writeStillImageRgba16f(
         output, pending_capture_format_, pending_capture_width_,
         pending_capture_height_, half_pixels, pixel_count * 4u,
         pending_capture_display_,
         pending_capture_transparent_background_, device_depth,
-        device_depth != nullptr ? pixel_count : 0u, &capture_error);
+        device_depth != nullptr ? pixel_count : 0u, &capture_error,
+        background_ptr);
+    if (pending_capture_is_runtime_) {
+      xpbd::log::infof(
+          "STILL_JOB save job_id=%llu path=%s result=%s",
+          static_cast<unsigned long long>(pending_capture_job_id_),
+          pending_capture_path_.c_str(),
+          capture_wrote ? "passed" : "failed");
+    }
     if (capture_wrote) {
       std::error_code size_error;
       const auto output_bytes =
@@ -792,6 +863,16 @@ void VulkanPathTracer::flushPendingCapture() {
   pending_capture_path_.clear();
   pending_aov_summary_path_.clear();
   pending_capture_is_runtime_ = false;
+  pending_capture_job_id_ = 0u;
+  pending_capture_background_face_size_ = 0u;
+  pending_capture_background_rgba8_.clear();
+  pending_capture_background_inverse_view_projection_ = {};
+  pending_capture_background_camera_position_ = {};
+  runtime_capture_job_id_ = 0u;
+  runtime_capture_background_face_size_ = 0u;
+  runtime_capture_background_rgba8_.clear();
+  runtime_capture_background_inverse_view_projection_ = {};
+  runtime_capture_background_camera_position_ = {};
 }
 
 void VulkanPathTracer::destroyFallbackAlbedo() {
@@ -936,6 +1017,11 @@ void VulkanPathTracer::shutdown() {
   runtime_capture_format_ = StillImageFormat::Png;
   runtime_capture_state_ = PathTraceCaptureState::Idle;
   runtime_capture_transparent_background_ = false;
+  runtime_capture_job_id_ = 0u;
+  runtime_capture_background_face_size_ = 0u;
+  runtime_capture_background_rgba8_.clear();
+  runtime_capture_background_inverse_view_projection_ = {};
+  runtime_capture_background_camera_position_ = {};
 }
 
 bool VulkanPathTracer::createPipelines(VkRenderPass render_pass) {
@@ -2204,9 +2290,7 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
   if (schedule_capture) {
     const bool capture_aovs =
         !runtime_capture_requested && !aov_summary_path_.empty();
-    const bool capture_runtime_depth =
-        runtime_capture_requested &&
-        runtime_capture_transparent_background_;
+    const bool capture_runtime_depth = runtime_capture_requested;
     const VkDeviceSize color_bytes =
         static_cast<VkDeviceSize>(image_w_) * image_h_ * 8u;
     const VkDeviceSize aov_offset = color_bytes;
@@ -2317,9 +2401,27 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
               ? runtime_capture_transparent_background_
               : true;
       pending_capture_is_runtime_ = runtime_capture_requested;
+      pending_capture_job_id_ =
+          runtime_capture_requested ? runtime_capture_job_id_ : 0u;
       if (runtime_capture_requested) {
+        pending_capture_background_face_size_ =
+            runtime_capture_background_face_size_;
+        pending_capture_background_rgba8_ =
+            std::move(runtime_capture_background_rgba8_);
+        pending_capture_background_inverse_view_projection_ =
+            runtime_capture_background_inverse_view_projection_;
+        pending_capture_background_camera_position_ =
+            runtime_capture_background_camera_position_;
+        runtime_capture_background_face_size_ = 0u;
+        runtime_capture_background_inverse_view_projection_ = {};
+        runtime_capture_background_camera_position_ = {};
         runtime_capture_state_ =
             PathTraceCaptureState::PendingGpuReadback;
+      } else {
+        pending_capture_background_face_size_ = 0u;
+        pending_capture_background_rgba8_.clear();
+        pending_capture_background_inverse_view_projection_ = {};
+        pending_capture_background_camera_position_ = {};
       }
       pending_capture_width_ = image_w_;
       pending_capture_height_ = image_h_;
@@ -2426,7 +2528,8 @@ void VulkanPathTracer::recordComposite(
       static_cast<float>(settings.tone_mapping);
   composite_push.flags[0] =
       (settings.transparent_background ? 1u : 0u) |
-      (use_reconstructed ? 2u : 0u);
+      (use_reconstructed ? 2u : 0u) |
+      (params.output_requires_srgb_encoding ? 4u : 0u);
   vkCmdPushConstants(cmd, composite_pipe_layout_,
                      VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                      sizeof(composite_push), &composite_push);

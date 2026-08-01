@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "gate_version": "S00-1.0",
+  "gate_version": "S00-1.2",
   "plan_version": "2.3+user-s00-blockers-2026-07-31",
   "baseline_commit": "664b4308fa5879ba83ad1523262cc1bc3df6f7ac",
   "result_commit_binding_required": true,
@@ -69,10 +69,26 @@
     }
   },
   "s00_b_rotating_fg": {
+    "fixture": "bedrock_s00_small_8cubes.geo.json",
+    "animation": "bedrock_s00_rotation_3deg_per_60hz.animation.json",
+    "animation_name": "animation.xpbd_s00_rotation_3deg_per_60hz",
+    "target_bone": "branch_000_depth_00",
+    "nominal_fps": 60,
     "fixed_seed": 20260731,
     "warmup_real_frames": 30,
     "captured_present_frames": 48,
     "model_yaw_degrees_per_real_frame": 3.0,
+    "runtime_hardware_image_matrix": {
+      "status": "WaivedByUser",
+      "authorized_date": "2026-08-01",
+      "blocking": false,
+      "reason": "User-authorized removal of the subsequent automated rotation/image threshold hardware matrix.",
+      "retained_scope": [
+        "root-cause product fix",
+        "unified Release build",
+        "pure CPU regression coverage"
+      ]
+    },
     "modes": [
       "RR FG Off",
       "SR Quality FG Off",
@@ -100,6 +116,9 @@
   },
   "s00_c_pt_visibility": {
     "fixture": "bedrock_s00_small_8cubes.geo.json",
+    "material_set": "bedrock_s00_alpha_emissive",
+    "base_texture": "bedrock_s00_alpha_emissive.png",
+    "labpbr_specular_texture": "bedrock_s00_alpha_emissive_s.png",
     "parent_target": "branch_000_depth_00",
     "descendant_target": "branch_000_depth_01",
     "baseline_cube_count": 8,
@@ -118,12 +137,18 @@
       "opaque rigid group (DownBody-equivalent)",
       "alpha-tested or blended group (UpperBody control)"
     ],
+    "required_visibility_observability": [
+      "rt_hidden_source_emitter_triangle_count",
+      "rt_hidden_positive_weight_triangle_count"
+    ],
     "required_outcomes": {
       "hidden_tlas_instance_mask": 0,
       "visible_tlas_instance_mask": 255,
       "blas_build_or_refit_delta_on_hide_show": 0,
       "packed_primitive_identity_stable": true,
       "hidden_emitter_positive_weight_count": 0,
+      "hidden_source_emitter_triangle_count_minimum": 1,
+      "hidden_final_positive_weight_triangle_count": 0,
       "cpu_pick_rejects_hidden_descendants": true,
       "unhide_restores_baseline": true
     },
@@ -134,7 +159,32 @@
     }
   },
   "s00_d_still_snapshot": {
-    "reliability_repeat_count": 20,
+    "reliability_repeat_count": 1,
+    "reliability_total_run_count": 3,
+    "repeat_stress_waiver": {
+      "status": "WaivedByUser",
+      "authorized_date": "2026-08-01",
+      "removed_repeat_count": 20,
+      "retained_execution": "offsets 0, 1, and environment_cache_ready each run once",
+      "retained_correctness": [
+        "lifecycle",
+        "scene content",
+        "sky",
+        "brightness and display transfer",
+        "cancel and restart"
+      ]
+    },
+    "preview_still_brightness_hardware_comparison": {
+      "status": "WaivedByUser",
+      "authorized_date": "2026-08-01",
+      "blocking": false,
+      "reason": "User-authorized removal of the preview-versus-Still brightness hardware comparison.",
+      "retained_scope": [
+        "display-transfer product fix",
+        "unified Release build",
+        "pure CPU regression coverage"
+      ]
+    },
     "reliability_resolution": [
       64,
       64

@@ -795,6 +795,12 @@ public:
     }
     still_path_tracer_.shutdown();
     still_active_job_id_ = 0;
+    still_path_trace_frame_index_ = 0;
+    still_waiting_job_id_ = 0;
+    still_wait_started_ = {};
+    still_progress_job_id_ = 0;
+    still_last_logged_samples_ = 0;
+    still_last_progress_time_ = {};
     destroyProceduralAtmosphereGpu();
     destroyWorldEnvironmentGpu();
     setVulkanPathTraceAvailability(false, false);
@@ -1175,6 +1181,7 @@ public:
 
   void render(const FrameInput &frame) override {
     const auto t0 = Clock::now();
+    stats_.present_succeeded = false;
     diagnostic_context_ = frame.diagnostics;
     diagnostic_trace_frame_ =
         perf_diagnostics_enabled_ && frame.diagnostics.active;
@@ -2199,6 +2206,11 @@ public:
     stats_.rt_blas_count = 0;
     stats_.rt_tlas_count = 0;
     stats_.rt_instance_count = 0;
+    stats_.rt_visible_instance_mask_count = 0;
+    stats_.rt_hidden_instance_mask_count = 0;
+    stats_.rt_positive_emitter_count = 0;
+    stats_.rt_hidden_source_emitter_triangle_count = 0;
+    stats_.rt_hidden_positive_weight_triangle_count = 0;
     stats_.rt_as_storage_bytes = 0;
     stats_.rt_scratch_bytes = 0;
     stats_.rt_attribute_bytes = 0;
@@ -2232,6 +2244,16 @@ public:
       stats_.rt_descriptor_cache_hits += scene_stats.descriptor_cache_hits;
     }
     stats_.rt_primitive_count = active_rt_stats.primitive_count;
+    stats_.rt_visible_instance_mask_count =
+        active_rt_stats.visible_instance_mask_count;
+    stats_.rt_hidden_instance_mask_count =
+        active_rt_stats.hidden_instance_mask_count;
+    stats_.rt_positive_emitter_count =
+        active_rt_stats.positive_emitter_count;
+    stats_.rt_hidden_source_emitter_triangle_count =
+        active_rt_stats.hidden_source_emitter_triangle_count;
+    stats_.rt_hidden_positive_weight_triangle_count =
+        active_rt_stats.hidden_positive_weight_triangle_count;
     stats_.rt_last_build_reason = active_rt_stats.last_build_reason;
     stats_.rt_last_tlas_reason = active_rt_stats.last_tlas_reason;
     stats_.rt_descriptor_write_calls = rt_descriptor_write_calls_frame_;
@@ -2376,6 +2398,9 @@ public:
         pt_params.frame_slot =
             static_cast<std::uint32_t>(frame_index_);
         pt_params.settings = path_settings;
+        pt_params.output_requires_srgb_encoding =
+            swap_format_ == VK_FORMAT_B8G8R8A8_UNORM ||
+            swap_format_ == VK_FORMAT_R8G8B8A8_UNORM;
         pt_params.exposure =
             std::exp2(pt_params.settings.display_exposure_ev);
         if (importance_environment_ready) {
@@ -2881,16 +2906,33 @@ public:
       status.target_samples = request.target_samples;
       status.output_path = request.output_path;
 
-      const bool terminal =
+      bool terminal =
           status.state == StillRenderJobState::Completed ||
           status.state == StillRenderJobState::Failed ||
           status.state == StillRenderJobState::Cancelled;
+      if (!terminal && frame_index_ == 0u &&
+          still_active_job_id_ == request.job_id &&
+          still_progress_job_id_ == request.job_id &&
+          Clock::now() - still_last_progress_time_ >
+              std::chrono::seconds(30)) {
+        still_path_tracer_.cancelStillCapture();
+        still_active_job_id_ = 0u;
+        status.state = StillRenderJobState::Failed;
+        status.error =
+            "Still render made no progress for 30 seconds";
+        terminal = true;
+        xpbd::log::errorf("STILL_JOB error job_id=%llu error=%s",
+                          static_cast<unsigned long long>(request.job_id),
+                          status.error.c_str());
+      }
       if (request.cancel_requested && !terminal) {
         if (frame_index_ == 0u) {
           still_path_tracer_.cancelStillCapture();
           still_active_job_id_ = 0u;
           status.state = StillRenderJobState::Cancelled;
           status.error.clear();
+          xpbd::log::infof("STILL_JOB cancelled job_id=%llu",
+                           static_cast<unsigned long long>(request.job_id));
         }
       } else if (!terminal &&
                  (active_render_path_ != RenderPath::RayTracing ||
@@ -2899,12 +2941,34 @@ public:
                   !still_path_tracer_.rtPipelineReady() ||
                   !request.path_trace_settings
                        .nvidia_rt_core_acceleration ||
-                  request.path_trace_settings.force_software_fallback)) {
+                   request.path_trace_settings.force_software_fallback)) {
+        still_path_tracer_.cancelStillCapture();
         status.state = StillRenderJobState::Failed;
         status.error =
             "Still rendering requires an active NVIDIA Vulkan RT pipeline";
         still_active_job_id_ = 0u;
-      } else if (!terminal && path_trace_active && frame_index_ == 0u) {
+        xpbd::log::errorf("STILL_JOB error job_id=%llu error=%s",
+                          static_cast<unsigned long long>(request.job_id),
+                          status.error.c_str());
+      } else if (!terminal && frame_index_ == 0u && !rt_scene.ready()) {
+        if (still_waiting_job_id_ != request.job_id) {
+          still_waiting_job_id_ = request.job_id;
+          still_wait_started_ = Clock::now();
+          xpbd::log::infof(
+              "STILL_JOB begin_wait job_id=%llu reason=rt_scene_not_ready",
+              static_cast<unsigned long long>(request.job_id));
+        } else if (Clock::now() - still_wait_started_ >
+                   std::chrono::seconds(30)) {
+          status.state = StillRenderJobState::Failed;
+          status.error =
+              "Still render RT scene did not become ready within 30 seconds";
+          still_active_job_id_ = 0u;
+          xpbd::log::errorf("STILL_JOB error job_id=%llu error=%s",
+                            static_cast<unsigned long long>(request.job_id),
+                            status.error.c_str());
+        }
+      } else if (!terminal && rt_scene.ready() && frame_index_ == 0u) {
+        still_waiting_job_id_ = 0u;
         const bool new_job = still_active_job_id_ != request.job_id;
         if (new_job) {
           still_path_tracer_.cancelStillCapture();
@@ -2912,15 +2976,44 @@ public:
           still_path_trace_frame_index_ = 0u;
           status.accumulated_samples = 0u;
           status.error.clear();
+          PathTraceStillBackgroundInput preview_background{};
+          const bool use_preview_background =
+              request.preview_skybox != nullptr &&
+              request.preview_skybox->valid() &&
+              !resolved_world_environment.background_visible;
+          if (use_preview_background) {
+            preview_background.face_size = static_cast<std::uint32_t>(
+                request.preview_skybox->face_size);
+            preview_background.rgba8 = request.preview_skybox->rgba.data();
+            preview_background.rgba8_size =
+                request.preview_skybox->rgba.size();
+            preview_background.view = request.view_matrix;
+            preview_background.proj = request.proj_matrix;
+          }
           if (request.output_path.empty() ||
               !still_path_tracer_.requestStillCapture(
                   std::filesystem::path(request.output_path), request.format,
-                  request.transparent_background)) {
+                  request.transparent_background, request.job_id,
+                  use_preview_background ? &preview_background : nullptr)) {
             status.state = StillRenderJobState::Failed;
             status.error = request.output_path.empty()
                                ? "Still render output path is empty"
                                : "Still render capture request was rejected";
             still_active_job_id_ = 0u;
+            xpbd::log::errorf("STILL_JOB error job_id=%llu error=%s",
+                              static_cast<unsigned long long>(request.job_id),
+                              status.error.c_str());
+          } else {
+            status.state = StillRenderJobState::Rendering;
+            still_progress_job_id_ = request.job_id;
+            still_last_logged_samples_ = 0u;
+            still_last_progress_time_ = Clock::now();
+            xpbd::log::infof(
+                "STILL_JOB begin job_id=%llu width=%u height=%u "
+                "target_samples=%u preview_background=%d",
+                static_cast<unsigned long long>(request.job_id), request.width,
+                request.height, request.target_samples,
+                use_preview_background ? 1 : 0);
           }
         }
 
@@ -2932,6 +3025,9 @@ public:
             still_active_job_id_ = 0u;
             status.state = StillRenderJobState::Failed;
             status.error = "Still render target allocation failed";
+            xpbd::log::errorf("STILL_JOB error job_id=%llu error=%s",
+                              static_cast<unsigned long long>(request.job_id),
+                              status.error.c_str());
           } else {
             PathTraceFrameParams still_params{};
             still_params.view = request.view_matrix;
@@ -3051,23 +3147,51 @@ public:
                 specular_view, VK_NULL_HANDLE);
             status.accumulated_samples =
                 still_path_tracer_.accumulatedSamples();
+            if (still_progress_job_id_ != request.job_id) {
+              still_progress_job_id_ = request.job_id;
+              still_last_logged_samples_ = 0u;
+            }
+            if (status.accumulated_samples != still_last_logged_samples_) {
+              still_last_logged_samples_ = status.accumulated_samples;
+              still_last_progress_time_ = Clock::now();
+              xpbd::log::infof(
+                  "STILL_JOB progress job_id=%llu samples=%u target=%u",
+                  static_cast<unsigned long long>(request.job_id),
+                  status.accumulated_samples, status.target_samples);
+            }
             switch (still_path_tracer_.captureState()) {
             case PathTraceCaptureState::Completed:
               status.state = StillRenderJobState::Completed;
               status.error.clear();
               still_active_job_id_ = 0u;
+              xpbd::log::infof(
+                  "STILL_JOB complete job_id=%llu samples=%u path=%s",
+                  static_cast<unsigned long long>(request.job_id),
+                  status.accumulated_samples, status.output_path.c_str());
               break;
             case PathTraceCaptureState::Failed:
               status.state = StillRenderJobState::Failed;
               status.error = still_path_tracer_.captureError();
               still_active_job_id_ = 0u;
+              xpbd::log::errorf("STILL_JOB error job_id=%llu error=%s",
+                                static_cast<unsigned long long>(request.job_id),
+                                status.error.c_str());
               break;
             case PathTraceCaptureState::Cancelled:
               status.state = StillRenderJobState::Cancelled;
               status.error.clear();
               still_active_job_id_ = 0u;
+              xpbd::log::infof("STILL_JOB cancelled job_id=%llu",
+                               static_cast<unsigned long long>(request.job_id));
               break;
             case PathTraceCaptureState::PendingGpuReadback:
+              if (status.state != StillRenderJobState::Saving) {
+                still_last_progress_time_ = Clock::now();
+                xpbd::log::infof(
+                    "STILL_JOB readback job_id=%llu samples=%u",
+                    static_cast<unsigned long long>(request.job_id),
+                    status.accumulated_samples);
+              }
               status.state = StillRenderJobState::Saving;
               break;
             case PathTraceCaptureState::Requested:
@@ -3204,6 +3328,11 @@ public:
         mulMat(frame.proj_matrix, view_rot, sky_mvp_gl);
         SkyboxPushConstants sky_pc{};
         glMvpToVulkan(sky_mvp_gl, sky_pc.mvp);
+        sky_pc.flags[0] =
+            swap_format_ == VK_FORMAT_B8G8R8A8_SRGB ||
+                    swap_format_ == VK_FORMAT_R8G8B8A8_SRGB
+                ? 1u
+                : 0u;
         constexpr VkShaderStageFlags kSkyPcStages =
             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         vkCmdBindPipeline(fs.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -3445,9 +3574,10 @@ public:
       // DLSS-G motion reconstruction as HUD-less scene color.
       image_barrier(
           swap_images_[image_index], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0,
+          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+          VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
           VK_ACCESS_TRANSFER_READ_BIT,
-          VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
           VK_PIPELINE_STAGE_TRANSFER_BIT);
       const VkImageLayout previous_hudless_layout =
           image_resource.fg_hudless_layout;
@@ -3597,7 +3727,6 @@ public:
           static_cast<std::uint32_t>(safe_viewport.w),
           static_cast<std::uint32_t>(safe_viewport.h));
     }
-
     stats_.draw_calls = draws;
     if (diagnostics_enabled_ && diagnostic_trace_frame_) {
       xpbd::log::infof(
@@ -3696,6 +3825,11 @@ public:
     VkResult pr =
         streamline_vulkan_runtime_.queuePresent(present_queue_, &pi);
     streamline_vulkan_runtime_.markPresentEnd();
+    stats_.present_succeeded =
+        pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR;
+    if (stats_.present_succeeded) {
+      ++stats_.present_success_count;
+    }
     const FrameGenerationTransitionResult fg_present_transition =
         streamline_vulkan_runtime_.updateFrameGenerationStateAfterPresent(pr);
     stats_.dlss_frame_generation_active =
@@ -4150,6 +4284,11 @@ private:
   std::vector<std::string> enabled_device_extensions_;
   std::uint64_t still_active_job_id_ = 0;
   std::uint32_t still_path_trace_frame_index_ = 0;
+  std::uint64_t still_waiting_job_id_ = 0;
+  Clock::time_point still_wait_started_{};
+  std::uint64_t still_progress_job_id_ = 0;
+  std::uint32_t still_last_logged_samples_ = 0;
+  Clock::time_point still_last_progress_time_{};
   bool rt_pipelines_ready_ = false;
   std::array<bool, 2> rt_scene_built_{};
   bool presentation_suspended_ = false;
@@ -7783,16 +7922,26 @@ private:
       return false;
     }
     VkSurfaceFormatKHR format = support.formats[0];
+    bool preferred_format_found = false;
     if (support.formats.size() == 1 &&
         support.formats[0].format == VK_FORMAT_UNDEFINED) {
       format.format = VK_FORMAT_B8G8R8A8_UNORM;
       format.colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+      preferred_format_found = true;
     }
-    for (auto &f : support.formats) {
-      if (f.format == VK_FORMAT_B8G8R8A8_UNORM ||
-          f.format == VK_FORMAT_B8G8R8A8_SRGB) {
+    for (const auto &f : support.formats) {
+      if (f.format == VK_FORMAT_B8G8R8A8_UNORM) {
         format = f;
+        preferred_format_found = true;
         break;
+      }
+    }
+    if (!preferred_format_found) {
+      for (const auto &f : support.formats) {
+        if (f.format == VK_FORMAT_B8G8R8A8_SRGB) {
+          format = f;
+          break;
+        }
       }
     }
     swap_format_ = format.format;
@@ -8414,6 +8563,12 @@ private:
       }
       still_path_tracer_.shutdown();
       still_active_job_id_ = 0;
+      still_path_trace_frame_index_ = 0;
+      still_waiting_job_id_ = 0;
+      still_wait_started_ = {};
+      still_progress_job_id_ = 0;
+      still_last_logged_samples_ = 0;
+      still_last_progress_time_ = {};
       setVulkanPathTraceAvailability(false, false);
       destroyGraphicsPipelines();
       if (fg_overlay_render_pass_) {

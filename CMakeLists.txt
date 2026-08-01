@@ -360,6 +360,30 @@ if(XPBD_BUILD_TESTS)
     endif()
     add_test(NAME xpbd_viewport_regression
              COMMAND xpbd_viewport_regression_tests)
+
+    add_executable(xpbd_nuklear_focus_regression_tests
+        src/app/nuklear_focus_regression_tests_main.cpp
+        src/app/nuklear_still_settings_panel.cpp
+    )
+    target_include_directories(xpbd_nuklear_focus_regression_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/app
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nuklear
+    )
+    target_link_libraries(xpbd_nuklear_focus_regression_tests PRIVATE
+        xpbd::core
+    )
+    if(MSVC)
+        target_compile_options(xpbd_nuklear_focus_regression_tests PRIVATE
+            /utf-8 /W4 /permissive-)
+        target_compile_definitions(xpbd_nuklear_focus_regression_tests PRIVATE
+            _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+    else()
+        target_compile_options(xpbd_nuklear_focus_regression_tests PRIVATE
+            -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME xpbd_nuklear_focus_regression
+             COMMAND xpbd_nuklear_focus_regression_tests)
 endif()
 
 if(XPBD_BUILD_CLI)
@@ -397,6 +421,7 @@ if(XPBD_BUILD_APP)
     add_executable(xpbd_baker_app
         src/app/main_sdl3.cpp
         src/app/nuklear_ui.cpp
+        src/app/nuklear_still_settings_panel.cpp
         src/app/app_session.cpp
         src/app/native_dialog.cpp
         src/app/prefer_high_perf_gpu.cpp

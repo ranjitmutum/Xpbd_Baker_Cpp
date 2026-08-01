@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 #include <vulkan/vulkan.h>
 
@@ -50,6 +51,9 @@ struct PathTraceFrameParams {
   RtDebugView rt_debug_view = RtDebugView::Off;
   std::uint32_t material_feature_flags = 0;
   bool hdr_environment = false;
+  // UNORM swapchain attachments require an explicit linear-to-sRGB encode;
+  // SRGB attachments perform that conversion in the fixed-function write.
+  bool output_requires_srgb_encoding = false;
   VkImageView environment_view = VK_NULL_HANDLE;
   VkSampler environment_sampler = VK_NULL_HANDLE;
   VkBuffer environment_distribution = VK_NULL_HANDLE;
@@ -67,6 +71,14 @@ enum class PathTraceCaptureState : std::uint8_t {
   Completed,
   Failed,
   Cancelled,
+};
+
+struct PathTraceStillBackgroundInput {
+  std::uint32_t face_size = 0;
+  const std::uint8_t *rgba8 = nullptr;
+  std::size_t rgba8_size = 0;
+  const float *view = nullptr;
+  const float *proj = nullptr;
 };
 
 class VulkanPathTracer {
@@ -130,7 +142,8 @@ public:
   }
   [[nodiscard]] bool requestStillCapture(
       const std::filesystem::path &path, StillImageFormat format,
-      bool transparent_background);
+      bool transparent_background, std::uint64_t job_id = 0u,
+      const PathTraceStillBackgroundInput *background = nullptr);
   void cancelStillCapture() noexcept;
   [[nodiscard]] VkImageView
   aovView(PathTraceAovLayer layer) const noexcept {
@@ -366,6 +379,11 @@ private:
   StillImageDisplayTransform pending_capture_display_{};
   bool pending_capture_transparent_background_ = true;
   bool pending_capture_is_runtime_ = false;
+  std::uint64_t pending_capture_job_id_ = 0u;
+  std::uint32_t pending_capture_background_face_size_ = 0u;
+  std::vector<std::uint8_t> pending_capture_background_rgba8_;
+  std::array<float, 16> pending_capture_background_inverse_view_projection_{};
+  std::array<float, 3> pending_capture_background_camera_position_{};
   std::uint32_t aov_capture_samples_ = 0;
   std::uint32_t pending_capture_width_ = 0;
   std::uint32_t pending_capture_height_ = 0;
@@ -381,6 +399,11 @@ private:
   PathTraceCaptureState runtime_capture_state_ =
       PathTraceCaptureState::Idle;
   bool runtime_capture_transparent_background_ = false;
+  std::uint64_t runtime_capture_job_id_ = 0u;
+  std::uint32_t runtime_capture_background_face_size_ = 0u;
+  std::vector<std::uint8_t> runtime_capture_background_rgba8_;
+  std::array<float, 16> runtime_capture_background_inverse_view_projection_{};
+  std::array<float, 3> runtime_capture_background_camera_position_{};
 };
 
 } // namespace xpbd::gfx

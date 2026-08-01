@@ -38,6 +38,25 @@ rtAccelerationBuildReasonName(RtAccelerationBuildReason reason) noexcept {
   return "unknown";
 }
 
+struct RtEmitterVisibilityAudit {
+  bool hidden_source_emitter = false;
+  bool hidden_positive_weight = false;
+};
+
+// Read-only classification used while rebuilding the mesh-light table. It
+// never changes the source radiance or sampling weight; it only exposes
+// whether a hidden primitive was an authored emitter and whether a positive
+// final weight incorrectly survived visibility suppression.
+[[nodiscard]] inline constexpr RtEmitterVisibilityAudit
+auditRtEmitterVisibility(float visibility_scale, bool source_emission_positive,
+                         double final_weight) noexcept {
+  const bool hidden = !(visibility_scale > 0.0f);
+  return {
+      hidden && source_emission_positive,
+      hidden && final_weight > 0.0,
+  };
+}
+
 struct FrameStats {
   float frame_ms = 0.0f;
   float ema_frame_ms = 16.0f;
@@ -111,11 +130,22 @@ struct FrameStats {
 
   // NVIDIA RT path selection (0 = Raster, 1 = RayTracing). See RenderPath.
   int active_render_path = 0;
+  // Set only when the most recent backend render reached a successful
+  // presentation result. The sequence is monotonic for the backend lifetime.
+  bool present_succeeded = false;
+  std::uint64_t present_success_count = 0;
   bool ray_tracing_supported = false;
   bool ray_tracing_requested = false;
   std::uint32_t rt_blas_count = 0;
   std::uint32_t rt_tlas_count = 0;
   std::uint32_t rt_instance_count = 0;
+  // Active RT scene diagnostics. Unlike rt_instance_count (which reflects
+  // all frame-slot scenes), these describe the TLAS used by this frame.
+  std::uint32_t rt_visible_instance_mask_count = 0;
+  std::uint32_t rt_hidden_instance_mask_count = 0;
+  std::uint32_t rt_positive_emitter_count = 0;
+  std::uint32_t rt_hidden_source_emitter_triangle_count = 0;
+  std::uint32_t rt_hidden_positive_weight_triangle_count = 0;
   std::uint32_t rt_primitive_count = 0;
   std::uint64_t rt_as_storage_bytes = 0;
   std::uint64_t rt_scratch_bytes = 0;

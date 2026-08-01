@@ -18,5 +18,17 @@ Generator v2 adds a project-owned 144-bone/10,368-Cube density fixture matching
 the count profile of the user's local S00-A reproducer without copying its
 geometry, names, UVs, transforms, or any other source content.
 
+Generator v3 preserves all four geometry payloads byte-for-byte and adds a
+project-owned Bedrock animation for S00-B. It drives
+`branch_000_depth_00` around Y at exactly 3 degrees per nominal 60 Hz frame
+using authored linear keyframes. The S00 runtime gate samples it by render
+frame rather than wall-clock autoplay.
+
+Generator v4 preserves the four geometry payloads and the animation payload
+byte-for-byte. It adds a deterministic 16x16 RGBA base texture with alpha 128
+and its deterministic LabPBR `_s` sidecar with alpha 254 (full emission).
+These project-owned textures exercise S00-C's blended-material and hidden
+source-emitter observability without changing the Bedrock geometry payloads.
+
 The user-supplied PT visibility screenshot is evidence rather than an input
 fixture. Its inventory entry belongs under `artifacts/scene_stage_S00/evidence/`.

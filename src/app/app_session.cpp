@@ -3021,6 +3021,19 @@ bool AppSession::queueStillRender() {
   still_render_job.status.job_id = next_still_render_job_id_++;
   still_render_job.status.target_samples = settings.target_samples;
   still_render_job.status.output_path = output_path.string();
+  xpbd::log::infof(
+      "STILL_JOB queue job_id=%llu width=%u height=%u target_samples=%u "
+      "samples_per_submit=%u format=%s transparent=%d model_generation=%llu "
+      "material_generation=%llu world_generation=%llu preview_scene=%u",
+      static_cast<unsigned long long>(still_render_job.status.job_id),
+      settings.width, settings.height, settings.target_samples,
+      settings.samples_per_submit,
+      settings.format == gfx::StillImageFormat::Exr ? "exr" : "png",
+      settings.transparent_background ? 1 : 0,
+      static_cast<unsigned long long>(snapshot.model_generation),
+      static_cast<unsigned long long>(snapshot.material_generation),
+      static_cast<unsigned long long>(snapshot.world_environment.generation),
+      static_cast<unsigned>(snapshot.preview_scene_id));
   playback_state = PlaybackState::Paused;
   still_render_playback_restored_ = false;
   last_error.clear();

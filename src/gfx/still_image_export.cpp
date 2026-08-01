@@ -87,6 +87,157 @@ void appendAttribute(std::vector<std::uint8_t> &header, const char *name,
              : 1.055f * std::pow(value, 1.0f / 2.4f) - 0.055f;
 }
 
+[[nodiscard]] float decodeSrgbDisplayChannel(float value) noexcept {
+  value = std::clamp(value, 0.0f, 1.0f);
+  return value <= 0.04045f
+             ? value / 12.92f
+             : std::pow((value + 0.055f) / 1.055f, 2.4f);
+}
+
+[[nodiscard]] std::uint16_t floatToHalf(float value) noexcept {
+  const std::uint32_t bits = std::bit_cast<std::uint32_t>(value);
+  const std::uint32_t sign = (bits >> 16u) & 0x8000u;
+  const std::uint32_t exponent = (bits >> 23u) & 0xffu;
+  const std::uint32_t mantissa = bits & 0x7fffffu;
+  if (exponent == 0xffu) {
+    return static_cast<std::uint16_t>(sign | (mantissa == 0u ? 0x7c00u
+                                                             : 0x7e00u));
+  }
+  const int half_exponent = static_cast<int>(exponent) - 127 + 15;
+  if (half_exponent >= 31) {
+    return static_cast<std::uint16_t>(sign | 0x7c00u);
+  }
+  if (half_exponent <= 0) {
+    if (half_exponent < -10) {
+      return static_cast<std::uint16_t>(sign);
+    }
+    const std::uint32_t normalized = mantissa | 0x800000u;
+    const unsigned shift = static_cast<unsigned>(14 - half_exponent);
+    std::uint32_t half_mantissa = normalized >> shift;
+    if (((normalized >> (shift - 1u)) & 1u) != 0u) {
+      ++half_mantissa;
+    }
+    return static_cast<std::uint16_t>(sign | half_mantissa);
+  }
+  std::uint32_t half_mantissa = mantissa >> 13u;
+  std::uint32_t rounded_exponent = static_cast<std::uint32_t>(half_exponent);
+  if ((mantissa & 0x1000u) != 0u) {
+    ++half_mantissa;
+    if (half_mantissa == 0x400u) {
+      half_mantissa = 0u;
+      ++rounded_exponent;
+      if (rounded_exponent >= 31u) {
+        return static_cast<std::uint16_t>(sign | 0x7c00u);
+      }
+    }
+  }
+  return static_cast<std::uint16_t>(
+      sign | (rounded_exponent << 10u) | half_mantissa);
+}
+
+[[nodiscard]] bool sampleCubemapBackground(
+    const StillImageCubemapBackground &background, std::uint32_t image_width,
+    std::uint32_t image_height, std::uint32_t pixel_x,
+    std::uint32_t pixel_y, std::array<std::uint8_t, 4> &sample) noexcept {
+  if (!background.valid() || image_width == 0u || image_height == 0u) {
+    return false;
+  }
+  const float uv_x = (static_cast<float>(pixel_x) + 0.5f) /
+                     static_cast<float>(image_width);
+  const float uv_y = (static_cast<float>(pixel_y) + 0.5f) /
+                     static_cast<float>(image_height);
+  const std::array<float, 4> clip{uv_x * 2.0f - 1.0f,
+                                  1.0f - uv_y * 2.0f, 1.0f, 1.0f};
+  std::array<float, 4> world{};
+  for (std::size_t row = 0; row < 4u; ++row) {
+    world[row] =
+        background.inverse_view_projection[row + 0u] * clip[0] +
+        background.inverse_view_projection[row + 4u] * clip[1] +
+        background.inverse_view_projection[row + 8u] * clip[2] +
+        background.inverse_view_projection[row + 12u] * clip[3];
+  }
+  const float divisor = (std::max)(std::abs(world[3]), 1.0e-6f);
+  float dx = world[0] / divisor - background.camera_position[0];
+  float dy = world[1] / divisor - background.camera_position[1];
+  float dz = world[2] / divisor - background.camera_position[2];
+  const float length = std::sqrt(dx * dx + dy * dy + dz * dz);
+  if (!std::isfinite(length) || length <= 1.0e-6f) {
+    return false;
+  }
+  dx /= length;
+  dy /= length;
+  dz /= length;
+
+  const float ax = std::abs(dx);
+  const float ay = std::abs(dy);
+  const float az = std::abs(dz);
+  std::uint32_t face = 0u;
+  float uc = 0.0f;
+  float vc = 0.0f;
+  if (ax >= ay && ax >= az) {
+    if (dx >= 0.0f) {
+      face = 0u;
+      uc = -dz / ax;
+      vc = -dy / ax;
+    } else {
+      face = 1u;
+      uc = dz / ax;
+      vc = -dy / ax;
+    }
+  } else if (ay >= az) {
+    if (dy >= 0.0f) {
+      face = 2u;
+      uc = dx / ay;
+      vc = dz / ay;
+    } else {
+      face = 3u;
+      uc = dx / ay;
+      vc = -dz / ay;
+    }
+  } else if (dz >= 0.0f) {
+    face = 4u;
+    uc = dx / az;
+    vc = -dy / az;
+  } else {
+    face = 5u;
+    uc = -dx / az;
+    vc = -dy / az;
+  }
+
+  const float face_size = static_cast<float>(background.face_size);
+  const float texel_x =
+      std::clamp((uc * 0.5f + 0.5f) * face_size - 0.5f, 0.0f,
+                 face_size - 1.0f);
+  const float texel_y =
+      std::clamp((vc * 0.5f + 0.5f) * face_size - 0.5f, 0.0f,
+                 face_size - 1.0f);
+  const std::uint32_t x0 = static_cast<std::uint32_t>(std::floor(texel_x));
+  const std::uint32_t y0 = static_cast<std::uint32_t>(std::floor(texel_y));
+  const std::uint32_t x1 = (std::min)(x0 + 1u, background.face_size - 1u);
+  const std::uint32_t y1 = (std::min)(y0 + 1u, background.face_size - 1u);
+  const float tx = texel_x - static_cast<float>(x0);
+  const float ty = texel_y - static_cast<float>(y0);
+  const std::size_t face_offset =
+      static_cast<std::size_t>(face) * background.face_size *
+      background.face_size * 4u;
+  const auto channel = [&](std::uint32_t x, std::uint32_t y,
+                           std::size_t c) {
+    const std::size_t index =
+        face_offset +
+        (static_cast<std::size_t>(y) * background.face_size + x) * 4u + c;
+    return static_cast<float>(background.rgba8[index]);
+  };
+  for (std::size_t c = 0; c < 4u; ++c) {
+    const float top = channel(x0, y0, c) * (1.0f - tx) +
+                      channel(x1, y0, c) * tx;
+    const float bottom = channel(x0, y1, c) * (1.0f - tx) +
+                         channel(x1, y1, c) * tx;
+    sample[c] = static_cast<std::uint8_t>(std::lround(
+        std::clamp(top * (1.0f - ty) + bottom * ty, 0.0f, 255.0f)));
+  }
+  return true;
+}
+
 [[nodiscard]] bool validInput(std::uint32_t width, std::uint32_t height,
                               const std::uint16_t *rgba16f,
                               std::size_t half_word_count,
@@ -221,7 +372,7 @@ bool writeStillImageRgba16f(
     const std::uint16_t *rgba16f, std::size_t half_word_count,
     const StillImageDisplayTransform &display, bool transparent_background,
     const float *device_depth, std::size_t depth_count,
-    std::string *error) {
+    std::string *error, const StillImageCubemapBackground *background) {
   if (!validInput(width, height, rgba16f, half_word_count, error)) {
     return false;
   }
@@ -230,22 +381,55 @@ bool writeStillImageRgba16f(
       static_cast<std::size_t>(width) * height;
   const bool valid_depth =
       device_depth != nullptr && depth_count >= pixel_count;
-  const auto background_pixel = [&](std::size_t pixel) {
-    return transparent_background && valid_depth &&
-           std::isfinite(device_depth[pixel]) &&
+  if (background != nullptr && !background->valid()) {
+    setError(error, "still image cubemap background is invalid");
+    return false;
+  }
+  const auto far_depth_pixel = [&](std::size_t pixel) {
+    return valid_depth && std::isfinite(device_depth[pixel]) &&
            device_depth[pixel] >= 0.999999f;
+  };
+  const auto source_alpha = [&](std::size_t pixel) {
+    const float value = halfToFloat(rgba16f[pixel * 4u + 3u]);
+    return std::isfinite(value) ? std::clamp(value, 0.0f, 1.0f) : 0.0f;
+  };
+  const auto pure_sky_pixel = [&](std::size_t pixel) {
+    return far_depth_pixel(pixel) && source_alpha(pixel) <= 1.0e-6f;
   };
 
   std::vector<std::uint8_t> bytes;
   if (format == StillImageFormat::Exr) {
     std::vector<std::uint16_t> transparent_pixels;
     const std::uint16_t *exr_pixels = rgba16f;
-    if (transparent_background && valid_depth) {
+    if ((transparent_background || background != nullptr) && valid_depth) {
       transparent_pixels.assign(rgba16f, rgba16f + pixel_count * 4u);
       for (std::size_t pixel = 0; pixel < pixel_count; ++pixel) {
-        if (background_pixel(pixel)) {
+        if (pure_sky_pixel(pixel) && transparent_background) {
           std::fill_n(transparent_pixels.data() + pixel * 4u, 4u,
                       std::uint16_t{0u});
+        } else if (far_depth_pixel(pixel) && !transparent_background &&
+                   background != nullptr) {
+          const std::uint32_t x =
+              static_cast<std::uint32_t>(pixel % width);
+          const std::uint32_t y =
+              static_cast<std::uint32_t>(pixel / width);
+          std::array<std::uint8_t, 4> sky{};
+          if (sampleCubemapBackground(*background, width, height, x, y,
+                                      sky)) {
+            const float coverage = source_alpha(pixel);
+            for (std::size_t channel = 0; channel < 3u; ++channel) {
+              const float sky_linear = decodeSrgbDisplayChannel(
+                  static_cast<float>(sky[channel]) / 255.0f);
+              float foreground =
+                  halfToFloat(rgba16f[pixel * 4u + channel]);
+              if (!std::isfinite(foreground)) {
+                foreground = 0.0f;
+              }
+              transparent_pixels[pixel * 4u + channel] = floatToHalf(
+                  foreground * coverage + sky_linear * (1.0f - coverage));
+            }
+            transparent_pixels[pixel * 4u + 3u] = 0x3c00u;
+          }
         }
       }
       exr_pixels = transparent_pixels.data();
@@ -282,6 +466,15 @@ bool writeStillImageRgba16f(
           static_cast<std::uint32_t>(pixel % width);
       const std::uint32_t y =
           static_cast<std::uint32_t>(pixel / width);
+      if (pure_sky_pixel(pixel) && transparent_background) {
+        std::fill_n(rgba.data() + pixel * 4u, 4u, std::uint8_t{0u});
+        continue;
+      }
+      std::array<std::uint8_t, 4> sky{};
+      const bool composite_preview_sky =
+          !transparent_background && background != nullptr &&
+          far_depth_pixel(pixel) &&
+          sampleCubemapBackground(*background, width, height, x, y, sky);
       for (std::size_t channel = 0; channel < 3u; ++channel) {
         float value =
             source_rgb(pixel, channel) * safe_exposure *
@@ -318,18 +511,16 @@ bool writeStillImageRgba16f(
         rgba[pixel * 4u + channel] = static_cast<std::uint8_t>(
             std::lround(linearToSrgb(value) * 255.0f));
       }
-      float alpha = transparent_background
-                        ? halfToFloat(rgba16f[pixel * 4u + 3u])
-                        : 1.0f;
-      if (background_pixel(pixel)) {
-        alpha = 0.0f;
-        std::fill_n(rgba.data() + pixel * 4u, 3u, std::uint8_t{0u});
-      }
-      if (!std::isfinite(alpha)) {
-        alpha = transparent_background ? 0.0f : 1.0f;
+      const float coverage = source_alpha(pixel);
+      if (composite_preview_sky) {
+        for (std::size_t channel = 0; channel < 3u; ++channel) {
+          rgba[pixel * 4u + channel] = static_cast<std::uint8_t>(std::lround(
+              static_cast<float>(rgba[pixel * 4u + channel]) * coverage +
+              static_cast<float>(sky[channel]) * (1.0f - coverage)));
+        }
       }
       rgba[pixel * 4u + 3u] = static_cast<std::uint8_t>(
-          std::lround(std::clamp(alpha, 0.0f, 1.0f) * 255.0f));
+          std::lround((transparent_background ? coverage : 1.0f) * 255.0f));
     }
     if (!encodePngRgba8(static_cast<int>(width), static_cast<int>(height),
                         rgba, bytes, error)) {

@@ -22,6 +22,14 @@ vec3 acesApprox(vec3 value) {
                0.0, 1.0);
 }
 
+vec3 linearToSrgb(vec3 value) {
+  value = clamp(value, vec3(0.0), vec3(1.0));
+  bvec3 cutoff = lessThanEqual(value, vec3(0.0031308));
+  vec3 low = value * 12.92;
+  vec3 high = 1.055 * pow(value, vec3(1.0 / 2.4)) - 0.055;
+  return mix(high, low, cutoff);
+}
+
 vec4 samplePathColor(vec2 uv) {
   return (composite_push.flags.x & 2u) != 0u
              ? texture(uReconstructed, uv)
@@ -71,6 +79,9 @@ void main() {
     color.rgb = color.rgb / (vec3(1.0) + color.rgb);
   } else if (toneMapping == 2) {
     color.rgb = acesApprox(color.rgb);
+  }
+  if ((composite_push.flags.x & 4u) != 0u) {
+    color.rgb = linearToSrgb(color.rgb);
   }
   // Path tracing and DLSS exchange straight RGBA. The Vulkan blend state
   // consumes premultiplied color, so associate RGB with coverage exactly once,
