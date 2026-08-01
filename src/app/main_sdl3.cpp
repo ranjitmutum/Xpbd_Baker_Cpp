@@ -2138,14 +2138,15 @@ int app_main(int argc, char **argv) {
         still_snapshot = &*session.still_render_job.snapshot;
       }
     }
-    const float *render_view =
-        still_snapshot != nullptr && still_snapshot->camera_frozen
-            ? still_snapshot->view_matrix.data()
-            : view;
-    const float *render_proj =
-        still_snapshot != nullptr && still_snapshot->camera_frozen
-            ? still_snapshot->proj_matrix.data()
-            : proj;
+    const float *preview_view = view;
+    const float *preview_proj = proj;
+    std::array<float, 16> frozen_preview_proj{};
+    if (still_snapshot != nullptr && still_snapshot->camera_frozen) {
+      preview_view = still_snapshot->view_matrix.data();
+      frozen_preview_proj = still_snapshot->proj_matrix;
+      frozen_preview_proj[0] = frozen_preview_proj[5] / viewport_aspect;
+      preview_proj = frozen_preview_proj.data();
+    }
 
 
 
@@ -2200,8 +2201,8 @@ int app_main(int argc, char **argv) {
     frame.fb_width = fb_w;
     frame.fb_height = fb_h;
     frame.viewport = framebuffer_viewport;
-    frame.view_matrix = render_view;
-    frame.proj_matrix = render_proj;
+    frame.view_matrix = preview_view;
+    frame.proj_matrix = preview_proj;
     frame.scene = render_loaded_scene
                       ? (use_static_model ? &static_model_frame.overlays
                                           : &scene)
