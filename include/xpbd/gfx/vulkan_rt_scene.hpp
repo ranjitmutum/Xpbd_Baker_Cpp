@@ -145,7 +145,7 @@ public:
 
   // Record pending BLAS/TLAS build or refit into cmd (before path-trace /
   // ray-query draws). No-op when nothing is pending. Inserts barriers so
-  // subsequent compute/fragment ray queries see the new AS.
+  // subsequent compute/fragment ray queries and RT shaders see the new AS.
   void recordBuilds(VkCommandBuffer cmd);
 
   // Compatibility: CPU update + one-shot GPU build (blocks). Prefer
@@ -322,7 +322,7 @@ private:
   void destroyAs(AccelerationStructure &as);
   [[nodiscard]] VkDeviceAddress bufferDeviceAddress(VkBuffer buffer) const;
   [[nodiscard]] VkCommandBuffer beginOneShot();
-  void submitOneShot(VkCommandBuffer cmd);
+  [[nodiscard]] bool submitOneShot(VkCommandBuffer cmd);
   [[nodiscard]] bool ensureScratch(VkDeviceSize size);
 
   void fillTriangleGeometry(

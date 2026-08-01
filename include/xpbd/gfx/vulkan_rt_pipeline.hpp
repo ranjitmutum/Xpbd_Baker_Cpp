@@ -50,6 +50,8 @@ struct RtPipelineDispatchParams {
   VkImageView normal_view = VK_NULL_HANDLE;
   VkImageView specular_view = VK_NULL_HANDLE;
   VkSampler albedo_sampler = VK_NULL_HANDLE;
+  VkSampler normal_sampler = VK_NULL_HANDLE;
+  VkSampler specular_sampler = VK_NULL_HANDLE;
   VkBuffer motion_frame_buffer = VK_NULL_HANDLE;
   VkDeviceSize motion_frame_buffer_bytes = 0;
 };
@@ -80,7 +82,8 @@ public:
 
   // Returns false when the optional RT-pipeline extension/procedures are not
   // available or a pipeline/SBT validation step fails. Ray-query remains usable.
-  [[nodiscard]] bool init(VkPhysicalDevice physical_device, VkDevice device);
+  [[nodiscard]] bool init(VkPhysicalDevice physical_device, VkDevice device,
+                          bool descriptor_binding_partially_bound = false);
   void shutdown();
 
   [[nodiscard]] bool ready() const noexcept {
@@ -100,6 +103,10 @@ public:
     descriptor_cache_hits_ = 0;
     descriptor_entries_written_ = 0;
     descriptor_update_ms_ = 0.0f;
+  }
+  void invalidateDescriptorCache() noexcept {
+    descriptor_key_ = {};
+    descriptor_key_valid_ = false;
   }
 
   [[nodiscard]] RtPipelineStats stats() const noexcept;
@@ -154,6 +161,7 @@ private:
   std::uint32_t shader_group_stride_ = 0;
   bool dispatch_logged_ = false;
   bool bounds_failure_logged_ = false;
+  bool descriptor_binding_partially_bound_enabled_ = false;
   DescriptorKey descriptor_key_{};
   bool descriptor_key_valid_ = false;
   std::uint64_t descriptor_write_calls_ = 0;

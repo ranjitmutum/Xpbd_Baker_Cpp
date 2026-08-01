@@ -171,6 +171,12 @@ normalizePathTraceSettings(PathTraceSettings settings) noexcept {
       std::clamp(settings.adaptive_noise_threshold, 0.0001f, 1.0f);
   settings.adaptive_minimum_samples =
       std::clamp(settings.adaptive_minimum_samples, 1u, 65'536u);
+  // MIS is only defined when explicit light sampling is active, and analytic
+  // lights have no BSDF-hit endpoint at all. Close both dependencies here so
+  // persisted legacy combinations cannot reach the GPU integrator.
+  if (settings.multiple_importance_sampling || settings.analytic_lights) {
+    settings.next_event_estimation = true;
+  }
   if (!std::isfinite(settings.emissive_multiplier)) {
     settings.emissive_multiplier = 1.0f;
   }
@@ -260,6 +266,49 @@ normalizePathTraceSettings(PathTraceSettings settings) noexcept {
           static_cast<int>(settings.interactive_quality), 0,
           static_cast<int>(PathTraceInteractiveQuality::Fast)));
   return settings;
+}
+
+PathTraceLightSamplingMode resolvedPathTraceLightSamplingMode(
+    const PathTraceSettings &settings) noexcept {
+  if (settings.multiple_importance_sampling) {
+    return PathTraceLightSamplingMode::Combined;
+  }
+  if (settings.next_event_estimation || settings.analytic_lights) {
+    return PathTraceLightSamplingMode::LightOnly;
+  }
+  return PathTraceLightSamplingMode::BsdfOnly;
+}
+
+float pathTraceLightEndpointWeight(PathTraceLightSamplingMode mode,
+                                   bool primary_or_previous_delta,
+                                   float bsdf_pdf,
+                                   float light_pdf) noexcept {
+  const float explicit_pdf =
+      std::isfinite(light_pdf) ? std::max(light_pdf, 0.0f) : 0.0f;
+  if (primary_or_previous_delta || !(explicit_pdf > 0.0f) ||
+      mode == PathTraceLightSamplingMode::BsdfOnly) {
+    return 1.0f;
+  }
+  if (mode == PathTraceLightSamplingMode::LightOnly) {
+    return 0.0f;
+  }
+  if (mode != PathTraceLightSamplingMode::Combined) {
+    return 1.0f;
+  }
+
+  float sampled_pdf =
+      std::isfinite(bsdf_pdf) ? std::max(bsdf_pdf, 0.0f) : 0.0f;
+  float other_pdf = explicit_pdf;
+  const float scale = std::max(sampled_pdf, other_pdf);
+  if (!(scale > 0.0f)) {
+    return 0.0f;
+  }
+  sampled_pdf /= scale;
+  other_pdf /= scale;
+  const float sampled_squared = sampled_pdf * sampled_pdf;
+  const float other_squared = other_pdf * other_pdf;
+  return sampled_squared /
+         std::max(sampled_squared + other_squared, 1.0e-20f);
 }
 
 PathTraceSettings
@@ -923,6 +972,40 @@ RtBsdfSample sampleRtBsdf(
   const RtBsdfLobeProbabilities probabilities =
       rtBsdfLobeProbabilities(material);
 
+  const float eta_incident = front_face ? 1.0f : material.ior;
+  const float eta_transmitted = front_face ? material.ior : 1.0f;
+  const float eta = eta_incident / eta_transmitted;
+  const float cos_i = std::clamp(n_dot_v, 0.0f, 1.0f);
+  const float sin_t_squared =
+      eta * eta * std::max(0.0f, 1.0f - cos_i * cos_i);
+  const bool total_internal_reflection =
+      probabilities.transmission > 0.0f && sin_t_squared >= 1.0f;
+  if (total_internal_reflection && lobe_u >= probabilities.diffuse) {
+    // Under TIR the glossy and transmission choices describe one physical
+    // delta reflection event. Collapse their probability mass and use F=1:
+    // neither the transmission tint nor a (1-F) term belongs on this path.
+    const float reflection_probability =
+        probabilities.glossy + probabilities.transmission;
+    if (!(reflection_probability > 0.0f)) {
+      return result;
+    }
+    result.direction =
+        normalize3(add3(multiply3(normal, 2.0f * cos_i),
+                        multiply3(view, -1.0f)),
+                   {});
+    result.weight.fill(1.0f / reflection_probability);
+    result.pdf = reflection_probability;
+    result.lobe = PathTraceLobe::Glossy;
+    result.delta = true;
+    result.total_internal_reflection = true;
+    result.valid = finite3(result.direction) && finite3(result.weight) &&
+                   std::isfinite(result.pdf);
+    if (!result.valid) {
+      result = {};
+    }
+    return result;
+  }
+
   if (lobe_u < probabilities.diffuse) {
     const PathTraceHemisphereSample sampled =
         samplePathTraceCosineHemisphere(normal, sample_u, sample_v);
@@ -960,47 +1043,23 @@ RtBsdfSample sampleRtBsdf(
                    {});
     result.lobe = PathTraceLobe::Glossy;
   } else {
-    const float eta_incident = front_face ? 1.0f : material.ior;
-    const float eta_transmitted = front_face ? material.ior : 1.0f;
-    const float eta = eta_incident / eta_transmitted;
-    const float cos_i = std::clamp(n_dot_v, 0.0f, 1.0f);
-    const float sin_t_squared =
-        eta * eta * std::max(0.0f, 1.0f - cos_i * cos_i);
     result.lobe = PathTraceLobe::Transmission;
     result.delta = true;
     result.pdf = probabilities.transmission;
-    if (sin_t_squared >= 1.0f) {
-      result.direction =
-          normalize3(add3(multiply3(normal, 2.0f * cos_i),
-                          multiply3(view, -1.0f)),
-                     {});
-      result.total_internal_reflection = true;
-      const float reflected_share =
-          max3(rtFresnelSchlick(material.f0, cos_i));
-      const float inverse_probability =
-          1.0f / std::max(probabilities.transmission, 1.0e-8f);
-      for (std::size_t i = 0; i < result.weight.size(); ++i) {
-        result.weight[i] =
-            material.base_color[i] * material.transmission *
-            (1.0f - reflected_share) *
-            inverse_probability;
-      }
-    } else {
-      const float cos_t =
-          std::sqrt(std::max(0.0f, 1.0f - sin_t_squared));
-      result.direction = normalize3(
-          add3(multiply3(view, -eta),
-               multiply3(normal, eta * cos_i - cos_t)),
-          {});
-      const float fresnel = rtFresnelDielectric(
-          cos_i, eta_incident, eta_transmitted);
-      const float inverse_probability =
-          1.0f / std::max(probabilities.transmission, 1.0e-8f);
-      for (std::size_t i = 0; i < result.weight.size(); ++i) {
-        result.weight[i] =
-            material.base_color[i] * material.transmission *
-            (1.0f - fresnel) * inverse_probability;
-      }
+    const float cos_t =
+        std::sqrt(std::max(0.0f, 1.0f - sin_t_squared));
+    result.direction = normalize3(
+        add3(multiply3(view, -eta),
+             multiply3(normal, eta * cos_i - cos_t)),
+        {});
+    const float fresnel = rtFresnelDielectric(
+        cos_i, eta_incident, eta_transmitted);
+    const float inverse_probability =
+        1.0f / std::max(probabilities.transmission, 1.0e-8f);
+    for (std::size_t i = 0; i < result.weight.size(); ++i) {
+      result.weight[i] =
+          material.base_color[i] * material.transmission *
+          (1.0f - fresnel) * inverse_probability;
     }
     result.valid = probabilities.transmission > 0.0f &&
                    finite3(result.direction) && finite3(result.weight);
@@ -1052,7 +1111,8 @@ float rtShadingNormalCorrection(
       std::abs((light_shading * view_geometric) /
                (light_geometric * view_shading));
   return std::isfinite(correction)
-             ? std::clamp(correction, 0.0f, 16.0f)
+             ? std::clamp(correction, 0.0f,
+                          kPathTraceShadingNormalCorrectionLimit)
              : 0.0f;
 }
 

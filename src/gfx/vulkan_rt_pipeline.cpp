@@ -1,5 +1,7 @@
 #include "xpbd/gfx/vulkan_rt_pipeline.hpp"
 
+#include "xpbd/gfx/path_trace_aov.hpp"
+
 #include "xpbd/log.hpp"
 
 #include <algorithm>
@@ -53,10 +55,13 @@ static_assert(sizeof(RtPathPushConstants) == 256u);
 } // namespace
 
 bool VulkanRtPipeline::init(VkPhysicalDevice physical_device,
-                            VkDevice device) {
+                            VkDevice device,
+                            bool descriptor_binding_partially_bound) {
   shutdown();
   physical_device_ = physical_device;
   device_ = device;
+  descriptor_binding_partially_bound_enabled_ =
+      descriptor_binding_partially_bound;
   if (physical_device_ == VK_NULL_HANDLE || device_ == VK_NULL_HANDLE) {
     shutdown();
     return false;
@@ -118,6 +123,7 @@ void VulkanRtPipeline::shutdown() {
   shader_group_stride_ = 0;
   dispatch_logged_ = false;
   bounds_failure_logged_ = false;
+  descriptor_binding_partially_bound_enabled_ = false;
   descriptor_key_ = {};
   descriptor_key_valid_ = false;
   descriptor_write_calls_ = 0;
@@ -284,6 +290,18 @@ bool VulkanRtPipeline::createDescriptorResources() {
   layout_info.bindingCount =
       static_cast<std::uint32_t>(bindings.size());
   layout_info.pBindings = bindings.data();
+  std::array<VkDescriptorBindingFlags, 28> binding_flags{};
+  VkDescriptorSetLayoutBindingFlagsCreateInfo binding_flags_info{
+      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+  if (descriptor_binding_partially_bound_enabled_) {
+    for (std::uint32_t binding = 21u; binding <= 27u; ++binding) {
+      binding_flags[binding] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+    }
+    binding_flags_info.bindingCount =
+        static_cast<std::uint32_t>(binding_flags.size());
+    binding_flags_info.pBindingFlags = binding_flags.data();
+    layout_info.pNext = &binding_flags_info;
+  }
   if (vkCreateDescriptorSetLayout(device_, &layout_info, nullptr,
                                   &descriptor_layout_) != VK_SUCCESS) {
     return false;
@@ -473,20 +491,43 @@ bool VulkanRtPipeline::createPipelineAndSbt() {
 bool VulkanRtPipeline::record(
     VkCommandBuffer command_buffer, const VulkanRtScene &scene,
     const RtPipelineDispatchParams &params) {
+  const auto missing_optional_view =
+      [&](VkImageView view, std::uint32_t output_mask) noexcept {
+        return view == VK_NULL_HANDLE &&
+               (!descriptor_binding_partially_bound_enabled_ ||
+                (params.output_write_mask & output_mask) != 0u);
+      };
   if (!ready() || command_buffer == VK_NULL_HANDLE || !scene.ready() ||
       params.output_view == VK_NULL_HANDLE ||
       params.depth_view == VK_NULL_HANDLE ||
-      params.aov_array_view == VK_NULL_HANDLE ||
-      params.statistics_view == VK_NULL_HANDLE ||
-      params.rr_motion_view == VK_NULL_HANDLE ||
-      params.rr_diffuse_albedo_view == VK_NULL_HANDLE ||
-      params.rr_specular_albedo_view == VK_NULL_HANDLE ||
-      params.rr_normal_roughness_view == VK_NULL_HANDLE ||
-      params.rr_specular_hit_distance_view == VK_NULL_HANDLE ||
+      missing_optional_view(params.aov_array_view,
+                            kPathTraceAllAovOutputMask) ||
+      missing_optional_view(params.statistics_view,
+                            kPathTraceStatisticsOutputMask) ||
+      missing_optional_view(params.rr_motion_view,
+                            kPathTraceRrMotionOutputMask) ||
+      missing_optional_view(
+          params.rr_diffuse_albedo_view,
+          pathTraceOptionalOutputBit(
+              PathTraceOptionalOutput::RrDiffuseAlbedo)) ||
+      missing_optional_view(
+          params.rr_specular_albedo_view,
+          pathTraceOptionalOutputBit(
+              PathTraceOptionalOutput::RrSpecularAlbedo)) ||
+      missing_optional_view(
+          params.rr_normal_roughness_view,
+          pathTraceOptionalOutputBit(
+              PathTraceOptionalOutput::RrNormalRoughness)) ||
+      missing_optional_view(
+          params.rr_specular_hit_distance_view,
+          pathTraceOptionalOutputBit(
+              PathTraceOptionalOutput::RrSpecularHitDistance)) ||
       params.albedo_view == VK_NULL_HANDLE ||
       params.normal_view == VK_NULL_HANDLE ||
       params.specular_view == VK_NULL_HANDLE ||
       params.albedo_sampler == VK_NULL_HANDLE ||
+      params.normal_sampler == VK_NULL_HANDLE ||
+      params.specular_sampler == VK_NULL_HANDLE ||
       params.motion_frame_buffer == VK_NULL_HANDLE ||
       params.motion_frame_buffer_bytes < 80u ||
       params.inverse_view_projection == nullptr ||
@@ -570,10 +611,10 @@ bool VulkanRtPipeline::record(
   images[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
   images[3].imageView = params.normal_view;
   images[3].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  images[3].sampler = params.albedo_sampler;
+  images[3].sampler = params.normal_sampler;
   images[4].imageView = params.specular_view;
   images[4].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  images[4].sampler = params.albedo_sampler;
+  images[4].sampler = params.specular_sampler;
   images[5].imageView = params.environment_view;
   images[5].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   images[5].sampler = params.environment_sampler;
@@ -681,10 +722,20 @@ bool VulkanRtPipeline::record(
   if (descriptor_key_valid_ && descriptor_key == descriptor_key_) {
     ++descriptor_cache_hits_;
   } else {
+    std::array<VkWriteDescriptorSet, 28> valid_writes{};
+    std::uint32_t valid_write_count = 0u;
+    for (const VkWriteDescriptorSet &write : writes) {
+      const bool missing_optional_storage_image =
+          write.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE &&
+          (write.pImageInfo == nullptr ||
+           write.pImageInfo->imageView == VK_NULL_HANDLE);
+      if (!missing_optional_storage_image) {
+        valid_writes[valid_write_count++] = write;
+      }
+    }
     const auto update_begin = std::chrono::steady_clock::now();
-    vkUpdateDescriptorSets(
-        device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0,
-        nullptr);
+    vkUpdateDescriptorSets(device_, valid_write_count, valid_writes.data(), 0,
+                           nullptr);
     descriptor_update_ms_ =
         std::chrono::duration<float, std::milli>(
             std::chrono::steady_clock::now() - update_begin)
@@ -692,7 +743,7 @@ bool VulkanRtPipeline::record(
     descriptor_key_ = descriptor_key;
     descriptor_key_valid_ = true;
     descriptor_write_calls_ = 1;
-    descriptor_entries_written_ = writes.size();
+    descriptor_entries_written_ = valid_write_count;
   }
 
   RtPathPushConstants push{};

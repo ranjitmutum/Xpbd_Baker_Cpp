@@ -43,6 +43,8 @@ set(XPBD_SPIRV_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/src/gfx/spirv/atmosphere_indirect_irradiance.comp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/gfx/spirv/atmosphere_multiple_scattering.comp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/gfx/spirv/atmosphere_environment_cache.comp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/bruneton/atmosphere/definitions.glsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/bruneton/atmosphere/functions.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/gfx/spirv/ui.vert"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/gfx/spirv/ui.frag"
 )
@@ -102,37 +104,96 @@ set(XPBD_SPIRV_INCLUDES
     "${CMAKE_CURRENT_SOURCE_DIR}/src/gfx/spirv/ui.vert.spv.inc"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/gfx/spirv/ui.frag.spv.inc"
 )
-if(WIN32)
-    find_program(XPBD_POWERSHELL_EXECUTABLE NAMES powershell pwsh)
-    set(XPBD_GLSLANG_VALIDATOR
-        "${CMAKE_CURRENT_SOURCE_DIR}/tools/glslang/bin/glslangValidator.exe")
-    if(XPBD_POWERSHELL_EXECUTABLE AND EXISTS "${XPBD_GLSLANG_VALIDATOR}")
-        add_custom_target(xpbd_rebuild_spirv
-            COMMAND "${XPBD_POWERSHELL_EXECUTABLE}" -NoProfile -ExecutionPolicy Bypass
-                -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_spirv.ps1"
-            DEPENDS ${XPBD_SPIRV_SOURCES}
-            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-            COMMENT "Rebuild deterministic embedded Vulkan SPIR-V"
-            VERBATIM)
-        if(XPBD_CHECK_SPIRV)
-            set(_xpbd_spirv_check_all ALL)
-        else()
-            set(_xpbd_spirv_check_all)
-        endif()
-        add_custom_target(xpbd_check_spirv ${_xpbd_spirv_check_all}
-            COMMAND "${XPBD_POWERSHELL_EXECUTABLE}" -NoProfile -ExecutionPolicy Bypass
-                -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_spirv.ps1" -Check
-            DEPENDS ${XPBD_SPIRV_SOURCES} ${XPBD_SPIRV_INCLUDES}
-            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-            COMMENT "Verify embedded Vulkan SPIR-V is current"
-            VERBATIM)
-    elseif(XPBD_CHECK_SPIRV)
-        message(FATAL_ERROR
-            "XPBD_CHECK_SPIRV requires PowerShell and tools/glslang/bin/glslangValidator.exe")
+set(XPBD_SPIRV_TOOL "${CMAKE_CURRENT_SOURCE_DIR}/tools/spirv_tool.py")
+set(XPBD_SPIRV_MANIFEST
+    "${CMAKE_CURRENT_SOURCE_DIR}/tools/spirv_manifest.json")
+find_package(Python3 3.9 COMPONENTS Interpreter QUIET)
+find_program(XPBD_GLSLANG_VALIDATOR
+    NAMES glslangValidator glslangValidator.exe
+    HINTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/glslang/bin"
+    DOC "glslangValidator used to reproduce checked-in SPIR-V")
+find_program(XPBD_SPIRV_VAL
+    NAMES spirv-val spirv-val.exe
+    HINTS
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/spirv-tools/bin"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/glslang/bin"
+    DOC "Optional standalone SPIR-V Tools validator (glslang validation is always enabled)")
+
+if(Python3_Interpreter_FOUND)
+    add_custom_target(xpbd_spirv_stale_detection
+        COMMAND "${Python3_EXECUTABLE}" "${XPBD_SPIRV_TOOL}" self-test
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        COMMENT "Exercise SPIR-V stale source/binary/include detection"
+        VERBATIM)
+endif()
+
+set(_xpbd_spirv_tools_ready TRUE)
+set(_xpbd_spirv_missing_tools)
+if(NOT Python3_Interpreter_FOUND)
+    set(_xpbd_spirv_tools_ready FALSE)
+    list(APPEND _xpbd_spirv_missing_tools
+        "Python 3.9+ (set Python3_EXECUTABLE)")
+endif()
+if(NOT XPBD_GLSLANG_VALIDATOR OR
+   NOT EXISTS "${XPBD_GLSLANG_VALIDATOR}")
+    set(_xpbd_spirv_tools_ready FALSE)
+    list(APPEND _xpbd_spirv_missing_tools
+        "glslangValidator (set XPBD_GLSLANG_VALIDATOR or run tools/setup_tools.ps1 on Windows)")
+endif()
+
+if(_xpbd_spirv_tools_ready)
+    set(_xpbd_spirv_validator_arguments)
+    if(XPBD_SPIRV_VAL AND EXISTS "${XPBD_SPIRV_VAL}")
+        list(APPEND _xpbd_spirv_validator_arguments
+            --spirv-val "${XPBD_SPIRV_VAL}")
+        message(STATUS
+            "xpbd_baker: SPIR-V validation enabled (${XPBD_SPIRV_VAL})")
     else()
         message(STATUS
-            "xpbd_baker: SPIR-V targets unavailable (run tools/setup_tools.ps1 on Windows)")
+            "xpbd_baker: standalone spirv-val not found; glslang built-in SPIRV-Tools validation remains enabled")
     endif()
+
+    add_custom_target(xpbd_rebuild_spirv
+        COMMAND "${Python3_EXECUTABLE}" "${XPBD_SPIRV_TOOL}" rebuild
+            --repo-root "${CMAKE_CURRENT_SOURCE_DIR}"
+            --manifest "${XPBD_SPIRV_MANIFEST}"
+            --glslang "${XPBD_GLSLANG_VALIDATOR}"
+            ${_xpbd_spirv_validator_arguments}
+        DEPENDS ${XPBD_SPIRV_SOURCES} "${XPBD_SPIRV_TOOL}"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        COMMENT "Rebuild deterministic embedded Vulkan SPIR-V and hash manifest"
+        VERBATIM)
+    if(XPBD_CHECK_SPIRV)
+        set(_xpbd_spirv_check_all ALL)
+    else()
+        set(_xpbd_spirv_check_all)
+    endif()
+    add_custom_target(xpbd_check_spirv ${_xpbd_spirv_check_all}
+        COMMAND "${Python3_EXECUTABLE}" "${XPBD_SPIRV_TOOL}" check
+            --repo-root "${CMAKE_CURRENT_SOURCE_DIR}"
+            --manifest "${XPBD_SPIRV_MANIFEST}"
+            --glslang "${XPBD_GLSLANG_VALIDATOR}"
+            ${_xpbd_spirv_validator_arguments}
+        DEPENDS
+            ${XPBD_SPIRV_SOURCES}
+            ${XPBD_SPIRV_INCLUDES}
+            "${XPBD_SPIRV_TOOL}"
+            "${XPBD_SPIRV_MANIFEST}"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        COMMENT "Verify GLSL, SPIR-V binaries, embedded words, and SHA-256 manifest"
+        VERBATIM)
+    add_dependencies(xpbd_check_spirv xpbd_spirv_stale_detection)
+elseif(XPBD_CHECK_SPIRV)
+    string(JOIN "; " _xpbd_spirv_missing_text
+        ${_xpbd_spirv_missing_tools})
+    message(FATAL_ERROR
+        "XPBD_CHECK_SPIRV is ON but required tools are unavailable: ${_xpbd_spirv_missing_text}")
+else()
+    string(JOIN "; " _xpbd_spirv_missing_text
+        ${_xpbd_spirv_missing_tools})
+    message(STATUS
+        "xpbd_baker: SPIR-V compile checks unavailable: ${_xpbd_spirv_missing_text}. "
+        "Ordinary builds continue because XPBD_CHECK_SPIRV=OFF.")
 endif()
 
 include(CheckIPOSupported)
@@ -322,6 +383,22 @@ endif()
 
 if(XPBD_BUILD_TESTS)
     enable_testing()
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME xpbd_spirv_stale_detection
+            COMMAND "${Python3_EXECUTABLE}" "${XPBD_SPIRV_TOOL}" self-test)
+        set_tests_properties(xpbd_spirv_stale_detection PROPERTIES
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+    endif()
+    if(_xpbd_spirv_tools_ready)
+        add_test(NAME xpbd_spirv_consistency
+            COMMAND "${Python3_EXECUTABLE}" "${XPBD_SPIRV_TOOL}" check
+                --repo-root "${CMAKE_CURRENT_SOURCE_DIR}"
+                --manifest "${XPBD_SPIRV_MANIFEST}"
+                --glslang "${XPBD_GLSLANG_VALIDATOR}"
+                ${_xpbd_spirv_validator_arguments})
+        set_tests_properties(xpbd_spirv_consistency PROPERTIES
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+    endif()
     add_executable(xpbd_viewport_regression_tests
         src/gfx/viewport_regression_tests_main.cpp
         src/gfx/viewport_mesh.cpp

@@ -5,10 +5,12 @@
 #include "xpbd/log.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <vector>
 
 namespace xpbd::gfx {
@@ -23,6 +25,55 @@ constexpr VkBuildAccelerationStructureFlagsKHR kStaticBlasFlags =
 constexpr VkBuildAccelerationStructureFlagsKHR kTlasFlags =
     VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR |
     VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+
+// Keep all consumers of Vulkan RT scene data in one stage/access contract.
+// In particular, a hardware RT pipeline reads the same TLAS and attribute
+// buffers as the compute ray-query fallback and hybrid fragment path.
+constexpr VkPipelineStageFlags kRtShaderReadStages =
+    VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+constexpr VkPipelineStageFlags kRtBuildAndShaderReadStages =
+    VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
+    kRtShaderReadStages;
+constexpr VkAccessFlags kRtSceneReadAccess =
+    VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+    VK_ACCESS_SHADER_READ_BIT;
+
+static_assert((kRtShaderReadStages &
+               VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR) != 0u);
+static_assert((kRtBuildAndShaderReadStages &
+               VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR) != 0u);
+
+void recordRtMemoryBarrier(VkCommandBuffer command_buffer,
+                           VkPipelineStageFlags source_stages,
+                           VkPipelineStageFlags destination_stages,
+                           VkAccessFlags source_access,
+                           VkAccessFlags destination_access) {
+  assert(command_buffer != VK_NULL_HANDLE);
+  assert(source_stages != 0u);
+  assert(destination_stages != 0u);
+  VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  barrier.srcAccessMask = source_access;
+  barrier.dstAccessMask = destination_access;
+  vkCmdPipelineBarrier(command_buffer, source_stages, destination_stages, 0u,
+                       1u, &barrier, 0u, nullptr, 0u, nullptr);
+}
+
+const char *vulkanRtResultName(VkResult result) noexcept {
+  switch (result) {
+  case VK_SUCCESS:
+    return "VK_SUCCESS";
+  case VK_ERROR_OUT_OF_HOST_MEMORY:
+    return "VK_ERROR_OUT_OF_HOST_MEMORY";
+  case VK_ERROR_OUT_OF_DEVICE_MEMORY:
+    return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+  case VK_ERROR_DEVICE_LOST:
+    return "VK_ERROR_DEVICE_LOST";
+  default:
+    return "VK_RESULT_UNKNOWN";
+  }
+}
 
 struct alignas(16) RtInstanceMotionGpu {
   std::array<float, 16> current_transform{};
@@ -383,26 +434,73 @@ VkCommandBuffer VulkanRtScene::beginOneShot() {
   ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
   ai.commandBufferCount = 1;
   VkCommandBuffer cmd = VK_NULL_HANDLE;
-  if (vkAllocateCommandBuffers(device_, &ai, &cmd) != VK_SUCCESS) {
+  const VkResult allocate_result =
+      vkAllocateCommandBuffers(device_, &ai, &cmd);
+  if (allocate_result != VK_SUCCESS) {
+    last_update_failure_reason_ =
+        std::string("vkAllocateCommandBuffers failed: ") +
+        vulkanRtResultName(allocate_result) + " (" +
+        std::to_string(static_cast<int>(allocate_result)) + ")";
+    xpbd::log::errorf("Vulkan RT scene one-shot %s",
+                      last_update_failure_reason_.c_str());
     return VK_NULL_HANDLE;
   }
   VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
   bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  if (vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS) {
+  const VkResult begin_result = vkBeginCommandBuffer(cmd, &bi);
+  if (begin_result != VK_SUCCESS) {
+    last_update_failure_reason_ =
+        std::string("vkBeginCommandBuffer failed: ") +
+        vulkanRtResultName(begin_result) + " (" +
+        std::to_string(static_cast<int>(begin_result)) + ")";
+    xpbd::log::errorf("Vulkan RT scene one-shot %s",
+                      last_update_failure_reason_.c_str());
     vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
     return VK_NULL_HANDLE;
   }
   return cmd;
 }
 
-void VulkanRtScene::submitOneShot(VkCommandBuffer cmd) {
-  vkEndCommandBuffer(cmd);
+bool VulkanRtScene::submitOneShot(VkCommandBuffer cmd) {
+  if (cmd == VK_NULL_HANDLE) {
+    last_update_failure_reason_ =
+        "one-shot submission received a null command buffer";
+    xpbd::log::errorf("Vulkan RT scene one-shot %s",
+                      last_update_failure_reason_.c_str());
+    return false;
+  }
+  auto release_command_buffer = [&] {
+    vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
+    cmd = VK_NULL_HANDLE;
+  };
+  auto fail = [&](const char *api, VkResult result) {
+    last_update_failure_reason_ =
+        std::string(api) + " failed: " + vulkanRtResultName(result) + " (" +
+        std::to_string(static_cast<int>(result)) + ")";
+    xpbd::log::errorf("Vulkan RT scene one-shot %s",
+                      last_update_failure_reason_.c_str());
+    release_command_buffer();
+    return false;
+  };
+
+  const VkResult end_result = vkEndCommandBuffer(cmd);
+  if (end_result != VK_SUCCESS) {
+    return fail("vkEndCommandBuffer", end_result);
+  }
   VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
   si.commandBufferCount = 1;
   si.pCommandBuffers = &cmd;
-  vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
-  vkQueueWaitIdle(queue_);
-  vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
+  const VkResult submit_result =
+      vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
+  if (submit_result != VK_SUCCESS) {
+    return fail("vkQueueSubmit", submit_result);
+  }
+  const VkResult wait_result = vkQueueWaitIdle(queue_);
+  if (wait_result != VK_SUCCESS) {
+    return fail("vkQueueWaitIdle", wait_result);
+  }
+  release_command_buffer();
+  return true;
 }
 
 bool VulkanRtScene::ensureScratch(VkDeviceSize size) {
@@ -1894,22 +1992,13 @@ void VulkanRtScene::recordBuilds(VkCommandBuffer cmd) {
     return;
   }
 
-  // Host-visible vertex writes must be visible to the AS build.
-  VkMemoryBarrier host_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-  host_barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
-  host_barrier.dstAccessMask =
-      VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
-      VK_ACCESS_SHADER_READ_BIT;
-  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT,
-                       VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                       0, 1, &host_barrier, 0, nullptr, 0, nullptr);
+  // Host-visible geometry/material writes feed AS builds and all three shader
+  // consumers, including the hardware RT pipeline.
+  recordRtMemoryBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT,
+                        kRtBuildAndShaderReadStages,
+                        VK_ACCESS_HOST_WRITE_BIT, kRtSceneReadAccess);
 
   const RtAccelerationBuildReason recorded_reason = pending_build_reason_;
-  VkMemoryBarrier blas_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-  blas_barrier.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-  blas_barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
   bool recorded_full_blas = false;
   for (GeometryState &state : geometry_states_) {
     if (!state.pending_full_build && !state.pending_refit) {
@@ -1927,10 +2016,11 @@ void VulkanRtScene::recordBuilds(VkCommandBuffer cmd) {
     state.pending_full_build = false;
     state.pending_refit = false;
     // Every BLAS uses the same scratch buffer, so serialize its reuse.
-    vkCmdPipelineBarrier(
+    recordRtMemoryBarrier(
         cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1,
-        &blas_barrier, 0, nullptr, 0, nullptr);
+        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+        VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
   }
   const bool tlas_update = tlas_built_once_ && !recorded_full_blas &&
                            !tlas_requires_full_build_ &&
@@ -1946,16 +2036,12 @@ void VulkanRtScene::recordBuilds(VkCommandBuffer cmd) {
   last_build_reason_ = recorded_reason;
   last_tlas_reason_ = recorded_reason;
 
-  // Make AS readable by path-tracer compute and hybrid ray-query fragments.
-  VkMemoryBarrier use_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-  use_barrier.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-  use_barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
-                              VK_ACCESS_SHADER_READ_BIT;
-  vkCmdPipelineBarrier(
+  // Make the completed TLAS/BLAS visible to hardware RT shaders as well as the
+  // compute and fragment ray-query paths.
+  recordRtMemoryBarrier(
       cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-      0, 1, &use_barrier, 0, nullptr, 0, nullptr);
+      kRtShaderReadStages,
+      VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR, kRtSceneReadAccess);
 
   pending_ = PendingBuild::None;
   pending_build_reason_ = RtAccelerationBuildReason::None;
@@ -1975,7 +2061,9 @@ bool VulkanRtScene::updateAndBuild(const float *bone_transforms_column_major,
     return false;
   }
   recordBuilds(cmd);
-  submitOneShot(cmd);
+  if (!submitOneShot(cmd)) {
+    return false;
+  }
   return ready();
 }
 

@@ -48,6 +48,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <limits>
 #include <optional>
 #include <string>
@@ -698,7 +699,9 @@ public:
     if (rt_capability_.device_extensions_enabled && render_pass_) {
       bool path_tracers_ready = true;
       for (auto &path_tracer : path_tracers_) {
-        if (!path_tracer.init(phys_, device_, render_pass_)) {
+        if (!path_tracer.init(
+                phys_, device_, render_pass_, true,
+                descriptor_binding_partially_bound_enabled_)) {
           path_tracers_ready = false;
           break;
         }
@@ -709,8 +712,9 @@ public:
         }
         xpbd::log::warn(
             "Vulkan path tracer init failed; hybrid RT shadows still available");
-      } else if (!still_path_tracer_.init(phys_, device_, render_pass_,
-                                          false)) {
+      } else if (!still_path_tracer_.init(
+                     phys_, device_, render_pass_, false,
+                     descriptor_binding_partially_bound_enabled_)) {
         xpbd::log::warn(
             "Vulkan still-render path tracer init failed; viewport path "
             "tracing remains available");
@@ -814,10 +818,7 @@ public:
     last_static_rt_descriptor_sets_ = {};
     last_mesh_rt_tlas_ = {};
     last_static_rt_tlas_ = {};
-    if (static_sampler_) {
-      vkDestroySampler(device_, static_sampler_, nullptr);
-      static_sampler_ = VK_NULL_HANDLE;
-    }
+    destroyStaticMaterialSamplers();
     if (static_desc_pool_) {
       vkDestroyDescriptorPool(device_, static_desc_pool_, nullptr);
       static_desc_pool_ = VK_NULL_HANDLE;
@@ -909,6 +910,7 @@ public:
     streamline_vulkan_runtime_.releaseAfterVulkan();
     instance_ = VK_NULL_HANDLE;
     device_ = VK_NULL_HANDLE;
+    descriptor_binding_partially_bound_enabled_ = false;
   }
 
   void resize(int, int) override {
@@ -1186,6 +1188,10 @@ public:
     diagnostic_trace_frame_ =
         perf_diagnostics_enabled_ && frame.diagnostics.active;
     if (fatal_error_ || !device_) {
+      failActiveStillRender(
+          frame, fatal_error_detail_.empty()
+                     ? "Vulkan backend is unavailable after a fatal error"
+                     : fatal_error_detail_);
       return;
     }
     // While a native file dialog is open, do not submit GPU work (avoids hang).
@@ -1343,6 +1349,7 @@ public:
                        VK_NULL_HANDLE);
     if (wait_result != VK_SUCCESS) {
       SDL_Log("Vulkan fence wait failed: %d", static_cast<int>(wait_result));
+      enterFatalVulkanError(frame, "vkWaitForFences(frame)", wait_result);
       return;
     }
 
@@ -1369,6 +1376,13 @@ public:
     const bool hdr_environment_ready =
         rt_capability_.device_extensions_enabled &&
         ensureWorldEnvironmentResources(resolved_world_environment);
+    if (fatal_error_) {
+      failActiveStillRender(
+          frame, fatal_error_detail_.empty()
+                     ? "Vulkan device was lost while updating environment resources"
+                     : fatal_error_detail_);
+      return;
+    }
     if (resolved_world_environment.sky_rendering ==
             SkyRendering::ProceduralDayNight &&
         !procedural_atmosphere_ready) {
@@ -2030,7 +2044,7 @@ public:
             streamline_vulkan_runtime_.classifyFrameGenerationVkResult(
                 acq, "Acquire");
         if (transition == FrameGenerationTransitionResult::FatalDeviceLost) {
-          fatal_error_ = true;
+          enterFatalVulkanError(frame, "vkAcquireNextImageKHR", acq);
         } else {
           fg_force_native_recovery_ = true;
           swapchain_recreate_target_ = SwapchainOwnership::Native;
@@ -2038,7 +2052,7 @@ public:
         }
       } else {
         SDL_Log("Vulkan acquire failed: %d", static_cast<int>(acq));
-        fatal_error_ = true;
+        enterFatalVulkanError(frame, "vkAcquireNextImageKHR", acq);
       }
       if (fatal_error_ || recreate_swapchain_) {
         return;
@@ -2071,7 +2085,7 @@ public:
       if (image_wait != VK_SUCCESS) {
         SDL_Log("Vulkan swapchain image fence wait failed: %d",
                 static_cast<int>(image_wait));
-        fatal_error_ = true;
+        enterFatalVulkanError(frame, "vkWaitForFences(image)", image_wait);
         return;
       }
     }
@@ -2100,7 +2114,8 @@ public:
       if (present_wait != VK_SUCCESS) {
         SDL_Log("Vulkan present fence wait before reuse failed: %d",
                 static_cast<int>(present_wait));
-        fatal_error_ = true;
+        enterFatalVulkanError(frame, "vkWaitForFences(present)",
+                              present_wait);
         return;
       }
       image_resource.present_pending = false;
@@ -2121,7 +2136,8 @@ public:
       if (reset_present != VK_SUCCESS) {
         SDL_Log("Vulkan present fence reset failed: %d",
                 static_cast<int>(reset_present));
-        fatal_error_ = true;
+        enterFatalVulkanError(frame, "vkResetFences(present)",
+                              reset_present);
         return;
       }
     }
@@ -2131,7 +2147,7 @@ public:
     if (reset_fence != VK_SUCCESS) {
       SDL_Log("Vulkan fence reset failed: %d",
               static_cast<int>(reset_fence));
-      fatal_error_ = true;
+      enterFatalVulkanError(frame, "vkResetFences(frame)", reset_fence);
       return;
     }
     const VkResult reset_command = call_with_diagnostics(
@@ -2140,7 +2156,7 @@ public:
     if (reset_command != VK_SUCCESS) {
       SDL_Log("Vulkan command buffer reset failed: %d",
               static_cast<int>(reset_command));
-      fatal_error_ = true;
+      enterFatalVulkanError(frame, "vkResetCommandBuffer", reset_command);
       return;
     }
 
@@ -2151,7 +2167,7 @@ public:
     if (begin_command != VK_SUCCESS) {
       SDL_Log("Vulkan command buffer begin failed: %d",
               static_cast<int>(begin_command));
-      fatal_error_ = true;
+      enterFatalVulkanError(frame, "vkBeginCommandBuffer", begin_command);
       return;
     }
 
@@ -2265,6 +2281,9 @@ public:
     // graphics pass).
     PathTraceFrameParams pt_params{};
     bool pt_dlss_active = false;
+    bool pt_target_exact_for_frame = false;
+    bool pt_motion_guide_ready_for_frame = false;
+    bool pt_dispatch_recorded_for_frame = false;
     bool pt_history_reset = true;
     bool pt_streamline_history_reset = true;
     std::uint64_t pt_streamline_history_key = 0u;
@@ -2298,9 +2317,29 @@ public:
       const std::uint32_t preview_output_height =
           static_cast<std::uint32_t>((std::max)(1, safe_viewport.h));
       StreamlineDlssOptimalSettings dlss_settings{};
-      const bool pt_rr_requested =
+      bool pt_rr_requested =
           pt_post.active_denoiser ==
           PathTraceDenoiser::DlssRayReconstruction;
+      const std::uint32_t supported_target_outputs =
+          path_tracer.supportedTargetOutputMask();
+      if (pt_rr_requested &&
+          (supported_target_outputs & kPathTraceAllRrGuideOutputMask) !=
+              kPathTraceAllRrGuideOutputMask) {
+        if (!streamline_rr_target_format_failure_logged_) {
+          xpbd::log::warnf(
+              "DLSS Ray Reconstruction disabled: required target formats "
+              "unsupported (required=0x%04x supported=0x%04x)",
+              static_cast<unsigned>(kPathTraceAllRrGuideOutputMask),
+              static_cast<unsigned>(supported_target_outputs));
+          streamline_rr_target_format_failure_logged_ = true;
+        }
+        pt_rr_requested = false;
+        pt_post.active_denoiser = PathTraceDenoiser::Raw;
+        pt_post.reconstruction_mode = PathTraceUpscale::Off;
+        streamline_vulkan_runtime_.invalidateDlssHistory();
+      } else {
+        streamline_rr_target_format_failure_logged_ = false;
+      }
       if (!interactive_preview_resize && pt_rr_requested) {
         dlss_settings =
             streamline_vulkan_runtime_
@@ -2355,9 +2394,45 @@ public:
           choosePathTraceTargetExtent(
               requested_ptw, requested_pth, path_tracer.targetWidth(),
               path_tracer.targetHeight(), interactive_preview_resize);
-      const std::uint32_t ptw = target_extent.width;
-      const std::uint32_t pth = target_extent.height;
-      if (path_tracer.ensureTarget(ptw, pth)) {
+      std::uint32_t requested_output_mask = 0u;
+      if (dlss_settings.valid ||
+          (desired_frame_generation && !interactive_preview_resize)) {
+        requested_output_mask |= kPathTraceRrMotionOutputMask;
+      }
+      if (dlss_settings.valid && pt_rr_requested) {
+        requested_output_mask |= kPathTraceAllRrGuideOutputMask;
+      }
+      const PathTraceTargetResult target_result = path_tracer.ensureTarget(
+          target_extent.width, target_extent.height,
+          PathTraceTargetRequirements{requested_output_mask});
+      if (target_result.failure.vk_result == VK_ERROR_DEVICE_LOST) {
+        enterFatalVulkanError(frame, "VulkanPathTracer::ensureTarget",
+                              VK_ERROR_DEVICE_LOST);
+        return;
+      }
+      const bool target_has_requested_outputs =
+          (target_result.allocated_output_mask & requested_output_mask) ==
+          requested_output_mask;
+      if (target_result.hasActiveTarget()) {
+        const std::uint32_t ptw = target_result.active_width;
+        const std::uint32_t pth = target_result.active_height;
+        if (!target_result.exact() || !target_has_requested_outputs) {
+          // Candidate failure keeps the last good color/depth alive. Avoid
+          // feeding mismatched extents or dummy guides to Streamline while the
+          // same-key retry backoff is active; composite the usable raw target.
+          dlss_settings = {};
+          pt_post.active_denoiser = PathTraceDenoiser::Raw;
+          pt_post.active_upscale = PathTraceUpscale::Off;
+          requested_output_mask = 0u;
+          streamline_vulkan_runtime_.invalidateDlssHistory();
+          streamline_temporal_history_valid_ = false;
+        }
+        pt_target_exact_for_frame = target_result.exact();
+        pt_motion_guide_ready_for_frame =
+            target_result.exact() &&
+            (requested_output_mask & kPathTraceRrMotionOutputMask) != 0u &&
+            (target_result.allocated_output_mask &
+             kPathTraceRrMotionOutputMask) != 0u;
         pt_params.view = frame.view_matrix;
         pt_params.proj = frame.proj_matrix;
         pt_params.previous_view =
@@ -2373,6 +2448,7 @@ public:
         pt_params.temporal_reconstruction_input = dlss_settings.valid;
         pt_params.ray_reconstruction_guides =
             dlss_settings.valid && pt_rr_requested;
+        pt_params.output_write_mask = requested_output_mask;
         if (frame.raster_scene) {
           pt_params.light_dir[0] = frame.raster_scene->lighting.direction[0];
           pt_params.light_dir[1] = frame.raster_scene->lighting.direction[1];
@@ -2442,22 +2518,10 @@ public:
         pt_params.viewport_y = safe_viewport.y;
         pt_params.viewport_w = safe_viewport.w;
         pt_params.viewport_h = safe_viewport.h;
-        // Raw preview writes no optional images. SR/FG need dense motion;
-        // RR needs the complete dedicated guide set. Debug and unattended AOV
-        // capture are augmented inside VulkanPathTracer.
-        if (dlss_settings.valid ||
-            (requested_frame_generation && !interactive_preview_resize)) {
-          pt_params.output_write_mask |= kPathTraceRrMotionOutputMask;
-        }
-        if (pt_params.ray_reconstruction_guides) {
-          pt_params.output_write_mask |= kPathTraceAllRrGuideOutputMask;
-        }
-        if (pt_params.rt_debug_view != RtDebugView::Off ||
-            pt_params.material_debug_view != LabPbrDebugView::Shaded) {
-          pt_params.output_write_mask |=
-              kPathTraceAllAovOutputMask |
-              kPathTraceStatisticsOutputMask;
-        }
+        // Raw and debug views are written directly to color/depth. Only
+        // temporal reconstruction asks for motion/RR guides; AOV/statistics
+        // stay lazy until an explicit export/inspection consumer requests
+        // them.
 
         // The key contains only radiance/visibility-affecting state. SPP and
         // maximum_samples intentionally remain compatible with the current
@@ -2734,7 +2798,8 @@ public:
         }
 
         // Sample the static model atlas so path-traced models keep textures
-        // (avoids white clay look). Nearest sampler lives in the path tracer.
+        // (avoids white clay look). Alpha shares the nearest albedo sampler;
+        // normal and LabPBR parameter sidecars are bilinear at base level.
         const VkImageView albedo_view =
             static_texture_.view != VK_NULL_HANDLE ? static_texture_.view
                                                    : VK_NULL_HANDLE;
@@ -2748,9 +2813,18 @@ public:
                 : VK_NULL_HANDLE;
         write_timestamp(GpuTimestampQuery::PathTraceBegin,
                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-        path_tracer.recordDispatch(fs.cmd, rt_scene, pt_params, albedo_view,
-                                   normal_view, specular_view, VK_NULL_HANDLE);
-        stats_.rt_aov_write_mask = path_tracer.lastOutputWriteMask();
+        if (target_result.exact()) {
+          path_tracer.recordDispatch(fs.cmd, rt_scene, pt_params, albedo_view,
+                                     normal_view, specular_view,
+                                     static_albedo_sampler_,
+                                     static_normal_sampler_,
+                                     static_specular_sampler_);
+          pt_dispatch_recorded_for_frame =
+              path_tracer.lastDispatchRecorded();
+          stats_.rt_aov_write_mask = path_tracer.lastOutputWriteMask();
+        } else {
+          stats_.rt_aov_write_mask = 0u;
+        }
         const VulkanPathTracer::DescriptorStats path_descriptor_stats =
             path_tracer.descriptorStats();
         stats_.rt_descriptor_write_calls += path_descriptor_stats.write_calls;
@@ -2760,7 +2834,7 @@ public:
         stats_.cpu_descriptor_update_ms += path_descriptor_stats.update_ms;
         write_timestamp(GpuTimestampQuery::PathTraceEnd,
                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-        if (dlss_settings.valid) {
+        if (dlss_settings.valid && pt_dispatch_recorded_for_frame) {
           auto fill_dlss_frame =
               [&](StreamlineDlssFrame &dlss_frame,
                   PathTraceUpscale mode) {
@@ -2870,15 +2944,22 @@ public:
             }
           }
         } else {
+          if (dlss_settings.valid) {
+            // Target exactness alone is insufficient: pause/max-sample and
+            // late dispatch prerequisites can leave last frame's guides in
+            // place. Never advance Streamline history with stale inputs.
+            streamline_vulkan_runtime_.invalidateDlssHistory();
+          }
           streamline_temporal_history_valid_ = false;
         }
-        if (frame.view_matrix != nullptr && frame.proj_matrix != nullptr) {
+        if (pt_dispatch_recorded_for_frame && frame.view_matrix != nullptr &&
+            frame.proj_matrix != nullptr) {
           std::copy_n(frame.view_matrix, 16u,
                       rt_motion_previous_view_.begin());
           std::copy_n(frame.proj_matrix, 16u,
                       rt_motion_previous_proj_.begin());
           rt_motion_camera_history_valid_ = true;
-        } else {
+        } else if (pt_dispatch_recorded_for_frame) {
           rt_motion_camera_history_valid_ = false;
         }
       } else {
@@ -3019,12 +3100,51 @@ public:
 
         if (still_active_job_id_ == request.job_id &&
             status.state != StillRenderJobState::Failed) {
-          if (!still_path_tracer_.ensureTarget(request.width,
-                                               request.height)) {
+          const PathTraceTargetResult still_target =
+              still_path_tracer_.ensureTarget(
+                  request.width, request.height,
+                  PathTraceTargetRequirements{0u});
+          if (still_target.failure.vk_result == VK_ERROR_DEVICE_LOST) {
+            enterFatalVulkanError(frame,
+                                  "VulkanPathTracer::ensureTarget(still)",
+                                  VK_ERROR_DEVICE_LOST);
+            return;
+          }
+          if (!still_target.exact()) {
             still_path_tracer_.cancelStillCapture();
             still_active_job_id_ = 0u;
             status.state = StillRenderJobState::Failed;
-            status.error = "Still render target allocation failed";
+            const PathTraceTargetFailure &failure = still_target.failure;
+            status.error =
+                "Still render target unavailable: VkResult=" +
+                std::string(vkResultName(failure.vk_result)) + "(" +
+                std::to_string(static_cast<int>(failure.vk_result)) +
+                ") resource=" +
+                (failure.resource.empty() ? std::string("target-bundle")
+                                          : failure.resource) +
+                " format=" +
+                std::to_string(static_cast<int>(failure.format)) +
+                " extent=" + std::to_string(request.width) + "x" +
+                std::to_string(request.height) + " estimated_bytes=" +
+                std::to_string(static_cast<unsigned long long>(
+                    still_target.estimated_bytes)) +
+                " memory_type=" + std::to_string(failure.memory_type) +
+                " heap=" + std::to_string(failure.heap) +
+                " heap_budget=" +
+                std::to_string(static_cast<unsigned long long>(
+                    failure.heap_budget)) +
+                " heap_usage=" +
+                std::to_string(static_cast<unsigned long long>(
+                    failure.heap_usage)) +
+                " frame_slot=0 still_job_id=" +
+                std::to_string(static_cast<unsigned long long>(
+                    request.job_id));
+            if (still_target.status ==
+                PathTraceTargetStatus::RetryDeferred) {
+              status.error += " retry_after_ms=" +
+                              std::to_string(
+                                  still_target.retry_after_ms);
+            }
             xpbd::log::errorf("STILL_JOB error job_id=%llu error=%s",
                               static_cast<unsigned long long>(request.job_id),
                               status.error.c_str());
@@ -3144,7 +3264,8 @@ public:
                     : VK_NULL_HANDLE;
             still_path_tracer_.recordDispatch(
                 fs.cmd, rt_scene, still_params, albedo_view, normal_view,
-                specular_view, VK_NULL_HANDLE);
+                specular_view, static_albedo_sampler_,
+                static_normal_sampler_, static_specular_sampler_);
             status.accumulated_samples =
                 still_path_tracer_.accumulatedSamples();
             if (still_progress_job_id_ != request.job_id) {
@@ -3209,6 +3330,8 @@ public:
             SwapchainOwnership::StreamlineFrameGenerationProxy &&
         frame_generation_available &&
         !interactive_preview_resize &&
+        pt_target_exact_for_frame && pt_motion_guide_ready_for_frame &&
+        pt_dispatch_recorded_for_frame &&
         path_trace_active && draw_viewport &&
         image_index < swap_images_.size() &&
         image_resource.fg_hudless.image != VK_NULL_HANDLE &&
@@ -3755,7 +3878,7 @@ public:
     if (end_command != VK_SUCCESS) {
       SDL_Log("Vulkan command buffer end failed: %d",
               static_cast<int>(end_command));
-      fatal_error_ = true;
+      enterFatalVulkanError(frame, "vkEndCommandBuffer", end_command);
       return;
     }
 
@@ -3777,7 +3900,7 @@ public:
     if (submit_result != VK_SUCCESS) {
       SDL_Log("Vulkan queue submit failed: %d",
               static_cast<int>(submit_result));
-      fatal_error_ = true;
+      enterFatalVulkanError(frame, "vkQueueSubmit(frame)", submit_result);
       return;
     }
     image_resource.last_in_flight = fs.fence;
@@ -3845,7 +3968,7 @@ public:
       recreate_swapchain_ = true;
     } else if (fg_present_transition ==
                FrameGenerationTransitionResult::FatalDeviceLost) {
-      fatal_error_ = true;
+      enterFatalVulkanError(frame, "vkQueuePresentKHR", pr);
     }
     if (presentFenceLifecycleEnabled()) {
       image_resource.present_pending =
@@ -3870,7 +3993,9 @@ public:
         // non-device-lost errors recover through a Native transaction.
         if (fg_present_transition ==
             FrameGenerationTransitionResult::FatalDeviceLost) {
-          fatal_error_ = true;
+          if (!fatal_error_) {
+            enterFatalVulkanError(frame, "vkQueuePresentKHR", pr);
+          }
         } else {
           fg_force_native_recovery_ = true;
           swapchain_recreate_target_ = SwapchainOwnership::Native;
@@ -3878,7 +4003,7 @@ public:
         }
       } else {
         SDL_Log("Vulkan present failed: %d", static_cast<int>(pr));
-        fatal_error_ = true;
+        enterFatalVulkanError(frame, "vkQueuePresentKHR", pr);
       }
     }
 
@@ -4012,6 +4137,42 @@ public:
   }
 
 private:
+  void failActiveStillRender(const FrameInput &frame,
+                             const std::string &detail) {
+    if (frame.still_render == nullptr ||
+        frame.still_render->status == nullptr ||
+        frame.still_render->job_id == 0u) {
+      return;
+    }
+    StillRenderStatus &status = *frame.still_render->status;
+    if (status.state == StillRenderJobState::Completed ||
+        status.state == StillRenderJobState::Failed ||
+        status.state == StillRenderJobState::Cancelled) {
+      return;
+    }
+    status.job_id = frame.still_render->job_id;
+    status.state = StillRenderJobState::Failed;
+    status.error = detail;
+    still_active_job_id_ = 0u;
+    xpbd::log::errorf("STILL_JOB error job_id=%llu error=%s",
+                      static_cast<unsigned long long>(status.job_id),
+                      status.error.c_str());
+  }
+
+  void enterFatalVulkanError(const FrameInput &frame, const char *api,
+                             VkResult result) {
+    recordFatalVulkanError(api, result);
+    failActiveStillRender(frame, fatal_error_detail_);
+  }
+
+  void recordFatalVulkanError(const char *api, VkResult result) {
+    fatal_error_ = true;
+    fatal_error_detail_ = std::string(api) + " failed: " +
+                          vkResultName(result) + " (" +
+                          std::to_string(static_cast<int>(result)) + ")";
+    xpbd::log::error(fatal_error_detail_);
+  }
+
   [[nodiscard]] bool presentFenceLifecycleEnabled() const noexcept {
     // DLSS-G owns an asynchronous proxy present. Its documented Vulkan
     // contract consumes the Present semaphore and later releases the acquired
@@ -4117,6 +4278,63 @@ private:
     std::uint32_t height = 0;
     std::uint32_t depth = 1;
   };
+  struct DynamicSkyCpuInput {
+    const std::uint16_t *readback = nullptr;
+    void *distribution_mapped = nullptr;
+    VkDeviceSize distribution_capacity = 0;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    CelestialState celestial{};
+    SunControls sun{};
+    MoonControls moon{};
+    bool background_visible = false;
+    bool environment_lighting = false;
+    bool sun_moon_lighting = false;
+    float environment_strength = 0.0f;
+    float background_multiplier = 0.0f;
+    float rotation_radians = 0.0f;
+    float moon_fraction = 0.0f;
+    float moon_phase_radians = 0.0f;
+  };
+  struct DynamicSkyCpuResult {
+    bool success = false;
+    VkResult fence_result = VK_SUCCESS;
+    std::string error;
+    double cache_compute_ms = 0.0;
+    double readback_ms = 0.0;
+    double distribution_build_ms = 0.0;
+    std::uint64_t positive_rgb = 0u;
+    float brightest_luminance = 0.0f;
+    std::uint32_t brightest_x = 0u;
+    std::uint32_t brightest_y = 0u;
+    double moon_probability = 0.0;
+    float moon_peak_luminance = 0.0f;
+  };
+  struct DynamicSkyPending {
+    ImageResource cache{};
+    ImageResource cloud_history{};
+    Buffer readback{};
+    Buffer distribution{};
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    std::future<DynamicSkyCpuResult> completion{};
+    std::string environment_key;
+    std::string cloud_compatibility_key;
+    std::array<float, 2> weather_offset{};
+    std::array<float, 4> cloud_history_parameters{};
+    std::uint32_t cloud_frame = 0u;
+    std::uint32_t previous_cloud_frame = 0u;
+    float cloud_history_weight = 0.0f;
+    std::uint32_t cloud_shadow_resolution = 0u;
+    bool cloud_enabled = false;
+    bool cloud_history_valid = false;
+    VkDeviceSize distribution_bytes = 0u;
+    Clock::time_point submitted_at{};
+
+    [[nodiscard]] bool active() const noexcept {
+      return fence != VK_NULL_HANDLE;
+    }
+  };
   struct SwapchainImageResource {
     VkImage depth_image = VK_NULL_HANDLE;
     VkDeviceMemory depth_memory = VK_NULL_HANDLE;
@@ -4186,6 +4404,7 @@ private:
   std::string fg_recovery_reason_;
   Clock::time_point next_swapchain_recreate_attempt_{};
   bool fatal_error_ = false;
+  std::string fatal_error_detail_;
   bool surface_maintenance1_khr_enabled_ = false;
   bool surface_maintenance1_ext_enabled_ = false;
   bool swapchain_maintenance1_enabled_ = false;
@@ -4195,6 +4414,8 @@ private:
   bool validation_requested_ = false;
   bool validation_enabled_ = false;
   bool storage_image_extended_formats_enabled_ = false;
+  bool memory_budget_supported_ = false;
+  bool descriptor_binding_partially_bound_enabled_ = false;
   bool diagnostic_trace_frame_ = false;
   FrameDiagnosticContext diagnostic_context_{};
 
@@ -4212,7 +4433,11 @@ private:
   VkPipelineLayout static_mesh_layout_ = VK_NULL_HANDLE;
   VkPipeline static_mesh_pipeline_ = VK_NULL_HANDLE;
   VkPipeline static_mesh_pipeline_blend_ = VK_NULL_HANDLE;
-  VkSampler static_sampler_ = VK_NULL_HANDLE;
+  // Base color and its alpha coverage stay nearest. Linear-data sidecars use
+  // separate bilinear samplers so descriptor intent remains explicit.
+  VkSampler static_albedo_sampler_ = VK_NULL_HANDLE;
+  VkSampler static_normal_sampler_ = VK_NULL_HANDLE;
+  VkSampler static_specular_sampler_ = VK_NULL_HANDLE;
 
   // Preview-scene skybox cubemap (Vulkan raster path).
   VkDescriptorSetLayout skybox_desc_layout_ = VK_NULL_HANDLE;
@@ -4254,7 +4479,13 @@ private:
   ImageResource atmosphere_irradiance_{};
   ImageResource atmosphere_environment_cache_{};
   ImageResource atmosphere_cloud_history_{};
+  ImageResource atmosphere_environment_spare_cache_{};
+  ImageResource atmosphere_cloud_history_spare_{};
+  Buffer atmosphere_environment_readback_{};
   Buffer atmosphere_environment_distribution_{};
+  Buffer atmosphere_environment_distribution_spare_{};
+  DynamicSkyPending atmosphere_environment_pending_{};
+  VkFence atmosphere_environment_spare_retirement_fence_ = VK_NULL_HANDLE;
   VkDeviceSize atmosphere_environment_distribution_bytes_ = 0;
   std::string atmosphere_resource_key_;
   std::string atmosphere_failed_key_;
@@ -4263,6 +4494,8 @@ private:
   std::string atmosphere_cloud_history_compatibility_key_;
   std::array<float, 2> atmosphere_cloud_history_weather_offset_{};
   std::uint32_t atmosphere_cloud_history_frame_ = 0u;
+  Clock::time_point atmosphere_environment_last_update_{};
+  std::uint64_t atmosphere_environment_cache_reallocations_ = 0u;
   bool atmosphere_ready_ = false;
   bool atmosphere_environment_ready_ = false;
 
@@ -4279,6 +4512,7 @@ private:
   StreamlineVulkanRuntime streamline_vulkan_runtime_{};
   bool streamline_dlss_failure_logged_ = false;
   bool streamline_rr_active_logged_ = false;
+  bool streamline_rr_target_format_failure_logged_ = false;
   mutable std::string post_process_status_cache_{};
   std::vector<std::string> enabled_instance_extensions_;
   std::vector<std::string> enabled_device_extensions_;
@@ -4676,6 +4910,84 @@ private:
     return std::nullopt;
   }
 
+  struct MemoryHeapDiagnostic {
+    std::uint32_t memory_type = (std::numeric_limits<std::uint32_t>::max)();
+    std::uint32_t heap = (std::numeric_limits<std::uint32_t>::max)();
+    VkDeviceSize budget = 0;
+    VkDeviceSize usage = 0;
+  };
+
+  [[nodiscard]] MemoryHeapDiagnostic
+  memoryHeapDiagnostic(std::uint32_t memory_type) const {
+    MemoryHeapDiagnostic diagnostic;
+    diagnostic.memory_type = memory_type;
+    if (phys_ == VK_NULL_HANDLE ||
+        memory_type == (std::numeric_limits<std::uint32_t>::max)()) {
+      return diagnostic;
+    }
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 properties{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    properties.pNext = memory_budget_supported_ ? &budget : nullptr;
+    vkGetPhysicalDeviceMemoryProperties2(phys_, &properties);
+    if (memory_type >= properties.memoryProperties.memoryTypeCount) {
+      return diagnostic;
+    }
+    diagnostic.heap =
+        properties.memoryProperties.memoryTypes[memory_type].heapIndex;
+    if (memory_budget_supported_ &&
+        diagnostic.heap < properties.memoryProperties.memoryHeapCount) {
+      diagnostic.budget = budget.heapBudget[diagnostic.heap];
+      diagnostic.usage = budget.heapUsage[diagnostic.heap];
+    }
+    return diagnostic;
+  }
+
+  void logBufferResourceError(const char *api, VkResult result,
+                              const char *resource_name, VkDeviceSize size,
+                              VkBufferUsageFlags usage,
+                              std::uint32_t memory_type) {
+    const MemoryHeapDiagnostic heap = memoryHeapDiagnostic(memory_type);
+    xpbd::log::errorf(
+        "Vulkan resource failure: API=%s VkResult=%s(%d) resource=%s "
+        "size=%llu usage=0x%x memory_type=%u heap=%u heap_budget=%llu "
+        "heap_usage=%llu frame_slot=%u still_job_id=%llu",
+        api, vkResultName(result), static_cast<int>(result), resource_name,
+        static_cast<unsigned long long>(size), static_cast<unsigned int>(usage),
+        heap.memory_type, heap.heap,
+        static_cast<unsigned long long>(heap.budget),
+        static_cast<unsigned long long>(heap.usage), frame_index_,
+        static_cast<unsigned long long>(still_active_job_id_));
+    if (result == VK_ERROR_DEVICE_LOST) {
+      recordFatalVulkanError(api, result);
+    }
+  }
+
+  void logImageResourceError(const char *api, VkResult result,
+                             const char *resource_name, VkFormat format,
+                             std::uint32_t width, std::uint32_t height,
+                             std::uint32_t depth, VkImageUsageFlags usage,
+                             VkDeviceSize allocation_size,
+                             std::uint32_t memory_type) {
+    const MemoryHeapDiagnostic heap = memoryHeapDiagnostic(memory_type);
+    xpbd::log::errorf(
+        "Vulkan resource failure: API=%s VkResult=%s(%d) resource=%s "
+        "format=%d extent=%ux%ux%u usage=0x%x allocation_size=%llu "
+        "memory_type=%u heap=%u heap_budget=%llu heap_usage=%llu "
+        "frame_slot=%u still_job_id=%llu",
+        api, vkResultName(result), static_cast<int>(result), resource_name,
+        static_cast<int>(format), width, height, depth,
+        static_cast<unsigned int>(usage),
+        static_cast<unsigned long long>(allocation_size), heap.memory_type,
+        heap.heap, static_cast<unsigned long long>(heap.budget),
+        static_cast<unsigned long long>(heap.usage), frame_index_,
+        static_cast<unsigned long long>(still_active_job_id_));
+    if (result == VK_ERROR_DEVICE_LOST) {
+      recordFatalVulkanError(api, result);
+    }
+  }
+
   void destroyBuffer(Buffer &b) {
     if (b.mapped && b.memory) {
       vkUnmapMemory(device_, b.memory);
@@ -4691,7 +5003,8 @@ private:
   }
 
   bool createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
-                    VkMemoryPropertyFlags props, Buffer &out) {
+                    VkMemoryPropertyFlags props, Buffer &out,
+                    const char *resource_name = "buffer") {
     destroyBuffer(out);
 
     VkDeviceSize alloc = size;
@@ -4705,8 +5018,9 @@ private:
     const VkResult create_result =
         vkCreateBuffer(device_, &bi, nullptr, &out.buffer);
     if (create_result != VK_SUCCESS) {
-      SDL_Log("Vulkan buffer creation failed: %d",
-              static_cast<int>(create_result));
+      logBufferResourceError(
+          "vkCreateBuffer", create_result, resource_name, alloc, usage,
+          (std::numeric_limits<std::uint32_t>::max)());
       return false;
     }
     VkMemoryRequirements req{};
@@ -4715,7 +5029,9 @@ private:
     ai.allocationSize = req.size;
     const auto memory_type = findMemoryType(req.memoryTypeBits, props);
     if (!memory_type) {
-      writeLog("Vulkan buffer has no compatible memory type");
+      logBufferResourceError(
+          "findMemoryType", VK_ERROR_FEATURE_NOT_PRESENT, resource_name,
+          req.size, usage, (std::numeric_limits<std::uint32_t>::max)());
       destroyBuffer(out);
       return false;
     }
@@ -4723,16 +5039,16 @@ private:
     const VkResult allocation_result =
         vkAllocateMemory(device_, &ai, nullptr, &out.memory);
     if (allocation_result != VK_SUCCESS) {
-      SDL_Log("Vulkan buffer memory allocation failed: %d",
-              static_cast<int>(allocation_result));
+      logBufferResourceError("vkAllocateMemory", allocation_result,
+                             resource_name, req.size, usage, *memory_type);
       destroyBuffer(out);
       return false;
     }
     const VkResult bind_result =
         vkBindBufferMemory(device_, out.buffer, out.memory, 0);
     if (bind_result != VK_SUCCESS) {
-      SDL_Log("Vulkan buffer memory bind failed: %d",
-              static_cast<int>(bind_result));
+      logBufferResourceError("vkBindBufferMemory", bind_result,
+                             resource_name, req.size, usage, *memory_type);
       destroyBuffer(out);
       return false;
     }
@@ -4741,8 +5057,8 @@ private:
       const VkResult map_result =
           vkMapMemory(device_, out.memory, 0, alloc, 0, &out.mapped);
       if (map_result != VK_SUCCESS) {
-        SDL_Log("Vulkan buffer memory map failed: %d",
-                static_cast<int>(map_result));
+        logBufferResourceError("vkMapMemory", map_result, resource_name,
+                               alloc, usage, *memory_type);
         destroyBuffer(out);
         return false;
       }
@@ -4803,15 +5119,517 @@ private:
     image = {};
   }
 
+  [[nodiscard]] static DynamicSkyCpuResult buildDynamicSkyDistribution(
+      const DynamicSkyCpuInput &input, VkDevice device, VkFence fence,
+      Clock::time_point submitted_at) {
+    DynamicSkyCpuResult result;
+    result.fence_result =
+        vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+    result.cache_compute_ms =
+        std::chrono::duration<double, std::milli>(Clock::now() - submitted_at)
+            .count();
+    if (result.fence_result != VK_SUCCESS) {
+      result.error = "dynamic-sky GPU fence wait failed";
+      return result;
+    }
+    if (input.readback == nullptr || input.distribution_mapped == nullptr ||
+        input.width == 0u || input.height == 0u) {
+      result.error = "dynamic-sky readback/output mapping is unavailable";
+      return result;
+    }
+
+    try {
+      const auto readback_begin = Clock::now();
+      const std::uint64_t pixel_count =
+          static_cast<std::uint64_t>(input.width) * input.height;
+      const VkDeviceSize distribution_bytes =
+          sizeof(WorldEnvironmentGpuHeader) +
+          static_cast<VkDeviceSize>(pixel_count) *
+              sizeof(WorldEnvironmentGpuAlias);
+      if (distribution_bytes > input.distribution_capacity) {
+        result.error = "dynamic-sky distribution buffer is undersized";
+        return result;
+      }
+
+      FloatEnvironmentImage radiance;
+      radiance.width = input.width;
+      radiance.height = input.height;
+      radiance.rgba.resize(static_cast<std::size_t>(pixel_count) * 4u);
+      std::uint64_t positive_rgb = 0u;
+      float brightest_luminance = 0.0f;
+      std::uint32_t brightest_x = 0u;
+      std::uint32_t brightest_y = 0u;
+      double moon_integrated_luminance = 0.0;
+      bool valid_radiance = true;
+      constexpr double kPi = 3.14159265358979323846;
+      constexpr double kTwoPi = 2.0 * kPi;
+      for (std::uint64_t pixel = 0;
+           valid_radiance && pixel < pixel_count; ++pixel) {
+        for (std::uint32_t channel = 0; channel < 3u; ++channel) {
+          const float value =
+              halfToFloat(input.readback[pixel * 4u + channel]);
+          if (!std::isfinite(value) || value < 0.0f) {
+            valid_radiance = false;
+            break;
+          }
+          radiance.rgba[pixel * 4u + channel] = value;
+          positive_rgb += value > 0.0f ? 1u : 0u;
+        }
+        const float moon_luminance =
+            halfToFloat(input.readback[pixel * 4u + 3u]);
+        radiance.rgba[pixel * 4u + 3u] = moon_luminance;
+        valid_radiance = valid_radiance && std::isfinite(moon_luminance) &&
+                         moon_luminance >= 0.0f;
+        if (!valid_radiance) {
+          break;
+        }
+        const float luminance =
+            0.2126f * radiance.rgba[pixel * 4u] +
+            0.7152f * radiance.rgba[pixel * 4u + 1u] +
+            0.0722f * radiance.rgba[pixel * 4u + 2u];
+        const std::uint32_t x =
+            static_cast<std::uint32_t>(pixel % input.width);
+        const std::uint32_t y =
+            static_cast<std::uint32_t>(pixel / input.width);
+        const double theta0 =
+            kPi * static_cast<double>(y) / static_cast<double>(input.height);
+        const double theta1 = kPi * static_cast<double>(y + 1u) /
+                              static_cast<double>(input.height);
+        const double solid_angle =
+            (kTwoPi / static_cast<double>(input.width)) *
+            (std::cos(theta0) - std::cos(theta1));
+        moon_integrated_luminance +=
+            static_cast<double>(moon_luminance) * solid_angle;
+        if (luminance > brightest_luminance) {
+          brightest_luminance = luminance;
+          brightest_x = x;
+          brightest_y = y;
+        }
+      }
+      if (!valid_radiance || positive_rgb == 0u) {
+        result.error = "dynamic-sky readback contains invalid radiance";
+        return result;
+      }
+
+      const double sun_angular_radius =
+          std::clamp(static_cast<double>(
+                         input.sun.angular_diameter_degrees),
+                     0.05, 5.0) *
+          0.5 * (kPi / 180.0);
+      const double sun_cos_radius = std::cos(sun_angular_radius);
+      const double cos_rotation = std::cos(input.rotation_radians);
+      const double sin_rotation = std::sin(input.rotation_radians);
+      const std::array<double, 3> sun_cache_direction = {
+          input.celestial.sun.direction[0] * cos_rotation -
+              input.celestial.sun.direction[2] * sin_rotation,
+          input.celestial.sun.direction[1],
+          input.celestial.sun.direction[2] * cos_rotation +
+              input.celestial.sun.direction[0] * sin_rotation};
+      const std::array<float, 3> sun_color =
+          colorTemperatureRgb(input.sun.color_temperature_kelvin);
+      const float sun_importance_strength =
+          input.sun_moon_lighting && input.sun.enabled
+              ? std::clamp(input.sun.strength, 0.0f, 32.0f)
+              : 0.0f;
+      const std::array<float, 3> analytic_sun_radiance = {
+          700.0f * sun_color[0] * sun_importance_strength,
+          700.0f * sun_color[1] * sun_importance_strength,
+          700.0f * sun_color[2] * sun_importance_strength};
+      for (std::uint64_t pixel = 0; pixel < pixel_count; ++pixel) {
+        const std::uint32_t x =
+            static_cast<std::uint32_t>(pixel % input.width);
+        const std::uint32_t y =
+            static_cast<std::uint32_t>(pixel / input.width);
+        const double theta =
+            kPi * (static_cast<double>(y) + 0.5) / input.height;
+        const double phi =
+            kTwoPi * (static_cast<double>(x) + 0.5) / input.width;
+        const double sin_theta = std::sin(theta);
+        const std::array<double, 3> direction = {
+            sin_theta * std::sin(phi), std::cos(theta),
+            sin_theta * std::cos(phi)};
+        const double cosine = direction[0] * sun_cache_direction[0] +
+                              direction[1] * sun_cache_direction[1] +
+                              direction[2] * sun_cache_direction[2];
+        double sun_coverage = 0.0;
+        if (cosine >= sun_cos_radius) {
+          const double angular_distance =
+              std::acos(std::clamp(cosine, -1.0, 1.0));
+          const double radial = angular_distance / sun_angular_radius;
+          const double edge =
+              std::clamp((radial - 0.94) / 0.06, 0.0, 1.0);
+          sun_coverage = 1.0 - edge * edge * (3.0 - 2.0 * edge);
+        }
+        const float moon_luminance = radiance.rgba[pixel * 4u + 3u];
+        const float lighting_moon_luminance =
+            input.sun_moon_lighting && input.moon.enabled
+                ? moon_luminance
+                : 0.0f;
+        for (std::uint32_t channel = 0; channel < 3u; ++channel) {
+          radiance.rgba[pixel * 4u + channel] +=
+              lighting_moon_luminance +
+              static_cast<float>(sun_coverage) *
+                  analytic_sun_radiance[channel];
+        }
+        radiance.rgba[pixel * 4u + 3u] = 1.0f;
+      }
+      result.readback_ms =
+          std::chrono::duration<double, std::milli>(Clock::now() -
+                                                    readback_begin)
+              .count();
+
+      EnvironmentDistribution distribution;
+      const auto distribution_begin = Clock::now();
+      if (!distribution.build(radiance)) {
+        result.error = "dynamic-sky importance distribution build failed";
+        return result;
+      }
+      result.distribution_build_ms =
+          std::chrono::duration<double, std::milli>(Clock::now() -
+                                                    distribution_begin)
+              .count();
+
+      const double moon_u_unwrapped =
+          std::atan2(input.celestial.moon.direction[0],
+                     input.celestial.moon.direction[2]) /
+          kTwoPi;
+      const double moon_u =
+          moon_u_unwrapped < 0.0 ? moon_u_unwrapped + 1.0
+                                 : moon_u_unwrapped;
+      const double moon_v =
+          std::acos(std::clamp(input.celestial.moon.direction[1], -1.0,
+                               1.0)) /
+          kPi;
+      const std::int32_t moon_center_x = static_cast<std::int32_t>(
+          std::clamp(moon_u * input.width, 0.0,
+                     static_cast<double>(input.width - 1u)));
+      const std::int32_t moon_center_y = static_cast<std::int32_t>(
+          std::clamp(moon_v * input.height, 0.0,
+                     static_cast<double>(input.height - 1u)));
+      const double moon_angular_radius =
+          std::clamp(static_cast<double>(
+                         input.moon.angular_diameter_degrees),
+                     0.05, 5.0) *
+          0.5 * (kPi / 180.0);
+      const double moon_solid_angle =
+          kTwoPi * (1.0 - std::cos(moon_angular_radius));
+      const float moon_mean_luminance =
+          moon_solid_angle > 0.0
+              ? static_cast<float>(moon_integrated_luminance /
+                                   moon_solid_angle)
+              : 0.0f;
+      double moon_probability = 0.0;
+      float moon_peak_luminance = 0.0f;
+      for (std::int32_t offset_y = -1; offset_y <= 1; ++offset_y) {
+        const std::uint32_t y = static_cast<std::uint32_t>(std::clamp(
+            moon_center_y + offset_y, 0,
+            static_cast<std::int32_t>(input.height - 1u)));
+        for (std::int32_t offset_x = -1; offset_x <= 1; ++offset_x) {
+          const std::int32_t wrapped_x =
+              (moon_center_x + offset_x +
+               static_cast<std::int32_t>(input.width)) %
+              static_cast<std::int32_t>(input.width);
+          const std::uint32_t x = static_cast<std::uint32_t>(wrapped_x);
+          moon_probability += distribution.texelProbability(x, y);
+          moon_peak_luminance = (std::max)(
+              moon_peak_luminance,
+              halfToFloat(input.readback[
+                  (static_cast<std::size_t>(y) * input.width + x) * 4u +
+                  3u]));
+        }
+      }
+
+      constexpr std::uint32_t kValidEnvironment = 1u << 0u;
+      constexpr std::uint32_t kBackgroundVisible = 1u << 1u;
+      constexpr std::uint32_t kLightingEnabled = 1u << 2u;
+      constexpr std::uint32_t kProceduralFiniteMoon = 1u << 3u;
+      constexpr std::uint32_t kSunBackgroundVisible = 1u << 4u;
+      constexpr std::uint32_t kMoonBackgroundVisible = 1u << 5u;
+      constexpr std::uint32_t kSunLightingEnabled = 1u << 6u;
+      constexpr std::uint32_t kMoonLightingEnabled = 1u << 7u;
+      constexpr std::uint32_t kSunCastsShadows = 1u << 8u;
+      constexpr std::uint32_t kMoonCastsShadows = 1u << 9u;
+      constexpr std::uint32_t kMoonSurfaceDetail = 1u << 10u;
+      constexpr std::uint32_t kMoonManualPhase = 1u << 11u;
+      WorldEnvironmentGpuHeader header;
+      header.flags =
+          kValidEnvironment |
+          (input.background_visible ? kBackgroundVisible : 0u) |
+          (input.environment_lighting ? kLightingEnabled : 0u) |
+          (input.moon.enabled ? kProceduralFiniteMoon : 0u) |
+          (input.sun.enabled && input.sun.disk_visible
+               ? kSunBackgroundVisible
+               : 0u) |
+          (input.moon.enabled && input.moon.disk_visible
+               ? kMoonBackgroundVisible
+               : 0u) |
+          (input.sun_moon_lighting && input.sun.enabled
+               ? kSunLightingEnabled
+               : 0u) |
+          (input.sun_moon_lighting && input.moon.enabled
+               ? kMoonLightingEnabled
+               : 0u) |
+          (input.sun.cast_shadows ? kSunCastsShadows : 0u) |
+          (input.moon.cast_shadows ? kMoonCastsShadows : 0u) |
+          (input.moon.surface_detail > 0.0f ? kMoonSurfaceDetail : 0u) |
+          (input.moon.phase_mode == MoonPhaseMode::Manual
+               ? kMoonManualPhase
+               : 0u);
+      header.width = input.width;
+      header.height = input.height;
+      header.entry_count = static_cast<std::uint32_t>(pixel_count);
+      header.lighting_strength = input.environment_strength;
+      header.background_multiplier = input.background_multiplier;
+      header.rotation_radians = input.rotation_radians;
+      header.padding = static_cast<float>(sun_angular_radius);
+      header.sun_direction_moon_mean = {
+          static_cast<float>(input.celestial.sun.direction[0]),
+          static_cast<float>(input.celestial.sun.direction[1]),
+          static_cast<float>(input.celestial.sun.direction[2]),
+          moon_mean_luminance};
+      header.moon_direction_angular_radius = {
+          static_cast<float>(input.celestial.moon.direction[0]),
+          static_cast<float>(input.celestial.moon.direction[1]),
+          static_cast<float>(input.celestial.moon.direction[2]),
+          static_cast<float>(moon_angular_radius)};
+      header.moon_phase_libration = {
+          input.moon_fraction, input.moon_phase_radians,
+          static_cast<float>(
+              input.celestial.moon_libration_latitude_degrees *
+              (kPi / 180.0)),
+          static_cast<float>(
+              input.celestial.moon_libration_longitude_degrees *
+              (kPi / 180.0))};
+      header.sun_color_strength = {
+          sun_color[0], sun_color[1], sun_color[2],
+          std::clamp(input.sun.strength, 0.0f, 32.0f)};
+      std::memcpy(input.distribution_mapped, &header, sizeof(header));
+      auto *gpu_alias = reinterpret_cast<WorldEnvironmentGpuAlias *>(
+          static_cast<std::byte *>(input.distribution_mapped) +
+          sizeof(WorldEnvironmentGpuHeader));
+      for (std::uint32_t y = 0; y < input.height; ++y) {
+        for (std::uint32_t x = 0; x < input.width; ++x) {
+          const std::uint32_t index = y * input.width + x;
+          gpu_alias[index].acceptance = static_cast<float>(
+              std::clamp(distribution.aliasAcceptance(x, y), 0.0, 1.0));
+          gpu_alias[index].alias_index = distribution.aliasIndex(x, y);
+          gpu_alias[index].probability = static_cast<float>(
+              (std::max)(distribution.texelProbability(x, y), 0.0));
+        }
+      }
+      result.success = true;
+      result.positive_rgb = positive_rgb;
+      result.brightest_luminance = brightest_luminance;
+      result.brightest_x = brightest_x;
+      result.brightest_y = brightest_y;
+      result.moon_probability = moon_probability;
+      result.moon_peak_luminance = moon_peak_luminance;
+    } catch (const std::exception &exception) {
+      result.error = std::string("dynamic-sky CPU build exception: ") +
+                     exception.what();
+    } catch (...) {
+      result.error = "dynamic-sky CPU build failed with unknown exception";
+    }
+    return result;
+  }
+
+  bool pollDynamicSkyEnvironmentCache(bool wait_for_completion = false) {
+    DynamicSkyPending &pending = atmosphere_environment_pending_;
+    if (!pending.active()) {
+      return false;
+    }
+    if (!pending.completion.valid()) {
+      if (!wait_for_completion) {
+        return false;
+      }
+      DynamicSkyCpuResult fallback;
+      fallback.fence_result =
+          vkWaitForFences(device_, 1, &pending.fence, VK_TRUE, UINT64_MAX);
+      fallback.error = "dynamic-sky worker launch failed";
+      std::promise<DynamicSkyCpuResult> promise;
+      pending.completion = promise.get_future();
+      promise.set_value(std::move(fallback));
+    } else if (!wait_for_completion &&
+               pending.completion.wait_for(std::chrono::milliseconds(0)) !=
+                   std::future_status::ready) {
+      return false;
+    }
+
+    DynamicSkyCpuResult cpu_result;
+    try {
+      cpu_result = pending.completion.get();
+    } catch (const std::exception &exception) {
+      // A broken future does not prove that the submitted command buffer has
+      // completed. Establish completion independently before reclaiming any
+      // Vulkan object owned by the pending transaction.
+      cpu_result.fence_result =
+          vkWaitForFences(device_, 1, &pending.fence, VK_TRUE, UINT64_MAX);
+      cpu_result.error = std::string("dynamic-sky worker completion failed: ") +
+                         exception.what();
+    } catch (...) {
+      cpu_result.fence_result =
+          vkWaitForFences(device_, 1, &pending.fence, VK_TRUE, UINT64_MAX);
+      cpu_result.error =
+          "dynamic-sky worker completion failed with unknown exception";
+    }
+    if (cpu_result.fence_result != VK_SUCCESS) {
+      xpbd::log::errorf(
+          "Dynamic sky completion could not be established: "
+          "API=vkWaitForFences VkResult=%s(%d) frame_slot=%u "
+          "still_job_id=%llu; quarantining submitted resources until device "
+          "teardown",
+          vkResultName(cpu_result.fence_result),
+          static_cast<int>(cpu_result.fence_result), frame_index_,
+          static_cast<unsigned long long>(still_active_job_id_));
+      recordFatalVulkanError("vkWaitForFences(dynamic_sky)",
+                             cpu_result.fence_result);
+      // Do not destroy the fence, free the command buffer, or release any
+      // image/buffer here: a non-successful wait does not prove completion.
+      return true;
+    }
+    if (pending.fence != VK_NULL_HANDLE) {
+      vkDestroyFence(device_, pending.fence, nullptr);
+      pending.fence = VK_NULL_HANDLE;
+    }
+    if (pending.command != VK_NULL_HANDLE) {
+      vkFreeCommandBuffers(device_, cmd_pool_, 1, &pending.command);
+      pending.command = VK_NULL_HANDLE;
+    }
+    if (!cpu_result.success) {
+      xpbd::log::warnf(
+          "Dynamic sky asynchronous update failed: VkResult=%s(%d) %s; "
+          "retaining previous radiance/PDF pair",
+          vkResultName(cpu_result.fence_result),
+          static_cast<int>(cpu_result.fence_result),
+          cpu_result.error.c_str());
+      atmosphere_environment_failed_key_ = pending.environment_key;
+      destroyImage(atmosphere_environment_spare_cache_);
+      atmosphere_environment_spare_cache_ = pending.cache;
+      pending.cache = {};
+      destroyImage(atmosphere_cloud_history_spare_);
+      atmosphere_cloud_history_spare_ = pending.cloud_history;
+      pending.cloud_history = {};
+      destroyBuffer(atmosphere_environment_distribution_spare_);
+      atmosphere_environment_distribution_spare_ = pending.distribution;
+      pending.distribution = {};
+      destroyBuffer(atmosphere_environment_readback_);
+      atmosphere_environment_readback_ = pending.readback;
+      pending.readback = {};
+      destroyImage(pending.cache);
+      destroyImage(pending.cloud_history);
+      destroyBuffer(pending.distribution);
+      destroyBuffer(pending.readback);
+      atmosphere_environment_pending_ = {};
+      atmosphere_environment_last_update_ = Clock::now();
+      return true;
+    }
+
+    const bool retiring_shared_front =
+        atmosphere_environment_cache_.image != VK_NULL_HANDLE ||
+        atmosphere_environment_distribution_.buffer != VK_NULL_HANDLE;
+    if (retiring_shared_front) {
+      const std::size_t other_slot =
+          (frame_index_ + 1u) % frames_.size();
+      atmosphere_environment_spare_retirement_fence_ =
+          frames_[other_slot].fence;
+    } else {
+      atmosphere_environment_spare_retirement_fence_ = VK_NULL_HANDLE;
+    }
+    destroyImage(atmosphere_environment_spare_cache_);
+    atmosphere_environment_spare_cache_ = atmosphere_environment_cache_;
+    atmosphere_environment_cache_ = pending.cache;
+    pending.cache = {};
+    destroyImage(atmosphere_cloud_history_spare_);
+    atmosphere_cloud_history_spare_ = atmosphere_cloud_history_;
+    atmosphere_cloud_history_ = pending.cloud_history;
+    pending.cloud_history = {};
+    destroyBuffer(atmosphere_environment_distribution_spare_);
+    atmosphere_environment_distribution_spare_ =
+        atmosphere_environment_distribution_;
+    atmosphere_environment_distribution_ = pending.distribution;
+    pending.distribution = {};
+    destroyBuffer(atmosphere_environment_readback_);
+    atmosphere_environment_readback_ = pending.readback;
+    pending.readback = {};
+    atmosphere_environment_distribution_bytes_ = pending.distribution_bytes;
+    atmosphere_environment_key_ = pending.environment_key;
+    atmosphere_cloud_history_compatibility_key_ =
+        pending.cloud_compatibility_key;
+    atmosphere_cloud_history_weather_offset_ = pending.weather_offset;
+    atmosphere_cloud_history_frame_ = pending.cloud_frame;
+    atmosphere_environment_failed_key_.clear();
+    atmosphere_environment_ready_ = true;
+    atmosphere_environment_last_update_ = Clock::now();
+    if (pending.cloud_enabled) {
+      xpbd::log::infof(
+          "Dynamic cloud temporal cache: %ux%u history=%s frame=%u "
+          "previous_frame=%u weather_delta=%.6f/%.6f weight=%.3f "
+          "shadow_resolution=%u",
+          atmosphere_environment_cache_.width,
+          atmosphere_environment_cache_.height,
+          pending.cloud_history_valid ? "reprojected" : "reset",
+          pending.cloud_frame, pending.previous_cloud_frame,
+          pending.cloud_history_parameters[0],
+          pending.cloud_history_parameters[1],
+          pending.cloud_history_weight, pending.cloud_shadow_resolution);
+    }
+    xpbd::log::infof(
+        "Dynamic sky asynchronous cache ready: %ux%u positive=%llu "
+        "table=%llu brightest=%.7g@%u,%u moon_pmf=%.9g "
+        "moon_peak=%.7g",
+        atmosphere_environment_cache_.width,
+        atmosphere_environment_cache_.height,
+        static_cast<unsigned long long>(cpu_result.positive_rgb),
+        static_cast<unsigned long long>(pending.distribution_bytes),
+        cpu_result.brightest_luminance, cpu_result.brightest_x,
+        cpu_result.brightest_y, cpu_result.moon_probability,
+        cpu_result.moon_peak_luminance);
+    xpbd::log::infof(
+        "Dynamic sky update perf: cache_compute_ms=%.3f readback_ms=%.3f "
+        "distribution_build_ms=%.3f queue_idle_count=0 "
+        "cache_realloc_count=%llu",
+        cpu_result.cache_compute_ms, cpu_result.readback_ms,
+        cpu_result.distribution_build_ms,
+        static_cast<unsigned long long>(
+            atmosphere_environment_cache_reallocations_));
+    atmosphere_environment_pending_ = {};
+    return true;
+  }
+
+  void discardDynamicSkyPending() {
+    if (!atmosphere_environment_pending_.active()) {
+      atmosphere_environment_pending_ = {};
+      return;
+    }
+    (void)pollDynamicSkyEnvironmentCache(true);
+    if (!atmosphere_environment_pending_.active()) {
+      return;
+    }
+    // poll(true) only leaves the transaction active when its fence completion
+    // could not be established. Intentionally lose the child handles here;
+    // vkDestroyDevice owns the final reclamation, while freeing them directly
+    // could race work that is still in flight.
+    xpbd::log::error(
+        "Dynamic sky pending resources quarantined for device teardown");
+    atmosphere_environment_pending_ = {};
+  }
+
   void clearDynamicSkyEnvironmentCache() {
+    discardDynamicSkyPending();
     destroyImage(atmosphere_environment_cache_);
     destroyImage(atmosphere_cloud_history_);
+    destroyImage(atmosphere_environment_spare_cache_);
+    destroyImage(atmosphere_cloud_history_spare_);
+    destroyBuffer(atmosphere_environment_readback_);
     destroyBuffer(atmosphere_environment_distribution_);
+    destroyBuffer(atmosphere_environment_distribution_spare_);
     atmosphere_environment_distribution_bytes_ = 0;
     atmosphere_environment_key_.clear();
     atmosphere_cloud_history_compatibility_key_.clear();
     atmosphere_cloud_history_weather_offset_ = {};
     atmosphere_cloud_history_frame_ = 0u;
+    atmosphere_environment_last_update_ = {};
+    atmosphere_environment_spare_retirement_fence_ = VK_NULL_HANDLE;
     atmosphere_environment_ready_ = false;
   }
 
@@ -5067,10 +5885,18 @@ private:
         VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
         VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
         VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
+    constexpr VkImageUsageFlags kUsage =
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+        VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    const VkDeviceSize estimated_bytes =
+        static_cast<VkDeviceSize>(width) * height * depth * 8u;
     if ((format_properties.optimalTilingFeatures & required_features) !=
         required_features) {
-      xpbd::log::warn(
-          "Procedural atmosphere requires RGBA16F storage+sample support");
+      logImageResourceError(
+          "vkGetPhysicalDeviceFormatProperties",
+          VK_ERROR_FORMAT_NOT_SUPPORTED, "procedural-atmosphere-rgba16f",
+          VK_FORMAT_R16G16B16A16_SFLOAT, width, height, depth, kUsage,
+          estimated_bytes, (std::numeric_limits<std::uint32_t>::max)());
       return false;
     }
 
@@ -5083,12 +5909,15 @@ private:
     image_info.arrayLayers = 1;
     image_info.samples = VK_SAMPLE_COUNT_1_BIT;
     image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    image_info.usage = VK_IMAGE_USAGE_STORAGE_BIT |
-                       VK_IMAGE_USAGE_SAMPLED_BIT |
-                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    image_info.usage = kUsage;
     image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (vkCreateImage(device_, &image_info, nullptr, &out.image) !=
-        VK_SUCCESS) {
+    const VkResult create_result =
+        vkCreateImage(device_, &image_info, nullptr, &out.image);
+    if (create_result != VK_SUCCESS) {
+      logImageResourceError(
+          "vkCreateImage", create_result, "procedural-atmosphere-rgba16f",
+          image_info.format, width, height, depth, image_info.usage,
+          estimated_bytes, (std::numeric_limits<std::uint32_t>::max)());
       return false;
     }
 
@@ -5097,15 +5926,34 @@ private:
     const auto memory_type = findMemoryType(
         requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (!memory_type) {
+      logImageResourceError(
+          "findMemoryType", VK_ERROR_FEATURE_NOT_PRESENT,
+          "procedural-atmosphere-rgba16f", image_info.format, width, height,
+          depth, image_info.usage, requirements.size,
+          (std::numeric_limits<std::uint32_t>::max)());
       destroyImage(out);
       return false;
     }
     VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     allocation.allocationSize = requirements.size;
     allocation.memoryTypeIndex = *memory_type;
-    if (vkAllocateMemory(device_, &allocation, nullptr, &out.memory) !=
-            VK_SUCCESS ||
-        vkBindImageMemory(device_, out.image, out.memory, 0) != VK_SUCCESS) {
+    const VkResult allocation_result =
+        vkAllocateMemory(device_, &allocation, nullptr, &out.memory);
+    if (allocation_result != VK_SUCCESS) {
+      logImageResourceError(
+          "vkAllocateMemory", allocation_result,
+          "procedural-atmosphere-rgba16f", image_info.format, width, height,
+          depth, image_info.usage, requirements.size, *memory_type);
+      destroyImage(out);
+      return false;
+    }
+    const VkResult bind_result =
+        vkBindImageMemory(device_, out.image, out.memory, 0);
+    if (bind_result != VK_SUCCESS) {
+      logImageResourceError(
+          "vkBindImageMemory", bind_result,
+          "procedural-atmosphere-rgba16f", image_info.format, width, height,
+          depth, image_info.usage, requirements.size, *memory_type);
       destroyImage(out);
       return false;
     }
@@ -5116,8 +5964,13 @@ private:
         depth > 1u ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
     view_info.format = VK_FORMAT_R16G16B16A16_SFLOAT;
     view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    if (vkCreateImageView(device_, &view_info, nullptr, &out.view) !=
-        VK_SUCCESS) {
+    const VkResult view_result =
+        vkCreateImageView(device_, &view_info, nullptr, &out.view);
+    if (view_result != VK_SUCCESS) {
+      logImageResourceError(
+          "vkCreateImageView", view_result,
+          "procedural-atmosphere-rgba16f", image_info.format, width, height,
+          depth, image_info.usage, requirements.size, *memory_type);
       destroyImage(out);
       return false;
     }
@@ -5469,9 +6322,36 @@ private:
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &command;
-    if (vkQueueSubmit(graphics_queue_, 1, &submit, VK_NULL_HANDLE) !=
-            VK_SUCCESS ||
-        vkQueueWaitIdle(graphics_queue_) != VK_SUCCESS) {
+    const VkResult submit_result =
+        vkQueueSubmit(graphics_queue_, 1, &submit, VK_NULL_HANDLE);
+    if (submit_result != VK_SUCCESS) {
+      xpbd::log::errorf(
+          "Procedural atmosphere LUT submit failed: API=vkQueueSubmit "
+          "VkResult=%s(%d) resource=atmosphere-luts frame_slot=%u "
+          "still_job_id=%llu",
+          vkResultName(submit_result), static_cast<int>(submit_result),
+          frame_index_,
+          static_cast<unsigned long long>(still_active_job_id_));
+      if (submit_result == VK_ERROR_DEVICE_LOST) {
+        recordFatalVulkanError("vkQueueSubmit(atmosphere_luts)",
+                               submit_result);
+      }
+      cleanup();
+      return false;
+    }
+    const VkResult wait_result = vkQueueWaitIdle(graphics_queue_);
+    if (wait_result != VK_SUCCESS) {
+      xpbd::log::errorf(
+          "Procedural atmosphere LUT wait failed: API=vkQueueWaitIdle "
+          "VkResult=%s(%d) resource=atmosphere-luts frame_slot=%u "
+          "still_job_id=%llu",
+          vkResultName(wait_result), static_cast<int>(wait_result),
+          frame_index_,
+          static_cast<unsigned long long>(still_active_job_id_));
+      if (wait_result == VK_ERROR_DEVICE_LOST) {
+        recordFatalVulkanError("vkQueueWaitIdle(atmosphere_luts)",
+                               wait_result);
+      }
       cleanup();
       return false;
     }
@@ -5598,6 +6478,10 @@ private:
     appendPathTraceHistoryBytes(hash, atmosphere_resource_key_.data(),
                                 atmosphere_resource_key_.size());
     appendPathTraceHistoryValue(hash, resolved.rotation_radians);
+    appendPathTraceHistoryValue(hash, resolved.background_visible);
+    appendPathTraceHistoryValue(hash, resolved.environment_lighting);
+    appendPathTraceHistoryValue(hash, resolved.environment_strength);
+    appendPathTraceHistoryValue(hash, resolved.background_multiplier);
     appendPathTraceHistoryValue(hash, resolved.sun_moon_lighting);
     appendPathTraceHistoryValue(hash, resolved.celestial->sun.direction);
     appendPathTraceHistoryValue(
@@ -5693,6 +6577,10 @@ private:
     const VkDeviceSize kReadbackBytes =
         static_cast<VkDeviceSize>(kPixelCount) * 4u *
         sizeof(std::uint16_t);
+    const VkDeviceSize kDistributionBytes =
+        sizeof(WorldEnvironmentGpuHeader) +
+        static_cast<VkDeviceSize>(kPixelCount) *
+            sizeof(WorldEnvironmentGpuAlias);
     if (!atmosphere_ready_ ||
         atmosphere_environment_cache_pipeline_ == VK_NULL_HANDLE ||
         atmosphere_transmittance_.image == VK_NULL_HANDLE ||
@@ -5701,34 +6589,141 @@ private:
         environment_key.empty() || !ensureWorldEnvironmentSampler()) {
       return false;
     }
-    if (atmosphere_environment_cache_.image != VK_NULL_HANDLE &&
-        vkQueueWaitIdle(graphics_queue_) != VK_SUCCESS) {
-      return false;
+    if (atmosphere_environment_pending_.active()) {
+      return true;
+    }
+    if (atmosphere_environment_spare_retirement_fence_ != VK_NULL_HANDLE) {
+      const VkResult retirement_result = vkGetFenceStatus(
+          device_, atmosphere_environment_spare_retirement_fence_);
+      if (retirement_result == VK_NOT_READY) {
+        // The old front bundle is still referenced by the other frame slot.
+        // Defer without blocking; that slot is waited at the start of its next
+        // frame before this function is called again.
+        return true;
+      }
+      if (retirement_result != VK_SUCCESS) {
+        xpbd::log::errorf(
+            "Dynamic sky retirement fence failed: API=vkGetFenceStatus "
+            "VkResult=%s(%d) frame_slot=%u still_job_id=%llu",
+            vkResultName(retirement_result),
+            static_cast<int>(retirement_result), frame_index_,
+            static_cast<unsigned long long>(still_active_job_id_));
+        recordFatalVulkanError("vkGetFenceStatus(dynamic_sky_retirement)",
+                               retirement_result);
+        return false;
+      }
+      atmosphere_environment_spare_retirement_fence_ = VK_NULL_HANDLE;
     }
 
     ImageResource candidate_cache{};
     ImageResource candidate_cloud_history{};
     Buffer readback{};
+    Buffer pending_distribution{};
+    bool candidate_cache_reused = false;
+    bool candidate_cloud_history_reused = false;
+    bool readback_reused = false;
+    bool pending_distribution_reused = false;
     VkCommandBuffer command = VK_NULL_HANDLE;
+    VkFence update_fence = VK_NULL_HANDLE;
     auto cleanup = [&] {
+      if (update_fence != VK_NULL_HANDLE) {
+        vkDestroyFence(device_, update_fence, nullptr);
+        update_fence = VK_NULL_HANDLE;
+      }
       if (command != VK_NULL_HANDLE) {
         vkFreeCommandBuffers(device_, cmd_pool_, 1, &command);
         command = VK_NULL_HANDLE;
       }
-      destroyBuffer(readback);
-      destroyImage(candidate_cache);
-      destroyImage(candidate_cloud_history);
+      if (readback_reused &&
+          atmosphere_environment_readback_.buffer == VK_NULL_HANDLE) {
+        atmosphere_environment_readback_ = readback;
+        readback = {};
+      } else {
+        destroyBuffer(readback);
+      }
+      if (candidate_cache_reused &&
+          atmosphere_environment_spare_cache_.image == VK_NULL_HANDLE) {
+        atmosphere_environment_spare_cache_ = candidate_cache;
+        candidate_cache = {};
+      } else {
+        destroyImage(candidate_cache);
+      }
+      if (candidate_cloud_history_reused &&
+          atmosphere_cloud_history_spare_.image == VK_NULL_HANDLE) {
+        atmosphere_cloud_history_spare_ = candidate_cloud_history;
+        candidate_cloud_history = {};
+      } else {
+        destroyImage(candidate_cloud_history);
+      }
+      if (pending_distribution_reused &&
+          atmosphere_environment_distribution_spare_.buffer ==
+              VK_NULL_HANDLE) {
+        atmosphere_environment_distribution_spare_ = pending_distribution;
+        pending_distribution = {};
+      } else {
+        destroyBuffer(pending_distribution);
+      }
     };
-    if (!createAtmosphereImage(kCacheWidth, kCacheHeight, 1u,
-                               candidate_cache) ||
-        !createAtmosphereImage(kCacheWidth, kCacheHeight, 1u,
-                               candidate_cloud_history) ||
-        !createBuffer(kReadbackBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                      readback)) {
+    const auto acquire_image = [&](ImageResource &spare,
+                                   ImageResource &candidate,
+                                   bool &reused) {
+      if (spare.image != VK_NULL_HANDLE && spare.width == kCacheWidth &&
+          spare.height == kCacheHeight && spare.depth == 1u) {
+        candidate = spare;
+        spare = {};
+        reused = true;
+        return true;
+      }
+      destroyImage(spare);
+      if (!createAtmosphereImage(kCacheWidth, kCacheHeight, 1u, candidate)) {
+        return false;
+      }
+      ++atmosphere_environment_cache_reallocations_;
+      return true;
+    };
+    if (!acquire_image(atmosphere_environment_spare_cache_, candidate_cache,
+                       candidate_cache_reused) ||
+        !acquire_image(atmosphere_cloud_history_spare_,
+                       candidate_cloud_history,
+                       candidate_cloud_history_reused)) {
       cleanup();
       return false;
+    }
+    if (atmosphere_environment_readback_.buffer != VK_NULL_HANDLE &&
+        atmosphere_environment_readback_.capacity >= kReadbackBytes) {
+      readback = atmosphere_environment_readback_;
+      atmosphere_environment_readback_ = {};
+      readback_reused = true;
+    } else {
+      destroyBuffer(atmosphere_environment_readback_);
+      if (!createBuffer(kReadbackBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                        readback, "dynamic-sky-readback")) {
+        cleanup();
+        return false;
+      }
+      ++atmosphere_environment_cache_reallocations_;
+    }
+    if (atmosphere_environment_distribution_spare_.buffer !=
+            VK_NULL_HANDLE &&
+        atmosphere_environment_distribution_spare_.capacity >=
+            kDistributionBytes) {
+      pending_distribution = atmosphere_environment_distribution_spare_;
+      atmosphere_environment_distribution_spare_ = {};
+      pending_distribution_reused = true;
+    } else {
+      destroyBuffer(atmosphere_environment_distribution_spare_);
+      if (!createBuffer(kDistributionBytes,
+                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                        pending_distribution,
+                        "dynamic-sky-environment-distribution")) {
+        cleanup();
+        return false;
+      }
+      ++atmosphere_environment_cache_reallocations_;
     }
 
     VolumetricCloudState cloud_compatibility;
@@ -5823,18 +6818,29 @@ private:
     }
 
     VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.oldLayout = candidate_cache_reused
+                            ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                            : VK_IMAGE_LAYOUT_UNDEFINED;
     barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = candidate_cache.image;
     barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    barrier.srcAccessMask = candidate_cache_reused
+                                ? VK_ACCESS_SHADER_READ_BIT
+                                : 0u;
     barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     VkImageMemoryBarrier cloud_history_barrier = barrier;
     cloud_history_barrier.image = candidate_cloud_history.image;
+    cloud_history_barrier.oldLayout =
+        candidate_cloud_history_reused
+            ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+            : VK_IMAGE_LAYOUT_UNDEFINED;
+    cloud_history_barrier.srcAccessMask =
+        candidate_cloud_history_reused ? VK_ACCESS_SHADER_READ_BIT : 0u;
     const std::array<VkImageMemoryBarrier, 2> output_barriers{
         barrier, cloud_history_barrier};
-    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
                          0, nullptr,
                          static_cast<std::uint32_t>(output_barriers.size()),
@@ -6003,13 +7009,23 @@ private:
     vkCmdCopyImageToBuffer(command, candidate_cache.image,
                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            readback.buffer, 1, &copy);
+    VkBufferMemoryBarrier readback_barrier{
+        VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    readback_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    readback_barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    readback_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    readback_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    readback_barrier.buffer = readback.buffer;
+    readback_barrier.offset = 0u;
+    readback_barrier.size = kReadbackBytes;
     barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
-                         nullptr, 1, &barrier);
+                         VK_PIPELINE_STAGE_HOST_BIT |
+                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         0, 0, nullptr, 1, &readback_barrier, 1, &barrier);
     if (vkEndCommandBuffer(command) != VK_SUCCESS) {
       cleanup();
       return false;
@@ -6017,372 +7033,104 @@ private:
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &command;
-    if (vkQueueSubmit(graphics_queue_, 1, &submit, VK_NULL_HANDLE) !=
-            VK_SUCCESS ||
-        vkQueueWaitIdle(graphics_queue_) != VK_SUCCESS) {
+    VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (vkCreateFence(device_, &fence_info, nullptr, &update_fence) !=
+        VK_SUCCESS) {
       cleanup();
       return false;
     }
-    vkFreeCommandBuffers(device_, cmd_pool_, 1, &command);
-    command = VK_NULL_HANDLE;
+    const auto cache_compute_begin = Clock::now();
+    const VkResult submit_result =
+        vkQueueSubmit(graphics_queue_, 1, &submit, update_fence);
+    if (submit_result != VK_SUCCESS) {
+      xpbd::log::warnf(
+          "Dynamic sky cache submit failed: API=vkQueueSubmit "
+          "VkResult=%s(%d) resource=dynamic-sky-cache extent=%ux%u "
+          "frame_slot=%u still_job_id=%llu",
+          vkResultName(submit_result), static_cast<int>(submit_result),
+          kCacheWidth, kCacheHeight, frame_index_,
+          static_cast<unsigned long long>(still_active_job_id_));
+      if (submit_result == VK_ERROR_DEVICE_LOST) {
+        recordFatalVulkanError("vkQueueSubmit(dynamic_sky)", submit_result);
+      }
+      cleanup();
+      return false;
+    }
 
-    const auto *half =
+    DynamicSkyCpuInput cpu_input;
+    cpu_input.readback =
         static_cast<const std::uint16_t *>(readback.mapped);
-    FloatEnvironmentImage radiance;
-    radiance.width = kCacheWidth;
-    radiance.height = kCacheHeight;
-    radiance.rgba.resize(static_cast<std::size_t>(kPixelCount) * 4u);
-    std::uint64_t positive_rgb = 0;
-    std::array<std::uint64_t, 3> positive_by_channel{};
-    std::array<float, 3> channel_min{
-        std::numeric_limits<float>::infinity(),
-        std::numeric_limits<float>::infinity(),
-        std::numeric_limits<float>::infinity()};
-    std::array<float, 3> channel_max{};
-    std::array<double, 3> channel_sum{};
-    std::array<double, 2> hemisphere_luminance_sum{};
-    std::array<float, 2> hemisphere_luminance_max{};
-    std::array<std::uint64_t, 2> hemisphere_pixels{};
-    float brightest_luminance = 0.0f;
-    std::uint32_t brightest_x = 0u;
-    std::uint32_t brightest_y = 0u;
-    double moon_integrated_luminance = 0.0;
-    bool valid_radiance = half != nullptr;
-    for (std::uint64_t pixel = 0; valid_radiance && pixel < kPixelCount;
-         ++pixel) {
-      for (std::uint32_t channel = 0; channel < 3u; ++channel) {
-        const float value = halfToFloat(half[pixel * 4u + channel]);
-        if (!std::isfinite(value) || value < 0.0f) {
-          valid_radiance = false;
-          break;
-        }
-        radiance.rgba[pixel * 4u + channel] = value;
-        positive_rgb += value > 0.0f ? 1u : 0u;
-        positive_by_channel[channel] += value > 0.0f ? 1u : 0u;
-        channel_min[channel] = (std::min)(channel_min[channel], value);
-        channel_max[channel] = (std::max)(channel_max[channel], value);
-        channel_sum[channel] += static_cast<double>(value);
-      }
-      const float moon_luminance =
-          halfToFloat(half[pixel * 4u + 3u]);
-      radiance.rgba[pixel * 4u + 3u] = moon_luminance;
-      valid_radiance =
-          valid_radiance && std::isfinite(moon_luminance) &&
-          moon_luminance >= 0.0f;
-      if (valid_radiance) {
-        const float luminance =
-            0.2126f * radiance.rgba[pixel * 4u] +
-            0.7152f * radiance.rgba[pixel * 4u + 1u] +
-            0.0722f * radiance.rgba[pixel * 4u + 2u];
-        const std::uint32_t y =
-            static_cast<std::uint32_t>(pixel / kCacheWidth);
-        const double theta0 =
-            3.14159265358979323846 * static_cast<double>(y) /
-            static_cast<double>(kCacheHeight);
-        const double theta1 =
-            3.14159265358979323846 * static_cast<double>(y + 1u) /
-            static_cast<double>(kCacheHeight);
-        const double solid_angle =
-            (2.0 * 3.14159265358979323846 /
-             static_cast<double>(kCacheWidth)) *
-            (std::cos(theta0) - std::cos(theta1));
-        moon_integrated_luminance +=
-            static_cast<double>(moon_luminance) * solid_angle;
-        const std::uint32_t hemisphere = y < kCacheHeight / 2u ? 0u : 1u;
-        hemisphere_luminance_sum[hemisphere] +=
-            static_cast<double>(luminance);
-        hemisphere_luminance_max[hemisphere] =
-            (std::max)(hemisphere_luminance_max[hemisphere], luminance);
-        ++hemisphere_pixels[hemisphere];
-        if (luminance > brightest_luminance) {
-          brightest_luminance = luminance;
-          brightest_x = static_cast<std::uint32_t>(pixel % kCacheWidth);
-          brightest_y = y;
-        }
-      }
-    }
-    destroyBuffer(readback);
-    FloatEnvironmentImage importance_radiance = radiance;
-    // Keep the finite Sun out of the low-resolution RGB cache so it cannot
-    // collapse into a square texel.  Add an analytic circular lobe only to
-    // the importance image; the RT shader evaluates the same disk exactly.
-    constexpr double kPi = 3.14159265358979323846;
-    constexpr double kTwoPi = 2.0 * kPi;
-    const double sun_angular_radius =
-        std::clamp(static_cast<double>(
-                       sun_controls.angular_diameter_degrees),
-                   0.05, 5.0) *
-        0.5 *
-        (kPi / 180.0);
-    const double sun_cos_radius = std::cos((std::max)(sun_angular_radius, 0.0));
-    const double rotation = resolved.rotation_radians;
-    const double cos_rotation = std::cos(rotation);
-    const double sin_rotation = std::sin(rotation);
-    const std::array<double, 3> sun_cache_direction = {
-        resolved.celestial->sun.direction[0] * cos_rotation -
-            resolved.celestial->sun.direction[2] * sin_rotation,
-        resolved.celestial->sun.direction[1],
-        resolved.celestial->sun.direction[2] * cos_rotation +
-            resolved.celestial->sun.direction[0] * sin_rotation};
-    const std::array<float, 3> sun_color =
-        colorTemperatureRgb(sun_controls.color_temperature_kelvin);
-    const float sun_importance_strength =
-        resolved.sun_moon_lighting && sun_controls.enabled
-            ? std::clamp(sun_controls.strength, 0.0f, 32.0f)
-            : 0.0f;
-    const std::array<float, 3> analytic_sun_radiance = {
-        700.0f * sun_color[0] * sun_importance_strength,
-        700.0f * sun_color[1] * sun_importance_strength,
-        700.0f * sun_color[2] * sun_importance_strength};
-    for (std::uint64_t pixel = 0; pixel < kPixelCount; ++pixel) {
-      const std::uint32_t x =
-          static_cast<std::uint32_t>(pixel % kCacheWidth);
-      const std::uint32_t y =
-          static_cast<std::uint32_t>(pixel / kCacheWidth);
-      const double theta =
-          kPi * (static_cast<double>(y) + 0.5) /
-          static_cast<double>(kCacheHeight);
-      const double phi =
-          kTwoPi * (static_cast<double>(x) + 0.5) /
-          static_cast<double>(kCacheWidth);
-      const double sin_theta = std::sin(theta);
-      const std::array<double, 3> cache_direction = {
-          sin_theta * std::sin(phi), std::cos(theta),
-          sin_theta * std::cos(phi)};
-      const double cosine =
-          cache_direction[0] * sun_cache_direction[0] +
-          cache_direction[1] * sun_cache_direction[1] +
-          cache_direction[2] * sun_cache_direction[2];
-      double sun_coverage = 0.0;
-      if (sun_angular_radius > 0.0 && cosine >= sun_cos_radius) {
-        const double angular_distance =
-            std::acos(std::clamp(cosine, -1.0, 1.0));
-        const double radial = angular_distance / sun_angular_radius;
-        const double edge = std::clamp((radial - 0.94) / 0.06, 0.0, 1.0);
-        sun_coverage = 1.0 - edge * edge * (3.0 - 2.0 * edge);
-      }
-      const float moon_luminance =
-          importance_radiance.rgba[pixel * 4u + 3u];
-      const float lighting_moon_luminance =
-          resolved.sun_moon_lighting && moon_controls.enabled
-              ? moon_luminance
-              : 0.0f;
-      for (std::uint32_t channel = 0; channel < 3u; ++channel) {
-        importance_radiance.rgba[pixel * 4u + channel] +=
-            lighting_moon_luminance +
-            static_cast<float>(sun_coverage) *
-                analytic_sun_radiance[channel];
-      }
-      importance_radiance.rgba[pixel * 4u + 3u] = 1.0f;
-    }
-    EnvironmentDistribution distribution;
-    if (!valid_radiance || positive_rgb == 0u ||
-        !distribution.build(importance_radiance)) {
-      xpbd::log::warn(
-          "Dynamic sky environment cache readback/distribution failed");
-      cleanup();
-      return false;
-    }
-    const double moon_u_unwrapped =
-        std::atan2(resolved.celestial->moon.direction[0],
-                   resolved.celestial->moon.direction[2]) /
-        (2.0 * 3.14159265358979323846);
-    const double moon_u =
-        moon_u_unwrapped < 0.0 ? moon_u_unwrapped + 1.0 : moon_u_unwrapped;
-    const double moon_v =
-        std::acos(std::clamp(resolved.celestial->moon.direction[1],
-                            -1.0, 1.0)) /
-        3.14159265358979323846;
-    const std::int32_t moon_center_x = static_cast<std::int32_t>(
-        std::clamp(moon_u * static_cast<double>(kCacheWidth), 0.0,
-                   static_cast<double>(kCacheWidth - 1u)));
-    const std::int32_t moon_center_y = static_cast<std::int32_t>(
-        std::clamp(moon_v * static_cast<double>(kCacheHeight), 0.0,
-                   static_cast<double>(kCacheHeight - 1u)));
-    const double moon_angular_radius =
-        std::clamp(static_cast<double>(
-                       moon_controls.angular_diameter_degrees),
-                   0.05, 5.0) *
-        0.5 *
-        (3.14159265358979323846 / 180.0);
-    const double moon_solid_angle =
-        kTwoPi * (1.0 - std::cos(moon_angular_radius));
-    const float moon_mean_luminance =
-        moon_solid_angle > 0.0
-            ? static_cast<float>(
-                  moon_integrated_luminance / moon_solid_angle)
-            : 0.0f;
-    double moon_probability = 0.0;
-    float moon_peak_luminance = 0.0f;
-    for (std::int32_t offset_y = -1; offset_y <= 1; ++offset_y) {
-      const std::uint32_t y = static_cast<std::uint32_t>(std::clamp(
-          moon_center_y + offset_y, 0,
-          static_cast<std::int32_t>(kCacheHeight - 1u)));
-      for (std::int32_t offset_x = -1; offset_x <= 1; ++offset_x) {
-        const std::int32_t wrapped_x =
-            (moon_center_x + offset_x +
-             static_cast<std::int32_t>(kCacheWidth)) %
-            static_cast<std::int32_t>(kCacheWidth);
-        const std::uint32_t x = static_cast<std::uint32_t>(wrapped_x);
-        moon_probability += distribution.texelProbability(x, y);
-        const std::size_t index =
-            (static_cast<std::size_t>(y) * kCacheWidth + x) * 4u;
-        const float sample_luminance = radiance.rgba[index + 3u];
-        moon_peak_luminance =
-            (std::max)(moon_peak_luminance, sample_luminance);
-      }
-    }
+    cpu_input.distribution_mapped = pending_distribution.mapped;
+    cpu_input.distribution_capacity = pending_distribution.capacity;
+    cpu_input.width = kCacheWidth;
+    cpu_input.height = kCacheHeight;
+    cpu_input.celestial = *resolved.celestial;
+    cpu_input.sun = sun_controls;
+    cpu_input.moon = moon_controls;
+    cpu_input.background_visible = resolved.background_visible;
+    cpu_input.environment_lighting = resolved.environment_lighting;
+    cpu_input.sun_moon_lighting = resolved.sun_moon_lighting;
+    cpu_input.environment_strength = resolved.environment_strength;
+    cpu_input.background_multiplier = resolved.background_multiplier;
+    cpu_input.rotation_radians = resolved.rotation_radians;
+    cpu_input.moon_fraction = moon_fraction;
+    cpu_input.moon_phase_radians = moon_phase_radians;
 
-    const VkDeviceSize distribution_bytes =
-        sizeof(WorldEnvironmentGpuHeader) +
-        static_cast<VkDeviceSize>(kPixelCount) *
-            sizeof(WorldEnvironmentGpuAlias);
-    Buffer candidate_distribution{};
-    if (!createBuffer(distribution_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                      candidate_distribution)) {
-      cleanup();
-      return false;
-    }
-    constexpr std::uint32_t kValidEnvironment = 1u << 0u;
-    constexpr std::uint32_t kBackgroundVisible = 1u << 1u;
-    constexpr std::uint32_t kLightingEnabled = 1u << 2u;
-    constexpr std::uint32_t kProceduralFiniteMoon = 1u << 3u;
-    constexpr std::uint32_t kSunBackgroundVisible = 1u << 4u;
-    constexpr std::uint32_t kMoonBackgroundVisible = 1u << 5u;
-    constexpr std::uint32_t kSunLightingEnabled = 1u << 6u;
-    constexpr std::uint32_t kMoonLightingEnabled = 1u << 7u;
-    constexpr std::uint32_t kSunCastsShadows = 1u << 8u;
-    constexpr std::uint32_t kMoonCastsShadows = 1u << 9u;
-    constexpr std::uint32_t kMoonSurfaceDetail = 1u << 10u;
-    constexpr std::uint32_t kMoonManualPhase = 1u << 11u;
-    WorldEnvironmentGpuHeader header;
-    header.flags =
-        kValidEnvironment |
-        (resolved.background_visible ? kBackgroundVisible : 0u) |
-        (resolved.environment_lighting ? kLightingEnabled : 0u) |
-        (moon_controls.enabled ? kProceduralFiniteMoon : 0u) |
-        (sun_controls.enabled && sun_controls.disk_visible
-             ? kSunBackgroundVisible
-             : 0u) |
-        (moon_controls.enabled && moon_controls.disk_visible
-             ? kMoonBackgroundVisible
-             : 0u) |
-        (resolved.sun_moon_lighting && sun_controls.enabled
-             ? kSunLightingEnabled
-             : 0u) |
-        (resolved.sun_moon_lighting && moon_controls.enabled
-             ? kMoonLightingEnabled
-             : 0u) |
-        (sun_controls.cast_shadows ? kSunCastsShadows : 0u) |
-        (moon_controls.cast_shadows ? kMoonCastsShadows : 0u) |
-        (moon_controls.surface_detail > 0.0f ? kMoonSurfaceDetail : 0u) |
-        (moon_controls.phase_mode == MoonPhaseMode::Manual
-             ? kMoonManualPhase
-             : 0u);
-    header.width = kCacheWidth;
-    header.height = kCacheHeight;
-    header.entry_count = static_cast<std::uint32_t>(kPixelCount);
-    header.lighting_strength = resolved.environment_strength;
-    header.background_multiplier = resolved.background_multiplier;
-    header.rotation_radians = resolved.rotation_radians;
-    header.padding = static_cast<float>(sun_angular_radius);
-    header.sun_direction_moon_mean = {
-        static_cast<float>(resolved.celestial->sun.direction[0]),
-        static_cast<float>(resolved.celestial->sun.direction[1]),
-        static_cast<float>(resolved.celestial->sun.direction[2]),
-        moon_mean_luminance};
-    header.moon_direction_angular_radius = {
-        static_cast<float>(resolved.celestial->moon.direction[0]),
-        static_cast<float>(resolved.celestial->moon.direction[1]),
-        static_cast<float>(resolved.celestial->moon.direction[2]),
-        static_cast<float>(moon_angular_radius)};
-    header.moon_phase_libration = {
-        moon_fraction, moon_phase_radians,
-        static_cast<float>(
-            resolved.celestial->moon_libration_latitude_degrees *
-            (3.14159265358979323846 / 180.0)),
-        static_cast<float>(
-            resolved.celestial->moon_libration_longitude_degrees *
-            (3.14159265358979323846 / 180.0))};
-    header.sun_color_strength = {
-        sun_color[0], sun_color[1], sun_color[2],
-        std::clamp(sun_controls.strength, 0.0f, 32.0f)};
-    std::memcpy(candidate_distribution.mapped, &header, sizeof(header));
-    auto *gpu_alias = reinterpret_cast<WorldEnvironmentGpuAlias *>(
-        static_cast<std::byte *>(candidate_distribution.mapped) +
-        sizeof(WorldEnvironmentGpuHeader));
-    for (std::uint32_t y = 0; y < kCacheHeight; ++y) {
-      for (std::uint32_t x = 0; x < kCacheWidth; ++x) {
-        const std::uint32_t index = y * kCacheWidth + x;
-        gpu_alias[index].acceptance = static_cast<float>(
-            std::clamp(distribution.aliasAcceptance(x, y), 0.0, 1.0));
-        gpu_alias[index].alias_index = distribution.aliasIndex(x, y);
-        gpu_alias[index].probability = static_cast<float>(
-            std::max(distribution.texelProbability(x, y), 0.0));
-      }
-    }
-
-    clearDynamicSkyEnvironmentCache();
-    atmosphere_environment_cache_ = candidate_cache;
+    DynamicSkyPending pending;
+    pending.cache = candidate_cache;
     candidate_cache = {};
-    atmosphere_cloud_history_ = candidate_cloud_history;
+    pending.cloud_history = candidate_cloud_history;
     candidate_cloud_history = {};
-    atmosphere_environment_distribution_ = candidate_distribution;
-    candidate_distribution = {};
-    atmosphere_environment_distribution_bytes_ = distribution_bytes;
-    atmosphere_environment_key_ = environment_key;
-    atmosphere_cloud_history_compatibility_key_ =
-        std::move(cloud_compatibility_key);
-    atmosphere_cloud_history_weather_offset_ = current_weather_offset;
-    atmosphere_cloud_history_frame_ =
+    pending.readback = readback;
+    readback = {};
+    pending.distribution = pending_distribution;
+    pending_distribution = {};
+    pending.command = command;
+    command = VK_NULL_HANDLE;
+    pending.fence = update_fence;
+    update_fence = VK_NULL_HANDLE;
+    pending.environment_key = environment_key;
+    pending.cloud_compatibility_key = std::move(cloud_compatibility_key);
+    pending.weather_offset = current_weather_offset;
+    pending.cloud_history_parameters = environment_push.cloud_history;
+    pending.cloud_frame =
         resolved.clouds != nullptr ? resolved.clouds->temporal_frame : 0u;
-    atmosphere_environment_failed_key_.clear();
-    atmosphere_environment_ready_ = true;
-    if (resolved.clouds != nullptr) {
-      xpbd::log::infof(
-          "Dynamic cloud temporal cache: %ux%u history=%s "
-          "frame=%u previous_frame=%u weather_delta=%.6f/%.6f "
-          "weight=%.3f shadow_resolution=%u",
-          kCacheWidth, kCacheHeight,
-          cloud_history_valid ? "reprojected" : "reset",
-          resolved.clouds->temporal_frame,
-          previous_cloud_frame,
-          environment_push.cloud_history[0],
-          environment_push.cloud_history[1],
-          resolved.clouds->history_weight,
-          resolved.clouds->shadow_resolution);
+    pending.previous_cloud_frame = previous_cloud_frame;
+    pending.cloud_history_weight =
+        resolved.clouds != nullptr ? resolved.clouds->history_weight : 0.0f;
+    pending.cloud_shadow_resolution =
+        resolved.clouds != nullptr ? resolved.clouds->shadow_resolution : 0u;
+    pending.cloud_enabled = resolved.clouds != nullptr;
+    pending.cloud_history_valid = cloud_history_valid;
+    pending.distribution_bytes = kDistributionBytes;
+    pending.submitted_at = cache_compute_begin;
+    atmosphere_environment_pending_ = std::move(pending);
+    try {
+      const VkDevice worker_device = device_;
+      const VkFence worker_fence = atmosphere_environment_pending_.fence;
+      atmosphere_environment_pending_.completion = std::async(
+          std::launch::async,
+          [cpu_input, worker_device, worker_fence,
+           cache_compute_begin]() mutable {
+            return buildDynamicSkyDistribution(
+                cpu_input, worker_device, worker_fence,
+                cache_compute_begin);
+          });
+    } catch (const std::exception &exception) {
+      xpbd::log::errorf(
+          "Dynamic sky worker launch failed: %s; waiting only to reclaim "
+          "submitted resources safely",
+          exception.what());
+      (void)pollDynamicSkyEnvironmentCache(true);
+      return false;
     }
+    atmosphere_environment_last_update_ = cache_compute_begin;
     xpbd::log::infof(
-        "Dynamic sky environment cache ready: %ux%u positive=%llu "
-        "table=%llu sun_altitude=%.3f rgb_min=%.7g/%.7g/%.7g "
-        "rgb_max=%.7g/%.7g/%.7g rgb_mean=%.7g/%.7g/%.7g "
-        "rgb_positive=%llu/%llu/%llu hemisphere_luminance="
-        "%.7g/%.7g max=%.7g/%.7g brightest=%.7g@%u,%u "
-        "twilight=%s moon_altitude=%.3f moon_phase=%.6f "
-        "moon_pmf=%.9g moon_peak=%.7g",
+        "Dynamic sky asynchronous update queued: %ux%u "
+        "queue_idle_count=0 cache_realloc_count=%llu",
         kCacheWidth, kCacheHeight,
-        static_cast<unsigned long long>(positive_rgb),
-        static_cast<unsigned long long>(distribution_bytes),
-        resolved.celestial->sun.apparent_altitude_degrees, channel_min[0],
-        channel_min[1], channel_min[2], channel_max[0], channel_max[1],
-        channel_max[2], channel_sum[0] / static_cast<double>(kPixelCount),
-        channel_sum[1] / static_cast<double>(kPixelCount),
-        channel_sum[2] / static_cast<double>(kPixelCount),
-        static_cast<unsigned long long>(positive_by_channel[0]),
-        static_cast<unsigned long long>(positive_by_channel[1]),
-        static_cast<unsigned long long>(positive_by_channel[2]),
-        hemisphere_luminance_sum[0] /
-            static_cast<double>(hemisphere_pixels[0]),
-        hemisphere_luminance_sum[1] /
-            static_cast<double>(hemisphere_pixels[1]),
-        hemisphere_luminance_max[0], hemisphere_luminance_max[1],
-        brightest_luminance, brightest_x, brightest_y,
-        twilightPhaseName(resolved.celestial->twilight),
-        resolved.celestial->moon.apparent_altitude_degrees,
-        resolved.celestial->moon_illuminated_fraction, moon_probability,
-        moon_peak_luminance);
+        static_cast<unsigned long long>(
+            atmosphere_environment_cache_reallocations_));
     return true;
   }
 
@@ -6399,6 +7147,10 @@ private:
       atmosphere_failed_key_.clear();
       return false;
     }
+    (void)pollDynamicSkyEnvironmentCache(false);
+    if (fatal_error_) {
+      return false;
+    }
     const std::string resource_key =
         brunetonAtmosphereCacheKey(*resolved.atmosphere);
     if (resource_key.empty()) {
@@ -6407,6 +7159,14 @@ private:
     if (atmosphere_ready_ && atmosphere_resource_key_ == resource_key) {
       // Reuse the static physical LUTs and update only the dynamic sky cache.
     } else {
+      // Static LUT rebuild updates the shared atmosphere descriptor set. It is
+      // rare and must not race an in-flight dynamic-cache dispatch.
+      if (atmosphere_environment_pending_.active()) {
+        (void)pollDynamicSkyEnvironmentCache(true);
+        if (fatal_error_ || atmosphere_environment_pending_.active()) {
+          return false;
+        }
+      }
       if (atmosphere_failed_key_ == resource_key) {
         return false;
       }
@@ -6424,31 +7184,42 @@ private:
     }
     if (atmosphere_environment_ready_ &&
         atmosphere_environment_key_ == environment_key) {
-      if (atmosphere_environment_distribution_.mapped != nullptr) {
-        constexpr std::uint32_t kBackgroundVisible = 1u << 1u;
-        constexpr std::uint32_t kLightingEnabled = 1u << 2u;
-        auto *header = static_cast<WorldEnvironmentGpuHeader *>(
-            atmosphere_environment_distribution_.mapped);
-        header->flags =
-            (header->flags &
-             ~(kBackgroundVisible | kLightingEnabled)) |
-            (resolved.background_visible ? kBackgroundVisible : 0u) |
-            (resolved.environment_lighting ? kLightingEnabled : 0u);
-        header->lighting_strength = resolved.environment_strength;
-        header->background_multiplier = resolved.background_multiplier;
-      }
+      return true;
+    }
+    if (atmosphere_environment_pending_.active()) {
+      return atmosphere_environment_ready_;
+    }
+    const float requested_render_ratio =
+        resolved.clouds != nullptr
+            ? std::clamp(resolved.clouds->render_ratio, 0.25f, 1.0f)
+            : 1.0f;
+    const std::uint32_t requested_width = static_cast<std::uint32_t>(
+        std::lround(2048.0f * requested_render_ratio));
+    const std::uint32_t requested_height = static_cast<std::uint32_t>(
+        std::lround(1024.0f * requested_render_ratio));
+    constexpr auto kMinimumDynamicSkyUpdateInterval =
+        std::chrono::milliseconds(100);
+    if (atmosphere_environment_ready_ &&
+        atmosphere_environment_cache_.width == requested_width &&
+        atmosphere_environment_cache_.height == requested_height &&
+        atmosphere_environment_last_update_ != Clock::time_point{} &&
+        Clock::now() - atmosphere_environment_last_update_ <
+            kMinimumDynamicSkyUpdateInterval) {
       return true;
     }
     if (atmosphere_environment_failed_key_ == environment_key) {
-      return false;
+      return atmosphere_environment_ready_;
     }
     if (!buildDynamicSkyEnvironmentCache(resolved, environment_key)) {
+      if (fatal_error_) {
+        return false;
+      }
       atmosphere_environment_failed_key_ = environment_key;
       xpbd::log::warn(
-          "Dynamic sky environment cache failed; resolving Procedural Off");
-      return false;
+          "Dynamic sky environment cache failed; retaining previous cache");
+      return atmosphere_environment_ready_;
     }
-    return true;
+    return atmosphere_environment_ready_;
   }
 
   void clearWorldEnvironmentResources() {
@@ -6665,9 +7436,36 @@ private:
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &command;
-    if (vkQueueSubmit(graphics_queue_, 1, &submit, VK_NULL_HANDLE) !=
-            VK_SUCCESS ||
-        vkQueueWaitIdle(graphics_queue_) != VK_SUCCESS) {
+    const VkResult submit_result =
+        vkQueueSubmit(graphics_queue_, 1, &submit, VK_NULL_HANDLE);
+    if (submit_result != VK_SUCCESS) {
+      xpbd::log::errorf(
+          "HDR environment upload submit failed: API=vkQueueSubmit "
+          "VkResult=%s(%d) resource=world-environment extent=%ux%u "
+          "frame_slot=%u still_job_id=%llu",
+          vkResultName(submit_result), static_cast<int>(submit_result),
+          radiance.width, radiance.height, frame_index_,
+          static_cast<unsigned long long>(still_active_job_id_));
+      if (submit_result == VK_ERROR_DEVICE_LOST) {
+        recordFatalVulkanError("vkQueueSubmit(world_environment)",
+                               submit_result);
+      }
+      cleanup();
+      return false;
+    }
+    const VkResult wait_result = vkQueueWaitIdle(graphics_queue_);
+    if (wait_result != VK_SUCCESS) {
+      xpbd::log::errorf(
+          "HDR environment upload wait failed: API=vkQueueWaitIdle "
+          "VkResult=%s(%d) resource=world-environment extent=%ux%u "
+          "frame_slot=%u still_job_id=%llu",
+          vkResultName(wait_result), static_cast<int>(wait_result),
+          radiance.width, radiance.height, frame_index_,
+          static_cast<unsigned long long>(still_active_job_id_));
+      if (wait_result == VK_ERROR_DEVICE_LOST) {
+        recordFatalVulkanError("vkQueueWaitIdle(world_environment)",
+                               wait_result);
+      }
       cleanup();
       return false;
     }
@@ -6849,15 +7647,33 @@ private:
     return true;
   }
 
+  void destroyStaticMaterialSamplers() {
+    if (static_specular_sampler_ != VK_NULL_HANDLE) {
+      vkDestroySampler(device_, static_specular_sampler_, nullptr);
+      static_specular_sampler_ = VK_NULL_HANDLE;
+    }
+    if (static_normal_sampler_ != VK_NULL_HANDLE) {
+      vkDestroySampler(device_, static_normal_sampler_, nullptr);
+      static_normal_sampler_ = VK_NULL_HANDLE;
+    }
+    if (static_albedo_sampler_ != VK_NULL_HANDLE) {
+      vkDestroySampler(device_, static_albedo_sampler_, nullptr);
+      static_albedo_sampler_ = VK_NULL_HANDLE;
+    }
+  }
+
   void updateStaticTextureDescriptors() {
     std::array<VkDescriptorImageInfo, 3> image_infos{};
     const std::array<VkImageView, 3> views{
         static_texture_.view, static_normal_texture_.view,
         static_specular_texture_.view};
+    const std::array<VkSampler, 3> samplers{
+        static_albedo_sampler_, static_normal_sampler_,
+        static_specular_sampler_};
     for (std::size_t i = 0; i < image_infos.size(); ++i) {
       image_infos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
       image_infos[i].imageView = views[i];
-      image_infos[i].sampler = static_sampler_;
+      image_infos[i].sampler = samplers[i];
     }
     std::array<VkWriteDescriptorSet, 6> writes{};
     for (std::size_t i = 0; i < frames_.size(); ++i) {
@@ -7151,6 +7967,42 @@ private:
                       &copy);
     }
 
+    std::array<VkBufferMemoryBarrier, 2> geometry_barriers{};
+    std::uint32_t geometry_barrier_count = 0u;
+    const auto append_geometry_barrier =
+        [&](VkBuffer buffer, VkAccessFlags consumer_access) {
+          auto &barrier = geometry_barriers[geometry_barrier_count++];
+          barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+          barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+          barrier.dstAccessMask = consumer_access |
+                                  VK_ACCESS_SHADER_READ_BIT |
+                                  VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+          barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+          barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+          barrier.buffer = buffer;
+          barrier.offset = 0u;
+          barrier.size = VK_WHOLE_SIZE;
+        };
+    if (vertex_bytes > 0) {
+      append_geometry_barrier(new_vertex_buffer.buffer,
+                              VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT);
+    }
+    if (index_bytes > 0) {
+      append_geometry_barrier(new_index_buffer.buffer,
+                              VK_ACCESS_INDEX_READ_BIT);
+    }
+    if (geometry_barrier_count > 0u) {
+      constexpr VkPipelineStageFlags kGeometryConsumerStages =
+          VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+          VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
+          VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+      vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           kGeometryConsumerStages, 0, 0, nullptr,
+                           geometry_barrier_count, geometry_barriers.data(),
+                           0, nullptr);
+    }
+
     const auto upload_image =
         [&](const ImageResource &image, std::uint32_t width,
             std::uint32_t height, VkDeviceSize offset) {
@@ -7178,9 +8030,13 @@ private:
           barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
           barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
           barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+          constexpr VkPipelineStageFlags kTextureConsumerStages =
+              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+              VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
           vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
-                               nullptr, 0, nullptr, 1, &barrier);
+                               kTextureConsumerStages, 0, 0, nullptr, 0,
+                               nullptr, 1, &barrier);
         };
     upload_image(new_texture, texture_width, texture_height,
                  vertex_bytes + index_bytes);
@@ -7666,6 +8522,11 @@ private:
 
     std::vector<const char *> device_extensions = {
         VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    memory_budget_supported_ = supportsDeviceExtension(
+        phys_, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    if (memory_budget_supported_) {
+      device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    }
     const char *maintenance_extension = nullptr;
     if (surface_maintenance1_khr_enabled_ &&
         supportsDeviceExtension(
@@ -7725,6 +8586,16 @@ private:
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
     VkPhysicalDeviceFeatures supported_core_features{};
     vkGetPhysicalDeviceFeatures(phys_, &supported_core_features);
+    VkPhysicalDeviceDescriptorIndexingFeatures
+        supported_descriptor_indexing_features{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
+    VkPhysicalDeviceFeatures2 descriptor_indexing_query{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    descriptor_indexing_query.pNext =
+        &supported_descriptor_indexing_features;
+    vkGetPhysicalDeviceFeatures2(phys_, &descriptor_indexing_query);
+    VkPhysicalDeviceDescriptorIndexingFeatures descriptor_indexing_features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
     VkPhysicalDeviceFeatures enabled_core_features{};
     enabled_core_features.shaderStorageImageExtendedFormats =
         supported_core_features.shaderStorageImageExtendedFormats;
@@ -7741,6 +8612,15 @@ private:
       optional_feature_chain = &maintenance_features;
     }
     const bool enable_rt = rt_capability_.supported;
+    descriptor_binding_partially_bound_enabled_ =
+        enable_rt &&
+        supported_descriptor_indexing_features
+                .descriptorBindingPartiallyBound == VK_TRUE;
+    if (descriptor_binding_partially_bound_enabled_) {
+      descriptor_indexing_features.descriptorBindingPartiallyBound = VK_TRUE;
+      descriptor_indexing_features.pNext = optional_feature_chain;
+      optional_feature_chain = &descriptor_indexing_features;
+    }
     bool has_rtp_ext = false;
     if (enable_rt) {
       VkPhysicalDeviceProperties props{};
@@ -7824,7 +8704,11 @@ private:
       rt_capability_.device_extensions_enabled = false;
       rt_capability_.unsupported_reason =
           "Driver rejected Vulkan RT feature chain; using rasterization";
+      descriptor_binding_partially_bound_enabled_ = false;
       std::vector<const char *> raster_exts = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+      if (memory_budget_supported_) {
+        raster_exts.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+      }
       void *raster_features = nullptr;
       if (synchronization2_enabled) {
         raster_exts.push_back(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
@@ -7846,6 +8730,9 @@ private:
       swapchain_maintenance1_extension_.clear();
       std::vector<const char *> core_exts = {
           VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+      if (memory_budget_supported_) {
+        core_exts.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+      }
       void *core_features = nullptr;
       if (synchronization2_enabled) {
         core_exts.push_back(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
@@ -8605,7 +9492,9 @@ private:
       if (rt_capability_.device_extensions_enabled && render_pass_) {
         bool path_tracers_ready = true;
         for (auto &path_tracer : path_tracers_) {
-          if (!path_tracer.init(phys_, device_, render_pass_)) {
+          if (!path_tracer.init(
+                  phys_, device_, render_pass_, true,
+                  descriptor_binding_partially_bound_enabled_)) {
             path_tracers_ready = false;
             break;
           }
@@ -8615,7 +9504,9 @@ private:
             path_tracer.shutdown();
           }
         } else {
-          (void)still_path_tracer_.init(phys_, device_, render_pass_, false);
+          (void)still_path_tracer_.init(
+              phys_, device_, render_pass_, false,
+              descriptor_binding_partially_bound_enabled_);
         }
       }
       const bool path_tracer_ready =
@@ -8880,8 +9771,22 @@ private:
     static_sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     static_sampler_info.minLod = 0.0f;
     static_sampler_info.maxLod = 0.0f;
-    VK_CHECK(vkCreateSampler(device_, &static_sampler_info, nullptr,
-                             &static_sampler_));
+    if (vkCreateSampler(device_, &static_sampler_info, nullptr,
+                        &static_albedo_sampler_) != VK_SUCCESS) {
+      return false;
+    }
+    static_sampler_info.magFilter = VK_FILTER_LINEAR;
+    static_sampler_info.minFilter = VK_FILTER_LINEAR;
+    if (vkCreateSampler(device_, &static_sampler_info, nullptr,
+                        &static_normal_sampler_) != VK_SUCCESS) {
+      destroyStaticMaterialSamplers();
+      return false;
+    }
+    if (vkCreateSampler(device_, &static_sampler_info, nullptr,
+                        &static_specular_sampler_) != VK_SUCCESS) {
+      destroyStaticMaterialSamplers();
+      return false;
+    }
 
     // Hybrid RT descriptors (ray-query acceleration structure bindings).
     if (rt_capability_.device_extensions_enabled) {
@@ -9027,8 +9932,13 @@ private:
     image_info.usage =
         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (vkCreateImage(device_, &image_info, nullptr, &skybox_cubemap_.image) !=
-        VK_SUCCESS) {
+    const VkResult create_result =
+        vkCreateImage(device_, &image_info, nullptr, &skybox_cubemap_.image);
+    if (create_result != VK_SUCCESS) {
+      logImageResourceError(
+          "vkCreateImage", create_result, "preview-skybox-cubemap",
+          image_info.format, face, face, 1u, image_info.usage, total_bytes,
+          (std::numeric_limits<std::uint32_t>::max)());
       return false;
     }
     VkMemoryRequirements requirements{};
@@ -9042,10 +9952,23 @@ private:
       return false;
     }
     allocation.memoryTypeIndex = *memory_type;
-    if (vkAllocateMemory(device_, &allocation, nullptr,
-                         &skybox_cubemap_.memory) != VK_SUCCESS ||
-        vkBindImageMemory(device_, skybox_cubemap_.image, skybox_cubemap_.memory,
-                          0) != VK_SUCCESS) {
+    const VkResult allocation_result = vkAllocateMemory(
+        device_, &allocation, nullptr, &skybox_cubemap_.memory);
+    if (allocation_result != VK_SUCCESS) {
+      logImageResourceError(
+          "vkAllocateMemory", allocation_result, "preview-skybox-cubemap",
+          image_info.format, face, face, 1u, image_info.usage,
+          requirements.size, *memory_type);
+      destroyImage(skybox_cubemap_);
+      return false;
+    }
+    const VkResult bind_result = vkBindImageMemory(
+        device_, skybox_cubemap_.image, skybox_cubemap_.memory, 0);
+    if (bind_result != VK_SUCCESS) {
+      logImageResourceError(
+          "vkBindImageMemory", bind_result, "preview-skybox-cubemap",
+          image_info.format, face, face, 1u, image_info.usage,
+          requirements.size, *memory_type);
       destroyImage(skybox_cubemap_);
       return false;
     }
@@ -9054,8 +9977,13 @@ private:
     view_info.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
     view_info.format = VK_FORMAT_R8G8B8A8_UNORM;
     view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6};
-    if (vkCreateImageView(device_, &view_info, nullptr, &skybox_cubemap_.view) !=
-        VK_SUCCESS) {
+    const VkResult view_result = vkCreateImageView(
+        device_, &view_info, nullptr, &skybox_cubemap_.view);
+    if (view_result != VK_SUCCESS) {
+      logImageResourceError(
+          "vkCreateImageView", view_result, "preview-skybox-cubemap",
+          image_info.format, face, face, 1u, image_info.usage,
+          requirements.size, *memory_type);
       destroyImage(skybox_cubemap_);
       return false;
     }
@@ -9066,7 +9994,7 @@ private:
     if (!createBuffer(total_bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                      staging)) {
+                      staging, "preview-skybox-staging")) {
       destroyImage(skybox_cubemap_);
       return false;
     }
@@ -9100,7 +10028,19 @@ private:
     }
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &bi);
+    const VkResult begin_result = vkBeginCommandBuffer(cmd, &bi);
+    if (begin_result != VK_SUCCESS) {
+      xpbd::log::errorf(
+          "Preview skybox command begin failed: API=vkBeginCommandBuffer "
+          "VkResult=%s(%d) frame_slot=%u still_job_id=%llu",
+          vkResultName(begin_result), static_cast<int>(begin_result),
+          frame_index_,
+          static_cast<unsigned long long>(still_active_job_id_));
+      vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
+      destroyBuffer(staging);
+      destroyImage(skybox_cubemap_);
+      return false;
+    }
 
     VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -9133,13 +10073,58 @@ private:
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr,
                          0, nullptr, 1, &barrier);
-    vkEndCommandBuffer(cmd);
+    const VkResult end_result = vkEndCommandBuffer(cmd);
+    if (end_result != VK_SUCCESS) {
+      xpbd::log::errorf(
+          "Preview skybox command end failed: API=vkEndCommandBuffer "
+          "VkResult=%s(%d) frame_slot=%u still_job_id=%llu",
+          vkResultName(end_result), static_cast<int>(end_result),
+          frame_index_,
+          static_cast<unsigned long long>(still_active_job_id_));
+      vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
+      destroyBuffer(staging);
+      destroyImage(skybox_cubemap_);
+      return false;
+    }
 
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cmd;
-    vkQueueSubmit(graphics_queue_, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(graphics_queue_);
+    const VkResult submit_result =
+        vkQueueSubmit(graphics_queue_, 1, &si, VK_NULL_HANDLE);
+    if (submit_result != VK_SUCCESS) {
+      xpbd::log::errorf(
+          "Preview skybox submit failed: API=vkQueueSubmit "
+          "VkResult=%s(%d) extent=%ux%u frame_slot=%u still_job_id=%llu",
+          vkResultName(submit_result), static_cast<int>(submit_result), face,
+          face, frame_index_,
+          static_cast<unsigned long long>(still_active_job_id_));
+      if (submit_result == VK_ERROR_DEVICE_LOST) {
+        recordFatalVulkanError("vkQueueSubmit(preview_skybox)",
+                               submit_result);
+      }
+      vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
+      destroyBuffer(staging);
+      destroyImage(skybox_cubemap_);
+      return false;
+    }
+    const VkResult wait_result = vkQueueWaitIdle(graphics_queue_);
+    if (wait_result != VK_SUCCESS) {
+      xpbd::log::errorf(
+          "Preview skybox wait failed: API=vkQueueWaitIdle "
+          "VkResult=%s(%d) extent=%ux%u frame_slot=%u still_job_id=%llu",
+          vkResultName(wait_result), static_cast<int>(wait_result), face,
+          face, frame_index_,
+          static_cast<unsigned long long>(still_active_job_id_));
+      if (wait_result == VK_ERROR_DEVICE_LOST) {
+        recordFatalVulkanError("vkQueueWaitIdle(preview_skybox)",
+                               wait_result);
+      }
+      vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
+      destroyBuffer(staging);
+      destroyImage(skybox_cubemap_);
+      return false;
+    }
     vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
     destroyBuffer(staging);
 

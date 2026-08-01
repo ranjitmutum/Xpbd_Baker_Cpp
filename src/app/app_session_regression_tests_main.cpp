@@ -564,6 +564,7 @@ void testPathTraceSettingsPersistenceAndClassification() {
       gfx::PathTraceReflexMode::OnBoost;
   session.path_trace_settings.preview_resolution_scale = 0.5f;
   session.path_trace_settings.pause_accumulation = true;
+  session.path_trace_settings.display_exposure_ev = 2.0f;
   expect(session.savePathTraceSettings(settings_path),
          "path tracing settings save to versioned JSON");
   session.path_trace_settings.requested_denoiser =
@@ -576,6 +577,7 @@ void testPathTraceSettingsPersistenceAndClassification() {
       gfx::PathTraceReflexMode::Off;
   session.path_trace_settings.preview_resolution_scale = 1.0f;
   session.path_trace_settings.pause_accumulation = false;
+  session.path_trace_settings.display_exposure_ev = -5.0f;
   expect(session.loadPathTraceSettings(settings_path) &&
              session.path_trace_settings.requested_denoiser ==
                  gfx::PathTraceDenoiser::DlssRayReconstruction &&
@@ -588,12 +590,32 @@ void testPathTraceSettingsPersistenceAndClassification() {
              std::abs(session.path_trace_settings
                           .preview_resolution_scale -
                       0.5f) < 1.0e-6f &&
-             session.path_trace_settings.pause_accumulation,
-         "path tracing JSON round-trip restores all parameter groups");
+             session.path_trace_settings.pause_accumulation &&
+             session.path_trace_settings.display_exposure_ev == 2.0f,
+         "path tracing JSON round-trip preserves an explicit +2 EV preference");
+
+  const auto legacy_settings_path =
+      std::filesystem::path(settings_path.string() + ".legacy");
+  {
+    std::ofstream legacy_output(legacy_settings_path,
+                                std::ios::binary | std::ios::trunc);
+    legacy_output <<
+        R"({"schema":"xpbd-path-tracing/1","film":{}})";
+  }
+  session.path_trace_settings.display_exposure_ev = -5.0f;
+  expect(session.loadPathTraceSettings(legacy_settings_path) &&
+             session.path_trace_settings.display_exposure_ev ==
+                 gfx::kDefaultPathTraceExposureEv &&
+             gfx::kDefaultPathTraceExposureEv == 0.0f,
+         "legacy path tracing JSON without exposure adopts neutral default");
   std::error_code remove_error;
   std::filesystem::remove(settings_path, remove_error);
   expect(!remove_error,
          "path tracing round-trip removes temporary JSON");
+  remove_error.clear();
+  std::filesystem::remove(legacy_settings_path, remove_error);
+  expect(!remove_error,
+         "path tracing legacy fixture removes temporary JSON");
   session.clearPathTraceRenderSnapshot();
 }
 
@@ -1009,6 +1031,29 @@ void testStillRenderSnapshotAndOutput() {
              !session.stillRenderActive(),
          "terminal still render restores prior playback state");
 
+  session.playback_state = xpbd::app::PlaybackState::Playing;
+  expect(session.queueStillRender(),
+         "queue another still render after completion");
+  session.still_render_job.status.state =
+      xpbd::gfx::StillRenderJobState::Failed;
+  session.still_render_job.status.error =
+      "injected target allocation failure";
+  session.synchronizeStillRenderState();
+  expect(session.playback_state == xpbd::app::PlaybackState::Playing &&
+             session.last_error == "injected target allocation failure" &&
+             !session.stillRenderActive(),
+         "failed still render restores playback and exposes backend error");
+
+  session.playback_state = xpbd::app::PlaybackState::Playing;
+  expect(session.queueStillRender(),
+         "queue another still render after failure");
+  session.still_render_job.status.state =
+      xpbd::gfx::StillRenderJobState::Cancelled;
+  session.synchronizeStillRenderState();
+  expect(session.playback_state == xpbd::app::PlaybackState::Playing &&
+             session.last_error.empty() && !session.stillRenderActive(),
+         "cancelled still render restores playback and clears stale errors");
+
   const std::array<std::uint16_t, 8> rgba16f{
       0x3c00u, 0x3800u, 0x0000u, 0x0000u,
       0x0000u, 0x3c00u, 0x3800u, 0x3c00u};
@@ -1028,6 +1073,41 @@ void testStillRenderSnapshotAndOutput() {
              &error) &&
              fs::file_size(exr_path, filesystem_error) == exr.size(),
          "still-image writer emits the encoded EXR file");
+  auto altered_display = display;
+  altered_display.exposure = 8.0f;
+  altered_display.white_balance_kelvin = 3200.0f;
+  altered_display.bloom_strength = 3.0f;
+  altered_display.tone_mapping = 2u;
+  const fs::path invariant_exr_path =
+      directory / "output" / "encoder-display-variant.exr";
+  expect(xpbd::gfx::writeStillImageRgba16f(
+             invariant_exr_path, xpbd::gfx::StillImageFormat::Exr, 2u, 1u,
+             rgba16f.data(), rgba16f.size(), altered_display, false, nullptr,
+             0u, &error) &&
+             readBytes(invariant_exr_path) == readBytes(exr_path),
+         "EXR bytes ignore exposure, white balance, bloom, and tone mapping");
+
+  const std::array<std::uint16_t, 4> bloom_rgba16f{
+      0x4400u, 0x4400u, 0x4400u, 0x3800u};
+  auto bloom_display = display;
+  bloom_display.bloom_strength = 1.0f;
+  bloom_display.tone_mapping = 1u;
+  const fs::path bloom_png_path =
+      directory / "output" / "coverage-weighted-bloom.png";
+  xpbd::gfx::TextureImage decoded_bloom_png;
+  expect(xpbd::gfx::writeStillImageRgba16f(
+             bloom_png_path, xpbd::gfx::StillImageFormat::Png, 1u, 1u,
+             bloom_rgba16f.data(), bloom_rgba16f.size(), bloom_display, true,
+             nullptr, 0u, &error) &&
+             xpbd::gfx::loadTextureImage(bloom_png_path, decoded_bloom_png,
+                                         &error) &&
+             decoded_bloom_png.rgba.size() == 4u &&
+             decoded_bloom_png.rgba[0] >= 234u &&
+             decoded_bloom_png.rgba[0] <= 236u &&
+             decoded_bloom_png.rgba[0] == decoded_bloom_png.rgba[1] &&
+             decoded_bloom_png.rgba[1] == decoded_bloom_png.rgba[2] &&
+             decoded_bloom_png.rgba[3] == 128u,
+         "PNG bloom matches preview coverage weighting before tone mapping");
   const fs::path png_path = directory / "output" / "transparent.png";
   xpbd::gfx::TextureImage decoded_png;
   expect(xpbd::gfx::writeStillImageRgba16f(

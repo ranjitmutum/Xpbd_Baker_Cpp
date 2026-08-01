@@ -154,6 +154,166 @@ void glMvpToVulkan(const float *matrix, float *out) {
   return std::bit_cast<float>(bits);
 }
 
+[[nodiscard]] std::uint64_t steadyNowNs() noexcept {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+struct PathTraceMemoryBudget {
+  bool valid = false;
+  std::uint32_t memory_type =
+      (std::numeric_limits<std::uint32_t>::max)();
+  std::uint32_t heap =
+      (std::numeric_limits<std::uint32_t>::max)();
+  VkDeviceSize budget = 0u;
+  VkDeviceSize usage = 0u;
+
+  [[nodiscard]] VkDeviceSize available() const noexcept {
+    return budget > usage ? budget - usage : 0u;
+  }
+};
+
+[[nodiscard]] bool
+supportsMemoryBudget(VkPhysicalDevice physical_device) {
+  std::uint32_t count = 0u;
+  if (vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &count,
+                                           nullptr) != VK_SUCCESS ||
+      count == 0u) {
+    return false;
+  }
+  std::vector<VkExtensionProperties> extensions(count);
+  if (vkEnumerateDeviceExtensionProperties(
+          physical_device, nullptr, &count, extensions.data()) !=
+      VK_SUCCESS) {
+    return false;
+  }
+  return std::any_of(
+      extensions.begin(), extensions.end(), [](const auto &extension) {
+        return std::strcmp(extension.extensionName,
+                           VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) == 0;
+      });
+}
+
+[[nodiscard]] PathTraceMemoryBudget queryDeviceLocalMemoryBudget(
+    VkPhysicalDevice physical_device,
+    std::uint32_t preferred_memory_type =
+        (std::numeric_limits<std::uint32_t>::max)()) {
+  VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+  VkPhysicalDeviceMemoryProperties2 properties{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+  properties.pNext = &budget;
+  vkGetPhysicalDeviceMemoryProperties2(physical_device, &properties);
+
+  PathTraceMemoryBudget best;
+  const auto consider = [&](std::uint32_t memory_type,
+                            PathTraceMemoryBudget &candidate) {
+    if (memory_type >= properties.memoryProperties.memoryTypeCount) {
+      return;
+    }
+    const auto &type = properties.memoryProperties.memoryTypes[memory_type];
+    if ((type.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0u ||
+        type.heapIndex >= properties.memoryProperties.memoryHeapCount) {
+      return;
+    }
+    PathTraceMemoryBudget current;
+    current.valid = budget.heapBudget[type.heapIndex] > 0u;
+    current.memory_type = memory_type;
+    current.heap = type.heapIndex;
+    current.budget = budget.heapBudget[type.heapIndex];
+    current.usage = budget.heapUsage[type.heapIndex];
+    if (current.valid &&
+        (!candidate.valid || current.available() > candidate.available())) {
+      candidate = current;
+    }
+  };
+  if (preferred_memory_type !=
+      (std::numeric_limits<std::uint32_t>::max)()) {
+    consider(preferred_memory_type, best);
+    return best;
+  }
+  for (std::uint32_t memory_type = 0u;
+       memory_type < properties.memoryProperties.memoryTypeCount;
+       ++memory_type) {
+    consider(memory_type, best);
+  }
+  return best;
+}
+
+[[nodiscard]] bool estimateTargetBytes(std::uint32_t width,
+                                       std::uint32_t height,
+                                       std::uint32_t allocated_mask,
+                                       VkDeviceSize &bytes) noexcept {
+  const std::uint64_t bytes_per_pixel =
+      pathTraceTargetBytesPerPixel(allocated_mask);
+  const std::uint64_t pixels = static_cast<std::uint64_t>(width) * height;
+  if (bytes_per_pixel != 0u &&
+      pixels > (std::numeric_limits<std::uint64_t>::max)() /
+                   bytes_per_pixel) {
+    bytes = 0u;
+    return false;
+  }
+  bytes = static_cast<VkDeviceSize>(pixels * bytes_per_pixel);
+  return true;
+}
+
+[[nodiscard]] PathTraceTargetError classifyTargetFailure(
+    PathTraceTargetFailureStage stage, VkResult result) noexcept {
+  if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+    return PathTraceTargetError::OutOfDeviceMemory;
+  }
+  if (result == VK_ERROR_OUT_OF_HOST_MEMORY) {
+    return PathTraceTargetError::OutOfHostMemory;
+  }
+  if (result == VK_ERROR_FORMAT_NOT_SUPPORTED) {
+    return PathTraceTargetError::UnsupportedFormat;
+  }
+  switch (stage) {
+  case PathTraceTargetFailureStage::ValidateFormatCapabilities:
+    return PathTraceTargetError::UnsupportedFormat;
+  case PathTraceTargetFailureStage::BudgetPreflight:
+    return PathTraceTargetError::OutOfDeviceMemory;
+  case PathTraceTargetFailureStage::CreateImage:
+    return PathTraceTargetError::CreateImageFailed;
+  case PathTraceTargetFailureStage::AllocateMemory:
+    return PathTraceTargetError::AllocationFailed;
+  case PathTraceTargetFailureStage::BindImageMemory:
+    return PathTraceTargetError::BindFailed;
+  case PathTraceTargetFailureStage::CreateImageView:
+    return PathTraceTargetError::ViewCreationFailed;
+  case PathTraceTargetFailureStage::SelectMemoryType:
+    return PathTraceTargetError::MemoryTypeUnavailable;
+  case PathTraceTargetFailureStage::None:
+    break;
+  }
+  return PathTraceTargetError::AllocationFailed;
+}
+
+[[nodiscard]] const char *targetStageName(
+    PathTraceTargetFailureStage stage) noexcept {
+  switch (stage) {
+  case PathTraceTargetFailureStage::None:
+    return "none";
+  case PathTraceTargetFailureStage::ValidateFormatCapabilities:
+    return "vkGetPhysicalDeviceFormatProperties";
+  case PathTraceTargetFailureStage::BudgetPreflight:
+    return "VK_EXT_memory_budget preflight";
+  case PathTraceTargetFailureStage::CreateImage:
+    return "vkCreateImage";
+  case PathTraceTargetFailureStage::SelectMemoryType:
+    return "select-memory-type";
+  case PathTraceTargetFailureStage::AllocateMemory:
+    return "vkAllocateMemory";
+  case PathTraceTargetFailureStage::BindImageMemory:
+    return "vkBindImageMemory";
+  case PathTraceTargetFailureStage::CreateImageView:
+    return "vkCreateImageView";
+  }
+  return "unknown";
+}
+
 } // namespace
 
 std::uint32_t VulkanPathTracer::findMemoryType(std::uint32_t bits,
@@ -181,12 +341,143 @@ VkShaderModule VulkanPathTracer::makeModule(const std::uint32_t *words,
   return m;
 }
 
+VkFormatFeatureFlags
+VulkanPathTracer::targetFormatFeatures(VkFormat format) const noexcept {
+  switch (format) {
+  case VK_FORMAT_R16G16B16A16_SFLOAT:
+    return rgba16_target_features_;
+  case VK_FORMAT_R32G32B32A32_SFLOAT:
+    return rgba32_target_features_;
+  case VK_FORMAT_R32G32_SFLOAT:
+    return rg32_target_features_;
+  case VK_FORMAT_R32_SFLOAT:
+    return r32_target_features_;
+  default:
+    return 0u;
+  }
+}
+
+bool VulkanPathTracer::queryTargetFormatCapabilities() {
+  target_formats_queried_ = false;
+  required_target_formats_supported_ = false;
+  supported_target_output_mask_ = kPathTraceAllOptionalOutputMask;
+  auto query = [&](VkFormat format, VkFormatFeatureFlags &features) {
+    VkFormatProperties properties{};
+    vkGetPhysicalDeviceFormatProperties(phys_, format, &properties);
+    features = properties.optimalTilingFeatures;
+  };
+  query(VK_FORMAT_R16G16B16A16_SFLOAT, rgba16_target_features_);
+  query(VK_FORMAT_R32_SFLOAT, r32_target_features_);
+  query(VK_FORMAT_R32G32_SFLOAT, rg32_target_features_);
+  query(VK_FORMAT_R32G32B32A32_SFLOAT, rgba32_target_features_);
+  target_formats_queried_ = true;
+
+  PathTraceTargetFailure required_failure;
+  auto validate = [&](VkFormat format, const char *resource,
+                      std::uint32_t dependent_optional_mask,
+                      bool mandatory) {
+    const VkFormatFeatureFlags available = targetFormatFeatures(format);
+    if (pathTraceFormatSupports(available, kPathTraceTargetFormatFeatures)) {
+      return;
+    }
+    supported_target_output_mask_ &= ~dependent_optional_mask;
+    const auto log_failure =
+        mandatory ? &xpbd::log::errorf : &xpbd::log::warnf;
+    log_failure(
+        "Path-trace target format unsupported: "
+        "api=vkGetPhysicalDeviceFormatProperties VkResult=%d resource=%s "
+        "format=%d extent=0x0x0 usage=0x%x estimated_bytes=0 "
+        "required_features=0x%x available_features=0x%x "
+        "masked_output_mask=0x%04x mandatory=%d",
+        static_cast<int>(VK_ERROR_FORMAT_NOT_SUPPORTED), resource,
+        static_cast<int>(format),
+        static_cast<unsigned>(kPathTraceTargetImageUsage),
+        static_cast<unsigned>(kPathTraceTargetFormatFeatures),
+        static_cast<unsigned>(available),
+        static_cast<unsigned>(dependent_optional_mask), mandatory ? 1 : 0);
+    if (mandatory && !required_failure.failed()) {
+      required_failure.error = PathTraceTargetError::UnsupportedFormat;
+      required_failure.stage =
+          PathTraceTargetFailureStage::ValidateFormatCapabilities;
+      required_failure.vk_result = VK_ERROR_FORMAT_NOT_SUPPORTED;
+      required_failure.format = format;
+      required_failure.usage = kPathTraceTargetImageUsage;
+      required_failure.resource = resource;
+    }
+  };
+  constexpr std::uint32_t kRgba16OptionalMask =
+      kPathTraceAllAovOutputMask |
+      pathTraceOptionalOutputBit(PathTraceOptionalOutput::RrDiffuseAlbedo) |
+      pathTraceOptionalOutputBit(PathTraceOptionalOutput::RrSpecularAlbedo) |
+      pathTraceOptionalOutputBit(PathTraceOptionalOutput::RrNormalRoughness);
+  validate(VK_FORMAT_R16G16B16A16_SFLOAT, "color-format",
+           kRgba16OptionalMask, true);
+  validate(
+      VK_FORMAT_R32_SFLOAT, "depth-format",
+      pathTraceOptionalOutputBit(
+          PathTraceOptionalOutput::RrSpecularHitDistance),
+      true);
+  validate(VK_FORMAT_R32G32_SFLOAT, "rr-motion-format",
+           kPathTraceRrMotionOutputMask, false);
+  validate(VK_FORMAT_R32G32B32A32_SFLOAT, "statistics-format",
+           kPathTraceStatisticsOutputMask, false);
+
+  required_target_formats_supported_ = !required_failure.failed();
+  if (!required_target_formats_supported_) {
+    last_target_result_ = {};
+    last_target_result_.status = PathTraceTargetStatus::FailedNoTarget;
+    last_target_result_.supported_output_mask = supported_target_output_mask_;
+    last_target_result_.failure = std::move(required_failure);
+    return false;
+  }
+  const bool missing_optional_storage_format =
+      !pathTraceFormatSupports(rg32_target_features_,
+                               VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) ||
+      !pathTraceFormatSupports(rgba32_target_features_,
+                               VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
+  if (missing_optional_storage_format &&
+      !descriptor_binding_partially_bound_enabled_) {
+    xpbd::log::error(
+        "Path-trace optional storage format is unavailable and "
+        "descriptorBindingPartiallyBound was not enabled; disabling the path "
+        "tracer instead of dispatching with an invalid descriptor");
+    last_target_result_ = {};
+    last_target_result_.status = PathTraceTargetStatus::FailedNoTarget;
+    last_target_result_.supported_output_mask = supported_target_output_mask_;
+    last_target_result_.failure.error =
+        PathTraceTargetError::UnsupportedFormat;
+    last_target_result_.failure.stage =
+        PathTraceTargetFailureStage::ValidateFormatCapabilities;
+    last_target_result_.failure.vk_result = VK_ERROR_FEATURE_NOT_PRESENT;
+    last_target_result_.failure.resource =
+        "descriptorBindingPartiallyBound";
+    return false;
+  }
+  xpbd::log::infof(
+      "Path-trace target format capabilities ready: "
+      "required_features=0x%x supported_output_mask=0x%04x "
+      "partially_bound=%d",
+      static_cast<unsigned>(kPathTraceTargetFormatFeatures),
+      static_cast<unsigned>(supported_target_output_mask_),
+      descriptor_binding_partially_bound_enabled_ ? 1 : 0);
+  return true;
+}
+
 bool VulkanPathTracer::init(VkPhysicalDevice phys, VkDevice device,
                             VkRenderPass render_pass,
-                            bool enable_diagnostic_capture) {
+                            bool enable_diagnostic_capture,
+                            bool descriptor_binding_partially_bound) {
   shutdown();
   phys_ = phys;
   device_ = device;
+  descriptor_binding_partially_bound_enabled_ =
+      descriptor_binding_partially_bound;
+  memory_budget_supported_ = supportsMemoryBudget(phys_);
+  xpbd::log::infof("Path-trace VK_EXT_memory_budget preflight: %s",
+                   memory_budget_supported_ ? "enabled" : "unavailable");
+  if (!queryTargetFormatCapabilities()) {
+    return false;
+  }
   if (enable_diagnostic_capture) {
     if (const char *capture = std::getenv("XPBD_PT_CAPTURE");
         capture != nullptr && capture[0] != '\0') {
@@ -213,7 +504,8 @@ bool VulkanPathTracer::init(VkPhysicalDevice phys, VkDevice device,
     shutdown();
     return false;
   }
-  if (!rt_pipeline_.init(phys_, device_)) {
+  if (!rt_pipeline_.init(phys_, device_,
+                         descriptor_binding_partially_bound_enabled_)) {
     xpbd::log::warn(
         "Vulkan RT Pipeline unavailable; compute ray-query fallback remains "
         "active");
@@ -303,141 +595,127 @@ void VulkanPathTracer::cancelStillCapture() noexcept {
   }
 }
 
+void VulkanPathTracer::destroyTargetBundle(TargetBundle &bundle) {
+  if (device_ == VK_NULL_HANDLE) {
+    bundle = {};
+    return;
+  }
+  for (VkImageView &view : bundle.aov_layer_views) {
+    if (view != VK_NULL_HANDLE) {
+      vkDestroyImageView(device_, view, nullptr);
+    }
+  }
+  const std::array<VkImageView, 9> views{
+      bundle.aov_array_view,
+      bundle.statistics_image_view,
+      bundle.rr_motion_image_view,
+      bundle.rr_diffuse_albedo_image_view,
+      bundle.rr_specular_albedo_image_view,
+      bundle.rr_normal_roughness_image_view,
+      bundle.rr_specular_hit_distance_image_view,
+      bundle.depth_image_view,
+      bundle.image_view};
+  for (const VkImageView view : views) {
+    if (view != VK_NULL_HANDLE) {
+      vkDestroyImageView(device_, view, nullptr);
+    }
+  }
+  const std::array<VkImage, 9> images{
+      bundle.aov_image,
+      bundle.statistics_image,
+      bundle.rr_motion_image,
+      bundle.rr_diffuse_albedo_image,
+      bundle.rr_specular_albedo_image,
+      bundle.rr_normal_roughness_image,
+      bundle.rr_specular_hit_distance_image,
+      bundle.depth_image,
+      bundle.image};
+  for (const VkImage image : images) {
+    if (image != VK_NULL_HANDLE) {
+      vkDestroyImage(device_, image, nullptr);
+    }
+  }
+  const std::array<VkDeviceMemory, 9> memories{
+      bundle.aov_image_memory,
+      bundle.statistics_image_memory,
+      bundle.rr_motion_image_memory,
+      bundle.rr_diffuse_albedo_image_memory,
+      bundle.rr_specular_albedo_image_memory,
+      bundle.rr_normal_roughness_image_memory,
+      bundle.rr_specular_hit_distance_image_memory,
+      bundle.depth_image_memory,
+      bundle.image_memory};
+  for (const VkDeviceMemory memory : memories) {
+    if (memory != VK_NULL_HANDLE) {
+      vkFreeMemory(device_, memory, nullptr);
+    }
+  }
+  bundle = {};
+}
+
+void VulkanPathTracer::swapActiveTarget(TargetBundle &bundle) noexcept {
+  using std::swap;
+  swap(image_, bundle.image);
+  swap(image_memory_, bundle.image_memory);
+  swap(image_view_, bundle.image_view);
+  swap(depth_image_, bundle.depth_image);
+  swap(depth_image_memory_, bundle.depth_image_memory);
+  swap(depth_image_view_, bundle.depth_image_view);
+  swap(aov_image_, bundle.aov_image);
+  swap(aov_image_memory_, bundle.aov_image_memory);
+  swap(aov_array_view_, bundle.aov_array_view);
+  swap(aov_layer_views_, bundle.aov_layer_views);
+  swap(statistics_image_, bundle.statistics_image);
+  swap(statistics_image_memory_, bundle.statistics_image_memory);
+  swap(statistics_image_view_, bundle.statistics_image_view);
+  swap(rr_motion_image_, bundle.rr_motion_image);
+  swap(rr_motion_image_memory_, bundle.rr_motion_image_memory);
+  swap(rr_motion_image_view_, bundle.rr_motion_image_view);
+  swap(rr_diffuse_albedo_image_, bundle.rr_diffuse_albedo_image);
+  swap(rr_diffuse_albedo_image_memory_, bundle.rr_diffuse_albedo_image_memory);
+  swap(rr_diffuse_albedo_image_view_, bundle.rr_diffuse_albedo_image_view);
+  swap(rr_specular_albedo_image_, bundle.rr_specular_albedo_image);
+  swap(rr_specular_albedo_image_memory_, bundle.rr_specular_albedo_image_memory);
+  swap(rr_specular_albedo_image_view_, bundle.rr_specular_albedo_image_view);
+  swap(rr_normal_roughness_image_, bundle.rr_normal_roughness_image);
+  swap(rr_normal_roughness_image_memory_, bundle.rr_normal_roughness_image_memory);
+  swap(rr_normal_roughness_image_view_, bundle.rr_normal_roughness_image_view);
+  swap(rr_specular_hit_distance_image_, bundle.rr_specular_hit_distance_image);
+  swap(rr_specular_hit_distance_image_memory_,
+       bundle.rr_specular_hit_distance_image_memory);
+  swap(rr_specular_hit_distance_image_view_,
+       bundle.rr_specular_hit_distance_image_view);
+  swap(image_w_, bundle.width);
+  swap(image_h_, bundle.height);
+  swap(target_requested_output_mask_, bundle.requested_output_mask);
+  swap(target_allocated_output_mask_, bundle.allocated_output_mask);
+  swap(target_image_count_, bundle.image_count);
+  swap(target_estimated_bytes_, bundle.estimated_bytes);
+  swap(target_allocated_bytes_, bundle.allocated_bytes);
+  swap(image_layout_, bundle.image_layout);
+  swap(depth_image_layout_, bundle.depth_image_layout);
+  swap(aov_image_layout_, bundle.aov_image_layout);
+  swap(statistics_image_layout_, bundle.statistics_image_layout);
+  swap(rr_motion_image_layout_, bundle.rr_motion_image_layout);
+  swap(rr_diffuse_albedo_image_layout_, bundle.rr_diffuse_albedo_image_layout);
+  swap(rr_specular_albedo_image_layout_, bundle.rr_specular_albedo_image_layout);
+  swap(rr_normal_roughness_image_layout_, bundle.rr_normal_roughness_image_layout);
+  swap(rr_specular_hit_distance_image_layout_,
+       bundle.rr_specular_hit_distance_image_layout);
+}
+
 void VulkanPathTracer::destroyImage() {
+  TargetBundle old;
+  swapActiveTarget(old);
+  destroyTargetBundle(old);
   history_key_ = 0;
   accumulated_samples_ = 0;
   history_valid_ = false;
-  if (device_ == VK_NULL_HANDLE) {
-    return;
-  }
-  for (VkImageView &view : aov_layer_views_) {
-    if (view != VK_NULL_HANDLE) {
-      vkDestroyImageView(device_, view, nullptr);
-      view = VK_NULL_HANDLE;
-    }
-  }
-  if (aov_array_view_ != VK_NULL_HANDLE) {
-    vkDestroyImageView(device_, aov_array_view_, nullptr);
-    aov_array_view_ = VK_NULL_HANDLE;
-  }
-  if (aov_image_ != VK_NULL_HANDLE) {
-    vkDestroyImage(device_, aov_image_, nullptr);
-    aov_image_ = VK_NULL_HANDLE;
-  }
-  if (aov_image_memory_ != VK_NULL_HANDLE) {
-    vkFreeMemory(device_, aov_image_memory_, nullptr);
-    aov_image_memory_ = VK_NULL_HANDLE;
-  }
-  if (statistics_image_view_ != VK_NULL_HANDLE) {
-    vkDestroyImageView(device_, statistics_image_view_, nullptr);
-    statistics_image_view_ = VK_NULL_HANDLE;
-  }
-  if (statistics_image_ != VK_NULL_HANDLE) {
-    vkDestroyImage(device_, statistics_image_, nullptr);
-    statistics_image_ = VK_NULL_HANDLE;
-  }
-  if (statistics_image_memory_ != VK_NULL_HANDLE) {
-    vkFreeMemory(device_, statistics_image_memory_, nullptr);
-    statistics_image_memory_ = VK_NULL_HANDLE;
-  }
-  if (rr_motion_image_view_ != VK_NULL_HANDLE) {
-    vkDestroyImageView(device_, rr_motion_image_view_, nullptr);
-    rr_motion_image_view_ = VK_NULL_HANDLE;
-  }
-  if (rr_motion_image_ != VK_NULL_HANDLE) {
-    vkDestroyImage(device_, rr_motion_image_, nullptr);
-    rr_motion_image_ = VK_NULL_HANDLE;
-  }
-  if (rr_motion_image_memory_ != VK_NULL_HANDLE) {
-    vkFreeMemory(device_, rr_motion_image_memory_, nullptr);
-    rr_motion_image_memory_ = VK_NULL_HANDLE;
-  }
-  if (rr_diffuse_albedo_image_view_ != VK_NULL_HANDLE) {
-    vkDestroyImageView(device_, rr_diffuse_albedo_image_view_, nullptr);
-    rr_diffuse_albedo_image_view_ = VK_NULL_HANDLE;
-  }
-  if (rr_diffuse_albedo_image_ != VK_NULL_HANDLE) {
-    vkDestroyImage(device_, rr_diffuse_albedo_image_, nullptr);
-    rr_diffuse_albedo_image_ = VK_NULL_HANDLE;
-  }
-  if (rr_diffuse_albedo_image_memory_ != VK_NULL_HANDLE) {
-    vkFreeMemory(device_, rr_diffuse_albedo_image_memory_, nullptr);
-    rr_diffuse_albedo_image_memory_ = VK_NULL_HANDLE;
-  }
-  if (rr_specular_albedo_image_view_ != VK_NULL_HANDLE) {
-    vkDestroyImageView(device_, rr_specular_albedo_image_view_, nullptr);
-    rr_specular_albedo_image_view_ = VK_NULL_HANDLE;
-  }
-  if (rr_specular_albedo_image_ != VK_NULL_HANDLE) {
-    vkDestroyImage(device_, rr_specular_albedo_image_, nullptr);
-    rr_specular_albedo_image_ = VK_NULL_HANDLE;
-  }
-  if (rr_specular_albedo_image_memory_ != VK_NULL_HANDLE) {
-    vkFreeMemory(device_, rr_specular_albedo_image_memory_, nullptr);
-    rr_specular_albedo_image_memory_ = VK_NULL_HANDLE;
-  }
-  if (rr_normal_roughness_image_view_ != VK_NULL_HANDLE) {
-    vkDestroyImageView(device_, rr_normal_roughness_image_view_, nullptr);
-    rr_normal_roughness_image_view_ = VK_NULL_HANDLE;
-  }
-  if (rr_normal_roughness_image_ != VK_NULL_HANDLE) {
-    vkDestroyImage(device_, rr_normal_roughness_image_, nullptr);
-    rr_normal_roughness_image_ = VK_NULL_HANDLE;
-  }
-  if (rr_normal_roughness_image_memory_ != VK_NULL_HANDLE) {
-    vkFreeMemory(device_, rr_normal_roughness_image_memory_, nullptr);
-    rr_normal_roughness_image_memory_ = VK_NULL_HANDLE;
-  }
-  if (rr_specular_hit_distance_image_view_ != VK_NULL_HANDLE) {
-    vkDestroyImageView(
-        device_, rr_specular_hit_distance_image_view_, nullptr);
-    rr_specular_hit_distance_image_view_ = VK_NULL_HANDLE;
-  }
-  if (rr_specular_hit_distance_image_ != VK_NULL_HANDLE) {
-    vkDestroyImage(
-        device_, rr_specular_hit_distance_image_, nullptr);
-    rr_specular_hit_distance_image_ = VK_NULL_HANDLE;
-  }
-  if (rr_specular_hit_distance_image_memory_ != VK_NULL_HANDLE) {
-    vkFreeMemory(
-        device_, rr_specular_hit_distance_image_memory_, nullptr);
-    rr_specular_hit_distance_image_memory_ = VK_NULL_HANDLE;
-  }
-  if (depth_image_view_) {
-    vkDestroyImageView(device_, depth_image_view_, nullptr);
-    depth_image_view_ = VK_NULL_HANDLE;
-  }
-  if (depth_image_) {
-    vkDestroyImage(device_, depth_image_, nullptr);
-    depth_image_ = VK_NULL_HANDLE;
-  }
-  if (depth_image_memory_) {
-    vkFreeMemory(device_, depth_image_memory_, nullptr);
-    depth_image_memory_ = VK_NULL_HANDLE;
-  }
-  if (image_view_) {
-    vkDestroyImageView(device_, image_view_, nullptr);
-    image_view_ = VK_NULL_HANDLE;
-  }
-  if (image_) {
-    vkDestroyImage(device_, image_, nullptr);
-    image_ = VK_NULL_HANDLE;
-  }
-  if (image_memory_) {
-    vkFreeMemory(device_, image_memory_, nullptr);
-    image_memory_ = VK_NULL_HANDLE;
-  }
-  image_w_ = image_h_ = 0;
-  image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-  depth_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-  aov_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-  statistics_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-  rr_motion_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-  rr_diffuse_albedo_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-  rr_specular_albedo_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-  rr_normal_roughness_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-  rr_specular_hit_distance_image_layout_ =
-      VK_IMAGE_LAYOUT_UNDEFINED;
+  target_stats_.requested_output_mask = 0;
+  target_stats_.allocated_output_mask = 0;
+  target_stats_.image_count = 0;
+  target_stats_.estimated_bytes = 0;
+  target_stats_.allocated_bytes = 0;
 }
 
 void VulkanPathTracer::destroyMotionFrame() {
@@ -469,8 +747,15 @@ bool VulkanPathTracer::ensureMotionFrame() {
   buffer_info.size = sizeof(PathTraceMotionFrameGpu);
   buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
   buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-  if (vkCreateBuffer(device_, &buffer_info, nullptr,
-                     &motion_frame_buffer_.buffer) != VK_SUCCESS) {
+  const VkResult create_result = vkCreateBuffer(
+      device_, &buffer_info, nullptr, &motion_frame_buffer_.buffer);
+  if (create_result != VK_SUCCESS) {
+    xpbd::log::errorf(
+        "Path-trace buffer failure: api=vkCreateBuffer VkResult=%d "
+        "resource=motion-frame size=%llu usage=0x%x",
+        static_cast<int>(create_result),
+        static_cast<unsigned long long>(buffer_info.size),
+        static_cast<unsigned>(buffer_info.usage));
     destroyMotionFrame();
     return false;
   }
@@ -489,13 +774,42 @@ bool VulkanPathTracer::ensureMotionFrame() {
       VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
   allocate_info.allocationSize = requirements.size;
   allocate_info.memoryTypeIndex = memory_type;
-  if (vkAllocateMemory(device_, &allocate_info, nullptr,
-                       &motion_frame_buffer_.memory) != VK_SUCCESS ||
+  const VkResult allocation_result = vkAllocateMemory(
+      device_, &allocate_info, nullptr, &motion_frame_buffer_.memory);
+  if (allocation_result != VK_SUCCESS) {
+    xpbd::log::errorf(
+        "Path-trace buffer failure: api=vkAllocateMemory VkResult=%d "
+        "resource=motion-frame size=%llu usage=0x%x memory_type=%u",
+        static_cast<int>(allocation_result),
+        static_cast<unsigned long long>(requirements.size),
+        static_cast<unsigned>(buffer_info.usage), memory_type);
+    destroyMotionFrame();
+    return false;
+  }
+  const VkResult bind_result =
       vkBindBufferMemory(device_, motion_frame_buffer_.buffer,
-                         motion_frame_buffer_.memory, 0) != VK_SUCCESS ||
+                         motion_frame_buffer_.memory, 0);
+  if (bind_result != VK_SUCCESS) {
+    xpbd::log::errorf(
+        "Path-trace buffer failure: api=vkBindBufferMemory VkResult=%d "
+        "resource=motion-frame size=%llu usage=0x%x memory_type=%u",
+        static_cast<int>(bind_result),
+        static_cast<unsigned long long>(requirements.size),
+        static_cast<unsigned>(buffer_info.usage), memory_type);
+    destroyMotionFrame();
+    return false;
+  }
+  const VkResult map_result =
       vkMapMemory(device_, motion_frame_buffer_.memory, 0,
                   sizeof(PathTraceMotionFrameGpu), 0,
-                  &motion_frame_mapped_) != VK_SUCCESS) {
+                  &motion_frame_mapped_);
+  if (map_result != VK_SUCCESS) {
+    xpbd::log::errorf(
+        "Path-trace buffer failure: api=vkMapMemory VkResult=%d "
+        "resource=motion-frame size=%llu usage=0x%x memory_type=%u",
+        static_cast<int>(map_result),
+        static_cast<unsigned long long>(requirements.size),
+        static_cast<unsigned>(buffer_info.usage), memory_type);
     destroyMotionFrame();
     return false;
   }
@@ -548,8 +862,15 @@ bool VulkanPathTracer::ensureCaptureBuffer(VkDeviceSize size) {
   buffer_info.size = size;
   buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-  if (vkCreateBuffer(device_, &buffer_info, nullptr,
-                     &capture_buffer_.buffer) != VK_SUCCESS) {
+  const VkResult create_result = vkCreateBuffer(
+      device_, &buffer_info, nullptr, &capture_buffer_.buffer);
+  if (create_result != VK_SUCCESS) {
+    xpbd::log::errorf(
+        "Path-trace buffer failure: api=vkCreateBuffer VkResult=%d "
+        "resource=capture-readback size=%llu usage=0x%x",
+        static_cast<int>(create_result),
+        static_cast<unsigned long long>(size),
+        static_cast<unsigned>(buffer_info.usage));
     destroyCaptureBuffer();
     return false;
   }
@@ -569,12 +890,40 @@ bool VulkanPathTracer::ensureCaptureBuffer(VkDeviceSize size) {
       VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
   allocate_info.allocationSize = requirements.size;
   allocate_info.memoryTypeIndex = memory_type;
-  if (vkAllocateMemory(device_, &allocate_info, nullptr,
-                       &capture_buffer_.memory) != VK_SUCCESS ||
+  const VkResult allocation_result = vkAllocateMemory(
+      device_, &allocate_info, nullptr, &capture_buffer_.memory);
+  if (allocation_result != VK_SUCCESS) {
+    xpbd::log::errorf(
+        "Path-trace buffer failure: api=vkAllocateMemory VkResult=%d "
+        "resource=capture-readback size=%llu usage=0x%x memory_type=%u",
+        static_cast<int>(allocation_result),
+        static_cast<unsigned long long>(requirements.size),
+        static_cast<unsigned>(buffer_info.usage), memory_type);
+    destroyCaptureBuffer();
+    return false;
+  }
+  const VkResult bind_result =
       vkBindBufferMemory(device_, capture_buffer_.buffer,
-                         capture_buffer_.memory, 0) != VK_SUCCESS ||
-      vkMapMemory(device_, capture_buffer_.memory, 0, size, 0,
-                  &capture_mapped_) != VK_SUCCESS) {
+                         capture_buffer_.memory, 0);
+  if (bind_result != VK_SUCCESS) {
+    xpbd::log::errorf(
+        "Path-trace buffer failure: api=vkBindBufferMemory VkResult=%d "
+        "resource=capture-readback size=%llu usage=0x%x memory_type=%u",
+        static_cast<int>(bind_result),
+        static_cast<unsigned long long>(requirements.size),
+        static_cast<unsigned>(buffer_info.usage), memory_type);
+    destroyCaptureBuffer();
+    return false;
+  }
+  const VkResult map_result = vkMapMemory(
+      device_, capture_buffer_.memory, 0, size, 0, &capture_mapped_);
+  if (map_result != VK_SUCCESS) {
+    xpbd::log::errorf(
+        "Path-trace buffer failure: api=vkMapMemory VkResult=%d "
+        "resource=capture-readback size=%llu usage=0x%x memory_type=%u",
+        static_cast<int>(map_result),
+        static_cast<unsigned long long>(requirements.size),
+        static_cast<unsigned>(buffer_info.usage), memory_type);
     destroyCaptureBuffer();
     return false;
   }
@@ -898,6 +1247,19 @@ bool VulkanPathTracer::ensureFallbackAlbedo() {
   if (fallback_albedo_view_) {
     return true;
   }
+  constexpr VkImageUsageFlags kUsage =
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  VkDeviceSize estimated_bytes = 4u;
+  auto log_failure = [&](const char *api, VkResult result) {
+    xpbd::log::errorf(
+        "Path-trace fallback image operation failed: api=%s VkResult=%d "
+        "resource=fallback-albedo format=%d extent=1x1x1 usage=0x%x "
+        "estimated_bytes=%llu",
+        api, static_cast<int>(result),
+        static_cast<int>(VK_FORMAT_R8G8B8A8_UNORM),
+        static_cast<unsigned>(kUsage),
+        static_cast<unsigned long long>(estimated_bytes));
+  };
   VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
   ii.imageType = VK_IMAGE_TYPE_2D;
   ii.format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -906,41 +1268,237 @@ bool VulkanPathTracer::ensureFallbackAlbedo() {
   ii.arrayLayers = 1;
   ii.samples = VK_SAMPLE_COUNT_1_BIT;
   ii.tiling = VK_IMAGE_TILING_OPTIMAL;
-  ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  ii.usage = kUsage;
   ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  if (vkCreateImage(device_, &ii, nullptr, &fallback_albedo_image_) !=
-      VK_SUCCESS) {
+  VkResult result =
+      vkCreateImage(device_, &ii, nullptr, &fallback_albedo_image_);
+  if (result != VK_SUCCESS) {
+    log_failure("vkCreateImage", result);
     return false;
   }
   VkMemoryRequirements req{};
   vkGetImageMemoryRequirements(device_, fallback_albedo_image_, &req);
+  estimated_bytes = req.size;
   const auto type =
       findMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   if (type == std::numeric_limits<std::uint32_t>::max()) {
+    log_failure("select-memory-type", VK_ERROR_FEATURE_NOT_PRESENT);
     destroyFallbackAlbedo();
     return false;
   }
   VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
   ai.allocationSize = req.size;
   ai.memoryTypeIndex = type;
-  if (vkAllocateMemory(device_, &ai, nullptr, &fallback_albedo_memory_) !=
-      VK_SUCCESS) {
+  result = vkAllocateMemory(device_, &ai, nullptr, &fallback_albedo_memory_);
+  if (result != VK_SUCCESS) {
+    log_failure("vkAllocateMemory", result);
     destroyFallbackAlbedo();
     return false;
   }
-  vkBindImageMemory(device_, fallback_albedo_image_, fallback_albedo_memory_, 0);
+  result = vkBindImageMemory(device_, fallback_albedo_image_,
+                             fallback_albedo_memory_, 0u);
+  if (result != VK_SUCCESS) {
+    log_failure("vkBindImageMemory", result);
+    destroyFallbackAlbedo();
+    return false;
+  }
 
   VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
   vi.image = fallback_albedo_image_;
   vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
   vi.format = VK_FORMAT_R8G8B8A8_UNORM;
   vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-  if (vkCreateImageView(device_, &vi, nullptr, &fallback_albedo_view_) !=
-      VK_SUCCESS) {
+  result = vkCreateImageView(device_, &vi, nullptr, &fallback_albedo_view_);
+  if (result != VK_SUCCESS) {
+    log_failure("vkCreateImageView", result);
     destroyFallbackAlbedo();
     return false;
   }
   // Cleared to white on first recordDispatch (needs a command buffer).
+  return true;
+}
+
+void VulkanPathTracer::destroyDummyStorageImages() {
+  if (device_ != VK_NULL_HANDLE) {
+    const std::array<VkImageView, 5> views{
+        dummy_rgba16_array_view_, dummy_rgba16_view_, dummy_rgba32_view_,
+        dummy_rg32_view_, dummy_r32_view_};
+    for (const VkImageView view : views) {
+      if (view != VK_NULL_HANDLE) {
+        vkDestroyImageView(device_, view, nullptr);
+      }
+    }
+    const std::array<VkImage, 4> images{
+        dummy_rgba16_image_, dummy_rgba32_image_, dummy_rg32_image_,
+        dummy_r32_image_};
+    for (const VkImage image : images) {
+      if (image != VK_NULL_HANDLE) {
+        vkDestroyImage(device_, image, nullptr);
+      }
+    }
+    const std::array<VkDeviceMemory, 4> memories{
+        dummy_rgba16_memory_, dummy_rgba32_memory_, dummy_rg32_memory_,
+        dummy_r32_memory_};
+    for (const VkDeviceMemory memory : memories) {
+      if (memory != VK_NULL_HANDLE) {
+        vkFreeMemory(device_, memory, nullptr);
+      }
+    }
+  }
+  dummy_rgba16_image_ = VK_NULL_HANDLE;
+  dummy_rgba16_memory_ = VK_NULL_HANDLE;
+  dummy_rgba16_array_view_ = VK_NULL_HANDLE;
+  dummy_rgba16_view_ = VK_NULL_HANDLE;
+  dummy_rgba16_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+  dummy_rgba32_image_ = VK_NULL_HANDLE;
+  dummy_rgba32_memory_ = VK_NULL_HANDLE;
+  dummy_rgba32_view_ = VK_NULL_HANDLE;
+  dummy_rgba32_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+  dummy_rg32_image_ = VK_NULL_HANDLE;
+  dummy_rg32_memory_ = VK_NULL_HANDLE;
+  dummy_rg32_view_ = VK_NULL_HANDLE;
+  dummy_rg32_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+  dummy_r32_image_ = VK_NULL_HANDLE;
+  dummy_r32_memory_ = VK_NULL_HANDLE;
+  dummy_r32_view_ = VK_NULL_HANDLE;
+  dummy_r32_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+}
+
+bool VulkanPathTracer::ensureDummyStorageImages() {
+  const bool rgba32_storage_supported = pathTraceFormatSupports(
+      rgba32_target_features_, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
+  const bool rg32_storage_supported = pathTraceFormatSupports(
+      rg32_target_features_, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
+  if (dummy_rgba16_array_view_ != VK_NULL_HANDLE &&
+      dummy_rgba16_view_ != VK_NULL_HANDLE &&
+      (!rgba32_storage_supported || dummy_rgba32_view_ != VK_NULL_HANDLE) &&
+      (!rg32_storage_supported || dummy_rg32_view_ != VK_NULL_HANDLE) &&
+      dummy_r32_view_ != VK_NULL_HANDLE) {
+    return true;
+  }
+  destroyDummyStorageImages();
+  auto create_dummy = [&](VkFormat format, std::uint32_t array_layers,
+                          VkImageViewType view_type, const char *name,
+                          VkImage &image, VkDeviceMemory &memory,
+                          VkImageView &view) {
+    const VkDeviceSize estimated_bytes =
+        static_cast<VkDeviceSize>(array_layers) *
+        (format == VK_FORMAT_R32G32B32A32_SFLOAT
+             ? 16u
+             : (format == VK_FORMAT_R32G32_SFLOAT ||
+                        format == VK_FORMAT_R16G16B16A16_SFLOAT
+                    ? 8u
+                    : 4u));
+    auto log_failure = [&](const char *api, VkResult result,
+                           VkDeviceSize bytes) {
+      xpbd::log::errorf(
+          "Path-trace dummy image operation failed: api=%s VkResult=%d "
+          "resource=%s format=%d extent=1x1x1 usage=0x%x "
+          "estimated_bytes=%llu",
+          api, static_cast<int>(result), name, static_cast<int>(format),
+          static_cast<unsigned>(VK_IMAGE_USAGE_STORAGE_BIT),
+          static_cast<unsigned long long>(bytes));
+    };
+    VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    image_info.imageType = VK_IMAGE_TYPE_2D;
+    image_info.format = format;
+    image_info.extent = {1u, 1u, 1u};
+    image_info.mipLevels = 1u;
+    image_info.arrayLayers = array_layers;
+    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_info.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+    image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkResult result = vkCreateImage(device_, &image_info, nullptr, &image);
+    if (result != VK_SUCCESS) {
+      log_failure("vkCreateImage", result, estimated_bytes);
+      return false;
+    }
+    VkMemoryRequirements memory_requirements{};
+    vkGetImageMemoryRequirements(device_, image, &memory_requirements);
+    const std::uint32_t memory_type = findMemoryType(
+        memory_requirements.memoryTypeBits,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (memory_type == (std::numeric_limits<std::uint32_t>::max)()) {
+      log_failure("select-memory-type", VK_ERROR_FEATURE_NOT_PRESENT,
+                  memory_requirements.size);
+      return false;
+    }
+    VkMemoryAllocateInfo allocation{
+        VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocation.allocationSize = memory_requirements.size;
+    allocation.memoryTypeIndex = memory_type;
+    result = vkAllocateMemory(device_, &allocation, nullptr, &memory);
+    if (result != VK_SUCCESS) {
+      log_failure("vkAllocateMemory", result, memory_requirements.size);
+      return false;
+    }
+    result = vkBindImageMemory(device_, image, memory, 0u);
+    if (result != VK_SUCCESS) {
+      log_failure("vkBindImageMemory", result, memory_requirements.size);
+      return false;
+    }
+    VkImageViewCreateInfo view_info{
+        VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    view_info.image = image;
+    view_info.viewType = view_type;
+    view_info.format = format;
+    view_info.subresourceRange = {
+        VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, array_layers};
+    result = vkCreateImageView(device_, &view_info, nullptr, &view);
+    if (result != VK_SUCCESS) {
+      log_failure("vkCreateImageView", result, memory_requirements.size);
+      return false;
+    }
+    return true;
+  };
+
+  constexpr std::uint32_t kAovLayers =
+      static_cast<std::uint32_t>(PathTraceAovLayer::Count);
+  if (!create_dummy(VK_FORMAT_R16G16B16A16_SFLOAT, kAovLayers,
+                    VK_IMAGE_VIEW_TYPE_2D_ARRAY, "dummy-rgba16-array",
+                    dummy_rgba16_image_, dummy_rgba16_memory_,
+                    dummy_rgba16_array_view_)) {
+    destroyDummyStorageImages();
+    return false;
+  }
+  VkImageViewCreateInfo rgba16_view{
+      VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  rgba16_view.image = dummy_rgba16_image_;
+  rgba16_view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  rgba16_view.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+  rgba16_view.subresourceRange = {
+      VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
+  VkResult rgba16_view_result = vkCreateImageView(
+      device_, &rgba16_view, nullptr, &dummy_rgba16_view_);
+  if (rgba16_view_result != VK_SUCCESS) {
+    xpbd::log::errorf(
+        "Path-trace dummy image operation failed: api=vkCreateImageView "
+        "VkResult=%d resource=dummy-rgba16-layer format=%d extent=1x1x1 "
+        "usage=0x%x estimated_bytes=%llu",
+        static_cast<int>(rgba16_view_result),
+        static_cast<int>(VK_FORMAT_R16G16B16A16_SFLOAT),
+        static_cast<unsigned>(VK_IMAGE_USAGE_STORAGE_BIT),
+        static_cast<unsigned long long>(8u * kAovLayers));
+    destroyDummyStorageImages();
+    return false;
+  }
+  if (!create_dummy(VK_FORMAT_R32_SFLOAT, 1u, VK_IMAGE_VIEW_TYPE_2D,
+                    "dummy-r32", dummy_r32_image_, dummy_r32_memory_,
+                    dummy_r32_view_) ||
+      (rgba32_storage_supported &&
+       !create_dummy(VK_FORMAT_R32G32B32A32_SFLOAT, 1u,
+                     VK_IMAGE_VIEW_TYPE_2D, "dummy-rgba32",
+                     dummy_rgba32_image_, dummy_rgba32_memory_,
+                     dummy_rgba32_view_)) ||
+      (rg32_storage_supported &&
+       !create_dummy(VK_FORMAT_R32G32_SFLOAT, 1u,
+                     VK_IMAGE_VIEW_TYPE_2D, "dummy-rg32",
+                     dummy_rg32_image_, dummy_rg32_memory_,
+                     dummy_rg32_view_))) {
+    destroyDummyStorageImages();
+    return false;
+  }
   return true;
 }
 
@@ -949,6 +1507,7 @@ void VulkanPathTracer::shutdown() {
     rt_pipeline_.shutdown();
     destroyImage();
     destroyMotionFrame();
+    destroyDummyStorageImages();
     destroyFallbackAlbedo();
     destroyCaptureBuffer();
     if (compute_pipeline_) {
@@ -981,6 +1540,12 @@ void VulkanPathTracer::shutdown() {
     if (albedo_sampler_) {
       vkDestroySampler(device_, albedo_sampler_, nullptr);
     }
+    if (normal_sampler_) {
+      vkDestroySampler(device_, normal_sampler_, nullptr);
+    }
+    if (specular_sampler_) {
+      vkDestroySampler(device_, specular_sampler_, nullptr);
+    }
   }
   compute_pipeline_ = VK_NULL_HANDLE;
   compute_pipe_layout_ = VK_NULL_HANDLE;
@@ -994,6 +1559,8 @@ void VulkanPathTracer::shutdown() {
   composite_layout_ = VK_NULL_HANDLE;
   sampler_ = VK_NULL_HANDLE;
   albedo_sampler_ = VK_NULL_HANDLE;
+  normal_sampler_ = VK_NULL_HANDLE;
+  specular_sampler_ = VK_NULL_HANDLE;
   rt_fallback_logged_ = false;
   compute_descriptor_key_ = {};
   compute_descriptor_key_valid_ = false;
@@ -1002,6 +1569,28 @@ void VulkanPathTracer::shutdown() {
   descriptor_entries_written_ = 0;
   descriptor_update_ms_ = 0.0f;
   rt_pipeline_.resetDescriptorStats();
+  target_requirement_hint_mask_ = 0u;
+  target_requested_output_mask_ = 0u;
+  supported_target_output_mask_ = 0u;
+  target_allocated_output_mask_ = 0u;
+  target_image_count_ = 0u;
+  target_estimated_bytes_ = 0u;
+  target_allocated_bytes_ = 0u;
+  last_target_result_ = {};
+  target_stats_ = {};
+  failed_target_width_ = 0u;
+  failed_target_height_ = 0u;
+  failed_target_output_mask_ = 0u;
+  consecutive_target_failures_ = 0u;
+  target_retry_not_before_ns_ = 0u;
+  rgba16_target_features_ = 0u;
+  rgba32_target_features_ = 0u;
+  rg32_target_features_ = 0u;
+  r32_target_features_ = 0u;
+  target_formats_queried_ = false;
+  required_target_formats_supported_ = false;
+  memory_budget_supported_ = false;
+  descriptor_binding_partially_bound_enabled_ = false;
   history_key_ = 0;
   history_reset_count_ = 0;
   accumulated_samples_ = 0;
@@ -1094,6 +1683,19 @@ bool VulkanPathTracer::createPipelines(VkRenderPass render_pass) {
       VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
   cli.bindingCount = static_cast<std::uint32_t>(cbind.size());
   cli.pBindings = cbind.data();
+  std::array<VkDescriptorBindingFlags, 24> compute_binding_flags{};
+  VkDescriptorSetLayoutBindingFlagsCreateInfo compute_binding_flags_info{
+      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+  if (descriptor_binding_partially_bound_enabled_) {
+    for (std::uint32_t binding = 17u; binding <= 23u; ++binding) {
+      compute_binding_flags[binding] =
+          VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+    }
+    compute_binding_flags_info.bindingCount =
+        static_cast<std::uint32_t>(compute_binding_flags.size());
+    compute_binding_flags_info.pBindingFlags = compute_binding_flags.data();
+    cli.pNext = &compute_binding_flags_info;
+  }
   if (vkCreateDescriptorSetLayout(device_, &cli, nullptr, &compute_layout_) !=
       VK_SUCCESS) {
     return false;
@@ -1155,6 +1757,7 @@ bool VulkanPathTracer::createPipelines(VkRenderPass render_pass) {
   }
 
   // Composite graphics pipeline
+  cli.pNext = nullptr;
   std::array<VkDescriptorSetLayoutBinding, 3> sbind{};
   for (std::uint32_t binding = 0; binding < sbind.size(); ++binding) {
     sbind[binding].binding = binding;
@@ -1181,7 +1784,8 @@ bool VulkanPathTracer::createPipelines(VkRenderPass render_pass) {
     return false;
   }
 
-  // Nearest filtering: 1:1 composite and pixel-art albedo (no filter moiré).
+  // The composite and pixel-art albedo remain nearest. Normal and LabPBR
+  // parameter textures use bilinear filtering within the only mip level.
   VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
   si.magFilter = VK_FILTER_NEAREST;
   si.minFilter = VK_FILTER_NEAREST;
@@ -1189,6 +1793,8 @@ bool VulkanPathTracer::createPipelines(VkRenderPass render_pass) {
   si.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
   si.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
   si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  si.minLod = 0.0f;
+  si.maxLod = 0.0f;
   if (vkCreateSampler(device_, &si, nullptr, &sampler_) != VK_SUCCESS) {
     return false;
   }
@@ -1198,7 +1804,19 @@ bool VulkanPathTracer::createPipelines(VkRenderPass render_pass) {
   if (vkCreateSampler(device_, &si, nullptr, &albedo_sampler_) != VK_SUCCESS) {
     return false;
   }
+  si.magFilter = VK_FILTER_LINEAR;
+  si.minFilter = VK_FILTER_LINEAR;
+  if (vkCreateSampler(device_, &si, nullptr, &normal_sampler_) != VK_SUCCESS) {
+    return false;
+  }
+  if (vkCreateSampler(device_, &si, nullptr, &specular_sampler_) !=
+      VK_SUCCESS) {
+    return false;
+  }
   if (!ensureFallbackAlbedo()) {
+    return false;
+  }
+  if (!ensureDummyStorageImages()) {
     return false;
   }
 
@@ -1304,273 +1922,447 @@ bool VulkanPathTracer::createPipelines(VkRenderPass render_pass) {
   return gr == VK_SUCCESS;
 }
 
-bool VulkanPathTracer::ensureTarget(std::uint32_t width, std::uint32_t height) {
+bool VulkanPathTracer::ensureTarget(std::uint32_t width,
+                                    std::uint32_t height) {
+  return ensureTarget(
+             width, height,
+             PathTraceTargetRequirements{target_requirement_hint_mask_})
+      .exact();
+}
+
+PathTraceTargetResult VulkanPathTracer::ensureTarget(
+    std::uint32_t width, std::uint32_t height,
+    PathTraceTargetRequirements requirements) {
   width = (std::max)(1u, width);
   height = (std::max)(1u, height);
-  if (image_ && depth_image_ && aov_image_ && statistics_image_ &&
-      rr_motion_image_ && rr_diffuse_albedo_image_ &&
-      rr_specular_albedo_image_ && rr_normal_roughness_image_ &&
-      rr_specular_hit_distance_image_ &&
-      image_w_ == width && image_h_ == height) {
-    return true;
-  }
-  destroyImage();
+  const std::uint32_t requested_mask =
+      requirements.output_mask & kPathTraceAllOptionalOutputMask;
+  const std::uint32_t allocated_mask =
+      pathTraceTargetAllocationMask(requested_mask,
+                                    supported_target_output_mask_);
+  target_requirement_hint_mask_ = requested_mask;
 
-  VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-  ii.imageType = VK_IMAGE_TYPE_2D;
-  ii.format = VK_FORMAT_R16G16B16A16_SFLOAT;
-  ii.extent = {width, height, 1};
-  ii.mipLevels = 1;
-  ii.arrayLayers = 1;
-  ii.samples = VK_SAMPLE_COUNT_1_BIT;
-  ii.tiling = VK_IMAGE_TILING_OPTIMAL;
-  ii.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-             VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-  ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  if (vkCreateImage(device_, &ii, nullptr, &image_) != VK_SUCCESS) {
-    return false;
+  VkDeviceSize estimated_bytes = 0u;
+  const bool estimate_valid =
+      estimateTargetBytes(width, height, allocated_mask, estimated_bytes);
+  auto make_result = [&](PathTraceTargetStatus status) {
+    PathTraceTargetResult result;
+    result.status = status;
+    result.requested_width = width;
+    result.requested_height = height;
+    result.requested_output_mask = requested_mask;
+    result.supported_output_mask = supported_target_output_mask_;
+    result.masked_output_mask =
+        requested_mask & ~supported_target_output_mask_;
+    result.active_width = image_w_;
+    result.active_height = image_h_;
+    result.allocated_output_mask = target_allocated_output_mask_;
+    result.estimated_bytes = estimated_bytes;
+    result.allocated_bytes = target_allocated_bytes_;
+    return result;
+  };
+  if (!target_formats_queried_ || !required_target_formats_supported_) {
+    PathTraceTargetFailure capability_failure = last_target_result_.failure;
+    if (!capability_failure.failed()) {
+      capability_failure.error = PathTraceTargetError::UnsupportedFormat;
+      capability_failure.stage =
+          PathTraceTargetFailureStage::ValidateFormatCapabilities;
+      capability_failure.vk_result = VK_ERROR_FORMAT_NOT_SUPPORTED;
+      capability_failure.resource = "target-format-capabilities";
+      capability_failure.usage = kPathTraceTargetImageUsage;
+    }
+    capability_failure.width = width;
+    capability_failure.height = height;
+    capability_failure.requested_output_mask = requested_mask;
+    capability_failure.estimated_bytes = estimated_bytes;
+    last_target_result_ = make_result(PathTraceTargetStatus::FailedNoTarget);
+    last_target_result_.failure = std::move(capability_failure);
+    return last_target_result_;
   }
-  VkMemoryRequirements req{};
-  vkGetImageMemoryRequirements(device_, image_, &req);
-  const auto type =
-      findMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-  if (type == std::numeric_limits<std::uint32_t>::max()) {
-    destroyImage();
-    return false;
-  }
-  VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-  ai.allocationSize = req.size;
-  ai.memoryTypeIndex = type;
-  if (vkAllocateMemory(device_, &ai, nullptr, &image_memory_) != VK_SUCCESS) {
-    destroyImage();
-    return false;
-  }
-  vkBindImageMemory(device_, image_, image_memory_, 0);
-  VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-  vi.image = image_;
-  vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
-  vi.format = VK_FORMAT_R16G16B16A16_SFLOAT;
-  vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-  if (vkCreateImageView(device_, &vi, nullptr, &image_view_) != VK_SUCCESS) {
-    destroyImage();
-    return false;
-  }
-
-  ii.format = VK_FORMAT_R32_SFLOAT;
-  if (vkCreateImage(device_, &ii, nullptr, &depth_image_) != VK_SUCCESS) {
-    destroyImage();
-    return false;
-  }
-  VkMemoryRequirements depth_req{};
-  vkGetImageMemoryRequirements(device_, depth_image_, &depth_req);
-  const auto depth_type = findMemoryType(
-      depth_req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-  if (depth_type == (std::numeric_limits<std::uint32_t>::max)()) {
-    destroyImage();
-    return false;
-  }
-  VkMemoryAllocateInfo depth_ai{
-      VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-  depth_ai.allocationSize = depth_req.size;
-  depth_ai.memoryTypeIndex = depth_type;
-  if (vkAllocateMemory(device_, &depth_ai, nullptr, &depth_image_memory_) !=
-      VK_SUCCESS) {
-    destroyImage();
-    return false;
-  }
-  if (vkBindImageMemory(device_, depth_image_, depth_image_memory_, 0) !=
-      VK_SUCCESS) {
-    destroyImage();
-    return false;
-  }
-  VkImageViewCreateInfo depth_vi{
-      VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-  depth_vi.image = depth_image_;
-  depth_vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
-  depth_vi.format = VK_FORMAT_R32_SFLOAT;
-  depth_vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-  if (vkCreateImageView(device_, &depth_vi, nullptr, &depth_image_view_) !=
-      VK_SUCCESS) {
-    destroyImage();
-    return false;
-  }
-
-  ii.format = VK_FORMAT_R16G16B16A16_SFLOAT;
-  ii.arrayLayers =
-      static_cast<std::uint32_t>(PathTraceAovLayer::Count);
-  if (vkCreateImage(device_, &ii, nullptr, &aov_image_) != VK_SUCCESS) {
-    destroyImage();
-    return false;
-  }
-  VkMemoryRequirements aov_req{};
-  vkGetImageMemoryRequirements(device_, aov_image_, &aov_req);
-  const auto aov_type = findMemoryType(
-      aov_req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-  if (aov_type == (std::numeric_limits<std::uint32_t>::max)()) {
-    destroyImage();
-    return false;
-  }
-  VkMemoryAllocateInfo aov_ai{
-      VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-  aov_ai.allocationSize = aov_req.size;
-  aov_ai.memoryTypeIndex = aov_type;
-  if (vkAllocateMemory(device_, &aov_ai, nullptr, &aov_image_memory_) !=
-          VK_SUCCESS ||
-      vkBindImageMemory(device_, aov_image_, aov_image_memory_, 0) !=
-          VK_SUCCESS) {
-    destroyImage();
-    return false;
-  }
-  VkImageViewCreateInfo aov_view_info{
-      VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-  aov_view_info.image = aov_image_;
-  aov_view_info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-  aov_view_info.format = VK_FORMAT_R16G16B16A16_SFLOAT;
-  aov_view_info.subresourceRange = {
-      VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
-      static_cast<std::uint32_t>(PathTraceAovLayer::Count)};
-  if (vkCreateImageView(device_, &aov_view_info, nullptr,
-                        &aov_array_view_) != VK_SUCCESS) {
-    destroyImage();
-    return false;
-  }
-  aov_view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-  aov_view_info.subresourceRange.layerCount = 1;
-  for (std::size_t layer = 0; layer < aov_layer_views_.size(); ++layer) {
-    aov_view_info.subresourceRange.baseArrayLayer =
-        static_cast<std::uint32_t>(layer);
-    if (vkCreateImageView(device_, &aov_view_info, nullptr,
-                          &aov_layer_views_[layer]) != VK_SUCCESS) {
-      destroyImage();
+  target_stats_.requested_output_mask = requested_mask;
+  target_stats_.supported_output_mask = supported_target_output_mask_;
+  target_stats_.masked_output_mask =
+      requested_mask & ~supported_target_output_mask_;
+  auto active_complete_for = [&](std::uint32_t mask) {
+    if (image_ == VK_NULL_HANDLE || image_memory_ == VK_NULL_HANDLE ||
+        image_view_ == VK_NULL_HANDLE || depth_image_ == VK_NULL_HANDLE ||
+        depth_image_memory_ == VK_NULL_HANDLE ||
+        depth_image_view_ == VK_NULL_HANDLE) {
       return false;
+    }
+    if ((mask & kPathTraceAllAovOutputMask) != 0u &&
+        (aov_image_ == VK_NULL_HANDLE ||
+         aov_image_memory_ == VK_NULL_HANDLE ||
+         aov_array_view_ == VK_NULL_HANDLE)) {
+      return false;
+    }
+    if ((mask & kPathTraceStatisticsOutputMask) != 0u &&
+        (statistics_image_ == VK_NULL_HANDLE ||
+         statistics_image_memory_ == VK_NULL_HANDLE ||
+         statistics_image_view_ == VK_NULL_HANDLE)) {
+      return false;
+    }
+    const auto guide_complete = [&](std::uint32_t bit, VkImage image,
+                                    VkDeviceMemory memory, VkImageView view) {
+      return (mask & bit) == 0u ||
+             (image != VK_NULL_HANDLE && memory != VK_NULL_HANDLE &&
+              view != VK_NULL_HANDLE);
+    };
+    return guide_complete(kPathTraceRrMotionOutputMask, rr_motion_image_,
+                          rr_motion_image_memory_, rr_motion_image_view_) &&
+           guide_complete(
+               pathTraceOptionalOutputBit(
+                   PathTraceOptionalOutput::RrDiffuseAlbedo),
+               rr_diffuse_albedo_image_, rr_diffuse_albedo_image_memory_,
+               rr_diffuse_albedo_image_view_) &&
+           guide_complete(
+               pathTraceOptionalOutputBit(
+                   PathTraceOptionalOutput::RrSpecularAlbedo),
+               rr_specular_albedo_image_, rr_specular_albedo_image_memory_,
+               rr_specular_albedo_image_view_) &&
+           guide_complete(
+               pathTraceOptionalOutputBit(
+                   PathTraceOptionalOutput::RrNormalRoughness),
+               rr_normal_roughness_image_, rr_normal_roughness_image_memory_,
+               rr_normal_roughness_image_view_) &&
+           guide_complete(
+               pathTraceOptionalOutputBit(
+                   PathTraceOptionalOutput::RrSpecularHitDistance),
+               rr_specular_hit_distance_image_,
+               rr_specular_hit_distance_image_memory_,
+               rr_specular_hit_distance_image_view_);
+  };
+  const bool any_active = active_complete_for(target_allocated_output_mask_);
+  if (estimate_valid && image_w_ == width && image_h_ == height &&
+      target_allocated_output_mask_ == allocated_mask &&
+      active_complete_for(allocated_mask)) {
+    target_requested_output_mask_ = requested_mask;
+    target_estimated_bytes_ = estimated_bytes;
+    target_stats_.requested_output_mask = requested_mask;
+    target_stats_.allocated_output_mask = allocated_mask;
+    target_stats_.image_count = target_image_count_;
+    target_stats_.estimated_bytes = target_estimated_bytes_;
+    target_stats_.allocated_bytes = target_allocated_bytes_;
+    consecutive_target_failures_ = 0u;
+    target_retry_not_before_ns_ = 0u;
+    last_target_result_ = make_result(PathTraceTargetStatus::Exact);
+    last_target_result_.allocated_output_mask = allocated_mask;
+    return last_target_result_;
+  }
+
+  const std::uint64_t now_ns = steadyNowNs();
+  const bool same_failed_key =
+      failed_target_width_ == width && failed_target_height_ == height &&
+      failed_target_output_mask_ == allocated_mask;
+  if (same_failed_key && now_ns < target_retry_not_before_ns_) {
+    PathTraceTargetFailure previous_failure = last_target_result_.failure;
+    last_target_result_ = make_result(PathTraceTargetStatus::RetryDeferred);
+    last_target_result_.failure = std::move(previous_failure);
+    const std::uint64_t remaining_ns = target_retry_not_before_ns_ - now_ns;
+    last_target_result_.retry_after_ms = static_cast<std::uint32_t>(
+        (std::min)(remaining_ns / 1000000u + 1u,
+                   static_cast<std::uint64_t>((std::numeric_limits<
+                       std::uint32_t>::max)())));
+    ++target_stats_.deferred_retries;
+    return last_target_result_;
+  }
+
+  TargetBundle candidate;
+  candidate.width = width;
+  candidate.height = height;
+  candidate.requested_output_mask = requested_mask;
+  candidate.allocated_output_mask = allocated_mask;
+  candidate.estimated_bytes = estimated_bytes;
+  PathTraceTargetFailure candidate_failure;
+  auto set_failure = [&](PathTraceTargetFailureStage stage, VkResult result,
+                         VkFormat format, const char *resource,
+                         std::uint32_t memory_type =
+                             (std::numeric_limits<std::uint32_t>::max)()) {
+    if (candidate_failure.failed()) {
+      return;
+    }
+    candidate_failure.error = classifyTargetFailure(stage, result);
+    candidate_failure.stage = stage;
+    candidate_failure.vk_result = result;
+    candidate_failure.format = format;
+    candidate_failure.width = width;
+    candidate_failure.height = height;
+    candidate_failure.requested_output_mask = requested_mask;
+    candidate_failure.estimated_bytes = estimated_bytes;
+    candidate_failure.usage = kPathTraceTargetImageUsage;
+    if (memory_budget_supported_) {
+      const PathTraceMemoryBudget budget =
+          queryDeviceLocalMemoryBudget(phys_, memory_type);
+      if (budget.valid) {
+        candidate_failure.memory_type = budget.memory_type;
+        candidate_failure.heap = budget.heap;
+        candidate_failure.heap_budget = budget.budget;
+        candidate_failure.heap_usage = budget.usage;
+      }
+    }
+    candidate_failure.resource = resource;
+  };
+  auto finish_failure = [&]() {
+    destroyTargetBundle(candidate);
+    const bool repeated = failed_target_width_ == width &&
+                          failed_target_height_ == height &&
+                          failed_target_output_mask_ == allocated_mask;
+    consecutive_target_failures_ =
+        repeated ? consecutive_target_failures_ + 1u : 1u;
+    failed_target_width_ = width;
+    failed_target_height_ = height;
+    failed_target_output_mask_ = allocated_mask;
+    const std::uint32_t shift =
+        (std::min)(consecutive_target_failures_ - 1u, 4u);
+    const std::uint32_t delay_ms = 250u << shift;
+    target_retry_not_before_ns_ =
+        steadyNowNs() + static_cast<std::uint64_t>(delay_ms) * 1000000u;
+    ++target_stats_.failed_rebuilds;
+    last_target_result_ = make_result(
+        any_active ? PathTraceTargetStatus::PreviousRetained
+                   : PathTraceTargetStatus::FailedNoTarget);
+    last_target_result_.failure = candidate_failure;
+    last_target_result_.retry_after_ms = delay_ms;
+    xpbd::log::errorf(
+        "Path-trace target rebuild failed: api=%s VkResult=%d resource=%s "
+        "format=%d extent=%ux%ux1 usage=0x%x requested_mask=0x%04x "
+        "allocated_mask=0x%04x estimated_bytes=%llu retry_ms=%u "
+        "memory_type=%u heap=%u heap_budget=%llu heap_usage=%llu "
+        "frame_slot=unknown still_job_id=unknown previous_retained=%d",
+        targetStageName(candidate_failure.stage),
+        static_cast<int>(candidate_failure.vk_result),
+        candidate_failure.resource.c_str(),
+        static_cast<int>(candidate_failure.format), width, height,
+        static_cast<unsigned>(candidate_failure.usage),
+        static_cast<unsigned>(requested_mask),
+        static_cast<unsigned>(allocated_mask),
+        static_cast<unsigned long long>(estimated_bytes), delay_ms,
+        candidate_failure.memory_type, candidate_failure.heap,
+        static_cast<unsigned long long>(candidate_failure.heap_budget),
+        static_cast<unsigned long long>(candidate_failure.heap_usage),
+        any_active ? 1 : 0);
+    return last_target_result_;
+  };
+  if (!estimate_valid) {
+    set_failure(PathTraceTargetFailureStage::AllocateMemory,
+                VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_FORMAT_UNDEFINED,
+                "target-byte-estimate");
+    return finish_failure();
+  }
+  if (memory_budget_supported_) {
+    const PathTraceMemoryBudget budget =
+        queryDeviceLocalMemoryBudget(phys_);
+    if (budget.valid) {
+      constexpr VkDeviceSize kMinimumSafetyReserve =
+          64ull * 1024ull * 1024ull;
+      const double requested_safety_factor =
+          std::isfinite(requirements.budget_safety_factor)
+              ? static_cast<double>(requirements.budget_safety_factor)
+              : 1.10;
+      const double safety_factor =
+          std::clamp(requested_safety_factor, 1.0, 2.0);
+      const double scaled_bytes =
+          static_cast<double>(estimated_bytes) * safety_factor;
+      const VkDeviceSize factor_reserve =
+          scaled_bytes >=
+                  static_cast<double>(
+                      (std::numeric_limits<VkDeviceSize>::max)())
+              ? (std::numeric_limits<VkDeviceSize>::max)()
+              : static_cast<VkDeviceSize>(std::ceil(scaled_bytes)) -
+                    estimated_bytes;
+      const VkDeviceSize safety_reserve =
+          (std::max)(kMinimumSafetyReserve, factor_reserve);
+      const VkDeviceSize required =
+          estimated_bytes >
+                  (std::numeric_limits<VkDeviceSize>::max)() - safety_reserve
+              ? (std::numeric_limits<VkDeviceSize>::max)()
+              : estimated_bytes + safety_reserve;
+      if (budget.available() < required) {
+        set_failure(PathTraceTargetFailureStage::BudgetPreflight,
+                    VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_FORMAT_UNDEFINED,
+                    "target-bundle-budget", budget.memory_type);
+        return finish_failure();
+      }
     }
   }
 
-  ii.format = VK_FORMAT_R32G32B32A32_SFLOAT;
-  ii.arrayLayers = 1;
-  if (vkCreateImage(device_, &ii, nullptr, &statistics_image_) !=
-      VK_SUCCESS) {
-    destroyImage();
-    return false;
+  auto create_image = [&](VkFormat format, std::uint32_t array_layers,
+                          VkImageViewType view_type, const char *resource,
+                          VkImage &image, VkDeviceMemory &memory,
+                          VkImageView &view) {
+    VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    image_info.imageType = VK_IMAGE_TYPE_2D;
+    image_info.format = format;
+    image_info.extent = {width, height, 1u};
+    image_info.mipLevels = 1u;
+    image_info.arrayLayers = array_layers;
+    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_info.usage = kPathTraceTargetImageUsage;
+    image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkResult result =
+        vkCreateImage(device_, &image_info, nullptr, &image);
+    if (result != VK_SUCCESS) {
+      set_failure(PathTraceTargetFailureStage::CreateImage, result, format,
+                  resource);
+      return false;
+    }
+    VkMemoryRequirements memory_requirements{};
+    vkGetImageMemoryRequirements(device_, image, &memory_requirements);
+    const std::uint32_t memory_type = findMemoryType(
+        memory_requirements.memoryTypeBits,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (memory_type == (std::numeric_limits<std::uint32_t>::max)()) {
+      set_failure(PathTraceTargetFailureStage::SelectMemoryType,
+                  VK_ERROR_FEATURE_NOT_PRESENT, format, resource);
+      return false;
+    }
+    VkMemoryAllocateInfo allocation{
+        VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocation.allocationSize = memory_requirements.size;
+    allocation.memoryTypeIndex = memory_type;
+    result = vkAllocateMemory(device_, &allocation, nullptr, &memory);
+    if (result != VK_SUCCESS) {
+      set_failure(PathTraceTargetFailureStage::AllocateMemory, result, format,
+                  resource, memory_type);
+      return false;
+    }
+    result = vkBindImageMemory(device_, image, memory, 0u);
+    if (result != VK_SUCCESS) {
+      set_failure(PathTraceTargetFailureStage::BindImageMemory, result, format,
+                  resource, memory_type);
+      return false;
+    }
+    VkImageViewCreateInfo view_info{
+        VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    view_info.image = image;
+    view_info.viewType = view_type;
+    view_info.format = format;
+    view_info.subresourceRange = {
+        VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, array_layers};
+    result = vkCreateImageView(device_, &view_info, nullptr, &view);
+    if (result != VK_SUCCESS) {
+      set_failure(PathTraceTargetFailureStage::CreateImageView, result, format,
+                  resource, memory_type);
+      return false;
+    }
+    if (candidate.allocated_bytes >
+        (std::numeric_limits<VkDeviceSize>::max)() -
+            memory_requirements.size) {
+      set_failure(PathTraceTargetFailureStage::AllocateMemory,
+                  VK_ERROR_OUT_OF_DEVICE_MEMORY, format, resource);
+      return false;
+    }
+    candidate.allocated_bytes += memory_requirements.size;
+    ++candidate.image_count;
+    return true;
+  };
+
+  if (!create_image(VK_FORMAT_R16G16B16A16_SFLOAT, 1u,
+                    VK_IMAGE_VIEW_TYPE_2D, "color", candidate.image,
+                    candidate.image_memory, candidate.image_view) ||
+      !create_image(VK_FORMAT_R32_SFLOAT, 1u, VK_IMAGE_VIEW_TYPE_2D,
+                    "depth", candidate.depth_image,
+                    candidate.depth_image_memory,
+                    candidate.depth_image_view)) {
+    return finish_failure();
   }
-  VkMemoryRequirements statistics_req{};
-  vkGetImageMemoryRequirements(device_, statistics_image_,
-                               &statistics_req);
-  const auto statistics_type = findMemoryType(
-      statistics_req.memoryTypeBits,
-      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-  if (statistics_type == (std::numeric_limits<std::uint32_t>::max)()) {
-    destroyImage();
-    return false;
+  if ((allocated_mask & kPathTraceAllAovOutputMask) != 0u) {
+    constexpr std::uint32_t kAovLayers =
+        static_cast<std::uint32_t>(PathTraceAovLayer::Count);
+    if (!create_image(VK_FORMAT_R16G16B16A16_SFLOAT, kAovLayers,
+                      VK_IMAGE_VIEW_TYPE_2D_ARRAY, "aov-array",
+                      candidate.aov_image, candidate.aov_image_memory,
+                      candidate.aov_array_view)) {
+      return finish_failure();
+    }
+    VkImageViewCreateInfo layer_view{
+        VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    layer_view.image = candidate.aov_image;
+    layer_view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    layer_view.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    layer_view.subresourceRange = {
+        VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
+    for (std::size_t layer = 0; layer < candidate.aov_layer_views.size();
+         ++layer) {
+      layer_view.subresourceRange.baseArrayLayer =
+          static_cast<std::uint32_t>(layer);
+      const VkResult result = vkCreateImageView(
+          device_, &layer_view, nullptr, &candidate.aov_layer_views[layer]);
+      if (result != VK_SUCCESS) {
+        set_failure(PathTraceTargetFailureStage::CreateImageView, result,
+                    VK_FORMAT_R16G16B16A16_SFLOAT, "aov-layer-view");
+        return finish_failure();
+      }
+    }
   }
-  VkMemoryAllocateInfo statistics_ai{
-      VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-  statistics_ai.allocationSize = statistics_req.size;
-  statistics_ai.memoryTypeIndex = statistics_type;
-  if (vkAllocateMemory(device_, &statistics_ai, nullptr,
-                       &statistics_image_memory_) != VK_SUCCESS ||
-      vkBindImageMemory(device_, statistics_image_,
-                        statistics_image_memory_, 0) != VK_SUCCESS) {
-    destroyImage();
-    return false;
+  if ((allocated_mask & kPathTraceStatisticsOutputMask) != 0u &&
+      !create_image(VK_FORMAT_R32G32B32A32_SFLOAT, 1u,
+                    VK_IMAGE_VIEW_TYPE_2D, "statistics",
+                    candidate.statistics_image,
+                    candidate.statistics_image_memory,
+                    candidate.statistics_image_view)) {
+    return finish_failure();
   }
-  VkImageViewCreateInfo statistics_view_info{
-      VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-  statistics_view_info.image = statistics_image_;
-  statistics_view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-  statistics_view_info.format = VK_FORMAT_R32G32B32A32_SFLOAT;
-  statistics_view_info.subresourceRange =
-      {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-  if (vkCreateImageView(device_, &statistics_view_info, nullptr,
-                        &statistics_image_view_) != VK_SUCCESS) {
-    destroyImage();
-    return false;
+  const auto needs = [&](PathTraceOptionalOutput output) {
+    return (allocated_mask & pathTraceOptionalOutputBit(output)) != 0u;
+  };
+  if (needs(PathTraceOptionalOutput::RrMotion) &&
+      !create_image(VK_FORMAT_R32G32_SFLOAT, 1u, VK_IMAGE_VIEW_TYPE_2D,
+                    "rr-motion", candidate.rr_motion_image,
+                    candidate.rr_motion_image_memory,
+                    candidate.rr_motion_image_view)) {
+    return finish_failure();
+  }
+  if (needs(PathTraceOptionalOutput::RrDiffuseAlbedo) &&
+      !create_image(VK_FORMAT_R16G16B16A16_SFLOAT, 1u,
+                    VK_IMAGE_VIEW_TYPE_2D, "rr-diffuse-albedo",
+                    candidate.rr_diffuse_albedo_image,
+                    candidate.rr_diffuse_albedo_image_memory,
+                    candidate.rr_diffuse_albedo_image_view)) {
+    return finish_failure();
+  }
+  if (needs(PathTraceOptionalOutput::RrSpecularAlbedo) &&
+      !create_image(VK_FORMAT_R16G16B16A16_SFLOAT, 1u,
+                    VK_IMAGE_VIEW_TYPE_2D, "rr-specular-albedo",
+                    candidate.rr_specular_albedo_image,
+                    candidate.rr_specular_albedo_image_memory,
+                    candidate.rr_specular_albedo_image_view)) {
+    return finish_failure();
+  }
+  if (needs(PathTraceOptionalOutput::RrNormalRoughness) &&
+      !create_image(VK_FORMAT_R16G16B16A16_SFLOAT, 1u,
+                    VK_IMAGE_VIEW_TYPE_2D, "rr-normal-roughness",
+                    candidate.rr_normal_roughness_image,
+                    candidate.rr_normal_roughness_image_memory,
+                    candidate.rr_normal_roughness_image_view)) {
+    return finish_failure();
+  }
+  if (needs(PathTraceOptionalOutput::RrSpecularHitDistance) &&
+      !create_image(VK_FORMAT_R32_SFLOAT, 1u, VK_IMAGE_VIEW_TYPE_2D,
+                    "rr-specular-hit-distance",
+                    candidate.rr_specular_hit_distance_image,
+                    candidate.rr_specular_hit_distance_image_memory,
+                    candidate.rr_specular_hit_distance_image_view)) {
+    return finish_failure();
   }
 
-  auto create_rr_guide =
-      [&](VkFormat format, VkImage &image, VkDeviceMemory &memory,
-          VkImageView &view) {
-        ii.format = format;
-        ii.arrayLayers = 1u;
-        if (vkCreateImage(device_, &ii, nullptr, &image) != VK_SUCCESS) {
-          return false;
-        }
-        VkMemoryRequirements guide_requirements{};
-        vkGetImageMemoryRequirements(
-            device_, image, &guide_requirements);
-        const std::uint32_t guide_type = findMemoryType(
-            guide_requirements.memoryTypeBits,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (guide_type ==
-            (std::numeric_limits<std::uint32_t>::max)()) {
-          return false;
-        }
-        VkMemoryAllocateInfo guide_allocation{
-            VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        guide_allocation.allocationSize = guide_requirements.size;
-        guide_allocation.memoryTypeIndex = guide_type;
-        if (vkAllocateMemory(
-                device_, &guide_allocation, nullptr, &memory) !=
-                VK_SUCCESS ||
-            vkBindImageMemory(device_, image, memory, 0u) !=
-                VK_SUCCESS) {
-          return false;
-        }
-        VkImageViewCreateInfo guide_view{
-            VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        guide_view.image = image;
-        guide_view.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        guide_view.format = format;
-        guide_view.subresourceRange = {
-            VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
-        return vkCreateImageView(
-                   device_, &guide_view, nullptr, &view) ==
-               VK_SUCCESS;
-      };
-  if (!create_rr_guide(
-          VK_FORMAT_R32G32_SFLOAT, rr_motion_image_,
-          rr_motion_image_memory_, rr_motion_image_view_) ||
-      !create_rr_guide(
-          VK_FORMAT_R16G16B16A16_SFLOAT, rr_diffuse_albedo_image_,
-          rr_diffuse_albedo_image_memory_,
-          rr_diffuse_albedo_image_view_) ||
-      !create_rr_guide(
-          VK_FORMAT_R16G16B16A16_SFLOAT, rr_specular_albedo_image_,
-          rr_specular_albedo_image_memory_,
-          rr_specular_albedo_image_view_) ||
-      !create_rr_guide(
-          VK_FORMAT_R16G16B16A16_SFLOAT, rr_normal_roughness_image_,
-          rr_normal_roughness_image_memory_,
-          rr_normal_roughness_image_view_) ||
-      !create_rr_guide(
-          VK_FORMAT_R32_SFLOAT, rr_specular_hit_distance_image_,
-          rr_specular_hit_distance_image_memory_,
-          rr_specular_hit_distance_image_view_)) {
-    destroyImage();
-    return false;
-  }
-
-  image_w_ = width;
-  image_h_ = height;
-  image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-  depth_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-  aov_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-  statistics_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-  rr_motion_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-  rr_diffuse_albedo_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-  rr_specular_albedo_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-  rr_normal_roughness_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-  rr_specular_hit_distance_image_layout_ =
-      VK_IMAGE_LAYOUT_UNDEFINED;
+  swapActiveTarget(candidate);
+  destroyTargetBundle(candidate);
+  history_key_ = 0u;
+  accumulated_samples_ = 0u;
+  history_valid_ = false;
   ++history_generation_;
+  compute_descriptor_key_ = {};
+  compute_descriptor_key_valid_ = false;
+  rt_pipeline_.invalidateDescriptorCache();
 
   std::array<VkDescriptorImageInfo, 3> descriptor_images{};
   descriptor_images[0].imageView = image_view_;
   descriptor_images[1].imageView = depth_image_view_;
   descriptor_images[2].imageView = image_view_;
   for (auto &descriptor_image : descriptor_images) {
-    descriptor_image.imageLayout =
-        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    descriptor_image.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     descriptor_image.sampler = sampler_;
   }
   std::array<VkWriteDescriptorSet, 3> writes{};
@@ -1586,8 +2378,32 @@ bool VulkanPathTracer::ensureTarget(std::uint32_t width, std::uint32_t height) {
     writes[binding].pImageInfo = &descriptor_images[binding];
   }
   vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()),
-                         writes.data(), 0, nullptr);
-  return true;
+                         writes.data(), 0u, nullptr);
+
+  failed_target_width_ = 0u;
+  failed_target_height_ = 0u;
+  failed_target_output_mask_ = 0u;
+  consecutive_target_failures_ = 0u;
+  target_retry_not_before_ns_ = 0u;
+  target_stats_.requested_output_mask = target_requested_output_mask_;
+  target_stats_.allocated_output_mask = target_allocated_output_mask_;
+  target_stats_.image_count = target_image_count_;
+  target_stats_.estimated_bytes = target_estimated_bytes_;
+  target_stats_.allocated_bytes = target_allocated_bytes_;
+  ++target_stats_.successful_rebuilds;
+  last_target_result_ = make_result(PathTraceTargetStatus::Exact);
+  last_target_result_.allocated_output_mask = target_allocated_output_mask_;
+  last_target_result_.allocated_bytes = target_allocated_bytes_;
+  xpbd::log::infof(
+      "Path-trace target committed: resolution=%ux%u requested_mask=0x%04x "
+      "allocated_mask=0x%04x estimated_bytes=%llu allocated_bytes=%llu "
+      "images=%u",
+      width, height, static_cast<unsigned>(requested_mask),
+      static_cast<unsigned>(target_allocated_output_mask_),
+      static_cast<unsigned long long>(target_estimated_bytes_),
+      static_cast<unsigned long long>(target_allocated_bytes_),
+      target_image_count_);
+  return last_target_result_;
 }
 
 void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
@@ -1596,7 +2412,10 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
                                       VkImageView albedo_view,
                                       VkImageView normal_view,
                                       VkImageView specular_view,
-                                      VkSampler albedo_sampler) {
+                                      VkSampler albedo_sampler,
+                                      VkSampler normal_sampler,
+                                      VkSampler specular_sampler) {
+  last_dispatch_recorded_ = false;
   descriptor_write_calls_ = 0;
   descriptor_cache_hits_ = 0;
   descriptor_entries_written_ = 0;
@@ -1608,7 +2427,7 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
   const bool diagnostic_aovs_requested =
       !aov_summary_path_.empty() && !capture_completed_;
   last_output_write_mask_ = params.output_write_mask;
-  if (debug_requested || diagnostic_aovs_requested) {
+  if (diagnostic_aovs_requested) {
     last_output_write_mask_ |=
         kPathTraceAllAovOutputMask | kPathTraceStatisticsOutputMask;
   }
@@ -1616,11 +2435,30 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
   // This slot's frame fence has been waited before the backend records its
   // next frame, so a copy queued on the prior use is now host-visible.
   flushPendingCapture();
+  target_requirement_hint_mask_ = last_output_write_mask_;
+  const PathTraceTargetResult target_result = ensureTarget(
+      params.width, params.height,
+      PathTraceTargetRequirements{last_output_write_mask_});
+  last_output_write_mask_ &= target_allocated_output_mask_;
+  constexpr std::uint32_t kDiagnosticOutputMask =
+      kPathTraceAllAovOutputMask | kPathTraceStatisticsOutputMask;
+  if (diagnostic_aovs_requested &&
+      (target_result.allocated_output_mask & kDiagnosticOutputMask) !=
+          kDiagnosticOutputMask) {
+    xpbd::log::errorf(
+        "Path-trace AOV summary disabled: required optional target format is "
+        "unsupported (required=0x%04x allocated=0x%04x supported=0x%04x)",
+        static_cast<unsigned>(kDiagnosticOutputMask),
+        static_cast<unsigned>(target_result.allocated_output_mask),
+        static_cast<unsigned>(target_result.supported_output_mask));
+    aov_summary_path_.clear();
+    last_output_write_mask_ &= ~kDiagnosticOutputMask;
+  }
+  if (!target_result.exact()) {
+    return;
+  }
   if (!ready() || !scene.ready() || !image_ || !depth_image_ ||
-      !aov_image_ || !statistics_image_ || !rr_motion_image_ ||
-      !rr_diffuse_albedo_image_ || !rr_specular_albedo_image_ ||
-      !rr_normal_roughness_image_ ||
-      !rr_specular_hit_distance_image_ || !ensureMotionFrame()) {
+      !ensureMotionFrame() || !ensureDummyStorageImages()) {
     return;
   }
   if (!scene.normalBuffer() || !scene.indexAttribBuffer() ||
@@ -1681,15 +2519,23 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
       return;
     }
   }
+  const bool rt_optional_descriptors_ready =
+      descriptor_binding_partially_bound_enabled_ ||
+      (dummy_rgba32_view_ != VK_NULL_HANDLE &&
+       dummy_rg32_view_ != VK_NULL_HANDLE);
   const bool try_rt_pipeline =
       rt_pipeline_.ready() &&
       settings.nvidia_rt_core_acceleration &&
-      !settings.force_software_fallback;
+      !settings.force_software_fallback && rt_optional_descriptors_ready;
   const VkPipelineStageFlags dispatch_stages =
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
       (try_rt_pipeline ? VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR : 0u);
   if (!try_rt_pipeline && !rt_fallback_logged_) {
-    if (rt_pipeline_.ready() &&
+    if (rt_pipeline_.ready() && !rt_optional_descriptors_ready) {
+      xpbd::log::warn(
+          "Vulkan RT Pipeline disabled because an optional storage-image "
+          "format is unavailable; using compatibility ray-query path");
+    } else if (rt_pipeline_.ready() &&
         (!settings.nvidia_rt_core_acceleration ||
          settings.force_software_fallback)) {
       xpbd::log::infof(
@@ -1740,6 +2586,39 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
     fallback_albedo_cleared_ = true;
   }
 
+  std::array<VkImageMemoryBarrier, 4> dummy_barriers{};
+  std::uint32_t dummy_barrier_count = 0u;
+  auto prepare_dummy = [&](VkImage image, VkImageLayout &layout,
+                           std::uint32_t layer_count) {
+    if (image == VK_NULL_HANDLE || layout == VK_IMAGE_LAYOUT_GENERAL) {
+      return;
+    }
+    VkImageMemoryBarrier &barrier = dummy_barriers[dummy_barrier_count++];
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = layout;
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image;
+    barrier.subresourceRange = {
+        VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, layer_count};
+    barrier.srcAccessMask = 0u;
+    barrier.dstAccessMask =
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    layout = VK_IMAGE_LAYOUT_GENERAL;
+  };
+  prepare_dummy(
+      dummy_rgba16_image_, dummy_rgba16_layout_,
+      static_cast<std::uint32_t>(PathTraceAovLayer::Count));
+  prepare_dummy(dummy_rgba32_image_, dummy_rgba32_layout_, 1u);
+  prepare_dummy(dummy_rg32_image_, dummy_rg32_layout_, 1u);
+  prepare_dummy(dummy_r32_image_, dummy_r32_layout_, 1u);
+  if (dummy_barrier_count > 0u) {
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         dispatch_stages, 0u, 0u, nullptr, 0u, nullptr,
+                         dummy_barrier_count, dummy_barriers.data());
+  }
+
   // Descriptors for this frame's AS + attribute buffers + albedo.
   VkWriteDescriptorSetAccelerationStructureKHR as_info{
       VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
@@ -1754,26 +2633,43 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
   depth_img.imageView = depth_image_view_;
   depth_img.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
   VkDescriptorImageInfo aov_img{};
-  aov_img.imageView = aov_array_view_;
+  aov_img.imageView = aov_array_view_ != VK_NULL_HANDLE
+                          ? aov_array_view_
+                          : dummy_rgba16_array_view_;
   aov_img.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
   VkDescriptorImageInfo statistics_img{};
-  statistics_img.imageView = statistics_image_view_;
+  statistics_img.imageView = statistics_image_view_ != VK_NULL_HANDLE
+                                 ? statistics_image_view_
+                                 : dummy_rgba32_view_;
   statistics_img.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
   VkDescriptorImageInfo rr_motion_img{};
-  rr_motion_img.imageView = rr_motion_image_view_;
+  rr_motion_img.imageView = rr_motion_image_view_ != VK_NULL_HANDLE
+                                ? rr_motion_image_view_
+                                : dummy_rg32_view_;
   rr_motion_img.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
   VkDescriptorImageInfo rr_diffuse_albedo_img{};
-  rr_diffuse_albedo_img.imageView = rr_diffuse_albedo_image_view_;
+  rr_diffuse_albedo_img.imageView =
+      rr_diffuse_albedo_image_view_ != VK_NULL_HANDLE
+          ? rr_diffuse_albedo_image_view_
+          : dummy_rgba16_view_;
   rr_diffuse_albedo_img.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
   VkDescriptorImageInfo rr_specular_albedo_img{};
-  rr_specular_albedo_img.imageView = rr_specular_albedo_image_view_;
+  rr_specular_albedo_img.imageView =
+      rr_specular_albedo_image_view_ != VK_NULL_HANDLE
+          ? rr_specular_albedo_image_view_
+          : dummy_rgba16_view_;
   rr_specular_albedo_img.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
   VkDescriptorImageInfo rr_normal_roughness_img{};
-  rr_normal_roughness_img.imageView = rr_normal_roughness_image_view_;
+  rr_normal_roughness_img.imageView =
+      rr_normal_roughness_image_view_ != VK_NULL_HANDLE
+          ? rr_normal_roughness_image_view_
+          : dummy_rgba16_view_;
   rr_normal_roughness_img.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
   VkDescriptorImageInfo rr_specular_hit_distance_img{};
   rr_specular_hit_distance_img.imageView =
-      rr_specular_hit_distance_image_view_;
+      rr_specular_hit_distance_image_view_ != VK_NULL_HANDLE
+          ? rr_specular_hit_distance_image_view_
+          : dummy_r32_view_;
   rr_specular_hit_distance_img.imageLayout =
       VK_IMAGE_LAYOUT_GENERAL;
 
@@ -1831,9 +2727,14 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
   VkDescriptorImageInfo normal_map = albedo;
   normal_map.imageView =
       normal_view != VK_NULL_HANDLE ? normal_view : fallback_albedo_view_;
+  normal_map.sampler = normal_sampler != VK_NULL_HANDLE ? normal_sampler
+                                                        : normal_sampler_;
   VkDescriptorImageInfo specular_map = albedo;
   specular_map.imageView =
       specular_view != VK_NULL_HANDLE ? specular_view : fallback_albedo_view_;
+  specular_map.sampler =
+      specular_sampler != VK_NULL_HANDLE ? specular_sampler
+                                         : specular_sampler_;
 
   VkWriteDescriptorSet writes[24]{};
   writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -2008,8 +2909,20 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
       descriptor_key == compute_descriptor_key_) {
     ++descriptor_cache_hits_;
   } else {
+    std::array<VkWriteDescriptorSet, 24> valid_writes{};
+    std::uint32_t valid_write_count = 0u;
+    for (const VkWriteDescriptorSet &write : writes) {
+      const bool missing_optional_storage_image =
+          write.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE &&
+          (write.pImageInfo == nullptr ||
+           write.pImageInfo->imageView == VK_NULL_HANDLE);
+      if (!missing_optional_storage_image) {
+        valid_writes[valid_write_count++] = write;
+      }
+    }
     const auto update_begin = std::chrono::steady_clock::now();
-    vkUpdateDescriptorSets(device_, 24u, writes, 0, nullptr);
+    vkUpdateDescriptorSets(device_, valid_write_count, valid_writes.data(), 0,
+                           nullptr);
     descriptor_update_ms_ =
         std::chrono::duration<float, std::milli>(
             std::chrono::steady_clock::now() - update_begin)
@@ -2017,14 +2930,19 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
     compute_descriptor_key_ = descriptor_key;
     compute_descriptor_key_valid_ = true;
     descriptor_write_calls_ = 1;
-    descriptor_entries_written_ = 24u;
+    descriptor_entries_written_ = valid_write_count;
   }
 
-  // Transition color, depth, AOVs and exact-format RR guides to GENERAL.
+  // Transition only allocated full-resolution targets to GENERAL. Missing
+  // optional bindings point at persistent dummies that remain in GENERAL.
   std::array<VkImageMemoryBarrier, 9> barriers{};
-  auto prepare_store_barrier = [](VkImageMemoryBarrier &barrier,
-                                  VkImage image, VkImageLayout old_layout,
-                                  std::uint32_t layer_count) {
+  std::uint32_t target_barrier_count = 0u;
+  auto prepare_store_barrier = [&](VkImage image, VkImageLayout &old_layout,
+                                   std::uint32_t layer_count) {
+    if (image == VK_NULL_HANDLE) {
+      return;
+    }
+    VkImageMemoryBarrier &barrier = barriers[target_barrier_count++];
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     barrier.oldLayout = old_layout;
     barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -2038,43 +2956,29 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
                                 : VK_ACCESS_SHADER_READ_BIT;
     barrier.dstAccessMask =
         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    old_layout = VK_IMAGE_LAYOUT_GENERAL;
   };
-  prepare_store_barrier(barriers[0], image_, image_layout_, 1u);
-  prepare_store_barrier(barriers[1], depth_image_, depth_image_layout_, 1u);
+  prepare_store_barrier(image_, image_layout_, 1u);
+  prepare_store_barrier(depth_image_, depth_image_layout_, 1u);
   prepare_store_barrier(
-      barriers[2], aov_image_, aov_image_layout_,
+      aov_image_, aov_image_layout_,
       static_cast<std::uint32_t>(PathTraceAovLayer::Count));
-  prepare_store_barrier(barriers[3], statistics_image_,
-                        statistics_image_layout_, 1u);
-  prepare_store_barrier(
-      barriers[4], rr_motion_image_, rr_motion_image_layout_, 1u);
-  prepare_store_barrier(
-      barriers[5], rr_diffuse_albedo_image_,
-      rr_diffuse_albedo_image_layout_, 1u);
-  prepare_store_barrier(
-      barriers[6], rr_specular_albedo_image_,
-      rr_specular_albedo_image_layout_, 1u);
-  prepare_store_barrier(
-      barriers[7], rr_normal_roughness_image_,
-      rr_normal_roughness_image_layout_, 1u);
-  prepare_store_barrier(
-      barriers[8], rr_specular_hit_distance_image_,
-      rr_specular_hit_distance_image_layout_, 1u);
+  prepare_store_barrier(statistics_image_, statistics_image_layout_, 1u);
+  prepare_store_barrier(rr_motion_image_, rr_motion_image_layout_, 1u);
+  prepare_store_barrier(rr_diffuse_albedo_image_,
+                        rr_diffuse_albedo_image_layout_, 1u);
+  prepare_store_barrier(rr_specular_albedo_image_,
+                        rr_specular_albedo_image_layout_, 1u);
+  prepare_store_barrier(rr_normal_roughness_image_,
+                        rr_normal_roughness_image_layout_, 1u);
+  prepare_store_barrier(rr_specular_hit_distance_image_,
+                        rr_specular_hit_distance_image_layout_, 1u);
   vkCmdPipelineBarrier(cmd,
                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           dispatch_stages,
                        dispatch_stages, 0, 0, nullptr, 0,
-                       nullptr, static_cast<std::uint32_t>(barriers.size()),
+                       nullptr, target_barrier_count,
                        barriers.data());
-  image_layout_ = VK_IMAGE_LAYOUT_GENERAL;
-  depth_image_layout_ = VK_IMAGE_LAYOUT_GENERAL;
-  aov_image_layout_ = VK_IMAGE_LAYOUT_GENERAL;
-  statistics_image_layout_ = VK_IMAGE_LAYOUT_GENERAL;
-  rr_motion_image_layout_ = VK_IMAGE_LAYOUT_GENERAL;
-  rr_diffuse_albedo_image_layout_ = VK_IMAGE_LAYOUT_GENERAL;
-  rr_specular_albedo_image_layout_ = VK_IMAGE_LAYOUT_GENERAL;
-  rr_normal_roughness_image_layout_ = VK_IMAGE_LAYOUT_GENERAL;
-  rr_specular_hit_distance_image_layout_ = VK_IMAGE_LAYOUT_GENERAL;
 
   PathTracePushConstants pc{};
   float view_proj[16]{};
@@ -2201,18 +3105,20 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
                         : scene.instanceMetadataBufferBytes();
     rt_params.output_view = image_view_;
     rt_params.depth_view = depth_image_view_;
-    rt_params.aov_array_view = aov_array_view_;
-    rt_params.statistics_view = statistics_image_view_;
-    rt_params.rr_motion_view = rr_motion_image_view_;
-    rt_params.rr_diffuse_albedo_view = rr_diffuse_albedo_image_view_;
-    rt_params.rr_specular_albedo_view = rr_specular_albedo_image_view_;
-    rt_params.rr_normal_roughness_view = rr_normal_roughness_image_view_;
+    rt_params.aov_array_view = aov_img.imageView;
+    rt_params.statistics_view = statistics_img.imageView;
+    rt_params.rr_motion_view = rr_motion_img.imageView;
+    rt_params.rr_diffuse_albedo_view = rr_diffuse_albedo_img.imageView;
+    rt_params.rr_specular_albedo_view = rr_specular_albedo_img.imageView;
+    rt_params.rr_normal_roughness_view = rr_normal_roughness_img.imageView;
     rt_params.rr_specular_hit_distance_view =
-        rr_specular_hit_distance_image_view_;
+        rr_specular_hit_distance_img.imageView;
     rt_params.albedo_view = albedo.imageView;
     rt_params.normal_view = normal_map.imageView;
     rt_params.specular_view = specular_map.imageView;
     rt_params.albedo_sampler = albedo.sampler;
+    rt_params.normal_sampler = normal_map.sampler;
+    rt_params.specular_sampler = specular_map.sampler;
     rt_params.motion_frame_buffer = motion_frame_buffer_.buffer;
     rt_params.motion_frame_buffer_bytes =
         sizeof(PathTraceMotionFrameGpu);
@@ -2269,6 +3175,7 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
     const std::uint32_t gy = (params.height + 7u) / 8u;
     vkCmdDispatch(cmd, gx, gy, 1);
   }
+  last_dispatch_recorded_ = true;
 
   const VkPipelineStageFlags dispatch_source =
       traced_with_rt_pipeline ? VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
@@ -2313,14 +3220,14 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
                                      : color_bytes);
     if (ensureCaptureBuffer(capture_bytes)) {
       std::array<VkImageMemoryBarrier, 9> capture_to_transfer = barriers;
-      for (VkImageMemoryBarrier &barrier : capture_to_transfer) {
+      for (std::uint32_t index = 0u; index < target_barrier_count; ++index) {
+        VkImageMemoryBarrier &barrier = capture_to_transfer[index];
         barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
         barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
       }
-      const std::uint32_t transfer_barrier_count =
-          static_cast<std::uint32_t>(capture_to_transfer.size());
+      const std::uint32_t transfer_barrier_count = target_barrier_count;
       vkCmdPipelineBarrier(
           cmd, dispatch_source, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
           nullptr, 0, nullptr, transfer_barrier_count,
@@ -2376,7 +3283,8 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
 
       std::array<VkImageMemoryBarrier, 9> capture_to_read =
           capture_to_transfer;
-      for (VkImageMemoryBarrier &barrier : capture_to_read) {
+      for (std::uint32_t index = 0u; index < target_barrier_count; ++index) {
+        VkImageMemoryBarrier &barrier = capture_to_read[index];
         barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -2447,7 +3355,8 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
   }
   if (!capture_pending_) {
     // GENERAL -> SHADER_READ for composite color/depth sampling.
-    for (VkImageMemoryBarrier &barrier : barriers) {
+    for (std::uint32_t index = 0u; index < target_barrier_count; ++index) {
+      VkImageMemoryBarrier &barrier = barriers[index];
       barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
       barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
       barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -2458,21 +3367,34 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0, 0, nullptr, 0, nullptr,
-        static_cast<std::uint32_t>(barriers.size()), barriers.data());
+        target_barrier_count, barriers.data());
   }
   image_layout_ = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   depth_image_layout_ = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  aov_image_layout_ = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  statistics_image_layout_ = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  rr_motion_image_layout_ = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  rr_diffuse_albedo_image_layout_ =
-      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  rr_specular_albedo_image_layout_ =
-      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  rr_normal_roughness_image_layout_ =
-      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  rr_specular_hit_distance_image_layout_ =
-      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  if (aov_image_ != VK_NULL_HANDLE) {
+    aov_image_layout_ = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  }
+  if (statistics_image_ != VK_NULL_HANDLE) {
+    statistics_image_layout_ = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  }
+  if (rr_motion_image_ != VK_NULL_HANDLE) {
+    rr_motion_image_layout_ = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  }
+  if (rr_diffuse_albedo_image_ != VK_NULL_HANDLE) {
+    rr_diffuse_albedo_image_layout_ = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  }
+  if (rr_specular_albedo_image_ != VK_NULL_HANDLE) {
+    rr_specular_albedo_image_layout_ =
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  }
+  if (rr_normal_roughness_image_ != VK_NULL_HANDLE) {
+    rr_normal_roughness_image_layout_ =
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  }
+  if (rr_specular_hit_distance_image_ != VK_NULL_HANDLE) {
+    rr_specular_hit_distance_image_layout_ =
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  }
 }
 
 void VulkanPathTracer::recordComposite(

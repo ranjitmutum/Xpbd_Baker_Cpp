@@ -25,6 +25,11 @@ const uint kMaterialTextured = 1u << 0u;
 const uint kMaterialBlend = 1u << 2u;
 const float kAlphaCutoff = 0.02;
 
+float sampleAlphaBaseLevel(vec2 uv) {
+  float alpha = textureLod(albedoTexture, uv, 0.0).a;
+  return isnan(alpha) || isinf(alpha) ? 1.0 : clamp(alpha, 0.0, 1.0);
+}
+
 uint hashAlphaWord(uint value) {
   value ^= value >> 16u;
   value *= 0x7feb352du;
@@ -48,7 +53,7 @@ void main() {
   if ((flags & kMaterialTextured) != 0u) {
     vec2 uv = uvs[i0] * w0 + uvs[i1] * hitBarycentrics.x +
               uvs[i2] * hitBarycentrics.y;
-    alpha *= textureLod(albedoTexture, uv, 0.0).a;
+    alpha *= sampleAlphaBaseLevel(uv);
   }
   if (!(alpha >= kAlphaCutoff)) {
     ignoreIntersectionEXT;

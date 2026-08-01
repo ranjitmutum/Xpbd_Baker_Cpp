@@ -12,6 +12,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -81,6 +82,172 @@ struct PathTraceStillBackgroundInput {
   const float *proj = nullptr;
 };
 
+// Full-resolution color and depth are mandatory. Optional storage targets are
+// selected with the same ABI mask consumed by both path-tracing shaders.
+struct PathTraceTargetRequirements {
+  std::uint32_t output_mask = 0;
+  // Candidate allocations coexist with the active bundle until commit.
+  // Callers may increase this factor for more conservative budget admission.
+  float budget_safety_factor = 1.10f;
+
+  [[nodiscard]] constexpr bool operator==(
+      const PathTraceTargetRequirements &) const = default;
+};
+
+inline constexpr VkImageUsageFlags kPathTraceTargetImageUsage =
+    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+    VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+inline constexpr VkFormatFeatureFlags kPathTraceTargetFormatFeatures =
+    VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+    VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
+
+[[nodiscard]] constexpr bool pathTraceFormatSupports(
+    VkFormatFeatureFlags available, VkFormatFeatureFlags required) noexcept {
+  return (available & required) == required;
+}
+
+// AOVs share one ten-layer image, so one requested AOV bit expands to the
+// complete physical AOV group after unsupported outputs have been removed.
+[[nodiscard]] constexpr std::uint32_t pathTraceTargetAllocationMask(
+    std::uint32_t requested_mask,
+    std::uint32_t supported_mask = kPathTraceAllOptionalOutputMask) noexcept {
+  std::uint32_t mask = requested_mask & supported_mask &
+                       kPathTraceAllOptionalOutputMask;
+  if ((mask & kPathTraceAllAovOutputMask) != 0u) {
+    mask |= kPathTraceAllAovOutputMask;
+  }
+  return mask;
+}
+
+[[nodiscard]] constexpr std::uint32_t
+pathTraceTargetBytesPerPixel(std::uint32_t allocated_mask) noexcept {
+  allocated_mask &= kPathTraceAllOptionalOutputMask;
+  std::uint32_t bytes = 12u; // RGBA16F color + R32F depth.
+  if ((allocated_mask & kPathTraceAllAovOutputMask) != 0u) {
+    bytes += 8u * static_cast<std::uint32_t>(PathTraceAovLayer::Count);
+  }
+  if ((allocated_mask & kPathTraceStatisticsOutputMask) != 0u) {
+    bytes += 16u;
+  }
+  if ((allocated_mask & kPathTraceRrMotionOutputMask) != 0u) {
+    bytes += 8u;
+  }
+  if ((allocated_mask & pathTraceOptionalOutputBit(
+                            PathTraceOptionalOutput::RrSpecularHitDistance)) !=
+      0u) {
+    bytes += 4u;
+  }
+  constexpr std::array<PathTraceOptionalOutput, 3> kRgba16Guides{
+      PathTraceOptionalOutput::RrDiffuseAlbedo,
+      PathTraceOptionalOutput::RrSpecularAlbedo,
+      PathTraceOptionalOutput::RrNormalRoughness};
+  for (const PathTraceOptionalOutput guide : kRgba16Guides) {
+    if ((allocated_mask & pathTraceOptionalOutputBit(guide)) != 0u) {
+      bytes += 8u;
+    }
+  }
+  return bytes;
+}
+
+static_assert(pathTraceTargetAllocationMask(1u) ==
+                  kPathTraceAllAovOutputMask &&
+              pathTraceTargetBytesPerPixel(0u) == 12u &&
+              pathTraceTargetBytesPerPixel(kPathTraceAllRrGuideOutputMask) ==
+                  48u &&
+              pathTraceTargetBytesPerPixel(kPathTraceAllOptionalOutputMask) ==
+                  144u,
+              "Path-trace target allocation policy regression");
+
+enum class PathTraceTargetError : std::uint8_t {
+  None = 0,
+  UnsupportedFormat,
+  CreateImageFailed,
+  MemoryTypeUnavailable,
+  OutOfDeviceMemory,
+  OutOfHostMemory,
+  AllocationFailed,
+  BindFailed,
+  ViewCreationFailed,
+};
+
+enum class PathTraceTargetFailureStage : std::uint8_t {
+  None = 0,
+  ValidateFormatCapabilities,
+  BudgetPreflight,
+  CreateImage,
+  SelectMemoryType,
+  AllocateMemory,
+  BindImageMemory,
+  CreateImageView,
+};
+
+enum class PathTraceTargetStatus : std::uint8_t {
+  Uninitialized = 0,
+  Exact,
+  PreviousRetained,
+  RetryDeferred,
+  FailedNoTarget,
+};
+
+struct PathTraceTargetFailure {
+  PathTraceTargetError error = PathTraceTargetError::None;
+  PathTraceTargetFailureStage stage = PathTraceTargetFailureStage::None;
+  VkResult vk_result = VK_SUCCESS;
+  VkFormat format = VK_FORMAT_UNDEFINED;
+  std::uint32_t width = 0;
+  std::uint32_t height = 0;
+  std::uint32_t requested_output_mask = 0;
+  VkDeviceSize estimated_bytes = 0;
+  VkImageUsageFlags usage = 0;
+  std::uint32_t memory_type =
+      (std::numeric_limits<std::uint32_t>::max)();
+  std::uint32_t heap =
+      (std::numeric_limits<std::uint32_t>::max)();
+  VkDeviceSize heap_budget = 0;
+  VkDeviceSize heap_usage = 0;
+  std::string resource;
+
+  [[nodiscard]] bool failed() const noexcept {
+    return error != PathTraceTargetError::None;
+  }
+};
+
+struct PathTraceTargetResult {
+  PathTraceTargetStatus status = PathTraceTargetStatus::Uninitialized;
+  std::uint32_t requested_width = 0;
+  std::uint32_t requested_height = 0;
+  std::uint32_t requested_output_mask = 0;
+  std::uint32_t supported_output_mask = 0;
+  std::uint32_t masked_output_mask = 0;
+  std::uint32_t active_width = 0;
+  std::uint32_t active_height = 0;
+  std::uint32_t allocated_output_mask = 0;
+  VkDeviceSize estimated_bytes = 0;
+  VkDeviceSize allocated_bytes = 0;
+  std::uint32_t retry_after_ms = 0;
+  PathTraceTargetFailure failure{};
+
+  [[nodiscard]] bool exact() const noexcept {
+    return status == PathTraceTargetStatus::Exact;
+  }
+  [[nodiscard]] bool hasActiveTarget() const noexcept {
+    return active_width > 0 && active_height > 0;
+  }
+};
+
+struct PathTraceTargetStats {
+  std::uint32_t requested_output_mask = 0;
+  std::uint32_t supported_output_mask = 0;
+  std::uint32_t masked_output_mask = 0;
+  std::uint32_t allocated_output_mask = 0;
+  std::uint32_t image_count = 0;
+  VkDeviceSize estimated_bytes = 0;
+  VkDeviceSize allocated_bytes = 0;
+  std::uint64_t successful_rebuilds = 0;
+  std::uint64_t failed_rebuilds = 0;
+  std::uint64_t deferred_retries = 0;
+};
+
 class VulkanPathTracer {
 public:
   struct DescriptorStats {
@@ -98,7 +265,8 @@ public:
 
   [[nodiscard]] bool init(VkPhysicalDevice phys, VkDevice device,
                           VkRenderPass render_pass,
-                          bool enable_diagnostic_capture = true);
+                          bool enable_diagnostic_capture = true,
+                          bool descriptor_binding_partially_bound = false);
   void shutdown();
 
   [[nodiscard]] bool ready() const noexcept {
@@ -133,6 +301,9 @@ public:
   }
   [[nodiscard]] std::uint32_t lastOutputWriteMask() const noexcept {
     return last_output_write_mask_;
+  }
+  [[nodiscard]] bool lastDispatchRecorded() const noexcept {
+    return last_dispatch_recorded_;
   }
   [[nodiscard]] PathTraceCaptureState captureState() const noexcept {
     return runtime_capture_state_;
@@ -231,19 +402,42 @@ public:
   [[nodiscard]] std::uint32_t targetHeight() const noexcept {
     return image_h_;
   }
+  [[nodiscard]] const PathTraceTargetResult &lastTargetResult() const noexcept {
+    return last_target_result_;
+  }
+  [[nodiscard]] const PathTraceTargetFailure &
+  lastTargetFailure() const noexcept {
+    return last_target_result_.failure;
+  }
+  [[nodiscard]] PathTraceTargetStats targetStats() const noexcept {
+    return target_stats_;
+  }
+  [[nodiscard]] std::uint32_t supportedTargetOutputMask() const noexcept {
+    return supported_target_output_mask_;
+  }
 
-  // Resize path-trace storage image to at least width x height.
+  // Compatibility path used by the backend before frame parameters are fully
+  // assembled. It uses the most recently dispatched optional-output mask.
   [[nodiscard]] bool ensureTarget(std::uint32_t width, std::uint32_t height);
+  // Requirements-aware transactional rebuild. A failed candidate never
+  // mutates the active target or its accumulation history.
+  [[nodiscard]] PathTraceTargetResult
+  ensureTarget(std::uint32_t width, std::uint32_t height,
+               PathTraceTargetRequirements requirements);
 
   // Record compute path-trace into storage image (before or outside render pass).
-  // albedo_view/sampler provide model base-color (Minecraft atlas); either may
-  // be null to fall back to a 1x1 white texture.
+  // Material views/samplers provide the static atlas and its linear-data
+  // sidecars. A null view falls back to the 1x1 default texture; a null sampler
+  // uses the path tracer's role-specific base-level sampler. Alpha shares the
+  // nearest albedo sampler because coverage is stored in the base image.
   void recordDispatch(VkCommandBuffer cmd, const VulkanRtScene &scene,
                       const PathTraceFrameParams &params,
                       VkImageView albedo_view = VK_NULL_HANDLE,
                       VkImageView normal_view = VK_NULL_HANDLE,
                       VkImageView specular_view = VK_NULL_HANDLE,
-                      VkSampler albedo_sampler = VK_NULL_HANDLE);
+                      VkSampler albedo_sampler = VK_NULL_HANDLE,
+                      VkSampler normal_sampler = VK_NULL_HANDLE,
+                      VkSampler specular_sampler = VK_NULL_HANDLE);
 
   // Draw composite quad into current render pass (viewport already set).
   void recordComposite(
@@ -255,6 +449,56 @@ private:
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize capacity = 0;
+  };
+
+  struct TargetBundle {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory image_memory = VK_NULL_HANDLE;
+    VkImageView image_view = VK_NULL_HANDLE;
+    VkImage depth_image = VK_NULL_HANDLE;
+    VkDeviceMemory depth_image_memory = VK_NULL_HANDLE;
+    VkImageView depth_image_view = VK_NULL_HANDLE;
+    VkImage aov_image = VK_NULL_HANDLE;
+    VkDeviceMemory aov_image_memory = VK_NULL_HANDLE;
+    VkImageView aov_array_view = VK_NULL_HANDLE;
+    std::array<VkImageView,
+               static_cast<std::size_t>(PathTraceAovLayer::Count)>
+        aov_layer_views{};
+    VkImage statistics_image = VK_NULL_HANDLE;
+    VkDeviceMemory statistics_image_memory = VK_NULL_HANDLE;
+    VkImageView statistics_image_view = VK_NULL_HANDLE;
+    VkImage rr_motion_image = VK_NULL_HANDLE;
+    VkDeviceMemory rr_motion_image_memory = VK_NULL_HANDLE;
+    VkImageView rr_motion_image_view = VK_NULL_HANDLE;
+    VkImage rr_diffuse_albedo_image = VK_NULL_HANDLE;
+    VkDeviceMemory rr_diffuse_albedo_image_memory = VK_NULL_HANDLE;
+    VkImageView rr_diffuse_albedo_image_view = VK_NULL_HANDLE;
+    VkImage rr_specular_albedo_image = VK_NULL_HANDLE;
+    VkDeviceMemory rr_specular_albedo_image_memory = VK_NULL_HANDLE;
+    VkImageView rr_specular_albedo_image_view = VK_NULL_HANDLE;
+    VkImage rr_normal_roughness_image = VK_NULL_HANDLE;
+    VkDeviceMemory rr_normal_roughness_image_memory = VK_NULL_HANDLE;
+    VkImageView rr_normal_roughness_image_view = VK_NULL_HANDLE;
+    VkImage rr_specular_hit_distance_image = VK_NULL_HANDLE;
+    VkDeviceMemory rr_specular_hit_distance_image_memory = VK_NULL_HANDLE;
+    VkImageView rr_specular_hit_distance_image_view = VK_NULL_HANDLE;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t requested_output_mask = 0;
+    std::uint32_t allocated_output_mask = 0;
+    std::uint32_t image_count = 0;
+    VkDeviceSize estimated_bytes = 0;
+    VkDeviceSize allocated_bytes = 0;
+    VkImageLayout image_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout depth_image_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout aov_image_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout statistics_image_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout rr_motion_image_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout rr_diffuse_albedo_image_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout rr_specular_albedo_image_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout rr_normal_roughness_image_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout rr_specular_hit_distance_image_layout =
+        VK_IMAGE_LAYOUT_UNDEFINED;
   };
 
   struct ComputeDescriptorKey {
@@ -272,6 +516,8 @@ private:
                                              VkMemoryPropertyFlags props) const;
   [[nodiscard]] VkShaderModule makeModule(const std::uint32_t *words,
                                           std::size_t count) const;
+  void destroyTargetBundle(TargetBundle &bundle);
+  void swapActiveTarget(TargetBundle &bundle) noexcept;
   void destroyImage();
   void destroyMotionFrame();
   [[nodiscard]] bool ensureMotionFrame();
@@ -280,6 +526,11 @@ private:
   [[nodiscard]] bool ensureCaptureBuffer(VkDeviceSize size);
   void flushPendingCapture();
   [[nodiscard]] bool ensureFallbackAlbedo();
+  [[nodiscard]] bool ensureDummyStorageImages();
+  void destroyDummyStorageImages();
+  [[nodiscard]] bool queryTargetFormatCapabilities();
+  [[nodiscard]] VkFormatFeatureFlags
+  targetFormatFeatures(VkFormat format) const noexcept;
   [[nodiscard]] bool createPipelines(VkRenderPass render_pass);
 
   VkPhysicalDevice phys_ = VK_NULL_HANDLE;
@@ -300,12 +551,35 @@ private:
   VkDescriptorSet composite_set_ = VK_NULL_HANDLE;
   VkSampler sampler_ = VK_NULL_HANDLE;          // composite (nearest)
   VkSampler albedo_sampler_ = VK_NULL_HANDLE;   // path-trace albedo (nearest)
+  VkSampler normal_sampler_ = VK_NULL_HANDLE;   // linear data, base level only
+  VkSampler specular_sampler_ = VK_NULL_HANDLE; // linear data, base level only
 
   // 1x1 white fallback when the static model texture is unavailable.
   VkImage fallback_albedo_image_ = VK_NULL_HANDLE;
   VkDeviceMemory fallback_albedo_memory_ = VK_NULL_HANDLE;
   VkImageView fallback_albedo_view_ = VK_NULL_HANDLE;
   bool fallback_albedo_cleared_ = false;
+
+  // Persistent exact-format 1x1 storage-image fallbacks. The RGBA16F image has
+  // ten layers so it can provide both a 2D-array AOV view and a layer-zero 2D
+  // view for disabled RR guides.
+  VkImage dummy_rgba16_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory dummy_rgba16_memory_ = VK_NULL_HANDLE;
+  VkImageView dummy_rgba16_array_view_ = VK_NULL_HANDLE;
+  VkImageView dummy_rgba16_view_ = VK_NULL_HANDLE;
+  VkImageLayout dummy_rgba16_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+  VkImage dummy_rgba32_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory dummy_rgba32_memory_ = VK_NULL_HANDLE;
+  VkImageView dummy_rgba32_view_ = VK_NULL_HANDLE;
+  VkImageLayout dummy_rgba32_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+  VkImage dummy_rg32_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory dummy_rg32_memory_ = VK_NULL_HANDLE;
+  VkImageView dummy_rg32_view_ = VK_NULL_HANDLE;
+  VkImageLayout dummy_rg32_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+  VkImage dummy_r32_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory dummy_r32_memory_ = VK_NULL_HANDLE;
+  VkImageView dummy_r32_view_ = VK_NULL_HANDLE;
+  VkImageLayout dummy_r32_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
   ComputeDescriptorKey compute_descriptor_key_{};
   bool compute_descriptor_key_valid_ = false;
   std::uint64_t descriptor_write_calls_ = 0;
@@ -313,6 +587,29 @@ private:
   std::uint64_t descriptor_entries_written_ = 0;
   float descriptor_update_ms_ = 0.0f;
   std::uint32_t last_output_write_mask_ = 0;
+  bool last_dispatch_recorded_ = false;
+  std::uint32_t target_requirement_hint_mask_ = 0;
+  std::uint32_t target_requested_output_mask_ = 0;
+  std::uint32_t supported_target_output_mask_ = 0;
+  std::uint32_t target_allocated_output_mask_ = 0;
+  std::uint32_t target_image_count_ = 0;
+  VkDeviceSize target_estimated_bytes_ = 0;
+  VkDeviceSize target_allocated_bytes_ = 0;
+  PathTraceTargetResult last_target_result_{};
+  PathTraceTargetStats target_stats_{};
+  std::uint32_t failed_target_width_ = 0;
+  std::uint32_t failed_target_height_ = 0;
+  std::uint32_t failed_target_output_mask_ = 0;
+  std::uint32_t consecutive_target_failures_ = 0;
+  std::uint64_t target_retry_not_before_ns_ = 0;
+  VkFormatFeatureFlags rgba16_target_features_ = 0;
+  VkFormatFeatureFlags rgba32_target_features_ = 0;
+  VkFormatFeatureFlags rg32_target_features_ = 0;
+  VkFormatFeatureFlags r32_target_features_ = 0;
+  bool target_formats_queried_ = false;
+  bool required_target_formats_supported_ = false;
+  bool memory_budget_supported_ = false;
+  bool descriptor_binding_partially_bound_enabled_ = false;
 
   VkImage image_ = VK_NULL_HANDLE;
   VkDeviceMemory image_memory_ = VK_NULL_HANDLE;

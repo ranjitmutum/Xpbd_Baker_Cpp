@@ -24,15 +24,18 @@
 
 #include <array>
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -56,6 +59,180 @@ void expectNear(float actual, float expected, float tolerance,
 void expectNearDouble(double actual, double expected, double tolerance,
                       const char *label) {
   expect(std::abs(actual - expected) <= tolerance, label);
+}
+
+std::string readTestSource(const std::filesystem::path &relative_path) {
+  const auto path =
+      std::filesystem::path(XPBD_TEST_SOURCE_DIR) / relative_path;
+  std::ifstream input(path, std::ios::binary);
+  return {std::istreambuf_iterator<char>(input),
+          std::istreambuf_iterator<char>()};
+}
+
+std::size_t countText(std::string_view text, std::string_view needle) {
+  std::size_t count = 0;
+  for (std::size_t position = 0;
+       (position = text.find(needle, position)) != std::string_view::npos;
+       position += needle.size()) {
+    ++count;
+  }
+  return count;
+}
+
+std::string compactTestSource(std::string_view text) {
+  std::string compact;
+  compact.reserve(text.size());
+  for (const char character : text) {
+    if (!std::isspace(static_cast<unsigned char>(character))) {
+      compact.push_back(character);
+    }
+  }
+  return compact;
+}
+
+void testPathTracePbrSourceContracts() {
+  const std::string closest_hit =
+      readTestSource("src/gfx/spirv/rt_debug.rchit");
+  const std::string any_hit =
+      readTestSource("src/gfx/spirv/rt_debug.rahit");
+  const std::string raygen =
+      readTestSource("src/gfx/spirv/rt_debug.rgen");
+  const std::string compute =
+      readTestSource("src/gfx/spirv/path_trace.comp");
+  const std::string composite =
+      readTestSource("src/gfx/spirv/pt_composite.frag");
+  const std::string backend =
+      readTestSource("src/gfx/vulkan_backend.cpp");
+  const std::string rt_pipeline =
+      readTestSource("src/gfx/vulkan_rt_pipeline.cpp");
+
+  expect(!closest_hit.empty() && !any_hit.empty() && !raygen.empty() &&
+             !compute.empty() && !composite.empty() && !backend.empty() &&
+             !rt_pipeline.empty(),
+         "PBR source-contract fixtures are readable");
+  expect(closest_hit.find("sampleAlbedoBaseLevel") != std::string::npos &&
+             closest_hit.find("sampleNormalBaseLevel") != std::string::npos &&
+             closest_hit.find("sampleSpecularBaseLevel") !=
+                 std::string::npos &&
+             any_hit.find("sampleAlphaBaseLevel") != std::string::npos &&
+             compute.find("sampleAlphaBaseLevel") != std::string::npos,
+         "RT material shaders expose purpose-specific base-level samplers");
+  expect(countText(closest_hit, "textureLod(albedoTexture") == 1u &&
+             countText(closest_hit, "textureLod(normalTexture") == 1u &&
+             countText(closest_hit, "textureLod(specularTexture") == 1u &&
+             countText(any_hit, "textureLod(albedoTexture") == 1u &&
+             countText(compute, "textureLod(uAlbedo") == 2u &&
+             countText(compute, "textureLod(uNormalTexture") == 1u &&
+             countText(compute, "textureLod(uSpecularTexture") == 1u &&
+             closest_hit.find(", uv, 0.0)") != std::string::npos &&
+             compute.find(", uv, 0.0)") != std::string::npos,
+         "all RT material reads remain explicit fixed LOD 0 helper calls");
+  expect(closest_hit.find("decodeLabPbrMicrofacetAlpha") !=
+                 std::string::npos &&
+             closest_hit.find("isnan") != std::string::npos &&
+             closest_hit.find("isinf") != std::string::npos &&
+             compute.find("decodeLabPbrMicrofacetAlpha") !=
+                 std::string::npos,
+         "RT normal/specular decoding retains finite roughness safeguards");
+  expect(backend.find("static_albedo_sampler_") != std::string::npos &&
+             backend.find("static_normal_sampler_") != std::string::npos &&
+             backend.find("static_specular_sampler_") != std::string::npos &&
+             rt_pipeline.find("images[3].sampler = params.normal_sampler") !=
+                 std::string::npos &&
+             rt_pipeline.find(
+                 "images[4].sampler = params.specular_sampler") !=
+                 std::string::npos,
+         "Vulkan descriptors bind nearest albedo separately from linear data maps");
+
+  const std::string compact_raygen = compactTestSource(raygen);
+  const std::array<std::string_view, 15> raygen_descriptor_contract{{
+      "layout(set=0,binding=0)uniformaccelerationStructureEXTtopLevelAS;",
+      "layout(set=0,binding=1,rgba16f)uniformimage2DoutputImage;",
+      "layout(set=0,binding=3,std430)readonlybufferIndexBuffer{",
+      "layout(set=0,binding=10,r32f)uniformimage2DoutputDepth;",
+      "layout(set=0,binding=14)uniformsampler2DenvironmentTexture;",
+      "layout(set=0,binding=15,std430)readonlybufferEnvironmentBuffer{",
+      "layout(set=0,binding=16,std430)readonlybufferEmissiveTriangleBuffer{",
+      "layout(set=0,binding=17,std430)readonlybufferPositionBuffer{",
+      "layout(set=0,binding=18,std430)readonlybufferPreviousPositionBuffer{",
+      "layout(set=0,binding=19,std430)readonlybufferInstanceMotionBuffer{",
+      "layout(set=0,binding=20,std430)readonlybufferMotionFrameBuffer{",
+      "layout(set=0,binding=21,rgba16f)uniformimage2DArrayoutputAov;",
+      "layout(set=0,binding=22,rgba32f)uniformimage2DoutputStatistics;",
+      "layout(set=0,binding=23,rg32f)uniformimage2DoutputRrMotion;",
+      "layout(set=0,binding=27,rgba16f)uniformimage2DoutputRrNormalRoughness;",
+  }};
+  bool raygen_bindings_match = true;
+  for (const std::string_view descriptor : raygen_descriptor_contract) {
+    raygen_bindings_match =
+        raygen_bindings_match &&
+        compact_raygen.find(descriptor) != std::string::npos;
+  }
+
+  const std::string compact_pipeline = compactTestSource(rt_pipeline);
+  const std::array<std::string_view, 18> pipeline_descriptor_contract{{
+      "std::array<VkDescriptorSetLayoutBinding,28>bindings{};",
+      "bindings[index].binding=index;",
+      "bindings[index].descriptorCount=1;",
+      "bindings[index].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;",
+      "bindings[0].descriptorType=VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;",
+      "bindings[1].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;",
+      "bindings[14].descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;",
+      "bindings[21].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;",
+      "bindings[27].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;",
+      "{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,1}",
+      "{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,9}",
+      "{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,14}",
+      "{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,4}",
+      "std::array<VkWriteDescriptorSet,28>writes{};",
+      "writes[binding].dstBinding=binding;",
+      "writes[14].pImageInfo=&images[5];",
+      "writes[15].pBufferInfo=&buffers[8];",
+      "writes[27].pImageInfo=&images[12];",
+  }};
+  bool pipeline_bindings_match = true;
+  for (const std::string_view descriptor : pipeline_descriptor_contract) {
+    pipeline_bindings_match =
+        pipeline_bindings_match &&
+        compact_pipeline.find(descriptor) != std::string::npos;
+  }
+  expect(raygen_bindings_match && pipeline_bindings_match,
+         "raygen set-0 descriptor ABI matches the Vulkan 28-binding layout and writes");
+
+  const auto binding_table_position = compact_pipeline.find(
+      "std::array<VkDescriptorSetLayoutBinding,28>bindings{};");
+  const auto descriptor_layout_position =
+      compact_pipeline.find("vkCreateDescriptorSetLayout(");
+  const auto descriptor_allocation_position =
+      compact_pipeline.find("vkAllocateDescriptorSets(");
+  const auto pipeline_layout_position =
+      compact_pipeline.find("vkCreatePipelineLayout(");
+  expect(binding_table_position != std::string::npos &&
+             descriptor_layout_position != std::string::npos &&
+             descriptor_allocation_position != std::string::npos &&
+             pipeline_layout_position != std::string::npos &&
+             binding_table_position < descriptor_layout_position &&
+             descriptor_layout_position < descriptor_allocation_position &&
+             descriptor_allocation_position < pipeline_layout_position,
+         "RT descriptor table is created, allocated, then installed in pipeline order");
+
+  const auto exposure_position =
+      composite.find("color.rgb *= max(composite_push.display.x");
+  const auto white_balance_position =
+      composite.find("color.rgb *= whiteBalanceScale");
+  const auto bloom_position = composite.find("if (bloom > 0.0)");
+  const auto tone_map_position = composite.find("int toneMapping");
+  const auto transfer_position = composite.find("linearToSrgb(color.rgb)");
+  expect(exposure_position != std::string::npos &&
+             white_balance_position != std::string::npos &&
+             bloom_position != std::string::npos &&
+             tone_map_position != std::string::npos &&
+             transfer_position != std::string::npos &&
+             exposure_position < white_balance_position &&
+             white_balance_position < bloom_position &&
+             bloom_position < tone_map_position &&
+             tone_map_position < transfer_position,
+         "preview display transform remains exposure-WB-bloom-tone-map-sRGB");
 }
 
 void testLogicalFramebufferViewportContract() {
@@ -139,6 +316,11 @@ constexpr unsigned char kWhitePng[] = {
     0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82};
 
 void testTextureFromMemory() {
+  using xpbd::gfx::TextureDecodeLimits;
+  using xpbd::gfx::TextureImage;
+  using xpbd::gfx::checkedTextureRgbaByteCount;
+  using xpbd::gfx::kTextureDecodeMaximumPixels;
+
   xpbd::gfx::TextureImage img;
   std::string err;
   const bool ok = xpbd::gfx::loadTextureImageFromMemory(
@@ -154,6 +336,106 @@ void testTextureFromMemory() {
     expect(a > 0.9f, "sample alpha opaque");
   }
   expect(!err.empty() || ok, "error string only on failure");
+
+  std::size_t rgba_bytes = 99u;
+  expect(checkedTextureRgbaByteCount(1u, 1u, rgba_bytes) &&
+             rgba_bytes == 4u,
+         "texture RGBA byte count uses checked multiplication");
+  rgba_bytes = 99u;
+  expect(!checkedTextureRgbaByteCount(
+             (std::numeric_limits<std::size_t>::max)(), 2u,
+             rgba_bytes) &&
+             rgba_bytes == 0u,
+         "texture RGBA byte count rejects size_t overflow");
+
+  TextureImage preserved;
+  preserved.width = 1;
+  preserved.height = 1;
+  preserved.source_channels = 4;
+  preserved.rgba = {1u, 2u, 3u, 4u};
+  preserved.path = "preserved.png";
+  const auto outputWasPreserved = [&]() {
+    return preserved.width == 1 && preserved.height == 1 &&
+           preserved.source_channels == 4 &&
+           preserved.rgba == std::vector<std::uint8_t>({1u, 2u, 3u, 4u}) &&
+           preserved.path == "preserved.png";
+  };
+  const auto pngWithDimensions = [](std::uint32_t width,
+                                    std::uint32_t height) {
+    std::vector<unsigned char> png(std::begin(kWhitePng),
+                                   std::end(kWhitePng));
+    const auto writeBigEndian = [&](std::size_t offset,
+                                    std::uint32_t value) {
+      png[offset + 0u] = static_cast<unsigned char>(value >> 24u);
+      png[offset + 1u] = static_cast<unsigned char>(value >> 16u);
+      png[offset + 2u] = static_cast<unsigned char>(value >> 8u);
+      png[offset + 3u] = static_cast<unsigned char>(value);
+    };
+    writeBigEndian(16u, width);
+    writeBigEndian(20u, height);
+    // stb_image's info preflight reads IHDR dimensions without decoding IDAT;
+    // the original payload is intentionally left tiny to model a decode bomb.
+    return png;
+  };
+
+  const std::array<unsigned char, 12> damaged_png{
+      0x89u, 0x50u, 0x4eu, 0x47u, 0x0du, 0x0au,
+      0x1au, 0x0au, 0x00u, 0x00u, 0x00u, 0x0du};
+  expect(!xpbd::gfx::loadTextureImageFromMemory(
+             damaged_png.data(), static_cast<int>(damaged_png.size()),
+             preserved, &err) &&
+             err.find("stbi_info") != std::string::npos &&
+             outputWasPreserved(),
+         "damaged texture fails preflight without changing output");
+
+  const auto oversized_side = pngWithDimensions(16'385u, 1u);
+  expect(!xpbd::gfx::loadTextureImageFromMemory(
+             oversized_side.data(), static_cast<int>(oversized_side.size()),
+             preserved, &err) &&
+             err.find("dimensions=16385x1") != std::string::npos &&
+             err.find("width=16384") != std::string::npos &&
+             outputWasPreserved(),
+         "texture hard side limit rejects compressed decode bomb");
+
+  const auto oversized_pixels = pngWithDimensions(16'384u, 8'193u);
+  expect(static_cast<std::size_t>(16'384u) * 8'193u >
+             kTextureDecodeMaximumPixels &&
+             !xpbd::gfx::loadTextureImageFromMemory(
+                 oversized_pixels.data(),
+                 static_cast<int>(oversized_pixels.size()), preserved, &err) &&
+             err.find("maximum_pixels=134217728") != std::string::npos &&
+             outputWasPreserved(),
+         "texture hard pixel limit rejects oversized IHDR before decode");
+
+  TextureDecodeLimits decoded_budget;
+  decoded_budget.maximum_decoded_bytes = 3u;
+  expect(!xpbd::gfx::loadTextureImageFromMemory(
+             kWhitePng, static_cast<int>(sizeof(kWhitePng)), preserved, &err,
+             decoded_budget) &&
+             err.find("decoded_rgba=4") != std::string::npos &&
+             err.find("maximum_decoded_bytes=3") != std::string::npos &&
+             outputWasPreserved(),
+         "texture decoded-byte budget is enforced transactionally");
+
+  TextureDecodeLimits peak_budget;
+  peak_budget.maximum_peak_bytes = preserved.rgba.capacity() + 7u;
+  expect(!xpbd::gfx::loadTextureImageFromMemory(
+             kWhitePng, static_cast<int>(sizeof(kWhitePng)), preserved, &err,
+             peak_budget) &&
+             err.find("required_peak=") != std::string::npos &&
+             err.find("maximum_peak_bytes=") != std::string::npos &&
+             outputWasPreserved(),
+         "texture decoder-plus-candidate peak budget is enforced");
+
+  TextureDecodeLimits overflowed_peak;
+  overflowed_peak.retained_resident_bytes =
+      (std::numeric_limits<std::size_t>::max)();
+  expect(!xpbd::gfx::loadTextureImageFromMemory(
+             kWhitePng, static_cast<int>(sizeof(kWhitePng)), preserved, &err,
+             overflowed_peak) &&
+             err.find("peak byte arithmetic overflow") != std::string::npos &&
+             outputWasPreserved(),
+         "texture peak-budget addition rejects size_t overflow");
 }
 
 void testCc0PreviewSceneAssets() {
@@ -1526,10 +1808,13 @@ void testRtNearestHitReference() {
 void testPathTraceSamplingAndAccumulation() {
   using xpbd::gfx::PathTraceAccumulationRequest;
   using xpbd::gfx::PathTraceFrameGeneration;
+  using xpbd::gfx::PathTraceLightSamplingMode;
   using xpbd::gfx::PathTraceSettings;
   using xpbd::gfx::PathTraceUpscale;
   using xpbd::gfx::advancePathTraceAccumulation;
+  using xpbd::gfx::pathTraceLightEndpointWeight;
   using xpbd::gfx::normalizePathTraceSettings;
+  using xpbd::gfx::kDefaultPathTraceExposureEv;
   using xpbd::gfx::pathTraceRandom01;
   using xpbd::gfx::pathTraceRandomBits;
   using xpbd::gfx::pathTraceTemporalJitter;
@@ -1572,11 +1857,71 @@ void testPathTraceSamplingAndAccumulation() {
              normalized_low.analytic_environment_strength == 16.0f &&
              normalized_low.display_exposure_ev == 16.0f,
          "path settings preserve Phase 5 total/environment limits");
-  expect(PathTraceSettings{}.display_exposure_ev == 2.0f,
-         "default PT exposure is the daylight inspection baseline");
+  expect(PathTraceSettings{}.display_exposure_ev ==
+             kDefaultPathTraceExposureEv &&
+             kDefaultPathTraceExposureEv == 0.0f,
+         "default PT display exposure is neutral");
   expect(PathTraceSettings{}.requested_frame_generation ==
              PathTraceFrameGeneration::Off,
          "DLSS Frame Generation is opt-in and defaults to Off");
+
+  PathTraceSettings bsdf_only;
+  bsdf_only.analytic_lights = false;
+  bsdf_only.next_event_estimation = false;
+  bsdf_only.multiple_importance_sampling = false;
+  const auto normalized_bsdf_only =
+      normalizePathTraceSettings(bsdf_only);
+  expect(!normalized_bsdf_only.next_event_estimation &&
+             xpbd::gfx::resolvedPathTraceLightSamplingMode(
+                 normalized_bsdf_only) ==
+                 PathTraceLightSamplingMode::BsdfOnly,
+         "disabled NEE resolves to the BSDF-only light mode");
+
+  PathTraceSettings light_only = bsdf_only;
+  light_only.next_event_estimation = true;
+  expect(xpbd::gfx::resolvedPathTraceLightSamplingMode(
+             normalizePathTraceSettings(light_only)) ==
+             PathTraceLightSamplingMode::LightOnly,
+         "NEE without MIS resolves to the light-only mode");
+
+  PathTraceSettings mis_requires_nee = bsdf_only;
+  mis_requires_nee.multiple_importance_sampling = true;
+  const auto normalized_mis =
+      normalizePathTraceSettings(mis_requires_nee);
+  expect(normalized_mis.next_event_estimation &&
+             xpbd::gfx::resolvedPathTraceLightSamplingMode(normalized_mis) ==
+                 PathTraceLightSamplingMode::Combined,
+         "MIS normalization enables NEE and resolves to combined sampling");
+
+  PathTraceSettings analytic_requires_nee = bsdf_only;
+  analytic_requires_nee.analytic_lights = true;
+  const auto normalized_analytic =
+      normalizePathTraceSettings(analytic_requires_nee);
+  expect(normalized_analytic.next_event_estimation &&
+             xpbd::gfx::resolvedPathTraceLightSamplingMode(
+                 normalized_analytic) ==
+                 PathTraceLightSamplingMode::LightOnly,
+         "analytic-light normalization enables explicit light sampling");
+
+  expect(pathTraceLightEndpointWeight(
+             PathTraceLightSamplingMode::BsdfOnly, false, 1.0f, 3.0f) ==
+             1.0f &&
+             pathTraceLightEndpointWeight(
+                 PathTraceLightSamplingMode::LightOnly, false, 1.0f,
+                 3.0f) == 0.0f &&
+             pathTraceLightEndpointWeight(
+                 PathTraceLightSamplingMode::LightOnly, true, 1.0f,
+                 3.0f) == 1.0f &&
+             pathTraceLightEndpointWeight(
+                 PathTraceLightSamplingMode::LightOnly, false, 1.0f,
+                 0.0f) == 1.0f &&
+             std::abs(pathTraceLightEndpointWeight(
+                          PathTraceLightSamplingMode::Combined, false,
+                          1.0f, 3.0f) -
+                      0.1f) < 1.0e-6f,
+         "endpoint weighting preserves primary/delta and unsampled lights while "
+         "LightOnly suppresses sampleable endpoints and Combined uses MIS");
+
   PathTraceSettings legacy_upscale;
   legacy_upscale.requested_upscale = PathTraceUpscale::Auto;
   expect(normalizePathTraceSettings(legacy_upscale).requested_upscale ==
@@ -1837,6 +2182,7 @@ void testPathTraceBsdfAndDepth() {
   using xpbd::gfx::rtGgxDistribution;
   using xpbd::gfx::rtShadingNormalCorrection;
   using xpbd::gfx::rtSmithGgxG1;
+  using xpbd::gfx::kPathTraceShadingNormalCorrectionLimit;
   using xpbd::gfx::samplePathTraceCosineHemisphere;
   using xpbd::gfx::sampleRtBsdf;
 
@@ -1962,7 +2308,7 @@ void testPathTraceBsdfAndDepth() {
   }
 
   RtBsdfMaterial glass;
-  glass.base_color = {1.0f, 0.95f, 0.9f};
+  glass.base_color = {1.0f, 1.0f, 1.0f};
   glass.f0 = {glass_f0, glass_f0, glass_f0};
   glass.roughness = 0.05f;
   glass.transmission = 1.0f;
@@ -1980,8 +2326,36 @@ void testPathTraceBsdfAndDepth() {
       glass, normal, inside_grazing, false, 0.99f, 0.4f, 0.7f);
   expect(tir.valid && tir.delta &&
              tir.total_internal_reflection &&
-             tir.direction[1] > 0.0f,
-         "glass sample reflects under total internal reflection");
+             tir.lobe == PathTraceLobe::Glossy &&
+             std::abs(tir.pdf - 1.0f) < 1.0e-6f &&
+             tir.direction[1] > 0.0f &&
+             std::abs(tir.weight[0] - 1.0f) < 1.0e-6f &&
+             std::abs(tir.weight[1] - 1.0f) < 1.0e-6f &&
+             std::abs(tir.weight[2] - 1.0f) < 1.0e-6f,
+         "neutral glass TIR is a unit glossy delta reflection");
+
+  RtBsdfMaterial colored_glass = glass;
+  colored_glass.base_color = {0.1f, 0.4f, 0.9f};
+  const auto colored_tir = sampleRtBsdf(
+      colored_glass, normal, inside_grazing, false, 0.01f, 0.2f, 0.8f);
+  expect(colored_tir.valid && colored_tir.delta &&
+             colored_tir.total_internal_reflection &&
+             colored_tir.lobe == PathTraceLobe::Glossy &&
+             std::abs(colored_tir.pdf - 1.0f) < 1.0e-6f &&
+             std::abs(colored_tir.weight[0] - 1.0f) < 1.0e-6f &&
+             std::abs(colored_tir.weight[1] - 1.0f) < 1.0e-6f &&
+             std::abs(colored_tir.weight[2] - 1.0f) < 1.0e-6f,
+         "colored glass TIR is not attenuated or tinted");
+
+  const std::array<float, 3> inside_below_critical{
+      0.6f, 0.8f, 0.0f};
+  const auto below_critical = sampleRtBsdf(
+      glass, normal, inside_below_critical, false, 0.99f, 0.4f, 0.7f);
+  expect(below_critical.valid && below_critical.delta &&
+             !below_critical.total_internal_reflection &&
+             below_critical.lobe == PathTraceLobe::Transmission &&
+             below_critical.direction[1] < 0.0f,
+         "inside-glass incidence below the critical angle still refracts");
   const std::array<std::array<float, 3>, 2> glass_views{{
       view, inside_grazing}};
   const std::array<bool, 2> glass_front_faces{{true, false}};
@@ -2011,8 +2385,12 @@ void testPathTraceBsdfAndDepth() {
     for (double &channel : energy) {
       channel /= kGlassEnergySamples;
       expect(std::isfinite(channel) && channel >= 0.0 &&
-                 channel <= energy_limit,
-             "glass/TIR white-furnace sampling remains energy bounded");
+                  channel <= energy_limit,
+              "glass/TIR white-furnace sampling remains energy bounded");
+      if (view_index == 1u) {
+        expect(channel >= 0.999 && channel <= 1.001,
+               "TIR white-furnace sampling conserves unit energy");
+      }
     }
   }
 
@@ -2021,8 +2399,17 @@ void testPathTraceBsdfAndDepth() {
   const float tilted_correction = rtShadingNormalCorrection(
       normal, {0.0f, 0.8f, 0.6f}, view, {0.3f, 0.9f, 0.1f});
   expect(std::isfinite(tilted_correction) &&
-             tilted_correction > 0.0f && tilted_correction <= 16.0f,
+             tilted_correction > 0.0f &&
+             tilted_correction <=
+                 kPathTraceShadingNormalCorrectionLimit,
          "tilted shading-normal correction stays finite and bounded");
+  const float extreme_correction = rtShadingNormalCorrection(
+      normal, {0.0f, 0.01f, 0.99995f}, view,
+      {0.0f, 0.01f, 0.99995f});
+  expect(std::abs(extreme_correction -
+                  kPathTraceShadingNormalCorrectionLimit) < 1.0e-6f &&
+             kPathTraceShadingNormalCorrectionLimit == 4.0f,
+         "extreme shading-normal energy is hard-capped at four");
   expect(rtShadingNormalCorrection(
              normal, {0.0f, 0.8f, 0.6f}, view,
              {0.0f, -0.2f, 1.0f}) == 0.0f,
@@ -3354,6 +3741,7 @@ int main() {
   testRtSceneGenerationContract();
   testPathTraceOptionalOutputMaskContract();
   testRtNearestHitReference();
+  testPathTracePbrSourceContracts();
   testPathTraceSamplingAndAccumulation();
   testPathTraceAdjustableSettingsContract();
   testPathTraceBsdfAndDepth();

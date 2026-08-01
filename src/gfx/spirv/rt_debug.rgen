@@ -391,7 +391,8 @@ vec3 sampleGgx(vec3 normal, vec3 view, float roughness,
 }
 
 float shadingNormalCorrection(vec3 geometricNormal, vec3 shadingNormal,
-                              vec3 view, vec3 light) {
+                               vec3 view, vec3 light) {
+  const float kCorrectionLimit = 4.0;
   float viewGeometric = dot(view, geometricNormal);
   float viewShading = dot(view, shadingNormal);
   float lightGeometric = dot(light, geometricNormal);
@@ -404,7 +405,7 @@ float shadingNormalCorrection(vec3 geometricNormal, vec3 shadingNormal,
   return clamp(
       abs((lightShading * viewGeometric) /
           (lightGeometric * viewShading)),
-      0.0, 16.0);
+      0.0, kCorrectionLimit);
 }
 
 vec3 analyticEnvironment(vec3 direction) {
@@ -1274,8 +1275,19 @@ void main() {
                        maxBounces);
   bool analyticLightsEnabled = integratorFlag(25u);
   bool emissiveSurfacesEnabled = integratorFlag(26u);
-  bool neeEnabled = integratorFlag(27u);
-  bool misEnabled = integratorFlag(28u);
+  const uint kLightSamplingBsdfOnly = 0u;
+  const uint kLightSamplingLightOnly = 1u;
+  const uint kLightSamplingCombined = 2u;
+  bool neeRequested = integratorFlag(27u);
+  bool misRequested = integratorFlag(28u);
+  uint lightSamplingMode =
+      misRequested
+          ? kLightSamplingCombined
+          : ((neeRequested || analyticLightsEnabled)
+                 ? kLightSamplingLightOnly
+                 : kLightSamplingBsdfOnly);
+  bool neeEnabled = lightSamplingMode != kLightSamplingBsdfOnly;
+  bool misEnabled = lightSamplingMode == kLightSamplingCombined;
   uint lightSamples =
       clamp(uint(round(pc.integrator.w)), 1u, 16u);
   vec3 radianceSum = vec3(0.0);
@@ -1324,11 +1336,18 @@ void main() {
         vec3 missRadiance =
             bounce == 0u ? backgroundEnvironment(direction)
                          : lightingEnvironment(direction);
-        float environmentWeight =
-            bounce == 0u || previousWasDelta || !misEnabled
-                ? 1.0
-                : powerHeuristic(
-                      previousBsdfPdf, environmentPdf(direction));
+        float environmentWeight = 1.0;
+        if (bounce > 0u && !previousWasDelta) {
+          float lightPdf = environmentPdf(direction);
+          if (lightPdf > 0.0) {
+            if (lightSamplingMode == kLightSamplingLightOnly) {
+              environmentWeight = 0.0;
+            } else if (lightSamplingMode == kLightSamplingCombined) {
+              environmentWeight =
+                  powerHeuristic(previousBsdfPdf, lightPdf);
+            }
+          }
+        }
         vec3 missContribution =
             throughput * missRadiance * environmentWeight;
         vec3 clampedMiss = clampContribution(
@@ -1406,13 +1425,17 @@ void main() {
         primaryHit = true;
       }
       float emissionWeight = 1.0;
-      if (bounce > 0u && !previousWasDelta && misEnabled &&
+      if (bounce > 0u && !previousWasDelta &&
           payload.status.w > 0u && meshLightsValid()) {
         float lightPdf = meshLightPdf(
             payload.status.w - 1u, origin, hitPosition);
         if (lightPdf > 0.0) {
-          emissionWeight =
-              powerHeuristic(previousBsdfPdf, lightPdf);
+          if (lightSamplingMode == kLightSamplingLightOnly) {
+            emissionWeight = 0.0;
+          } else if (lightSamplingMode == kLightSamplingCombined) {
+            emissionWeight =
+                powerHeuristic(previousBsdfPdf, lightPdf);
+          }
         }
       }
       vec3 emissionContribution = clampContribution(
@@ -1625,7 +1648,37 @@ void main() {
       float nextBsdfPdf = 0.0;
       bool nextWasDelta = false;
 
-      if (lobeSample < probabilities.x) {
+      float etaIncident = frontFace ? 1.0 : ior;
+      float etaTransmitted = frontFace ? ior : 1.0;
+      float eta = etaIncident / etaTransmitted;
+      float cosI = clamp(dot(normal, view), 0.0, 1.0);
+      float sinTSquared =
+          eta * eta * max(0.0, 1.0 - cosI * cosI);
+      bool totalInternalReflection =
+          probabilities.z > 0.0 && sinTSquared >= 1.0;
+      float reflectionSelectionProbability =
+          probabilities.y + probabilities.z;
+
+      if (totalInternalReflection &&
+          lobeSample >= probabilities.x) {
+        if (!(reflectionSelectionProbability > 0.0) ||
+            glossyBounces >= pc.depthLimits.y) {
+          break;
+        }
+        ++glossyBounces;
+        if (bounce == 0u) {
+          primaryPathClass = 2u;
+        }
+        nextDirection = safeNormalize(
+            2.0 * cosI * normal - view, geometricNormal);
+        // TIR is one neutral delta-reflection event with F=1. The glossy and
+        // transmission selection intervals both choose it, so divide by their
+        // combined probability and apply no base/transmission tint or (1-F).
+        sampleWeight =
+            vec3(1.0 / reflectionSelectionProbability);
+        nextBsdfPdf = reflectionSelectionProbability;
+        nextWasDelta = true;
+      } else if (lobeSample < probabilities.x) {
         if (diffuseBounces >= pc.depthLimits.x) {
           break;
         }
@@ -1678,32 +1731,16 @@ void main() {
           primaryPathClass = 2u;
         }
         nextWasDelta = true;
-        float etaIncident = frontFace ? 1.0 : ior;
-        float etaTransmitted = frontFace ? ior : 1.0;
-        float eta = etaIncident / etaTransmitted;
-        float cosI = clamp(dot(normal, view), 0.0, 1.0);
-        float sinTSquared =
-            eta * eta * max(0.0, 1.0 - cosI * cosI);
-        if (sinTSquared >= 1.0) {
-          nextDirection =
-              safeNormalize(2.0 * cosI * normal - view,
-                            geometricNormal);
-          float reflectedShare =
-              max3(fresnelSchlick(f0, cosI));
-          sampleWeight =
-              baseColor * transmission * (1.0 - reflectedShare) /
-              probabilities.z;
-        } else {
-          float cosT = sqrt(max(0.0, 1.0 - sinTSquared));
-          nextDirection = safeNormalize(
-              -eta * view + (eta * cosI - cosT) * normal,
-              -geometricNormal);
-          float fresnel = dielectricFresnel(
-              cosI, etaIncident, etaTransmitted);
-          sampleWeight =
-              baseColor * transmission * (1.0 - fresnel) /
-              probabilities.z;
-        }
+        nextBsdfPdf = probabilities.z;
+        float cosT = sqrt(max(0.0, 1.0 - sinTSquared));
+        nextDirection = safeNormalize(
+            -eta * view + (eta * cosI - cosT) * normal,
+            -geometricNormal);
+        float fresnel = dielectricFresnel(
+            cosI, etaIncident, etaTransmitted);
+        sampleWeight =
+            baseColor * transmission * (1.0 - fresnel) /
+            probabilities.z;
       }
 
       float correction = shadingNormalCorrection(

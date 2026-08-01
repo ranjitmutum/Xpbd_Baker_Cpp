@@ -113,13 +113,67 @@ vec3 srgbToLinear(vec3 value) {
   return mix(high, low, cutoff);
 }
 
-vec3 decodeLabPbrNormal(vec4 packed) {
+bool finiteFloat(float value) {
+  return !isnan(value) && !isinf(value);
+}
+
+bool finite3(vec3 value) {
+  return !any(isnan(value)) && !any(isinf(value));
+}
+
+vec3 safeNormalizeNormal(vec3 value, vec3 fallbackValue) {
+  float lengthSquared = dot(value, value);
+  if (!finiteFloat(lengthSquared) || lengthSquared < 1.0e-8) {
+    return fallbackValue;
+  }
+  return value * inversesqrt(lengthSquared);
+}
+
+vec4 sampleAlbedoBaseLevel(vec2 uv) {
+  vec4 packed = textureLod(uAlbedo, uv, 0.0);
+  if (any(isnan(packed)) || any(isinf(packed))) {
+    return vec4(1.0);
+  }
+  packed = clamp(packed, vec4(0.0), vec4(1.0));
+  return vec4(srgbToLinear(packed.rgb), packed.a);
+}
+
+float sampleAlphaBaseLevel(vec2 uv) {
+  float alpha = textureLod(uAlbedo, uv, 0.0).a;
+  return finiteFloat(alpha) ? clamp(alpha, 0.0, 1.0) : 1.0;
+}
+
+vec3 sampleNormalBaseLevel(vec2 uv) {
+  vec3 packed = textureLod(uNormalTexture, uv, 0.0).rgb;
+  return finite3(packed) ? clamp(packed, vec3(0.0), vec3(1.0))
+                         : vec3(0.5, 0.5, 1.0);
+}
+
+vec4 sampleSpecularBaseLevel(vec2 uv) {
+  vec4 packed = textureLod(uSpecularTexture, uv, 0.0);
+  return any(isnan(packed)) || any(isinf(packed))
+             ? vec4(0.0, 10.0 / 255.0, 0.0, 1.0)
+             : clamp(packed, vec4(0.0), vec4(1.0));
+}
+
+vec3 decodeLabPbrNormal(vec3 packed) {
   vec2 xy = vec2(packed.r * 2.0 - 1.0, 1.0 - packed.g * 2.0);
   float xy2 = dot(xy, xy);
+  if (!finiteFloat(xy2)) {
+    return vec3(0.0, 0.0, 1.0);
+  }
   if (xy2 > 1.0) {
     xy *= inversesqrt(xy2);
   }
-  return vec3(xy, sqrt(max(0.0, 1.0 - dot(xy, xy))));
+  return safeNormalizeNormal(
+      vec3(xy, sqrt(max(0.0, 1.0 - dot(xy, xy)))),
+      vec3(0.0, 0.0, 1.0));
+}
+
+float decodeLabPbrMicrofacetAlpha(float smoothness) {
+  float perceptualRoughness =
+      finiteFloat(smoothness) ? clamp(1.0 - smoothness, 0.0, 1.0) : 1.0;
+  return max(perceptualRoughness * perceptualRoughness, 0.02);
 }
 
 float decodeLabPbrEmission(float packed) {
@@ -286,10 +340,7 @@ void fetchSurface(uint primitive, vec2 barycentrics, out vec3 normal,
   float w = 1.0 - barycentrics.x - barycentrics.y;
   normal = normals[i0].xyz * w + normals[i1].xyz * barycentrics.x +
            normals[i2].xyz * barycentrics.y;
-  float normalLength2 = dot(normal, normal);
-  normal = normalLength2 > 1.0e-10
-               ? normalize(normal)
-               : vec3(0.0, 1.0, 0.0);
+  normal = safeNormalizeNormal(normal, vec3(0.0, 1.0, 0.0));
   uv = uvs[i0] * w + uvs[i1] * barycentrics.x +
        uvs[i2] * barycentrics.y;
   vertexColor = colors[i0] * w + colors[i1] * barycentrics.x +
@@ -301,9 +352,9 @@ void fetchSurface(uint primitive, vec2 barycentrics, out vec3 normal,
 
 vec4 sampleBaseColor(vec2 uv, vec4 vertexColor, uint flags) {
   if ((flags & kMaterialTextured) != 0u) {
-    vec4 packed = textureLod(uAlbedo, uv, 0.0);
-    return vec4(srgbToLinear(packed.rgb) * vertexColor.rgb,
-                packed.a * vertexColor.a);
+    vec4 sampledAlbedo = sampleAlbedoBaseLevel(uv);
+    return vec4(sampledAlbedo.rgb * vertexColor.rgb,
+                sampledAlbedo.a * vertexColor.a);
   }
   return vertexColor;
 }
@@ -331,7 +382,7 @@ void resolveMaterial(vec2 uv, vec4 baseColor, uint flags,
       tangentData.xyz -
       geometricNormal * dot(geometricNormal, tangentData.xyz);
   float tangentLength2 = dot(tangent, tangent);
-  if (tangentLength2 <= 1.0e-10) {
+  if (!finiteFloat(tangentLength2) || tangentLength2 <= 1.0e-10) {
     vec3 helper = abs(geometricNormal.z) < 0.999
                       ? vec3(0.0, 0.0, 1.0)
                       : vec3(0.0, 1.0, 0.0);
@@ -342,21 +393,21 @@ void resolveMaterial(vec2 uv, vec4 baseColor, uint flags,
   vec3 bitangent =
       cross(geometricNormal, tangent) *
       (tangentData.w < 0.0 ? -1.0 : 1.0);
-  vec4 normalSample =
-      normalMapActive ? textureLod(uNormalTexture, uv, 0.0)
-                      : vec4(0.5, 0.5, 1.0, 1.0);
+  vec3 normalSample =
+      normalMapActive ? sampleNormalBaseLevel(uv)
+                      : vec3(0.5, 0.5, 1.0);
   tangentSpaceNormal =
       normalMapActive ? decodeLabPbrNormal(normalSample)
                       : vec3(0.0, 0.0, 1.0);
   materialNormal =
-      normalize(mat3(tangent, bitangent, geometricNormal) *
-                tangentSpaceNormal);
-  ambientOcclusion = normalSample.b;
+      safeNormalizeNormal(mat3(tangent, bitangent, geometricNormal) *
+                              tangentSpaceNormal,
+                          geometricNormal);
+  ambientOcclusion = clamp(normalSample.b, 0.0, 1.0);
 
   if (specularMapActive) {
-    vec4 specularSample = textureLod(uSpecularTexture, uv, 0.0);
-    float perceptualRoughness = 1.0 - specularSample.r;
-    linearRoughness = perceptualRoughness * perceptualRoughness;
+    vec4 specularSample = sampleSpecularBaseLevel(uv);
+    linearRoughness = decodeLabPbrMicrofacetAlpha(specularSample.r);
     f0 = decodeLabPbrF0(specularSample.g, baseColor.rgb, metal);
     emission =
         baseColor.rgb * decodeLabPbrEmission(specularSample.a);
@@ -388,7 +439,10 @@ float traceShadowVisibility(vec3 origin, vec3 direction, float tMin,
     uint flags;
     fetchSurface(primitive, barycentrics, normal, uv, vertexColor, tangent,
                  flags);
-    float alpha = clamp(sampleBaseColor(uv, vertexColor, flags).a, 0.0, 1.0);
+    float alpha = clamp(vertexColor.a, 0.0, 1.0);
+    if ((flags & kMaterialTextured) != 0u) {
+      alpha *= sampleAlphaBaseLevel(uv);
+    }
     if (alpha < kAlphaCutoff) {
       tMin = nextRayMin(tHit);
       continue;

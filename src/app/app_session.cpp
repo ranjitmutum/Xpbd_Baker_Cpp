@@ -3233,6 +3233,10 @@ bool AppSession::loadPathTraceSettings(
           "unsupported path tracing settings schema");
     }
     gfx::PathTraceSettings candidate = path_trace_settings;
+    // A legacy settings file without film.exposure_ev adopts the current
+    // application default. Do not infer migration from a numeric value: an
+    // explicitly saved +2 EV remains a valid user preference.
+    candidate.display_exposure_ev = gfx::kDefaultPathTraceExposureEv;
     const auto readFloat = [](const nlohmann::json &object,
                               const char *key, float fallback) {
       const float value = object.value(key, fallback);
@@ -3372,7 +3376,7 @@ bool AppSession::loadPathTraceSettings(
                     candidate.transparent_background);
       candidate.display_exposure_ev =
           readFloat(*it, "exposure_ev",
-                    candidate.display_exposure_ev);
+                    gfx::kDefaultPathTraceExposureEv);
       candidate.tone_mapping =
           static_cast<gfx::PathTraceToneMapping>(std::clamp(
               it->value("tone_mapping",

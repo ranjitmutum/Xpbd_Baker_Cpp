@@ -46,12 +46,13 @@ void main() {
     discard;
   }
 
-  // Color is already premultiplied by the compute front-to-back traversal.
-  // The sampled depth belongs to the nearest opaque RT surface, allowing
+  // The path-trace target stores straight RGBA. The sampled depth belongs to
+  // the nearest opaque RT surface, allowing
   // later raster grid/axis/skeleton passes to remain correctly occluded.
   gl_FragDepth = depth;
   color.rgb *= max(composite_push.display.x, 0.0);
-  color.rgb *= whiteBalance(composite_push.display.y);
+  vec3 whiteBalanceScale = whiteBalance(composite_push.display.y);
+  color.rgb *= whiteBalanceScale;
 
   float bloom = max(composite_push.display.z, 0.0);
   if (bloom > 0.0) {
@@ -67,7 +68,7 @@ void main() {
             samplePathColor(vUV + vec2(x, y) * texel);
         vec3 sampleColor =
             sampleValue.rgb * clamp(sampleValue.a, 0.0, 1.0) *
-            max(composite_push.display.x, 0.0);
+            max(composite_push.display.x, 0.0) * whiteBalanceScale;
         glow += max(sampleColor - vec3(1.0), vec3(0.0));
       }
     }

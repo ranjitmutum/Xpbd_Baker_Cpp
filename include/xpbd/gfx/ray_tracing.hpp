@@ -81,6 +81,16 @@ enum class PathTraceInteractiveQuality : std::uint8_t {
   Fast = 2,
 };
 
+// The path integrator has exactly three legal ways to combine BSDF endpoint
+// sampling with explicit light sampling. PathTraceSettings retains the legacy
+// NEE/MIS booleans for persistence and UI compatibility; normalization and the
+// resolver below map them onto this closed set.
+enum class PathTraceLightSamplingMode : std::uint8_t {
+  BsdfOnly = 0,
+  LightOnly = 1,
+  Combined = 2,
+};
+
 enum class PathTraceFrameGeneration : std::uint8_t {
   Off = 0,
   On = 1,
@@ -131,6 +141,9 @@ hasPathTraceChange(PathTraceChangeClass value,
   return !history_valid || !motion_history_valid ||
          previous_compatibility_key != current_compatibility_key;
 }
+
+inline constexpr float kDefaultPathTraceExposureEv = 0.0f;
+inline constexpr float kPathTraceShadingNormalCorrectionLimit = 4.0f;
 
 struct PathTraceSettings {
   PathTracePreset preset = PathTracePreset::Realtime;
@@ -193,8 +206,8 @@ struct PathTraceSettings {
   float analytic_environment_strength = 0.0f;
   // Display-only whole-frame exposure in photographic stops. It is applied
   // after linear HDR accumulation, so changing it preserves compatible PT
-  // history. +2 EV is the calibrated default daylight inspection baseline.
-  float display_exposure_ev = 2.0f;
+  // history. Explicitly saved user values are restored by AppSession.
+  float display_exposure_ev = kDefaultPathTraceExposureEv;
   PathTraceToneMapping tone_mapping = PathTraceToneMapping::Aces;
   float white_balance_kelvin = 6500.0f;
   float bloom_strength = 0.0f;
@@ -216,6 +229,14 @@ struct PathTraceSettings {
 
 [[nodiscard]] PathTraceSettings
 normalizePathTraceSettings(PathTraceSettings settings) noexcept;
+[[nodiscard]] PathTraceLightSamplingMode resolvedPathTraceLightSamplingMode(
+    const PathTraceSettings &settings) noexcept;
+// Returns the BSDF-sampled environment/emissive endpoint weight. A primary or
+// delta path is never suppressed, and LightOnly suppresses an endpoint only
+// when the same endpoint has a non-zero explicit-light sampling PDF.
+[[nodiscard]] float pathTraceLightEndpointWeight(
+    PathTraceLightSamplingMode mode, bool primary_or_previous_delta,
+    float bsdf_pdf, float light_pdf) noexcept;
 [[nodiscard]] PathTraceSettings
 pathTraceSettingsForPreset(PathTracePreset preset) noexcept;
 [[nodiscard]] PathTraceSettings

@@ -494,7 +494,10 @@ bool writeStillImageRgba16f(
               const std::size_t sample_pixel =
                   static_cast<std::size_t>(sample_y) * width + sample_x;
               glow += (std::max)(
-                  source_rgb(sample_pixel, channel) * safe_exposure - 1.0f,
+                  source_rgb(sample_pixel, channel) *
+                          source_alpha(sample_pixel) * safe_exposure *
+                          white_balance[channel] -
+                      1.0f,
                   0.0f);
             }
           }
