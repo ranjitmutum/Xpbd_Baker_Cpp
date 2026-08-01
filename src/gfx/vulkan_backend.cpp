@@ -2284,6 +2284,7 @@ public:
     bool pt_target_exact_for_frame = false;
     bool pt_motion_guide_ready_for_frame = false;
     bool pt_dispatch_recorded_for_frame = false;
+    bool pt_temporal_reconstruction_requested_for_frame = false;
     bool pt_history_reset = true;
     bool pt_streamline_history_reset = true;
     std::uint64_t pt_streamline_history_key = 0u;
@@ -2320,6 +2321,9 @@ public:
       bool pt_rr_requested =
           pt_post.active_denoiser ==
           PathTraceDenoiser::DlssRayReconstruction;
+      pt_temporal_reconstruction_requested_for_frame =
+          pt_rr_requested ||
+          pt_post.active_upscale != PathTraceUpscale::Off;
       const std::uint32_t supported_target_outputs =
           path_tracer.supportedTargetOutputMask();
       if (pt_rr_requested &&
@@ -2798,8 +2802,9 @@ public:
         }
 
         // Sample the static model atlas so path-traced models keep textures
-        // (avoids white clay look). Alpha shares the nearest albedo sampler;
-        // normal and LabPBR parameter sidecars are bilinear at base level.
+        // (avoids white clay look). Every pixel-art atlas channel uses nearest
+        // base-level sampling so normal and LabPBR texels stay aligned with
+        // albedo and alpha coverage.
         const VkImageView albedo_view =
             static_texture_.view != VK_NULL_HANDLE ? static_texture_.view
                                                    : VK_NULL_HANDLE;
@@ -3330,6 +3335,9 @@ public:
             SwapchainOwnership::StreamlineFrameGenerationProxy &&
         frame_generation_available &&
         !interactive_preview_resize &&
+        frameGenerationTemporalInputIsReady(
+            pt_temporal_reconstruction_requested_for_frame,
+            pt_dlss_active) &&
         pt_target_exact_for_frame && pt_motion_guide_ready_for_frame &&
         pt_dispatch_recorded_for_frame &&
         path_trace_active && draw_viewport &&
@@ -3882,8 +3890,16 @@ public:
       return;
     }
 
+    const bool fg_acquire_handoff =
+        frameGenerationAcquireMustPrecedeFrame(
+            streamline_vulkan_runtime_.swapchainOwnership());
+    // NVIDIA's Vulkan DLSS-G contract requires waiting on the intercepted
+    // acquire semaphore before starting any work for the new frame. Native
+    // presentation can retain the narrower first-swapchain-use dependency.
     VkPipelineStageFlags wait_stage =
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        fg_acquire_handoff
+            ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
+            : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.waitSemaphoreCount = 1;
     si.pWaitSemaphores = &fs.image_available;
@@ -4433,8 +4449,9 @@ private:
   VkPipelineLayout static_mesh_layout_ = VK_NULL_HANDLE;
   VkPipeline static_mesh_pipeline_ = VK_NULL_HANDLE;
   VkPipeline static_mesh_pipeline_blend_ = VK_NULL_HANDLE;
-  // Base color and its alpha coverage stay nearest. Linear-data sidecars use
-  // separate bilinear samplers so descriptor intent remains explicit.
+  // Pixel-art atlas channels all stay nearest-filtered so base color, normal,
+  // and LabPBR parameter texels remain aligned. The sidecars are still linear
+  // UNORM data; color-space interpretation is independent of filtering.
   VkSampler static_albedo_sampler_ = VK_NULL_HANDLE;
   VkSampler static_normal_sampler_ = VK_NULL_HANDLE;
   VkSampler static_specular_sampler_ = VK_NULL_HANDLE;
@@ -9775,8 +9792,6 @@ private:
                         &static_albedo_sampler_) != VK_SUCCESS) {
       return false;
     }
-    static_sampler_info.magFilter = VK_FILTER_LINEAR;
-    static_sampler_info.minFilter = VK_FILTER_LINEAR;
     if (vkCreateSampler(device_, &static_sampler_info, nullptr,
                         &static_normal_sampler_) != VK_SUCCESS) {
       destroyStaticMaterialSamplers();

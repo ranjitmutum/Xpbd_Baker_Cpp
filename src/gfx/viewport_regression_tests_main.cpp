@@ -103,12 +103,14 @@ void testPathTracePbrSourceContracts() {
       readTestSource("src/gfx/spirv/pt_composite.frag");
   const std::string backend =
       readTestSource("src/gfx/vulkan_backend.cpp");
+  const std::string path_tracer =
+      readTestSource("src/gfx/vulkan_path_tracer.cpp");
   const std::string rt_pipeline =
       readTestSource("src/gfx/vulkan_rt_pipeline.cpp");
 
   expect(!closest_hit.empty() && !any_hit.empty() && !raygen.empty() &&
              !compute.empty() && !composite.empty() && !backend.empty() &&
-             !rt_pipeline.empty(),
+             !path_tracer.empty() && !rt_pipeline.empty(),
          "PBR source-contract fixtures are readable");
   expect(closest_hit.find("sampleAlbedoBaseLevel") != std::string::npos &&
              closest_hit.find("sampleNormalBaseLevel") != std::string::npos &&
@@ -142,7 +144,29 @@ void testPathTracePbrSourceContracts() {
              rt_pipeline.find(
                  "images[4].sampler = params.specular_sampler") !=
                  std::string::npos,
-         "Vulkan descriptors bind nearest albedo separately from linear data maps");
+         "Vulkan descriptors bind distinct pixel-atlas channel samplers");
+  expect(countText(
+             backend,
+             "static_sampler_info.magFilter = VK_FILTER_NEAREST;") == 1u &&
+             countText(
+                 backend,
+                 "static_sampler_info.minFilter = VK_FILTER_NEAREST;") == 1u &&
+             countText(
+                 backend,
+                 "static_sampler_info.magFilter = VK_FILTER_LINEAR;") == 0u &&
+             countText(
+                 backend,
+                 "static_sampler_info.minFilter = VK_FILTER_LINEAR;") == 0u &&
+             countText(path_tracer,
+                       "si.magFilter = VK_FILTER_NEAREST;") == 1u &&
+             countText(path_tracer,
+                       "si.minFilter = VK_FILTER_NEAREST;") == 1u &&
+             countText(path_tracer,
+                       "si.magFilter = VK_FILTER_LINEAR;") == 0u &&
+             countText(path_tracer,
+                       "si.minFilter = VK_FILTER_LINEAR;") == 0u,
+         "Raster and path tracing keep every pixel-atlas channel "
+         "nearest-filtered");
 
   const std::string compact_raygen = compactTestSource(raygen);
   const std::array<std::string_view, 15> raygen_descriptor_contract{{
@@ -3037,15 +3061,49 @@ void testRayTracingCapability() {
 }
 
 void testFrameGenerationStateLegality() {
+  using xpbd::gfx::frameGenerationAcquireMustPrecedeFrame;
   using xpbd::gfx::frameGenerationCurrentFrameInputsReady;
   using xpbd::gfx::frameGenerationInputClearMayArmProxy;
   using xpbd::gfx::frameGenerationRuntimeCombinationIsLegal;
   using xpbd::gfx::frameGenerationStateAfterValidInputTagging;
+  using xpbd::gfx::frameGenerationTemporalInputIsReady;
+  using xpbd::gfx::frameGenerationViewportIsValid;
+  using xpbd::gfx::makeFrameGenerationTagExtent;
   using xpbd::gfx::FrameGenerationRuntimeState;
   using xpbd::gfx::SwapchainOwnership;
   constexpr SwapchainOwnership native = SwapchainOwnership::Native;
   constexpr SwapchainOwnership proxy =
       SwapchainOwnership::StreamlineFrameGenerationProxy;
+
+  expect(!frameGenerationAcquireMustPrecedeFrame(native),
+         "native acquire may wait at first swapchain image use");
+  expect(frameGenerationAcquireMustPrecedeFrame(proxy),
+         "DLSS-G acquire handoff blocks all work at frame start");
+
+  constexpr auto asymmetric_extent =
+      makeFrameGenerationTagExtent(991u, 37u, 289u, 763u);
+  expect(asymmetric_extent.top == 37u &&
+             asymmetric_extent.left == 991u &&
+             asymmetric_extent.width == 289u &&
+             asymmetric_extent.height == 763u,
+         "DLSS-G maps viewport y/x to Streamline top/left order");
+  expect(frameGenerationViewportIsValid(
+             1280u, 800u, 991u, 37u, 289u, 763u),
+         "DLSS-G accepts an asymmetric subrect touching right/bottom edges");
+  expect(!frameGenerationViewportIsValid(
+             1280u, 800u, 992u, 37u, 289u, 763u),
+         "DLSS-G rejects a subrect beyond the right edge");
+  expect(!frameGenerationViewportIsValid(
+             (std::numeric_limits<std::uint32_t>::max)(), 800u,
+             (std::numeric_limits<std::uint32_t>::max)() - 3u,
+             37u, 8u, 100u),
+         "DLSS-G viewport validation rejects unsigned overflow");
+  expect(frameGenerationTemporalInputIsReady(false, false),
+         "DLSS-G accepts native full-resolution input without reconstruction");
+  expect(frameGenerationTemporalInputIsReady(true, true),
+         "DLSS-G accepts a successful temporal reconstruction output");
+  expect(!frameGenerationTemporalInputIsReady(true, false),
+         "DLSS-G rejects raw fallback after temporal reconstruction failure");
 
   expect(frameGenerationRuntimeCombinationIsLegal(
              FrameGenerationRuntimeState::Unsupported, false, native, false,

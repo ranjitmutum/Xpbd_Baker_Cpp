@@ -304,9 +304,9 @@ struct StreamlineVulkanRuntime::Impl {
   std::uint64_t frame_generation_generation = 0u;
   bool force_history_reset = true;
   // A transient invalid guide frame pauses DLSS-G without destroying its
-  // proxy swapchain.  The first valid frame after the pause must rewrite
-  // common constants with reset=true even when SR/RR already used the same
-  // frame token.
+  // proxy swapchain. The first valid frame after the pause must carry a
+  // reset=true common-constants update. If SR/RR already submitted constants
+  // for that token, reuse them: Streamline permits only one update per frame.
   bool frame_generation_resume_reset_pending = false;
 
 #if XPBD_WITH_STREAMLINE && defined(_WIN32)
@@ -2671,10 +2671,9 @@ bool StreamlineVulkanRuntime::recordFrameGenerationInputs(
       frame.view != nullptr && frame.projection != nullptr &&
       frame.color_format != VK_FORMAT_UNDEFINED &&
       frame.render_width > 0u && frame.render_height > 0u &&
-      frame.output_width > 0u && frame.output_height > 0u &&
-      frame.viewport_width > 0u && frame.viewport_height > 0u &&
-      frame.viewport_x + frame.viewport_width <= frame.output_width &&
-      frame.viewport_y + frame.viewport_height <= frame.output_height &&
+      frameGenerationViewportIsValid(
+          frame.output_width, frame.output_height, frame.viewport_x,
+          frame.viewport_y, frame.viewport_width, frame.viewport_height) &&
       frame.swapchain_image_count > 0u;
   if (!valid) {
     impl_->frame_generation_status =
@@ -2695,7 +2694,7 @@ bool StreamlineVulkanRuntime::recordFrameGenerationInputs(
   }
 
   const bool resume_reset = impl_->frame_generation_resume_reset_pending;
-  if (impl_->constants_frame_index != frame.frame_index || resume_reset) {
+  if (impl_->constants_frame_index != frame.frame_index) {
     StreamlineDlssFrame constants_frame{};
     constants_frame.view = frame.view;
     constants_frame.projection = frame.projection;
@@ -2835,18 +2834,24 @@ bool StreamlineVulkanRuntime::recordFrameGenerationInputs(
       frame.output_width, frame.output_height);
   const sl::Extent guide_extent{
       0u, 0u, frame.render_width, frame.render_height};
-  const sl::Extent viewport_extent{
-      frame.viewport_x, frame.viewport_y,
-      frame.viewport_width, frame.viewport_height};
+  const FrameGenerationTagExtent tag_extent =
+      makeFrameGenerationTagExtent(
+          frame.viewport_x, frame.viewport_y, frame.viewport_width,
+          frame.viewport_height);
+  sl::Extent viewport_extent{};
+  viewport_extent.top = tag_extent.top;
+  viewport_extent.left = tag_extent.left;
+  viewport_extent.width = tag_extent.width;
+  viewport_extent.height = tag_extent.height;
   // FG is intentionally limited to the preview subrect. NVIDIA requires the
   // HUD-less and UI tag extents to exactly match the tagged backbuffer extent,
   // even when their underlying images cover the full swapchain.
   const sl::Extent &color_extent = viewport_extent;
   const std::array<sl::ResourceTag, 5> tags{{
       {&depth, sl::kBufferTypeDepth,
-       sl::ResourceLifecycle::eValidUntilPresent, &guide_extent},
+       sl::ResourceLifecycle::eOnlyValidNow, &guide_extent},
       {&motion, sl::kBufferTypeMotionVectors,
-       sl::ResourceLifecycle::eValidUntilPresent, &guide_extent},
+       sl::ResourceLifecycle::eOnlyValidNow, &guide_extent},
       {&hudless, sl::kBufferTypeHUDLessColor,
        sl::ResourceLifecycle::eValidUntilPresent, &color_extent},
       {&ui, sl::kBufferTypeUIColorAndAlpha,

@@ -1784,8 +1784,9 @@ bool VulkanPathTracer::createPipelines(VkRenderPass render_pass) {
     return false;
   }
 
-  // The composite and pixel-art albedo remain nearest. Normal and LabPBR
-  // parameter textures use bilinear filtering within the only mip level.
+  // Keep every pixel-art material channel nearest-filtered at base level so
+  // albedo, alpha, normal, and LabPBR parameter texels cannot bleed across
+  // atlas boundaries. Normal/specular images remain linear UNORM data.
   VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
   si.magFilter = VK_FILTER_NEAREST;
   si.minFilter = VK_FILTER_NEAREST;
@@ -1804,8 +1805,6 @@ bool VulkanPathTracer::createPipelines(VkRenderPass render_pass) {
   if (vkCreateSampler(device_, &si, nullptr, &albedo_sampler_) != VK_SUCCESS) {
     return false;
   }
-  si.magFilter = VK_FILTER_LINEAR;
-  si.minFilter = VK_FILTER_LINEAR;
   if (vkCreateSampler(device_, &si, nullptr, &normal_sampler_) != VK_SUCCESS) {
     return false;
   }
