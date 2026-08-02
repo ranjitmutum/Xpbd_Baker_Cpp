@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cwchar>
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -41,7 +42,6 @@
 
 
 #include <windows.h>
-#include <commdlg.h>
 #include <shobjidl.h>
 
 #endif
@@ -2379,7 +2379,7 @@ bool AppSession::importLabPbrSuiteInternal(
   labpbr_imported_normal = std::move(imported_normal);
   labpbr_suite_source = std::move(imported.suite.source);
   labpbr_last_import_cache_hit = imported.suite.cache_hit;
-  texture_path = labpbr_suite_source.base.path.string();
+  texture_path = gfx::pathUtf8String(labpbr_suite_source.base.path);
   labpbr_import_confirmation_pending = false;
   pending_labpbr_import_path_.reset();
   pending_labpbr_import_is_relink_ = false;
@@ -2395,7 +2395,9 @@ bool AppSession::importLabPbrSuiteInternal(
   last_error.clear();
   status = relink ? "LabPBR suite relinked: " :
                     "LabPBR suite imported: ";
-  status += labpbr_suite_source.base.path.filename().string() + " (" +
+  status += gfx::pathUtf8String(
+                labpbr_suite_source.base.path.filename()) +
+            " (" +
             std::to_string(model_texture.width) + "x" +
             std::to_string(model_texture.height) + ")";
   if (labpbr_last_import_cache_hit) {
@@ -2600,7 +2602,7 @@ bool AppSession::loadTexture(const std::filesystem::path &path) {
   if (!keep_imported_normal) {
     labpbr_imported_normal.clear();
   }
-  texture_path = path.string();
+  texture_path = model_texture.path;
   labpbr_suite_source = {};
   labpbr_import_confirmation_pending = false;
   pending_labpbr_import_path_.reset();
@@ -2613,7 +2615,7 @@ bool AppSession::loadTexture(const std::filesystem::path &path) {
     advanceGeneration(material_generation_);
   }
   last_error.clear();
-  status = "Texture: " + path.filename().string() + " (" +
+  status = "Texture: " + gfx::pathUtf8String(path.filename()) + " (" +
            std::to_string(model_texture.width) + "x" +
            std::to_string(model_texture.height) + ")";
   if (resolved_material.normal_map_active ||
@@ -4322,7 +4324,8 @@ bool AppSession::importLabPbrSpecular(const std::filesystem::path &path) {
     advanceGeneration(material_generation_);
   }
   last_error.clear();
-  status = "Imported LabPBR specular image: " + path.filename().string();
+  status = "Imported LabPBR specular image: " +
+           gfx::pathUtf8String(path.filename());
   return true;
 }
 
@@ -4418,7 +4421,7 @@ bool AppSession::importLabPbrNormal(const std::filesystem::path &path) {
   }
   last_error.clear();
   status = "Imported LabPBR / Iris normal image: " +
-           path.filename().string();
+           gfx::pathUtf8String(path.filename());
   return true;
 }
 
@@ -6667,138 +6670,177 @@ render::SkeletonDrawList AppSession::buildViewportDrawList(float view_w,
 }
 
 #if defined(_WIN32)
-std::optional<std::filesystem::path> openFileDialog(const wchar_t *title,
-                                                    const wchar_t *filter) {
+class ComApartmentScope {
+public:
+  ComApartmentScope() noexcept
+      : result_(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
+                                           COINIT_DISABLE_OLE1DDE)),
+        uninitialize_(result_ == S_OK || result_ == S_FALSE) {}
+
+  ~ComApartmentScope() {
+    if (uninitialize_) {
+      CoUninitialize();
+    }
+  }
+
+  [[nodiscard]] bool ready() const noexcept {
+    return SUCCEEDED(result_) || result_ == RPC_E_CHANGED_MODE;
+  }
+
+private:
+  HRESULT result_ = E_FAIL;
+  bool uninitialize_ = false;
+};
+
+class DialogFilterStorage {
+public:
+  explicit DialogFilterStorage(const wchar_t *packed_filter) {
+    if (packed_filter == nullptr) {
+      return;
+    }
+    const wchar_t *cursor = packed_filter;
+    while (*cursor != L'\0') {
+      names_.emplace_back(cursor);
+      cursor += names_.back().size() + 1u;
+      if (*cursor == L'\0') {
+        names_.pop_back();
+        break;
+      }
+      patterns_.emplace_back(cursor);
+      cursor += patterns_.back().size() + 1u;
+    }
+    specs_.reserve((std::min)(names_.size(), patterns_.size()));
+    for (std::size_t index = 0; index < names_.size() &&
+                                index < patterns_.size();
+         ++index) {
+      specs_.push_back(
+          COMDLG_FILTERSPEC{names_[index].c_str(), patterns_[index].c_str()});
+    }
+  }
+
+  [[nodiscard]] const COMDLG_FILTERSPEC *data() const noexcept {
+    return specs_.data();
+  }
+  [[nodiscard]] UINT size() const noexcept {
+    return static_cast<UINT>(specs_.size());
+  }
+
+private:
+  std::vector<std::wstring> names_;
+  std::vector<std::wstring> patterns_;
+  std::vector<COMDLG_FILTERSPEC> specs_;
+};
+
+enum class FileDialogKind { Open, Save };
+
+std::optional<std::filesystem::path> runFileSystemDialog(
+    FileDialogKind kind, const wchar_t *title, const wchar_t *filter,
+    const wchar_t *default_name, const wchar_t *default_extension,
+    FILEOPENDIALOGOPTIONS requested_options) {
   // Pause GPU / RT before the modal shell dialog so the picker is not
   // contending with in-flight command buffers (fixes hang after close).
   NativeDialogScope modal_scope;
-
-  wchar_t file[MAX_PATH] = {};
-  OPENFILENAMEW ofn{};
-  ofn.lStructSize = sizeof(ofn);
-  ofn.hwndOwner = static_cast<HWND>(nativeDialogHooks().owner_window);
-  ofn.lpstrFile = file;
-  ofn.nMaxFile = MAX_PATH;
-  ofn.lpstrFilter = filter;
-  ofn.nFilterIndex = 1;
-  ofn.lpstrTitle = title;
-  ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR |
-              OFN_EXPLORER | OFN_HIDEREADONLY;
-  if (GetOpenFileNameW(&ofn) == TRUE) {
-    return std::filesystem::path(file);
-  }
-  return std::nullopt;
-}
-
-std::optional<std::filesystem::path> openFolderDialog(
-    const wchar_t *title) {
-  NativeDialogScope modal_scope;
-
-  const HRESULT initialize_result =
-      CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
-                                  COINIT_DISABLE_OLE1DDE);
-  const bool uninitialize =
-      initialize_result == S_OK || initialize_result == S_FALSE;
-  if (FAILED(initialize_result) &&
-      initialize_result != RPC_E_CHANGED_MODE) {
+  ComApartmentScope apartment;
+  if (!apartment.ready()) {
     return std::nullopt;
   }
 
   IFileDialog *dialog = nullptr;
-  HRESULT result =
-      CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
-                       IID_PPV_ARGS(&dialog));
+  HRESULT result = E_FAIL;
+  if (kind == FileDialogKind::Open) {
+    IFileOpenDialog *open_dialog = nullptr;
+    result = CoCreateInstance(CLSID_FileOpenDialog, nullptr,
+                              CLSCTX_INPROC_SERVER,
+                              IID_PPV_ARGS(&open_dialog));
+    dialog = open_dialog;
+  } else {
+    IFileSaveDialog *save_dialog = nullptr;
+    result = CoCreateInstance(CLSID_FileSaveDialog, nullptr,
+                              CLSCTX_INPROC_SERVER,
+                              IID_PPV_ARGS(&save_dialog));
+    dialog = save_dialog;
+  }
+  if (FAILED(result) || dialog == nullptr) {
+    return std::nullopt;
+  }
+
+  FILEOPENDIALOGOPTIONS options{};
+  result = dialog->GetOptions(&options);
+  if (SUCCEEDED(result)) {
+    result = dialog->SetOptions(options | FOS_FORCEFILESYSTEM |
+                                FOS_NOCHANGEDIR | requested_options);
+  }
+  if (SUCCEEDED(result) && title != nullptr) {
+    result = dialog->SetTitle(title);
+  }
+  DialogFilterStorage filters(filter);
+  if (SUCCEEDED(result) && filters.size() != 0u) {
+    result = dialog->SetFileTypes(filters.size(), filters.data());
+    if (SUCCEEDED(result)) {
+      result = dialog->SetFileTypeIndex(1u);
+    }
+  }
+  if (SUCCEEDED(result) && default_name != nullptr) {
+    result = dialog->SetFileName(default_name);
+  }
+  if (SUCCEEDED(result) && default_extension != nullptr) {
+    result = dialog->SetDefaultExtension(default_extension);
+  }
+  if (SUCCEEDED(result)) {
+    result = dialog->Show(
+        static_cast<HWND>(nativeDialogHooks().owner_window));
+  }
+
   std::optional<std::filesystem::path> selected;
-  if (SUCCEEDED(result) && dialog != nullptr) {
-    FILEOPENDIALOGOPTIONS options{};
-    result = dialog->GetOptions(&options);
-    if (SUCCEEDED(result)) {
-      result = dialog->SetOptions(options | FOS_PICKFOLDERS |
-                                  FOS_FORCEFILESYSTEM |
-                                  FOS_PATHMUSTEXIST |
-                                  FOS_NOCHANGEDIR);
-    }
-    if (SUCCEEDED(result) && title != nullptr) {
-      result = dialog->SetTitle(title);
-    }
-    if (SUCCEEDED(result)) {
-      result = dialog->Show(
-          static_cast<HWND>(nativeDialogHooks().owner_window));
-    }
-    if (SUCCEEDED(result)) {
-      IShellItem *item = nullptr;
-      result = dialog->GetResult(&item);
-      if (SUCCEEDED(result) && item != nullptr) {
-        PWSTR path = nullptr;
-        result = item->GetDisplayName(SIGDN_FILESYSPATH, &path);
-        if (SUCCEEDED(result) && path != nullptr) {
-          selected = std::filesystem::path(path);
-        }
-        if (path != nullptr) {
-          CoTaskMemFree(path);
-        }
-        item->Release();
+  if (SUCCEEDED(result)) {
+    IShellItem *item = nullptr;
+    result = dialog->GetResult(&item);
+    if (SUCCEEDED(result) && item != nullptr) {
+      PWSTR selected_path = nullptr;
+      result = item->GetDisplayName(SIGDN_FILESYSPATH, &selected_path);
+      if (SUCCEEDED(result) && selected_path != nullptr) {
+        selected = std::filesystem::path(selected_path);
       }
+      if (selected_path != nullptr) {
+        CoTaskMemFree(selected_path);
+      }
+      item->Release();
     }
-    dialog->Release();
   }
-  if (uninitialize) {
-    CoUninitialize();
-  }
+  dialog->Release();
   return selected;
+}
+
+std::optional<std::filesystem::path> openFileDialog(const wchar_t *title,
+                                                    const wchar_t *filter) {
+  return runFileSystemDialog(
+      FileDialogKind::Open, title, filter, nullptr, nullptr,
+      FOS_PATHMUSTEXIST | FOS_FILEMUSTEXIST);
+}
+
+std::optional<std::filesystem::path> openFolderDialog(
+    const wchar_t *title) {
+  return runFileSystemDialog(FileDialogKind::Open, title, nullptr, nullptr,
+                             nullptr, FOS_PICKFOLDERS | FOS_PATHMUSTEXIST);
 }
 
 std::optional<std::filesystem::path>
 saveFileDialog(const wchar_t *title, const wchar_t *filter,
                const wchar_t *default_name) {
-  NativeDialogScope modal_scope;
-
-  wchar_t file[MAX_PATH] = {};
-  if (default_name != nullptr) {
-    wcsncpy_s(file, default_name, _TRUNCATE);
-  }
-  OPENFILENAMEW ofn{};
-  ofn.lStructSize = sizeof(ofn);
-  ofn.hwndOwner = static_cast<HWND>(nativeDialogHooks().owner_window);
-  ofn.lpstrFile = file;
-  ofn.nMaxFile = MAX_PATH;
-  ofn.lpstrFilter = filter;
-  ofn.nFilterIndex = 1;
-  ofn.lpstrTitle = title;
-  ofn.lpstrDefExt = L"json";
-  ofn.Flags = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR | OFN_EXPLORER |
-              OFN_HIDEREADONLY;
-  if (GetSaveFileNameW(&ofn) == TRUE) {
-    return ensureJsonExtension(std::filesystem::path(file));
-  }
-  return std::nullopt;
+  const auto selected = runFileSystemDialog(
+      FileDialogKind::Save, title, filter, default_name, L"json",
+      FOS_OVERWRITEPROMPT);
+  return selected ? std::optional<std::filesystem::path>(
+                        ensureJsonExtension(*selected))
+                  : std::nullopt;
 }
 
 std::optional<std::filesystem::path>
 savePngFileDialog(const wchar_t *title, const wchar_t *default_name) {
-  NativeDialogScope modal_scope;
-
-  wchar_t file[MAX_PATH] = {};
-  if (default_name != nullptr) {
-    wcsncpy_s(file, default_name, _TRUNCATE);
-  }
   static constexpr wchar_t kPngFilter[] =
       L"PNG Image (*.png)\0*.png\0All Files (*.*)\0*.*\0\0";
-  OPENFILENAMEW ofn{};
-  ofn.lStructSize = sizeof(ofn);
-  ofn.hwndOwner = static_cast<HWND>(nativeDialogHooks().owner_window);
-  ofn.lpstrFile = file;
-  ofn.nMaxFile = MAX_PATH;
-  ofn.lpstrFilter = kPngFilter;
-  ofn.nFilterIndex = 1;
-  ofn.lpstrTitle = title;
-  ofn.lpstrDefExt = L"png";
-  ofn.Flags =
-      OFN_NOCHANGEDIR | OFN_EXPLORER | OFN_HIDEREADONLY | OFN_PATHMUSTEXIST;
-  if (GetSaveFileNameW(&ofn) == TRUE) {
-    return std::filesystem::path(file);
-  }
-  return std::nullopt;
+  return runFileSystemDialog(FileDialogKind::Save, title, kPngFilter,
+                             default_name, L"png", FOS_PATHMUSTEXIST);
 }
 #else
 std::optional<std::filesystem::path> openFileDialog(const wchar_t *,

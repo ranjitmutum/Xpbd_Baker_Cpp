@@ -5,9 +5,10 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
-#include <fstream>
 #include <limits>
+#include <new>
 #include <set>
+#include <stdexcept>
 #include <utility>
 
 namespace xpbd::gfx {
@@ -617,59 +618,63 @@ bool importReadOnlyIrisNormal(const std::filesystem::path &path,
                               int expected_width, int expected_height,
                               ReadOnlyIrisNormalAsset &out,
                               std::string *error) {
-  std::ifstream input(path, std::ios::binary);
-  if (!input) {
-    if (error != nullptr) {
-      *error = "failed to open Iris normal image";
+  try {
+    FileByteSnapshot snapshot;
+    if (!snapshotFileBytes(path, snapshot, error, "Iris Normal")) {
+      return false;
     }
-    return false;
-  }
-  std::vector<std::uint8_t> bytes(
-      (std::istreambuf_iterator<char>(input)),
-      std::istreambuf_iterator<char>());
-  if (bytes.empty()) {
-    if (error != nullptr) {
-      *error = "Iris normal image is empty";
-    }
-    return false;
-  }
-  TextureImage decoded;
-  std::string decode_error;
-  if (bytes.size() >
-          static_cast<std::size_t>((std::numeric_limits<int>::max)()) ||
-      !loadTextureImageFromMemory(bytes.data(), static_cast<int>(bytes.size()),
-                                  decoded, &decode_error)) {
-    if (error != nullptr) {
-      *error = decode_error.empty() ? "failed to decode Iris normal image"
-                                    : decode_error;
-    }
-    return false;
-  }
-  if (decoded.source_channels != 4) {
-    if (error != nullptr) {
-      *error = "Iris normal image must be RGBA";
-    }
-    return false;
-  }
-  if (decoded.width != expected_width ||
-      decoded.height != expected_height) {
-    if (error != nullptr) {
-      *error = "Iris normal dimensions do not match the base atlas";
-    }
-    return false;
-  }
 
-  ReadOnlyIrisNormalAsset imported;
-  imported.source_path = path;
-  imported.original_file_bytes = std::move(bytes);
-  imported.sha256 = sha256Hex(imported.original_file_bytes);
-  imported.decoded = std::move(decoded);
-  imported.decoded.path = path.string();
-  out = std::move(imported);
-  if (error != nullptr) {
-    error->clear();
+    TextureImage decoded;
+    std::string decode_error;
+    if (!loadTextureImageFromMemory(
+            snapshot.bytes->data(), static_cast<int>(snapshot.bytes->size()),
+            decoded, &decode_error)) {
+      if (error != nullptr) {
+        *error = "Iris Normal Decode stage failed: " +
+                 (decode_error.empty() ? std::string("invalid image")
+                                       : decode_error);
+      }
+      return false;
+    }
+    if (decoded.source_channels != 4) {
+      if (error != nullptr) {
+        *error = "Iris Normal Decode stage failed: image must be RGBA";
+      }
+      return false;
+    }
+    if (decoded.width != expected_width ||
+        decoded.height != expected_height) {
+      if (error != nullptr) {
+        *error = "Iris Normal Domain stage failed: dimensions do not match "
+                 "the base atlas";
+      }
+      return false;
+    }
+
+    ReadOnlyIrisNormalAsset imported;
+    imported.source_path = snapshot.path;
+    imported.original_file_bytes.assign(snapshot.bytes->begin(),
+                                        snapshot.bytes->end());
+    imported.sha256 = sha256Hex(imported.original_file_bytes);
+    imported.decoded = std::move(decoded);
+    imported.decoded.path = pathUtf8String(snapshot.path);
+    out = std::move(imported);
+    if (error != nullptr) {
+      error->clear();
+    }
+    return true;
+  } catch (const std::bad_alloc &) {
+    if (error != nullptr) {
+      *error = "Iris Normal budget stage failed: std::bad_alloc";
+    }
+    return false;
+  } catch (const std::length_error &exception) {
+    if (error != nullptr) {
+      *error = std::string("Iris Normal budget stage failed: ") +
+               exception.what();
+    }
+    return false;
   }
-  return true;
 }
 
 bool encodePngRgba8(int width, int height,

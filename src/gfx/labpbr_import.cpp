@@ -5,8 +5,8 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
-#include <fstream>
 #include <limits>
+#include <new>
 #include <optional>
 #include <span>
 #include <sstream>
@@ -16,7 +16,7 @@ namespace xpbd::gfx {
 namespace {
 
 constexpr std::uintmax_t kMaxImportFileBytes =
-    static_cast<std::uintmax_t>((std::numeric_limits<int>::max)());
+    kFileByteSnapshotMaximumBytes;
 
 std::string lowerAscii(std::string value) {
   std::transform(value.begin(), value.end(), value.begin(), [](char c) {
@@ -29,6 +29,43 @@ std::string lowerAscii(std::string value) {
 bool endsWith(std::string_view value, std::string_view suffix) {
   return value.size() >= suffix.size() &&
          value.substr(value.size() - suffix.size()) == suffix;
+}
+
+template <typename Character>
+std::basic_string<Character>
+lowerAsciiNative(std::basic_string<Character> value) {
+  std::transform(value.begin(), value.end(), value.begin(), [](Character c) {
+    if (c >= static_cast<Character>('A') &&
+        c <= static_cast<Character>('Z')) {
+      return static_cast<Character>(c +
+                                    (static_cast<Character>('a') -
+                                     static_cast<Character>('A')));
+    }
+    return c;
+  });
+  return value;
+}
+
+template <typename Character>
+bool endsWithNative(const std::basic_string<Character> &value,
+                    const std::basic_string<Character> &suffix) {
+  return value.size() >= suffix.size() &&
+         value.substr(value.size() - suffix.size()) == suffix;
+}
+
+std::filesystem::path publicPathFromIo(const std::filesystem::path &path) {
+#ifdef _WIN32
+  const auto native = path.native();
+  constexpr std::wstring_view unc_prefix = LR"(\\?\UNC\)";
+  constexpr std::wstring_view local_prefix = LR"(\\?\)";
+  if (native.starts_with(unc_prefix)) {
+    return std::filesystem::path(LR"(\\)" + native.substr(unc_prefix.size()));
+  }
+  if (native.starts_with(local_prefix)) {
+    return std::filesystem::path(native.substr(local_prefix.size()));
+  }
+#endif
+  return path;
 }
 
 std::string trim(std::string_view value) {
@@ -51,26 +88,35 @@ std::filesystem::path normalizedPath(const std::filesystem::path &path) {
 
 std::optional<std::filesystem::path>
 findSiblingCaseInsensitive(const std::filesystem::path &parent,
-                           std::string_view filename) {
+                           const std::filesystem::path::string_type &filename) {
   std::error_code error;
   const auto exact = parent / std::filesystem::path(filename);
-  if (std::filesystem::is_regular_file(exact, error)) {
+  if (std::filesystem::is_regular_file(pathForFilesystemIo(exact), error)) {
     return normalizedPath(exact);
   }
   error.clear();
-  const std::string wanted = lowerAscii(std::string(filename));
-  std::filesystem::directory_iterator iterator(parent, error);
+  const auto wanted = lowerAsciiNative(filename);
+  std::filesystem::directory_iterator iterator(pathForFilesystemIo(parent),
+                                                error);
   const std::filesystem::directory_iterator end;
   while (!error && iterator != end) {
     const auto &entry = *iterator;
     std::error_code type_error;
     if (entry.is_regular_file(type_error) && !type_error &&
-        lowerAscii(entry.path().filename().string()) == wanted) {
-      return normalizedPath(entry.path());
+        lowerAsciiNative(entry.path().filename().native()) == wanted) {
+      return normalizedPath(publicPathFromIo(entry.path()));
     }
     iterator.increment(error);
   }
   return std::nullopt;
+}
+
+std::filesystem::path::string_type
+sidecarName(const std::filesystem::path &stem,
+            std::filesystem::path::string_type suffix) {
+  auto name = stem.native();
+  name += suffix;
+  return name;
 }
 
 LabPbrSourceFile absentSource(const std::filesystem::path &path) {
@@ -80,77 +126,31 @@ LabPbrSourceFile absentSource(const std::filesystem::path &path) {
 }
 
 bool snapshotFile(const std::filesystem::path &path, LabPbrSourceFile &out,
-                  std::string &error) {
-  const auto normalized = normalizedPath(path);
-  std::error_code filesystem_error;
-  if (!std::filesystem::is_regular_file(normalized, filesystem_error)) {
-    error = filesystem_error
-                ? "cannot inspect source file '" + normalized.string() +
-                      "': " + filesystem_error.message()
-                : "required source file is missing: " + normalized.string();
-    return false;
-  }
-  const auto initial_size =
-      std::filesystem::file_size(normalized, filesystem_error);
-  if (filesystem_error) {
-    error = "cannot read source file size '" + normalized.string() +
-            "': " + filesystem_error.message();
-    return false;
-  }
-  if (initial_size > kMaxImportFileBytes) {
-    error = "source file is too large to import: " + normalized.string();
-    return false;
-  }
-  const auto initial_time =
-      std::filesystem::last_write_time(normalized, filesystem_error);
-  if (filesystem_error) {
-    error = "cannot read source timestamp '" + normalized.string() +
-            "': " + filesystem_error.message();
-    return false;
-  }
-
-  std::ifstream input(normalized, std::ios::binary);
-  if (!input) {
-    error = "cannot open source file: " + normalized.string();
-    return false;
-  }
-  auto bytes = std::make_shared<std::vector<std::uint8_t>>(
-      static_cast<std::size_t>(initial_size));
-  if (!bytes->empty()) {
-    input.read(reinterpret_cast<char *>(bytes->data()),
-               static_cast<std::streamsize>(bytes->size()));
-    if (!input ||
-        input.gcount() != static_cast<std::streamsize>(bytes->size())) {
-      error = "source file could not be read completely: " +
-              normalized.string();
+                   std::string &error, std::string_view label) {
+  try {
+    FileByteSnapshot bytes;
+    if (!snapshotFileBytes(path, bytes, &error, label,
+                           kMaxImportFileBytes)) {
       return false;
     }
-  }
-
-  const auto final_size =
-      std::filesystem::file_size(normalized, filesystem_error);
-  if (filesystem_error) {
-    error = "cannot recheck source file size: " + normalized.string();
+    LabPbrSourceFile snapshot;
+    snapshot.path = bytes.path;
+    snapshot.present = true;
+    snapshot.size = bytes.size;
+    snapshot.write_time = bytes.write_time;
+    snapshot.sha256 = sha256Hex(std::span<const std::uint8_t>(*bytes.bytes));
+    snapshot.original_bytes = std::move(bytes.bytes);
+    out = std::move(snapshot);
+    error.clear();
+    return true;
+  } catch (const std::bad_alloc &) {
+    error = std::string(label) +
+            " budget stage failed while hashing the source snapshot";
+    return false;
+  } catch (const std::length_error &exception) {
+    error = std::string(label) + " budget stage failed: " + exception.what();
     return false;
   }
-  const auto final_time =
-      std::filesystem::last_write_time(normalized, filesystem_error);
-  if (filesystem_error || final_size != initial_size ||
-      final_time != initial_time) {
-    error = "source file changed while it was being read: " +
-            normalized.string();
-    return false;
-  }
-
-  LabPbrSourceFile snapshot;
-  snapshot.path = normalized;
-  snapshot.present = true;
-  snapshot.size = initial_size;
-  snapshot.write_time = initial_time;
-  snapshot.sha256 = sha256Hex(std::span<const std::uint8_t>(*bytes));
-  snapshot.original_bytes = std::move(bytes);
-  out = std::move(snapshot);
-  return true;
 }
 
 bool decodeSnapshot(const LabPbrSourceFile &source, const char *label,
@@ -158,18 +158,20 @@ bool decodeSnapshot(const LabPbrSourceFile &source, const char *label,
   if (!source.valid() ||
       source.original_bytes->size() >
           static_cast<std::size_t>((std::numeric_limits<int>::max)())) {
-    error = std::string(label) + " source snapshot is invalid";
+    error = std::string(label) + " read stage failed: source snapshot is invalid";
     return false;
   }
   TextureImage decoded;
+  std::string decode_detail;
   if (!loadTextureImageFromMemory(
           source.original_bytes->data(),
-          static_cast<int>(source.original_bytes->size()), decoded, &error)) {
-    error = std::string(label) + " decode failed: " +
-            (error.empty() ? "invalid image" : error);
+          static_cast<int>(source.original_bytes->size()), decoded,
+          &decode_detail)) {
+    error = std::string(label) + " Decode stage failed: " +
+            (decode_detail.empty() ? "invalid image" : decode_detail);
     return false;
   }
-  decoded.path = source.path.string();
+  decoded.path = pathUtf8String(source.path);
   out = std::move(decoded);
   return true;
 }
@@ -218,7 +220,7 @@ bool declaresLabPbr13(const LabPbrSourceFile &properties,
 std::string sourceCacheKey(const LabPbrSuiteSource &source) {
   std::string key;
   const auto append = [&](const LabPbrSourceFile &file) {
-    const auto path = file.path.generic_string();
+    const auto path = pathUtf8String(file.path);
     key += std::to_string(path.size());
     key += ':';
     key += path;
@@ -307,10 +309,12 @@ void appendChangedPath(LabPbrSourceChangeReport &report,
 void compareSourceFile(const LabPbrSourceFile &expected,
                        LabPbrSourceChangeReport &report) {
   std::error_code filesystem_error;
+  const auto io_path = pathForFilesystemIo(expected.path);
+  const auto display_path = pathUtf8String(expected.path);
   const bool present =
-      std::filesystem::is_regular_file(expected.path, filesystem_error);
+      std::filesystem::is_regular_file(io_path, filesystem_error);
   if (filesystem_error) {
-    report.error = "cannot inspect source file '" + expected.path.string() +
+    report.error = "Source file-check stage failed for '" + display_path +
                    "': " + filesystem_error.message();
     report.availability_changed = true;
     appendChangedPath(report, expected.path);
@@ -326,20 +330,20 @@ void compareSourceFile(const LabPbrSourceFile &expected,
   }
 
   const auto current_size =
-      std::filesystem::file_size(expected.path, filesystem_error);
+      std::filesystem::file_size(io_path, filesystem_error);
   if (filesystem_error) {
-    report.error = "cannot inspect source file size '" +
-                   expected.path.string() + "': " +
+    report.error = "Source file-check stage failed for '" + display_path +
+                   "': size query failed: " +
                    filesystem_error.message();
     report.availability_changed = true;
     appendChangedPath(report, expected.path);
     return;
   }
   const auto current_time =
-      std::filesystem::last_write_time(expected.path, filesystem_error);
+      std::filesystem::last_write_time(io_path, filesystem_error);
   if (filesystem_error) {
-    report.error = "cannot inspect source timestamp '" +
-                   expected.path.string() + "': " +
+    report.error = "Source file-check stage failed for '" + display_path +
+                   "': timestamp query failed: " +
                    filesystem_error.message();
     report.availability_changed = true;
     appendChangedPath(report, expected.path);
@@ -352,7 +356,7 @@ void compareSourceFile(const LabPbrSourceFile &expected,
 
   LabPbrSourceFile current;
   std::string error;
-  if (!snapshotFile(expected.path, current, error)) {
+  if (!snapshotFile(expected.path, current, error, "Source")) {
     report.error = std::move(error);
     report.availability_changed = true;
     appendChangedPath(report, expected.path);
@@ -413,7 +417,8 @@ discoverLabPbrSuiteCandidates(const std::filesystem::path &folder,
                               std::string *error) {
   std::vector<std::filesystem::path> candidates;
   std::error_code filesystem_error;
-  if (!std::filesystem::is_directory(folder, filesystem_error)) {
+  const auto io_folder = pathForFilesystemIo(folder);
+  if (!std::filesystem::is_directory(io_folder, filesystem_error)) {
     if (error != nullptr) {
       *error = filesystem_error
                    ? "cannot inspect LabPBR folder: " +
@@ -423,22 +428,30 @@ discoverLabPbrSuiteCandidates(const std::filesystem::path &folder,
     return candidates;
   }
 
-  std::filesystem::directory_iterator iterator(folder, filesystem_error);
+  std::filesystem::directory_iterator iterator(io_folder, filesystem_error);
   const std::filesystem::directory_iterator end;
+  const auto png_suffix = lowerAsciiNative(
+      std::filesystem::path(".png").native());
+  const auto specular_suffix = lowerAsciiNative(
+      std::filesystem::path("_s").native());
+  const auto normal_suffix = lowerAsciiNative(
+      std::filesystem::path("_n").native());
   while (!filesystem_error && iterator != end) {
     const auto &entry = *iterator;
     std::error_code type_error;
     if (entry.is_regular_file(type_error) && !type_error) {
-      const auto filename = entry.path().filename().string();
-      const auto lower_filename = lowerAscii(filename);
-      const auto lower_stem = lowerAscii(entry.path().stem().string());
-      if (endsWith(lower_filename, ".png") &&
-          !endsWith(lower_stem, "_s") && !endsWith(lower_stem, "_n")) {
-        const std::string specular_name =
-            entry.path().stem().string() + "_s.png";
-        if (findSiblingCaseInsensitive(entry.path().parent_path(),
+      const auto public_entry = publicPathFromIo(entry.path());
+      const auto lower_filename =
+          lowerAsciiNative(public_entry.filename().native());
+      const auto lower_stem = lowerAsciiNative(public_entry.stem().native());
+      if (endsWithNative(lower_filename, png_suffix) &&
+          !endsWithNative(lower_stem, specular_suffix) &&
+          !endsWithNative(lower_stem, normal_suffix)) {
+        const auto specular_name = sidecarName(
+            public_entry.stem(), std::filesystem::path("_s.png").native());
+        if (findSiblingCaseInsensitive(public_entry.parent_path(),
                                        specular_name)) {
-          candidates.push_back(normalizedPath(entry.path()));
+          candidates.push_back(normalizedPath(public_entry));
         }
       }
     }
@@ -454,8 +467,8 @@ discoverLabPbrSuiteCandidates(const std::filesystem::path &folder,
   }
   std::sort(candidates.begin(), candidates.end(),
             [](const auto &lhs, const auto &rhs) {
-              return lowerAscii(lhs.generic_string()) <
-                     lowerAscii(rhs.generic_string());
+              return lowerAscii(pathUtf8String(lhs)) <
+                     lowerAscii(pathUtf8String(rhs));
             });
   if (error != nullptr) {
     error->clear();
@@ -470,48 +483,60 @@ LabPbrSuiteImportResult importLabPbrSuite(
   LabPbrSuiteImportResult result;
   const auto normalized_base = normalizedPath(base_path);
   const auto lower_extension =
-      lowerAscii(normalized_base.extension().string());
-  const auto lower_stem = lowerAscii(normalized_base.stem().string());
-  if (normalized_base.empty() || lower_extension != ".png" ||
-      endsWith(lower_stem, "_s") || endsWith(lower_stem, "_n")) {
+      lowerAsciiNative(normalized_base.extension().native());
+  const auto lower_stem = lowerAsciiNative(normalized_base.stem().native());
+  const auto png_extension =
+      lowerAsciiNative(std::filesystem::path(".png").native());
+  const auto specular_suffix =
+      lowerAsciiNative(std::filesystem::path("_s").native());
+  const auto normal_suffix =
+      lowerAsciiNative(std::filesystem::path("_n").native());
+  if (normalized_base.empty() || lower_extension != png_extension ||
+      endsWithNative(lower_stem, specular_suffix) ||
+      endsWithNative(lower_stem, normal_suffix)) {
     result.error =
         "select the base <stem>.png, not a sidecar or non-PNG file";
     return result;
   }
 
   const auto parent = normalized_base.parent_path();
-  const auto stem = normalized_base.stem().string();
-  const auto specular =
-      findSiblingCaseInsensitive(parent, stem + "_s.png");
+  const auto stem = normalized_base.stem();
+  const auto specular_name =
+      sidecarName(stem, std::filesystem::path("_s.png").native());
+  const auto normal_name =
+      sidecarName(stem, std::filesystem::path("_n.png").native());
+  const auto properties_name = std::filesystem::path("texture.properties").native();
+  const auto specular = findSiblingCaseInsensitive(parent, specular_name);
   if (!specular) {
-    result.error = "required LabPBR specular file is missing: " +
-                   (parent / (stem + "_s.png")).string();
+    result.error = "Specular Sidecar file-check stage failed: required file is missing: " +
+                   pathUtf8String(parent / specular_name);
     return result;
   }
-  const auto normal =
-      findSiblingCaseInsensitive(parent, stem + "_n.png");
-  const auto properties =
-      findSiblingCaseInsensitive(parent, "texture.properties");
+  const auto normal = findSiblingCaseInsensitive(parent, normal_name);
+  const auto properties = findSiblingCaseInsensitive(parent, properties_name);
 
   LabPbrSuiteSource source;
   std::string snapshot_error;
-  if (!snapshotFile(normalized_base, source.base, snapshot_error) ||
-      !snapshotFile(*specular, source.specular, snapshot_error)) {
+  if (!snapshotFile(normalized_base, source.base, snapshot_error, "Base") ||
+      !snapshotFile(*specular, source.specular, snapshot_error,
+                    "Specular Sidecar")) {
     result.error = std::move(snapshot_error);
     return result;
   }
   source.normal =
       normal ? LabPbrSourceFile{} :
-               absentSource(parent / (stem + "_n.png"));
-  if (normal && !snapshotFile(*normal, source.normal, snapshot_error)) {
+               absentSource(parent / normal_name);
+  if (normal && !snapshotFile(*normal, source.normal, snapshot_error,
+                              "Normal Sidecar")) {
     result.error = std::move(snapshot_error);
     return result;
   }
   source.properties =
       properties ? LabPbrSourceFile{} :
-                   absentSource(parent / "texture.properties");
+                   absentSource(parent / properties_name);
   if (properties &&
-      !snapshotFile(*properties, source.properties, snapshot_error)) {
+      !snapshotFile(*properties, source.properties, snapshot_error,
+                    "Properties Sidecar")) {
     result.error = std::move(snapshot_error);
     return result;
   }
@@ -523,38 +548,43 @@ LabPbrSuiteImportResult importLabPbrSuite(
   TextureImage specular_image;
   TextureImage normal_image;
   std::string decode_error;
-  if (!decodeSnapshot(source.base, "base", base, decode_error) ||
-      !decodeSnapshot(source.specular, "specular", specular_image,
+  if (!decodeSnapshot(source.base, "Base", base, decode_error) ||
+      !decodeSnapshot(source.specular, "Specular Sidecar", specular_image,
                       decode_error)) {
     result.error = std::move(decode_error);
     return result;
   }
   if (base.source_channels < 3) {
-    result.error = "base image must contain RGB or RGBA channels";
+    result.error =
+        "Base Decode stage failed: image must contain RGB or RGBA channels";
     return result;
   }
   if (specular_image.source_channels != 4) {
-    result.error = "LabPBR _s.png must be an RGBA image";
+    result.error =
+        "Specular Sidecar Decode stage failed: _s.png must be an RGBA image";
     return result;
   }
   if (base.width != specular_image.width ||
       base.height != specular_image.height) {
-    result.error = "LabPBR _s.png dimensions do not match the base image";
+    result.error =
+        "LabPBR Domain stage failed: _s.png dimensions do not match the base image";
     return result;
   }
   if (source.normal.present) {
-    if (!decodeSnapshot(source.normal, "normal", normal_image,
+    if (!decodeSnapshot(source.normal, "Normal Sidecar", normal_image,
                         decode_error)) {
       result.error = std::move(decode_error);
       return result;
     }
     if (normal_image.source_channels != 4) {
-      result.error = "LabPBR _n.png must be an RGBA image";
+      result.error =
+          "Normal Sidecar Decode stage failed: _n.png must be an RGBA image";
       return result;
     }
     if (base.width != normal_image.width ||
         base.height != normal_image.height) {
-      result.error = "LabPBR _n.png dimensions do not match the base image";
+      result.error =
+          "LabPBR Domain stage failed: _n.png dimensions do not match the base image";
       return result;
     }
   }
@@ -563,14 +593,15 @@ LabPbrSuiteImportResult importLabPbrSuite(
     std::string declared_format;
     if (!declaresLabPbr13(source.properties, declared_format,
                           result.error)) {
+      result.error = "Properties Sidecar stage failed: " + result.error;
       return result;
     }
   } else if (!confirm_labpbr13_without_properties) {
     result.status =
         LabPbrSuiteImportStatus::NeedsLabPbr13Confirmation;
     result.error =
-        "texture.properties is missing; explicit LabPBR 1.3 confirmation "
-        "is required";
+        "Properties Sidecar stage requires explicit LabPBR 1.3 confirmation "
+        "because texture.properties is missing";
     return result;
   }
 

@@ -2,7 +2,7 @@
 
 ## Current phase
 
-S02 — apply one Domain to material consumers and clamp model atlases (`COMPLETE`; isolated commit pending).
+Gate A — full Release build and CTest correctness gate (`PENDING`; S03 is green and ready for its isolated commit).
 
 ## Phases and dependencies
 
@@ -11,7 +11,7 @@ S02 — apply one Domain to material consumers and clamp model atlases (`COMPLET
 | S00 | Baseline; runtime synthetic fixtures; checked compact-memory estimate | — | COMPLETE |
 | S01 | Pure double-precision face UV parsing, bounds, and `ResolvedUvDomain` | S00 | COMPLETE |
 | S02 | Apply one domain to mesh/material consumers; atlas clamp; transaction/history behavior | S01 | COMPLETE |
-| S03 | Unicode/long-path snapshot-and-memory image import | S02 | PENDING |
+| S03 | Unicode/long-path snapshot-and-memory image import | S02 | COMPLETE |
 | Gate A | Release app build and full CTest correctness gate | S00–S03 | PENDING |
 | S04 | Remove persistent resolved-texel expansion; final-model budget preflight | Gate A | PENDING |
 | S05 | Lazy Coverage/Composition and compact run encoding | S04 | PENDING |

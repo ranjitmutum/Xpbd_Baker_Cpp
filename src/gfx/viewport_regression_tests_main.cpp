@@ -1746,7 +1746,8 @@ void testStrictLabPbrSuiteImport() {
   const auto corrupt =
       xpbd::gfx::importLabPbrSuite(base_path, false, nullptr);
   expect(corrupt.status == LabPbrSuiteImportStatus::Failed &&
-             corrupt.error.find("decode failed") != std::string::npos,
+             corrupt.error.find("Specular Sidecar") != std::string::npos &&
+             corrupt.error.find("Header stage") != std::string::npos,
          "corrupt _s is rejected");
 
   const auto wrong_selection =

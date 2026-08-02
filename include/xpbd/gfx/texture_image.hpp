@@ -3,7 +3,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
+#include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace xpbd::gfx {
@@ -17,6 +20,8 @@ inline constexpr std::size_t kTextureDecodeMaximumRgbaBytes =
 // commit. Keep their combined allocation (plus retained caller state) bounded.
 inline constexpr std::size_t kTextureDecodeMaximumPeakBytes =
     std::size_t{1024} * 1024u * 1024u;
+inline constexpr std::uintmax_t kFileByteSnapshotMaximumBytes =
+    static_cast<std::uintmax_t>((std::numeric_limits<int>::max)());
 
 struct TextureDecodeLimits {
     std::uint32_t maximum_width = kTextureDecodeMaximumWidth;
@@ -32,6 +37,32 @@ struct TextureDecodeLimits {
 [[nodiscard]] bool checkedTextureRgbaByteCount(
     std::size_t width, std::size_t height,
     std::size_t& byte_count) noexcept;
+
+struct FileByteSnapshot {
+    std::filesystem::path path;
+    std::uintmax_t size = 0;
+    std::filesystem::file_time_type write_time{};
+    std::shared_ptr<const std::vector<std::uint8_t>> bytes;
+
+    [[nodiscard]] bool valid() const noexcept {
+        return !path.empty() && bytes != nullptr &&
+               size <= kFileByteSnapshotMaximumBytes &&
+               bytes->size() == static_cast<std::size_t>(size);
+    }
+};
+
+[[nodiscard]] std::string
+pathUtf8String(const std::filesystem::path& path);
+
+// Windows file operations use an internal extended-length spelling. Session
+// metadata and diagnostics continue to retain the ordinary absolute path.
+[[nodiscard]] std::filesystem::path
+pathForFilesystemIo(const std::filesystem::path& path);
+
+bool snapshotFileBytes(
+    const std::filesystem::path& path, FileByteSnapshot& out,
+    std::string* error = nullptr, std::string_view label = "Texture",
+    std::uintmax_t maximum_bytes = kFileByteSnapshotMaximumBytes);
 
 struct TextureImage {
     int width = 0;
@@ -68,7 +99,6 @@ struct TextureImage {
         sample(u, v, r, g, b, a);
     }
 };
-
 
 bool loadTextureImage(const std::filesystem::path& path, TextureImage& out,
                       std::string* err = nullptr,

@@ -6,6 +6,7 @@
 #include "xpbd/gfx/still_image_export.hpp"
 #include "test_support/labpbr_synthetic_fixture.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -625,14 +626,15 @@ void testPathTraceSettingsPersistenceAndClassification() {
 
 bool writeBytes(const std::filesystem::path &path,
                 const std::vector<std::uint8_t> &bytes) {
-  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  std::ofstream output(xpbd::gfx::pathForFilesystemIo(path),
+                       std::ios::binary | std::ios::trunc);
   output.write(reinterpret_cast<const char *>(bytes.data()),
                static_cast<std::streamsize>(bytes.size()));
   return output.good();
 }
 
 std::vector<std::uint8_t> readBytes(const std::filesystem::path &path) {
-  std::ifstream input(path, std::ios::binary);
+  std::ifstream input(xpbd::gfx::pathForFilesystemIo(path), std::ios::binary);
   return {std::istreambuf_iterator<char>(input),
           std::istreambuf_iterator<char>()};
 }
@@ -872,6 +874,231 @@ void testTransactionalLabPbrSuiteImport() {
   session.clearTexture();
   fs::remove_all(directory, filesystem_error);
   expect(!filesystem_error, "remove isolated AppSession fixture directory");
+}
+
+void testUnicodeLongPathTextureTransactions() {
+  namespace fs = std::filesystem;
+
+  const auto nonce =
+      std::chrono::steady_clock::now().time_since_epoch().count();
+  const fs::path root =
+      fs::temp_directory_path() / fs::path(L"xpbd_Unicode路径_事务") /
+      std::to_wstring(nonce);
+  fs::path directory = root;
+  while (directory.native().size() < 330u) {
+    directory /= fs::path(L"层级_长路径_甲乙丙丁_0123456789");
+  }
+
+  std::error_code filesystem_error;
+  fs::create_directories(xpbd::gfx::pathForFilesystemIo(directory),
+                         filesystem_error);
+  expect(!filesystem_error && directory.native().size() > 260u,
+         "create runtime Unicode path longer than the legacy Windows limit");
+  if (filesystem_error) {
+    return;
+  }
+
+  const std::vector<std::uint8_t> base_rgba{
+      240u, 120u, 60u, 255u, 20u, 70u, 150u, 80u};
+  const std::vector<std::uint8_t> specular_rgba{
+      0u, 10u, 32u, 0u, 255u, 230u, 64u, 254u};
+  const std::vector<std::uint8_t> normal_rgba{
+      128u, 128u, 255u, 255u, 140u, 120u, 210u, 24u};
+  const auto base_png = encodePng(2, 1, base_rgba);
+  const auto specular_png = encodePng(2, 1, specular_rgba);
+  const auto normal_png = encodePng(2, 1, normal_rgba);
+  const std::string properties_text = "format=lab-pbr/1.3\n";
+  const std::vector<std::uint8_t> properties_bytes(properties_text.begin(),
+                                                     properties_text.end());
+
+  const fs::path base_path = directory / fs::path(L"角色_基础贴图.png");
+  const fs::path specular_path =
+      directory / fs::path(L"角色_基础贴图_s.png");
+  const fs::path normal_path =
+      directory / fs::path(L"角色_基础贴图_n.png");
+  const fs::path properties_path = directory / "texture.properties";
+  expect(writeBytes(base_path, base_png) &&
+             writeBytes(specular_path, specular_png) &&
+             writeBytes(normal_path, normal_png) &&
+             writeBytes(properties_path, properties_bytes),
+         "write runtime Unicode Base/Normal/Specular/properties fixtures");
+
+  xpbd::gfx::TextureImage decoded_base;
+  std::string error;
+  expect(xpbd::gfx::loadTextureImage(base_path, decoded_base, &error) &&
+             decoded_base.rgba == base_rgba &&
+             decoded_base.path == xpbd::gfx::pathUtf8String(base_path),
+         "memory-only Base import accepts a Unicode long path");
+
+  xpbd::gfx::TextureImage preserved = decoded_base;
+  preserved.path = "preserved-candidate";
+  const auto preserved_before = preserved;
+  xpbd::gfx::TextureDecodeLimits tight_limits;
+  tight_limits.maximum_peak_bytes = 1u;
+  error.clear();
+  expect(!xpbd::gfx::loadTextureImage(base_path, preserved, &error,
+                                      tight_limits) &&
+             sameTexture(preserved, preserved_before) &&
+             preserved.path == preserved_before.path &&
+             error.find("budget stage") != std::string::npos,
+         "Base snapshot budget rejection preserves the output candidate");
+
+  xpbd::gfx::TextureImage resident_preserved = decoded_base;
+  resident_preserved.path = "resident-preserved-candidate";
+  const auto resident_before = resident_preserved;
+  xpbd::gfx::TextureDecodeLimits resident_limits;
+  // 77 encoded + 8 decoder + 8 candidate + 8 resident caller bytes = 101.
+  resident_limits.maximum_peak_bytes = 100u;
+  error.clear();
+  expect(!xpbd::gfx::loadTextureImage(base_path, resident_preserved, &error,
+                                      resident_limits) &&
+             sameTexture(resident_preserved, resident_before) &&
+             resident_preserved.path == resident_before.path &&
+             error.find("required_peak=101 bytes") != std::string::npos,
+         "Base path decode counts resident output and preserves it on budget failure");
+
+  const auto strict = xpbd::gfx::importLabPbrSuite(base_path, false);
+  expect(strict.imported() && strict.suite.base_image.rgba == base_rgba &&
+             *strict.suite.source.base.original_bytes == base_png &&
+             *strict.suite.source.specular.original_bytes == specular_png &&
+             *strict.suite.source.normal.original_bytes == normal_png &&
+             *strict.suite.source.properties.original_bytes ==
+                 properties_bytes,
+         "strict Unicode suite import retains exact immutable snapshots");
+
+  xpbd::gfx::ReadOnlyIrisNormalAsset iris;
+  expect(xpbd::gfx::importReadOnlyIrisNormal(normal_path, 2, 1, iris,
+                                             &error) &&
+             iris.original_file_bytes == normal_png &&
+             iris.decoded.rgba == normal_rgba &&
+             iris.decoded.path == xpbd::gfx::pathUtf8String(normal_path),
+         "read-only Iris import accepts Unicode long paths and exact bytes");
+
+  auto &session = xpbd::app::AppSession::instance();
+  session.labpbr_draft_dirty = false;
+  session.clearTexture();
+  expect(session.loadTexture(base_path) &&
+             session.texture_path == xpbd::gfx::pathUtf8String(base_path),
+         "AppSession commits a Base texture from a Unicode long path");
+  expect(session.requestLabPbrSuiteImport(base_path) &&
+             session.labpbr_suite_source.valid() &&
+             session.texture_path == xpbd::gfx::pathUtf8String(base_path),
+         "AppSession commits a strict suite from a Unicode long path");
+  expect(session.importLabPbrNormal(normal_path) &&
+             session.labpbr_imported_normal.original_file_bytes == normal_png,
+         "AppSession commits a read-only Iris normal from a Unicode long path");
+  const auto committed = snapshot(session);
+
+  const fs::path missing_base = directory / fs::path(L"不存在_基础.png");
+  expect(!session.loadTexture(missing_base) && unchanged(session, committed) &&
+             session.last_error.find("file-check stage") != std::string::npos,
+         "missing Unicode Base import preserves the complete material session");
+
+  const fs::path corrupt_base = directory / fs::path(L"损坏_基础.png");
+  const std::vector<std::uint8_t> corrupt_header{0u, 1u, 2u, 3u};
+  expect(writeBytes(corrupt_base, corrupt_header) &&
+             !session.loadTexture(corrupt_base) &&
+             unchanged(session, committed) &&
+             session.last_error.find("Header stage") != std::string::npos,
+         "corrupt Unicode Base header preserves the complete material session");
+
+  auto corrupt_decode_png = base_png;
+  const std::array<std::uint8_t, 4> idat{'I', 'D', 'A', 'T'};
+  const auto idat_position =
+      std::search(corrupt_decode_png.begin(), corrupt_decode_png.end(),
+                  idat.begin(), idat.end());
+  if (idat_position != corrupt_decode_png.end() &&
+      std::distance(idat_position, corrupt_decode_png.end()) > 4) {
+    *(idat_position + 4) = 0u;
+  }
+  const fs::path decode_failure = directory / fs::path(L"损坏_IDAT.png");
+  expect(idat_position != corrupt_decode_png.end() &&
+             writeBytes(decode_failure, corrupt_decode_png) &&
+             !session.loadTexture(decode_failure) &&
+             unchanged(session, committed) &&
+             session.last_error.find("Decode stage") != std::string::npos,
+         "post-Header Base decode failure preserves the complete session");
+
+  const fs::path missing_suite_directory = directory / fs::path(L"缺少边车");
+  fs::create_directories(
+      xpbd::gfx::pathForFilesystemIo(missing_suite_directory),
+      filesystem_error);
+  const fs::path missing_suite_base =
+      missing_suite_directory / fs::path(L"缺少组合.png");
+  expect(!filesystem_error && writeBytes(missing_suite_base, base_png) &&
+             !session.requestLabPbrSuiteImport(missing_suite_base) &&
+             unchanged(session, committed) &&
+             session.last_error.find("Specular Sidecar") != std::string::npos,
+         "missing Unicode Sidecar preserves the complete material session");
+
+  const fs::path corrupt_suite_directory = directory / fs::path(L"损坏边车");
+  fs::create_directories(
+      xpbd::gfx::pathForFilesystemIo(corrupt_suite_directory),
+      filesystem_error);
+  const fs::path corrupt_suite_base =
+      corrupt_suite_directory / fs::path(L"组合.png");
+  const fs::path corrupt_suite_specular =
+      corrupt_suite_directory / fs::path(L"组合_s.png");
+  expect(!filesystem_error && writeBytes(corrupt_suite_base, base_png) &&
+             writeBytes(corrupt_suite_specular, corrupt_header) &&
+             !session.requestLabPbrSuiteImport(corrupt_suite_base) &&
+             unchanged(session, committed) &&
+             session.last_error.find("Specular Sidecar") != std::string::npos &&
+             session.last_error.find("Header stage") != std::string::npos,
+         "corrupt Unicode Sidecar preserves the complete material session");
+
+  const fs::path missing_iris = directory / fs::path(L"不存在_法线.png");
+  expect(!session.importLabPbrNormal(missing_iris) &&
+             unchanged(session, committed) &&
+             session.last_error.find("file-check stage") != std::string::npos,
+         "missing Unicode Iris normal preserves the complete material session");
+  const fs::path corrupt_iris = directory / fs::path(L"损坏_法线.png");
+  expect(writeBytes(corrupt_iris, corrupt_header) &&
+             !session.importLabPbrNormal(corrupt_iris) &&
+             unchanged(session, committed) &&
+             session.last_error.find("Header stage") != std::string::npos,
+         "corrupt Unicode Iris normal preserves the complete material session");
+  const fs::path mismatched_iris = directory / fs::path(L"错尺寸_法线.png");
+  expect(writeBytes(mismatched_iris,
+                    encodePng(1, 1, {128u, 128u, 255u, 255u})) &&
+             !session.importLabPbrNormal(mismatched_iris) &&
+             unchanged(session, committed) &&
+             session.last_error.find("Domain stage") != std::string::npos,
+         "mismatched Unicode Iris Domain preserves the complete session");
+
+  const fs::path app_source_path =
+      fs::absolute(fs::path(__FILE__)).parent_path() / "app_session.cpp";
+  const fs::path texture_source_path =
+      fs::absolute(fs::path(__FILE__)).parent_path().parent_path() / "gfx" /
+      "texture_image.cpp";
+  const auto app_source_bytes = readBytes(app_source_path);
+  const auto texture_source_bytes = readBytes(texture_source_path);
+  const std::string app_source(app_source_bytes.begin(), app_source_bytes.end());
+  const std::string texture_source(texture_source_bytes.begin(),
+                                   texture_source_bytes.end());
+  expect(app_source.find("IFileOpenDialog") != std::string::npos &&
+             app_source.find("IFileSaveDialog") != std::string::npos &&
+             app_source.find("GetOpenFileName") == std::string::npos &&
+             app_source.find("GetSaveFileName") == std::string::npos &&
+             app_source.find("OPENFILENAME") == std::string::npos &&
+             app_source.find("MAX_PATH") == std::string::npos,
+         "file-dialog source contract has no fixed legacy path buffer");
+  expect(texture_source.find("stbi_info_from_memory") != std::string::npos &&
+             texture_source.find("stbi_load_from_memory") !=
+                 std::string::npos &&
+             texture_source.find("stbi_info(") == std::string::npos &&
+             texture_source.find("stbi_load(") == std::string::npos,
+         "texture source contract uses memory-only stb decode");
+
+  expect(readBytes(base_path) == base_png &&
+             readBytes(specular_path) == specular_png &&
+             readBytes(normal_path) == normal_png &&
+             readBytes(properties_path) == properties_bytes,
+         "Unicode success and failure paths never mutate source fixtures");
+  session.clearTexture();
+  filesystem_error.clear();
+  fs::remove_all(xpbd::gfx::pathForFilesystemIo(root), filesystem_error);
+  expect(!filesystem_error, "remove runtime Unicode long-path fixtures");
 }
 
 void testLargeUvModelMaterialTransactions() {
@@ -1440,6 +1667,7 @@ int main(int argc, char **argv) {
   testPathTraceSettingsPersistenceAndClassification();
   testStillRenderSnapshotAndOutput();
   testTransactionalLabPbrSuiteImport();
+  testUnicodeLongPathTextureTransactions();
   testLargeUvModelMaterialTransactions();
   if (argc >= 2) {
     testExternalLabPbrSuite(std::filesystem::path(argv[1]));
