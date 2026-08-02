@@ -3356,6 +3356,8 @@ public:
         path_tracer.rrMotionImage() != VK_NULL_HANDLE &&
         path_tracer.rrMotionMemory() != VK_NULL_HANDLE &&
         path_tracer.rrMotionView() != VK_NULL_HANDLE;
+    const bool temporal_selection_active =
+        pt_dlss_active || fg_frame_candidate;
 
     std::array<VkClearValue, 2> clears{};
     clears[0].color = {{frame.clear_r, frame.clear_g, frame.clear_b, 1.0f}};
@@ -3371,50 +3373,25 @@ public:
 
 
     int draws = 0;
-    if (draw_ui) {
-      stats_.ui_commands = drawUi(fs, *frame.ui, false);
-      draws += stats_.ui_commands;
-    }
-    write_timestamp(GpuTimestampQuery::UiEnd,
-                    VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-
-
+    VkViewport viewport{};
+    VkRect2D viewport_scissor{};
+    MeshScenePushConstants mesh_pc{};
+    constexpr VkShaderStageFlags kMeshPcStages =
+        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     if (draw_viewport) {
-      VkViewport vp{};
-      vp.x = static_cast<float>(safe_viewport.x);
-      vp.y = static_cast<float>(safe_viewport.y);
-      vp.width = static_cast<float>(safe_viewport.w);
-      vp.height = static_cast<float>(safe_viewport.h);
-      vp.minDepth = 0.0f;
-      vp.maxDepth = 1.0f;
-      VkRect2D sc{{safe_viewport.x, safe_viewport.y},
-                  {static_cast<uint32_t>(safe_viewport.w),
-                   static_cast<uint32_t>(safe_viewport.h)}};
-      vkCmdSetViewport(fs.cmd, 0, 1, &vp);
-      vkCmdSetScissor(fs.cmd, 0, 1, &sc);
-
-      // Always clear the viewport. Full RT keeps the raster sky, then
-      // composites unified model/environment visibility with explicit depth.
-      {
-        const float cr = raster ? raster->lighting.clear_r : (30.0f / 255.0f);
-        const float cg = raster ? raster->lighting.clear_g : (30.0f / 255.0f);
-        const float cb = raster ? raster->lighting.clear_b : (40.0f / 255.0f);
-        VkClearAttachment cas[2]{};
-        cas[0].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        cas[0].colorAttachment = 0;
-        cas[0].clearValue.color = {{cr, cg, cb, 1.0f}};
-        cas[1].aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-        cas[1].clearValue.depthStencil = {1.0f, 0};
-        VkClearRect crct{};
-        crct.rect = sc;
-        crct.baseArrayLayer = 0;
-        crct.layerCount = 1;
-        vkCmdClearAttachments(fs.cmd, 2, cas, 1, &crct);
-      }
+      viewport.x = static_cast<float>(safe_viewport.x);
+      viewport.y = static_cast<float>(safe_viewport.y);
+      viewport.width = static_cast<float>(safe_viewport.w);
+      viewport.height = static_cast<float>(safe_viewport.h);
+      viewport.minDepth = 0.0f;
+      viewport.maxDepth = 1.0f;
+      viewport_scissor = {
+          {safe_viewport.x, safe_viewport.y},
+          {static_cast<uint32_t>(safe_viewport.w),
+           static_cast<uint32_t>(safe_viewport.h)}};
 
       float mvp_gl[16];
       mulMat(frame.proj_matrix, frame.view_matrix, mvp_gl);
-      MeshScenePushConstants mesh_pc{};
       glMvpToVulkan(mvp_gl, mesh_pc.mvp);
       if (raster != nullptr) {
         mesh_pc.light_dir[0] = raster->lighting.direction[0];
@@ -3439,8 +3416,53 @@ public:
           static_cast<std::uint32_t>(frame.material_debug_view);
       mesh_pc.material_debug[1] =
           labPbrFeatureFlags(frame.static_model_material);
-      constexpr VkShaderStageFlags kMeshPcStages =
-          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    const auto draw_selection_lines = [&](VkPipeline pipeline) {
+      if (!draw_mesh || frame.scene == nullptr || frame.scene->lines.empty() ||
+          pipeline == VK_NULL_HANDLE) {
+        return;
+      }
+      vkCmdSetViewport(fs.cmd, 0, 1, &viewport);
+      vkCmdSetScissor(fs.cmd, 0, 1, &viewport_scissor);
+      vkCmdBindPipeline(fs.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+      vkCmdPushConstants(fs.cmd, mesh_layout_, kMeshPcStages, 0,
+                         sizeof(mesh_pc), &mesh_pc);
+      const VkDeviceSize off = mesh_upload.lines.offset_bytes;
+      vkCmdBindVertexBuffers(fs.cmd, 0, 1, &fs.mesh_vbo.buffer, &off);
+      vkCmdDraw(fs.cmd, static_cast<uint32_t>(frame.scene->lines.size()), 1, 0,
+                0);
+      ++draws;
+    };
+    if (draw_ui) {
+      stats_.ui_commands = drawUi(fs, *frame.ui, false);
+      draws += stats_.ui_commands;
+    }
+    write_timestamp(GpuTimestampQuery::UiEnd,
+                    VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+
+
+    if (draw_viewport) {
+      vkCmdSetViewport(fs.cmd, 0, 1, &viewport);
+      vkCmdSetScissor(fs.cmd, 0, 1, &viewport_scissor);
+
+      // Always clear the viewport. Full RT keeps the raster sky, then
+      // composites unified model/environment visibility with explicit depth.
+      {
+        const float cr = raster ? raster->lighting.clear_r : (30.0f / 255.0f);
+        const float cg = raster ? raster->lighting.clear_g : (30.0f / 255.0f);
+        const float cb = raster ? raster->lighting.clear_b : (40.0f / 255.0f);
+        VkClearAttachment cas[2]{};
+        cas[0].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        cas[0].colorAttachment = 0;
+        cas[0].clearValue.color = {{cr, cg, cb, 1.0f}};
+        cas[1].aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        cas[1].clearValue.depthStencil = {1.0f, 0};
+        VkClearRect crct{};
+        crct.rect = viewport_scissor;
+        crct.baseArrayLayer = 0;
+        crct.layerCount = 1;
+        vkCmdClearAttachments(fs.cmd, 2, cas, 1, &crct);
+      }
 
       // --- Forward rasterization / unified RT composite ---
       // Raster: sky, environment, opaque model, transparent ranges, lines.
@@ -3632,16 +3654,10 @@ public:
       }
       write_timestamp(GpuTimestampQuery::TransparentEnd,
                       VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-      if (draw_mesh && !frame.scene->lines.empty()) {
-        vkCmdBindPipeline(fs.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                          mesh_pipeline_overlay_lines_);
-        vkCmdPushConstants(fs.cmd, mesh_layout_, kMeshPcStages, 0,
-                           sizeof(mesh_pc), &mesh_pc);
-        const VkDeviceSize off = mesh_upload.lines.offset_bytes;
-        vkCmdBindVertexBuffers(fs.cmd, 0, 1, &fs.mesh_vbo.buffer, &off);
-        vkCmdDraw(fs.cmd, static_cast<uint32_t>(frame.scene->lines.size()), 1,
-                  0, 0);
-        ++draws;
+      if (!fg_frame_candidate) {
+        draw_selection_lines(
+            temporal_selection_active ? mesh_pipeline_temporal_hud_lines_
+                                      : mesh_pipeline_overlay_lines_);
       }
       if (draw_raster_grid) {
         vkCmdBindPipeline(fs.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -3700,9 +3716,8 @@ public:
                                  0, nullptr, 1, &barrier);
           };
 
-      // All scene geometry, including the white/yellow model-selection
-      // guides, has been drawn before this copy. It therefore participates in
-      // DLSS-G motion reconstruction as HUD-less scene color.
+      // Selection/hover guides are deliberately deferred, so HUDLess contains
+      // only scene color described by the tagged depth and motion vectors.
       image_barrier(
           swap_images_[image_index], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -3763,6 +3778,7 @@ public:
       fg_ui_rp.pClearValues = fg_ui_clears.data();
       vkCmdBeginRenderPass(fs.cmd, &fg_ui_rp,
                            VK_SUBPASS_CONTENTS_INLINE);
+      draw_selection_lines(mesh_pipeline_temporal_hud_lines_);
       if (draw_ui && frame.ui->overlay_visible) {
         (void)drawUi(fs, *frame.ui, true);
       }
@@ -3790,6 +3806,7 @@ public:
       fg_overlay_rp.pClearValues = nullptr;
       vkCmdBeginRenderPass(fs.cmd, &fg_overlay_rp,
                            VK_SUBPASS_CONTENTS_INLINE);
+      draw_selection_lines(mesh_pipeline_temporal_hud_lines_);
       if (draw_ui && frame.ui->overlay_visible) {
         const int overlay_commands = drawUi(fs, *frame.ui, true);
         stats_.ui_commands += overlay_commands;
@@ -4445,6 +4462,7 @@ private:
   VkPipeline mesh_pipeline_trans_ = VK_NULL_HANDLE;
   VkPipeline mesh_pipeline_lines_ = VK_NULL_HANDLE;
   VkPipeline mesh_pipeline_overlay_lines_ = VK_NULL_HANDLE;
+  VkPipeline mesh_pipeline_temporal_hud_lines_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout static_desc_layout_ = VK_NULL_HANDLE;
   VkDescriptorPool static_desc_pool_ = VK_NULL_HANDLE;
   VkPipelineLayout static_mesh_layout_ = VK_NULL_HANDLE;
@@ -4846,6 +4864,10 @@ private:
       vkDestroyPipeline(device_, mesh_pipeline_overlay_lines_, nullptr);
       mesh_pipeline_overlay_lines_ = VK_NULL_HANDLE;
     }
+    if (mesh_pipeline_temporal_hud_lines_) {
+      vkDestroyPipeline(device_, mesh_pipeline_temporal_hud_lines_, nullptr);
+      mesh_pipeline_temporal_hud_lines_ = VK_NULL_HANDLE;
+    }
     if (mesh_pipeline_) {
       vkDestroyPipeline(device_, mesh_pipeline_, nullptr);
       mesh_pipeline_ = VK_NULL_HANDLE;
@@ -4909,6 +4931,7 @@ private:
                       skybox_layout_ && ui_pipeline_ && mesh_pipeline_ &&
                       mesh_pipeline_trans_ && mesh_pipeline_lines_ &&
                       mesh_pipeline_overlay_lines_ &&
+                      mesh_pipeline_temporal_hud_lines_ &&
                       static_mesh_pipeline_ && static_mesh_pipeline_blend_ &&
                       skybox_pipeline_;
     if (!base) {
@@ -10392,6 +10415,7 @@ bool VulkanBackend::createPipelines() {
   auto makePipe = [&](VkShaderModule vs, VkShaderModule fs,
                       VkPipelineLayout layout, bool ui, bool static_mesh,
                       bool lines, bool mesh_trans, bool overlay_lines,
+                      bool temporal_hud_lines,
                       VkPipeline *out) -> bool {
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -10471,15 +10495,16 @@ bool VulkanBackend::createPipelines() {
 
     VkPipelineDepthStencilStateCreateInfo ds{
         VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-    ds.depthTestEnable = ui ? VK_FALSE : VK_TRUE;
-    ds.depthWriteEnable = (ui || mesh_trans || overlay_lines) ? VK_FALSE
-                                                              : VK_TRUE;
+    ds.depthTestEnable = (ui || temporal_hud_lines) ? VK_FALSE : VK_TRUE;
+    ds.depthWriteEnable =
+        (ui || mesh_trans || overlay_lines || temporal_hud_lines) ? VK_FALSE
+                                                                  : VK_TRUE;
     ds.depthCompareOp = overlay_lines ? VK_COMPARE_OP_LESS_OR_EQUAL
                                       : VK_COMPARE_OP_LESS;
 
     VkPipelineColorBlendAttachmentState blend{};
     blend.colorWriteMask = 0xF;
-    if (ui || mesh_trans) {
+    if (ui || mesh_trans || temporal_hud_lines) {
       blend.blendEnable = VK_TRUE;
       blend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
       blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
@@ -10528,22 +10553,26 @@ bool VulkanBackend::createPipelines() {
   };
 
   if (!makePipe(ui_vs, ui_fs, ui_layout_, true, false, false, false, false,
-                &ui_pipeline_) ||
+                 false, &ui_pipeline_) ||
       !makePipe(mesh_vs, mesh_fs, mesh_layout_, false, false, false, false,
-                false,
-                &mesh_pipeline_) ||
+                 false, false,
+                 &mesh_pipeline_) ||
       !makePipe(mesh_vs, mesh_fs, mesh_layout_, false, false, false, true,
-                false,
-                &mesh_pipeline_trans_) ||
+                 false, false,
+                 &mesh_pipeline_trans_) ||
       !makePipe(mesh_vs, mesh_fs, mesh_layout_, false, false, true, false,
-                false,
-                &mesh_pipeline_lines_) ||
+                 false, false,
+                 &mesh_pipeline_lines_) ||
       !makePipe(mesh_vs, mesh_fs, mesh_layout_, false, false, true, false,
-                true, &mesh_pipeline_overlay_lines_) ||
+                 true, false, &mesh_pipeline_overlay_lines_) ||
+      !makePipe(mesh_vs, mesh_fs, mesh_layout_, false, false, true, false,
+                 false, true, &mesh_pipeline_temporal_hud_lines_) ||
       !makePipe(static_mesh_vs, static_mesh_fs, static_mesh_layout_, false,
-                true, false, false, false, &static_mesh_pipeline_) ||
+                 true, false, false, false, false,
+                 &static_mesh_pipeline_) ||
       !makePipe(static_mesh_vs, static_mesh_fs, static_mesh_layout_, false,
-                true, false, true, false, &static_mesh_pipeline_blend_)) {
+                 true, false, true, false, false,
+                 &static_mesh_pipeline_blend_)) {
     return fail("Vulkan graphics-pipeline bundle creation failed");
   }
 
@@ -10603,13 +10632,13 @@ bool VulkanBackend::createPipelines() {
 
     const bool rt_ok =
         makePipe(mesh_rt_vs, mesh_rt_fs, mesh_rt_layout_, false, false, false,
-                 false, false, &mesh_rt_pipeline_) &&
+                 false, false, false, &mesh_rt_pipeline_) &&
         makePipe(mesh_rt_vs, mesh_rt_fs, mesh_rt_layout_, false, false, false,
-                 true, false, &mesh_rt_pipeline_trans_) &&
+                 true, false, false, &mesh_rt_pipeline_trans_) &&
         makePipe(static_rt_vs, static_rt_fs, static_rt_layout_, false, true,
-                 false, false, false, &static_rt_pipeline_) &&
+                 false, false, false, false, &static_rt_pipeline_) &&
         makePipe(static_rt_vs, static_rt_fs, static_rt_layout_, false, true,
-                 false, true, false, &static_rt_pipeline_blend_);
+                 false, true, false, false, &static_rt_pipeline_blend_);
     vkDestroyShaderModule(device_, mesh_rt_vs, nullptr);
     vkDestroyShaderModule(device_, mesh_rt_fs, nullptr);
     vkDestroyShaderModule(device_, static_rt_vs, nullptr);
