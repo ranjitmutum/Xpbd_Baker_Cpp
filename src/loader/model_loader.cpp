@@ -174,7 +174,8 @@ Cube ModelLoader::parseCube(const nlohmann::json& json) {
         }
     }
     for (int i = 0; i < 3; ++i) {
-        if (std::abs(c.size[i]) + c.inflate * 2.0 < 0.0) {
+        if (c.size[i] != 0.0 &&
+            std::abs(c.size[i]) + c.inflate * 2.0 < 0.0) {
             throw std::invalid_argument("cube inflate shrinks an effective size below zero");
         }
     }

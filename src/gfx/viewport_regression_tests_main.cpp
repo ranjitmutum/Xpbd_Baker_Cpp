@@ -1128,6 +1128,75 @@ void testBedrockUvDomainResolution() {
          "loader accepts the 16384 precision boundary exactly");
 }
 
+void testNegativeInflatePlaneCompatibility() {
+  using xpbd::baker::CubeGeometry;
+  using xpbd::loader::ModelLoader;
+
+  const auto geometry = ModelLoader::loadFromString(R"({
+    "minecraft:geometry": [{
+      "description": {"identifier": "geometry.negative_inflate_plane"},
+      "bones": [{
+        "name": "root",
+        "cubes": [{
+          "origin": [-0.6, 32.27232, -1.45091],
+          "size": [1.2, 0.8, 0],
+          "inflate": -0.001,
+          "uv": {"south": {"uv": [32, 8], "uv_size": [1, 1]}}
+        }]
+      }]
+    }]
+  })");
+  const auto &plane = geometry.bones.front().cubes.front();
+  const auto effective_size = CubeGeometry::effectiveSize(plane);
+  const auto effective_origin = CubeGeometry::effectiveOrigin(plane);
+  bool bind_vertices_valid = true;
+  try {
+    (void)CubeGeometry::bindVertices(plane);
+  } catch (const std::exception &) {
+    bind_vertices_valid = false;
+  }
+  expect(geometry.bones.size() == 1u &&
+             geometry.bones.front().cubes.size() == 1u &&
+             bind_vertices_valid,
+         "loader accepts a zero-thickness plane with negative inflate");
+  expectNearDouble(effective_size[0], 1.198, 1.0e-12,
+                   "negative inflate still contracts a nonzero plane axis");
+  expectNearDouble(effective_size[1], 0.798, 1.0e-12,
+                   "negative inflate contracts both nonzero plane axes");
+  expectNearDouble(effective_size[2], 0.0, 0.0,
+                   "negative inflate preserves zero plane thickness");
+  expectNearDouble(effective_origin[2], plane.origin[2], 0.0,
+                   "negative inflate keeps a zero-thickness plane centered");
+
+  bool over_deflated_solid_rejected = false;
+  try {
+    (void)ModelLoader::loadFromString(R"({
+      "minecraft:geometry": [{
+        "bones": [{
+          "name": "root",
+          "cubes": [{
+            "origin": [0, 0, 0],
+            "size": [1, 1, 0.001],
+            "inflate": -0.001
+          }]
+        }]
+      }]
+    })");
+  } catch (const std::exception &) {
+    over_deflated_solid_rejected = true;
+  }
+  expect(over_deflated_solid_rejected,
+         "loader still rejects negative effective size on a nonzero axis");
+
+  xpbd::loader::Cube positively_inflated_plane;
+  positively_inflated_plane.size[2] = 0.0;
+  positively_inflated_plane.inflate = 0.5;
+  const auto positive_size =
+      CubeGeometry::effectiveSize(positively_inflated_plane);
+  expectNearDouble(positive_size[2], 1.0, 0.0,
+                   "positive inflate still thickens a zero-thickness plane");
+}
+
 void testResolvedUvDomainMaterialConsumers() {
   using xpbd::gfx::LabPbrUvCoverage;
   using xpbd::gfx::ResolvedMaterialTable;
@@ -5123,6 +5192,7 @@ int main(int argc, char **argv) {
   testTextureFromMemory();
   testSyntheticLargeUvFixtureAndMemoryBaseline();
   testBedrockUvDomainResolution();
+  testNegativeInflatePlaneCompatibility();
   testResolvedUvDomainMaterialConsumers();
   testCc0PreviewSceneAssets();
   testEmptyTextureSample();
