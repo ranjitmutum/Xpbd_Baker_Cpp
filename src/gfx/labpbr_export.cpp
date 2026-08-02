@@ -130,14 +130,15 @@ LabPbrExportResult exportLabPbrBundle(
           "LabPBR composition has validation errors or UV conflicts");
     }
     const bool materialization_deferred =
-        !composition.specular.valid() &&
+        (composition.specular == nullptr ||
+         !composition.specular->valid()) &&
         composition.specular_materialization_deferred;
     const int specular_width = materialization_deferred
                                    ? composition.deferred_width
-                                   : composition.specular.width;
+                                   : composition.specular->width;
     const int specular_height = materialization_deferred
                                     ? composition.deferred_height
-                                    : composition.specular.height;
+                                    : composition.specular->height;
     const auto normalized = normalizeLabPbrSpecularPath(destination);
     if (normalized.empty()) {
       throw std::runtime_error("LabPBR export destination is empty");
@@ -154,9 +155,9 @@ LabPbrExportResult exportLabPbrBundle(
 
     if (normal != nullptr) {
       if (!normal->valid() ||
-          normal->decoded.width != specular_width ||
-          normal->decoded.height != specular_height ||
-          sha256Hex(normal->original_file_bytes) != normal->sha256) {
+          normal->decoded->width != specular_width ||
+          normal->decoded->height != specular_height ||
+          sha256Hex(*normal->original_file_bytes) != normal->sha256) {
         throw std::runtime_error(
             "imported Iris normal bytes or checksum are invalid");
       }
@@ -178,7 +179,7 @@ LabPbrExportResult exportLabPbrBundle(
     }
 
     TextureImage materialized_specular;
-    const TextureImage *effective_specular = &composition.specular;
+    const TextureImage *effective_specular = composition.specular.get();
     if (materialization_deferred) {
       std::string materialize_error;
       if (!materializeLabPbrSpecular(
@@ -221,7 +222,7 @@ LabPbrExportResult exportLabPbrBundle(
       if (normal != nullptr) {
         const auto staged_normal =
             stage_directory / result.normal_path.filename();
-        writeBytes(staged_normal, normal->original_file_bytes);
+        writeBytes(staged_normal, *normal->original_file_bytes);
         stage_files.push_back(staged_normal);
         pending.push_back({result.normal_path, staged_normal,
                            backup_directory /
@@ -255,8 +256,10 @@ LabPbrExportResult exportLabPbrBundle(
                 stage_directory / result.normal_path.filename(),
                 effective_specular->width, effective_specular->height,
                 verified_normal, &validation_error) ||
-            verified_normal.original_file_bytes !=
-                normal->original_file_bytes ||
+            verified_normal.original_file_bytes == nullptr ||
+            normal->original_file_bytes == nullptr ||
+            *verified_normal.original_file_bytes !=
+                *normal->original_file_bytes ||
             verified_normal.sha256 != normal->sha256) {
           throw std::runtime_error(
               validation_error.empty()

@@ -38,14 +38,14 @@ const char *labPbrChannelLabel(gfx::LabPbrOverrideChannel channel) {
 void drawLabPbrEditor(nk_context *ctx, const Geom &g, AppSession &session) {
   heading(ctx, g, tr("labpbr_material"));
   mutedWrap(ctx, g, tr("labpbr_material_hint"));
-  if (!session.model_texture.valid()) {
+  if (session.model_texture == nullptr || !session.model_texture->valid()) {
     muted(ctx, g, tr("labpbr_load_texture"));
     return;
   }
 
   char atlas_line[160];
   std::snprintf(atlas_line, sizeof(atlas_line), tr("labpbr_atlas_size"),
-                session.model_texture.width, session.model_texture.height);
+                session.model_texture->width, session.model_texture->height);
   muted(ctx, g, atlas_line);
 
   heading(ctx, g, tr("labpbr_specular_image"));

@@ -20,6 +20,7 @@ struct LabPbrSourceFile {
   std::string sha256;
   std::shared_ptr<const std::vector<std::uint8_t>> original_bytes;
 
+  [[nodiscard]] bool metadataValid() const noexcept;
   [[nodiscard]] bool valid() const noexcept;
 };
 
@@ -31,11 +32,12 @@ struct LabPbrSuiteSource {
   bool confirmed_labpbr13_without_properties = false;
   std::string cache_key;
 
+  [[nodiscard]] bool metadataValid() const noexcept;
   [[nodiscard]] bool valid() const noexcept;
 };
 
 struct ImportedLabPbrSuite {
-  TextureImage base_image;
+  SharedTextureImage base_image;
   ResolvedMaterialTable material;
   LabPbrSuiteSource source;
   bool cache_hit = false;

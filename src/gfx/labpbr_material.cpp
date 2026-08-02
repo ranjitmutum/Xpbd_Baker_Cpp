@@ -4,8 +4,10 @@
 #include <cmath>
 #include <fstream>
 #include <limits>
+#include <new>
 #include <sstream>
 #include <string_view>
+#include <utility>
 
 namespace xpbd::gfx {
 namespace {
@@ -160,6 +162,101 @@ void readFormatDeclaration(ResolvedMaterialTable &table) {
 }
 
 } // namespace
+
+const TextureImage &ResolvedMaterialTable::imageOrEmpty(
+    const SharedTextureImage &asset) noexcept {
+  static const TextureImage empty;
+  return asset != nullptr ? *asset : empty;
+}
+
+ResolvedMaterialTable::ResolvedMaterialTable() noexcept
+    : base_image(imageOrEmpty(base_image_asset_)),
+      normal_image(imageOrEmpty(normal_image_asset_)),
+      specular_image(imageOrEmpty(specular_image_asset_)) {}
+
+ResolvedMaterialTable::ResolvedMaterialTable(
+    SharedTextureImage base_image_asset,
+    SharedTextureImage normal_image_asset,
+    SharedTextureImage specular_image_asset) noexcept
+    : base_image_asset_(std::move(base_image_asset)),
+      normal_image_asset_(std::move(normal_image_asset)),
+      specular_image_asset_(std::move(specular_image_asset)),
+      base_image(imageOrEmpty(base_image_asset_)),
+      normal_image(imageOrEmpty(normal_image_asset_)),
+      specular_image(imageOrEmpty(specular_image_asset_)) {}
+
+ResolvedMaterialTable::ResolvedMaterialTable(
+    const ResolvedMaterialTable &other)
+    : base_image_asset_(other.base_image_asset_),
+      normal_image_asset_(other.normal_image_asset_),
+      specular_image_asset_(other.specular_image_asset_), width(other.width),
+      height(other.height), base_image(imageOrEmpty(base_image_asset_)),
+      assets(other.assets), format(other.format),
+      declared_format(other.declared_format),
+      format_declared(other.format_declared),
+      normal_map_active(other.normal_map_active),
+      specular_map_active(other.specular_map_active),
+      normal_image(imageOrEmpty(normal_image_asset_)),
+      specular_image(imageOrEmpty(specular_image_asset_)),
+      warnings(other.warnings) {}
+
+ResolvedMaterialTable::ResolvedMaterialTable(
+    ResolvedMaterialTable &&other) noexcept
+    // Copy the handles so the moved-from object's public image references
+    // remain valid for its remaining lifetime.
+    : base_image_asset_(other.base_image_asset_),
+      normal_image_asset_(other.normal_image_asset_),
+      specular_image_asset_(other.specular_image_asset_), width(other.width),
+      height(other.height), base_image(imageOrEmpty(base_image_asset_)),
+      assets(std::move(other.assets)), format(other.format),
+      declared_format(std::move(other.declared_format)),
+      format_declared(other.format_declared),
+      normal_map_active(other.normal_map_active),
+      specular_map_active(other.specular_map_active),
+      normal_image(imageOrEmpty(normal_image_asset_)),
+      specular_image(imageOrEmpty(specular_image_asset_)),
+      warnings(std::move(other.warnings)) {}
+
+ResolvedMaterialTable &ResolvedMaterialTable::operator=(
+    const ResolvedMaterialTable &other) {
+  if (this == &other) {
+    return *this;
+  }
+  ResolvedMaterialTable replacement(other);
+  this->~ResolvedMaterialTable();
+  ::new (static_cast<void *>(this))
+      ResolvedMaterialTable(std::move(replacement));
+  return *this;
+}
+
+ResolvedMaterialTable &ResolvedMaterialTable::operator=(
+    ResolvedMaterialTable &&other) noexcept {
+  if (this == &other) {
+    return *this;
+  }
+  this->~ResolvedMaterialTable();
+  ::new (static_cast<void *>(this)) ResolvedMaterialTable(std::move(other));
+  return *this;
+}
+
+void ResolvedMaterialTable::setImageAssets(
+    SharedTextureImage base_image_asset,
+    SharedTextureImage normal_image_asset,
+    SharedTextureImage specular_image_asset) {
+  ResolvedMaterialTable replacement(std::move(base_image_asset),
+                                    std::move(normal_image_asset),
+                                    std::move(specular_image_asset));
+  replacement.width = width;
+  replacement.height = height;
+  replacement.assets = assets;
+  replacement.format = format;
+  replacement.declared_format = declared_format;
+  replacement.format_declared = format_declared;
+  replacement.normal_map_active = normal_map_active;
+  replacement.specular_map_active = specular_map_active;
+  replacement.warnings = warnings;
+  *this = std::move(replacement);
+}
 
 bool ResolvedMaterialTable::valid() const noexcept {
   if (width <= 0 || height <= 0 || !base_image.valid() ||
@@ -427,9 +524,11 @@ bool resolveLabPbrMaterial(const TextureImage &base,
   }
   resolved.width = base.width;
   resolved.height = base.height;
-  resolved.base_image = base;
   resolved.assets = discoverLabPbrAssets(base_path);
   readFormatDeclaration(resolved);
+
+  TextureImage normal_image;
+  TextureImage specular_image;
 
   const bool has_sidecar =
       resolved.assets.normal_exists || resolved.assets.specular_exists;
@@ -455,14 +554,23 @@ bool resolveLabPbrMaterial(const TextureImage &base,
     if (resolved.assets.normal_exists) {
       resolved.normal_map_active =
           loadCompatibleSidecar(resolved.assets.normal, base, "normal",
-                                resolved.normal_image, resolved);
+                                normal_image, resolved);
     }
     if (resolved.assets.specular_exists) {
       resolved.specular_map_active =
           loadCompatibleSidecar(resolved.assets.specular, base, "specular",
-                                resolved.specular_image, resolved);
+                                specular_image, resolved);
     }
   }
+
+  resolved.setImageAssets(
+      std::make_shared<const TextureImage>(base),
+      resolved.normal_map_active
+          ? std::make_shared<const TextureImage>(std::move(normal_image))
+          : SharedTextureImage{},
+      resolved.specular_map_active
+          ? std::make_shared<const TextureImage>(std::move(specular_image))
+          : SharedTextureImage{});
 
   out = std::move(resolved);
   if (error != nullptr) {

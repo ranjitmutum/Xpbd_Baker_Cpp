@@ -792,11 +792,21 @@ void testSyntheticLargeUvFixtureAndMemoryBaseline() {
   stress_normal.rgba.assign(stress_bytes, 128u);
   xpbd::gfx::TextureImage stress_specular = stress_base;
   stress_specular.rgba.assign(stress_bytes, 64u);
+  const auto stress_base_asset =
+      std::make_shared<const xpbd::gfx::TextureImage>(std::move(stress_base));
+  const auto stress_normal_asset =
+      std::make_shared<const xpbd::gfx::TextureImage>(std::move(stress_normal));
+  const auto stress_specular_asset =
+      std::make_shared<const xpbd::gfx::TextureImage>(
+          std::move(stress_specular));
   xpbd::gfx::ResolvedMaterialTable stress_material;
   expect(buildAuthoredResolvedMaterial(
-             stress_base, {}, &stress_normal, &stress_specular,
+             stress_base_asset, {}, stress_normal_asset, stress_specular_asset,
              stress_material, &error) &&
              stress_material.valid() &&
+             stress_material.baseImageAsset() == stress_base_asset &&
+             stress_material.normalImageAsset() == stress_normal_asset &&
+             stress_material.specularImageAsset() == stress_specular_asset &&
              stress_material.base_image.rgba.size() == stress_bytes &&
              stress_material.normal_image.rgba.size() == stress_bytes &&
              stress_material.specular_image.rgba.size() == stress_bytes &&
@@ -1173,11 +1183,14 @@ void testResolvedUvDomainMaterialConsumers() {
   ResolvedMaterialTable clamp_table;
   clamp_table.width = 2;
   clamp_table.height = 1;
-  clamp_table.base_image.width = 2;
-  clamp_table.base_image.height = 1;
-  clamp_table.base_image.source_channels = 4;
-  clamp_table.base_image.rgba =
+  xpbd::gfx::TextureImage clamp_base;
+  clamp_base.width = 2;
+  clamp_base.height = 1;
+  clamp_base.source_channels = 4;
+  clamp_base.rgba =
       {255u, 255u, 255u, 64u, 255u, 255u, 255u, 191u};
+  clamp_table.setImageAssets(
+      std::make_shared<const xpbd::gfx::TextureImage>(std::move(clamp_base)));
   expectNear(clamp_table.sample(-0.25f, 0.5f).opacity, 64.0f / 255.0f,
               1.0e-6f,
               "resolved material clamps the lower atlas edge");
@@ -1744,7 +1757,7 @@ void testStrictLabPbrSuiteImport() {
   expect(predecode_rejected.status == LabPbrSuiteImportStatus::Failed &&
              predecode_rejected.error.find("budget preflight") !=
                  std::string::npos &&
-             !predecode_rejected.suite.base_image.valid() &&
+             predecode_rejected.suite.base_image == nullptr &&
              cache.size() == 0u,
          "strict Suite rejects the final-model budget after Header and before pixel decode");
 
@@ -1754,8 +1767,21 @@ void testStrictLabPbrSuiteImport() {
          "strict complete LabPBR suite imports");
   expect(imported.suite.material.specular_map_active &&
              imported.suite.material.normal_map_active &&
-             imported.suite.material.format_declared,
-         "strict import activates RGBA sidecars and declaration");
+             imported.suite.material.format_declared &&
+             imported.suite.base_image ==
+                 imported.suite.material.baseImageAsset() &&
+             imported.suite.material.normalImageAsset() != nullptr &&
+             imported.suite.material.specularImageAsset() != nullptr,
+         "strict import activates sidecars and shares decoded image assets");
+  const auto imported_copy = imported.suite;
+  expect(imported_copy.base_image == imported.suite.base_image &&
+             imported_copy.material.baseImageAsset() ==
+                 imported.suite.material.baseImageAsset() &&
+             imported_copy.material.normalImageAsset() ==
+                 imported.suite.material.normalImageAsset() &&
+             imported_copy.material.specularImageAsset() ==
+                 imported.suite.material.specularImageAsset(),
+         "Imported Suite copies retain shared image identities");
   expect(imported.suite.source.base.valid() &&
              imported.suite.source.specular.valid() &&
              imported.suite.source.normal.valid() &&
@@ -1774,8 +1800,13 @@ void testStrictLabPbrSuiteImport() {
          "strict import never mutates source files");
 
   auto cached = xpbd::gfx::importLabPbrSuite(base_path, false, &cache);
-  expect(cached.imported() && cached.suite.cache_hit && cache.size() == 1u,
-         "same path and checksum reimport reuses cache");
+  expect(cached.imported() && cached.suite.cache_hit && cache.size() == 1u &&
+             cached.suite.base_image == imported.suite.base_image &&
+             cached.suite.material.normalImageAsset() ==
+                 imported.suite.material.normalImageAsset() &&
+             cached.suite.material.specularImageAsset() ==
+                 imported.suite.material.specularImageAsset(),
+         "same path and checksum reimport reuses shared cache assets");
   const auto unchanged =
       xpbd::gfx::checkLabPbrSuiteSourceChanges(cached.suite.source);
   expect(!unchanged.reloadRecommended() && !unchanged.metadata_changed &&
@@ -1985,6 +2016,26 @@ void testLabPbrAuthoringEncodingAndCoverage() {
              authoring_source.find("std::unordered_set<std::uint32_t>") ==
                  std::string::npos,
          "production Coverage uses marked touched sort merge without texel Set nodes");
+  const auto texture_header =
+      readTestSource("include/xpbd/gfx/texture_image.hpp");
+  const auto app_session_source =
+      readTestSource("src/app/app_session.cpp");
+  expect(texture_header.find(
+             "using SharedTextureImage = std::shared_ptr<const TextureImage>") !=
+                 std::string::npos &&
+             authoring_source.find(
+                 "imported.original_file_bytes = snapshot.bytes;") !=
+                 std::string::npos &&
+             app_session_source.find(
+                 "imported.suite.source.normal.original_bytes;") !=
+                 std::string::npos &&
+             app_session_source.find(
+                 "metadata.base.original_bytes.reset();") !=
+                 std::string::npos &&
+             app_session_source.find(
+                 "base_path, confirm_missing_properties, nullptr,") !=
+                 std::string::npos,
+         "shared-image and Iris snapshot ownership source contract is explicit");
 
   expect(encodeLabPbrEmission(0.0f) == 0u,
          "LabPBR emission zero encodes to zero");
@@ -2022,11 +2073,12 @@ void testLabPbrAuthoringEncodingAndCoverage() {
   expect(validGroupLabPbrOverride(subsurface, &validation_error),
          "subsurface override validates as a unit interval");
   const auto sss_composition = xpbd::gfx::composeLabPbrSpecular(
-      1, 1, nullptr,
+      1, 1, xpbd::gfx::SharedTextureImage{},
       xpbd::gfx::LabPbrUvCoverage{1, 1, {{"sss", {{0u, 0u, 0u}}}}},
       {{"sss", subsurface}});
   expect(sss_composition.exportable() &&
-             sss_composition.specular.rgba[2] == 160u,
+             sss_composition.specular != nullptr &&
+             sss_composition.specular->rgba[2] == 160u,
          "subsurface override writes the LabPBR SSS B range");
 
   GroupLabPbrOverride semantic;
@@ -2118,12 +2170,12 @@ void testLabPbrAuthoringEncodingAndCoverage() {
          "8K run Coverage rejects before allocation and preserves estimate output");
 
   const auto lazy_default = xpbd::gfx::composeLabPbrSpecular(
-      2, 2, nullptr, {}, {});
+      2, 2, xpbd::gfx::SharedTextureImage{}, {}, {});
   expect(lazy_default.exportable() &&
              lazy_default.specular_materialization_deferred &&
              lazy_default.deferred_width == 2 &&
              lazy_default.deferred_height == 2 &&
-             lazy_default.specular.rgba.empty(),
+             lazy_default.specular == nullptr,
          "no Override keeps default Specular and Coverage nonresident");
   xpbd::gfx::TextureImage materialized_default;
   expect(xpbd::gfx::materializeLabPbrSpecular(
@@ -2152,7 +2204,8 @@ void testLabPbrAuthoringEncodingAndCoverage() {
   missing_group.emission_enabled = true;
   missing_group.emission = 1.0f;
   const auto empty_composition = xpbd::gfx::composeLabPbrSpecular(
-      2, 2, nullptr, empty_coverage, {{"missing", missing_group}});
+      2, 2, xpbd::gfx::SharedTextureImage{}, empty_coverage,
+      {{"missing", missing_group}});
   expect(empty_composition.exportable() &&
              empty_composition.warnings.size() == 1u,
          "selected group without textured UVs is a safe warned no-op");
@@ -2218,14 +2271,16 @@ void testLabPbrCompositionAndConflicts() {
       1u, 2u, 3u, 4u,       5u, 6u, 7u, 8u,
       9u, 10u, 11u, 12u,    13u, 14u, 15u, 16u,
   };
+  const auto imported_asset =
+      std::make_shared<const xpbd::gfx::TextureImage>(imported);
 
   const auto lazy_source = xpbd::gfx::composeLabPbrSpecular(
-      2, 2, &imported, {}, {});
+      2, 2, imported_asset, {}, {});
   xpbd::gfx::TextureImage materialized_source;
   std::string materialize_error;
   expect(lazy_source.exportable() &&
-             lazy_source.specular_materialization_deferred &&
-             lazy_source.specular.rgba.empty() &&
+             !lazy_source.specular_materialization_deferred &&
+             lazy_source.specular == imported_asset &&
              xpbd::gfx::materializeLabPbrSpecular(
                  2, 2, &imported, materialized_source,
                  &materialize_error) &&
@@ -2239,17 +2294,18 @@ void testLabPbrCompositionAndConflicts() {
   std::map<std::string, GroupLabPbrOverride> overrides{
       {"group_a", group_a}};
   auto composed = xpbd::gfx::composeLabPbrSpecular(
-      2, 2, &imported, coverage, overrides);
-  expect(composed.exportable(),
+      2, 2, imported_asset, coverage, overrides);
+  expect(composed.exportable() && composed.specular != nullptr &&
+             composed.specular != imported_asset,
          "single selected-group override composes without conflict");
-  expect(composed.specular.rgba[0] == 191u &&
-             composed.specular.rgba[4] == 191u &&
-             composed.specular.rgba[8] == 191u &&
-             composed.specular.rgba[12] == 191u,
+  expect(composed.specular->rgba[0] == 191u &&
+             composed.specular->rgba[4] == 191u &&
+             composed.specular->rgba[8] == 191u &&
+             composed.specular->rgba[12] == 191u,
          "roughness override changes only covered R texels");
-  expect(composed.specular.rgba[1] == imported.rgba[1] &&
-             composed.specular.rgba[2] == imported.rgba[2] &&
-             composed.specular.rgba[3] == imported.rgba[3],
+  expect(composed.specular->rgba[1] == imported.rgba[1] &&
+             composed.specular->rgba[2] == imported.rgba[2] &&
+             composed.specular->rgba[3] == imported.rgba[3],
          "disabled channels preserve imported texture bytes");
 
   group_a = {};
@@ -2260,14 +2316,14 @@ void testLabPbrCompositionAndConflicts() {
   group_b.group_name = "group_b";
   overrides = {{"group_a", group_a}, {"group_b", group_b}};
   composed = xpbd::gfx::composeLabPbrSpecular(
-      2, 2, &imported, coverage, overrides);
+      2, 2, imported_asset, coverage, overrides);
   expect(composed.exportable() && composed.conflicts.empty(),
          "identical overlapping group values are exportable");
 
   group_b.emission = 1.0f;
   overrides["group_b"] = group_b;
   composed = xpbd::gfx::composeLabPbrSpecular(
-      2, 2, &imported, coverage, overrides);
+      2, 2, imported_asset, coverage, overrides);
   expect(!composed.exportable() && composed.conflicts.size() == 4u,
          "different overlapping group values block all conflict texels");
   if (!composed.conflicts.empty()) {
@@ -2333,24 +2389,27 @@ void testLabPbrPngChecksumAndNormalImport() {
   expect(xpbd::gfx::importReadOnlyIrisNormal(
              normal_path, 2, 1, normal, &error),
          "import matching RGBA Iris normal asset");
-  expect(normal.valid() && normal.original_file_bytes == png &&
+  expect(normal.valid() && normal.original_file_bytes != nullptr &&
+             *normal.original_file_bytes == png &&
              normal.sha256 == xpbd::gfx::sha256Hex(png),
          "Iris normal import preserves exact bytes and checksum");
 
   const auto preserved_bytes = normal.original_file_bytes;
   const auto preserved_hash = normal.sha256;
-  const auto preserved_decoded = normal.decoded.rgba;
-  xpbd::gfx::TextureDecodeLimits iris_copy_budget;
-  iris_copy_budget.maximum_peak_bytes =
-      normal.original_file_bytes.capacity() + normal.decoded.rgba.capacity() +
-      png.size() + normal.decoded.rgba.size() * 2u;
-  expect(!xpbd::gfx::importReadOnlyIrisNormal(
-             normal_path, 2, 1, normal, &error, iris_copy_budget) &&
-             error.find("encoded-byte copy") != std::string::npos &&
-             normal.original_file_bytes == preserved_bytes &&
-             normal.sha256 == preserved_hash &&
-             normal.decoded.rgba == preserved_decoded,
-         "Iris encoded-byte copy budget rejects before allocation and preserves output");
+  const auto preserved_decoded = normal.decoded;
+  xpbd::gfx::TextureDecodeLimits iris_shared_budget;
+  iris_shared_budget.maximum_peak_bytes =
+      normal.original_file_bytes->capacity() +
+      normal.decoded->rgba.capacity() + png.size() +
+      normal.decoded->rgba.size() * 2u;
+  expect(xpbd::gfx::importReadOnlyIrisNormal(
+             normal_path, 2, 1, normal, &error, iris_shared_budget) &&
+             normal.original_file_bytes != nullptr &&
+             *normal.original_file_bytes == png &&
+             normal.decoded != nullptr && normal.decoded->rgba == rgba,
+         "Iris sharing fits the peak that previously required an encoded-byte copy");
+  const auto committed_bytes = normal.original_file_bytes;
+  const auto committed_decoded = normal.decoded;
 
   const std::vector<std::uint8_t> rgb_png(
       std::begin(kWhitePng), std::end(kWhitePng));
@@ -2359,9 +2418,11 @@ void testLabPbrPngChecksumAndNormalImport() {
   expect(!xpbd::gfx::importReadOnlyIrisNormal(
              normal_path, 2, 1, normal, &error),
          "RGB Iris normal import is rejected");
-  expect(normal.original_file_bytes == preserved_bytes &&
-             normal.sha256 == preserved_hash,
-         "failed normal replacement preserves active imported bytes");
+  expect(normal.original_file_bytes == committed_bytes &&
+             normal.decoded == committed_decoded &&
+             normal.sha256 == preserved_hash &&
+             preserved_bytes != nullptr && preserved_decoded != nullptr,
+         "failed normal replacement preserves active shared Iris assets");
 
   fs::remove_all(directory, filesystem_error);
 }
@@ -2395,11 +2456,15 @@ void testLabPbrBundleExport() {
   };
 
   xpbd::gfx::LabPbrCompositionResult composition;
-  composition.specular.width = 2;
-  composition.specular.height = 1;
-  composition.specular.source_channels = 4;
-  composition.specular.rgba = {
+  xpbd::gfx::TextureImage composition_image;
+  composition_image.width = 2;
+  composition_image.height = 1;
+  composition_image.source_channels = 4;
+  composition_image.rgba = {
       255u, 229u, 64u, 254u, 0u, 255u, 0u, 0u};
+  composition.specular =
+      std::make_shared<const xpbd::gfx::TextureImage>(
+          std::move(composition_image));
   std::vector<std::uint8_t> base_png;
   const std::vector<std::uint8_t> base_rgba{
       240u, 220u, 200u, 255u, 120u, 140u, 160u, 255u};
@@ -2436,7 +2501,7 @@ void testLabPbrBundleExport() {
   expect(xpbd::gfx::loadTextureImage(
              exported.specular_path, exported_specular, &error) &&
              exported_specular.source_channels == 4 &&
-             exported_specular.rgba == composition.specular.rgba,
+             exported_specular.rgba == composition.specular->rgba,
          "exported specular PNG round-trips exact RGBA bytes");
   expect(read_bytes(exported.normal_path) == normal_png,
          "exported Iris normal preserves exact original file bytes");
@@ -2449,14 +2514,18 @@ void testLabPbrBundleExport() {
       xpbd::gfx::importLabPbrSuite(base_path, false, nullptr);
   expect(imported_before_edit.imported() &&
              imported_before_edit.suite.material.specular_image.rgba ==
-                 composition.specular.rgba &&
+                 composition.specular->rgba &&
              imported_before_edit.suite.source.normal.original_bytes &&
              *imported_before_edit.suite.source.normal.original_bytes ==
                  normal_png,
          "exported complete LabPBR suite imports before editing");
 
   const auto original_specular = exported_specular.rgba;
-  composition.specular.rgba[0] = 7u;
+  auto edited_composition_image = *composition.specular;
+  edited_composition_image.rgba[0] = 7u;
+  composition.specular =
+      std::make_shared<const xpbd::gfx::TextureImage>(
+          std::move(edited_composition_image));
   auto overwrite = xpbd::gfx::exportLabPbrBundle(
       directory / "skin_s.png", composition, &normal, false);
   expect(!overwrite.success && overwrite.overwrite_required &&
@@ -2473,13 +2542,13 @@ void testLabPbrBundleExport() {
          "approved LabPBR bundle overwrite completes");
   expect(xpbd::gfx::loadTextureImage(
              overwrite.specular_path, exported_specular, &error) &&
-             exported_specular.rgba == composition.specular.rgba,
+             exported_specular.rgba == composition.specular->rgba,
          "approved overwrite installs newly validated specular bytes");
   const auto reimported_after_edit =
       xpbd::gfx::importLabPbrSuite(base_path, false, nullptr);
   expect(reimported_after_edit.imported() &&
              reimported_after_edit.suite.material.specular_image.rgba ==
-                 composition.specular.rgba &&
+                 composition.specular->rgba &&
              reimported_after_edit.suite.source.normal.original_bytes &&
              *reimported_after_edit.suite.source.normal.original_bytes ==
                  normal_png &&
@@ -2492,28 +2561,28 @@ void testLabPbrBundleExport() {
   deferred.deferred_height = 1;
   const auto deferred_prompt = xpbd::gfx::exportLabPbrBundle(
       directory / "skin_s.png", deferred, nullptr, false,
-      &composition.specular);
+      composition.specular.get());
   expect(deferred_prompt.overwrite_required &&
-             deferred.specular.rgba.empty(),
+             deferred.specular == nullptr,
          "deferred overwrite prompt does not materialize Source Specular");
 
   const auto deferred_source_export = xpbd::gfx::exportLabPbrBundle(
       directory / "lazy_source.png", deferred, nullptr, true,
-      &composition.specular);
+      composition.specular.get());
   xpbd::gfx::TextureImage lazy_source_image;
   expect(deferred_source_export.success &&
-             deferred.specular.rgba.empty() &&
+             deferred.specular == nullptr &&
              xpbd::gfx::loadTextureImage(
                  deferred_source_export.specular_path, lazy_source_image,
                  &error) &&
-             lazy_source_image.rgba == composition.specular.rgba,
+             lazy_source_image.rgba == composition.specular->rgba,
          "actual deferred export materializes exact Source Specular locally");
 
   const auto deferred_default_export = xpbd::gfx::exportLabPbrBundle(
       directory / "lazy_default.png", deferred, nullptr, true, nullptr);
   xpbd::gfx::TextureImage lazy_default_image;
   expect(deferred_default_export.success &&
-             deferred.specular.rgba.empty() &&
+             deferred.specular == nullptr &&
              xpbd::gfx::loadTextureImage(
                  deferred_default_export.specular_path, lazy_default_image,
                  &error) &&

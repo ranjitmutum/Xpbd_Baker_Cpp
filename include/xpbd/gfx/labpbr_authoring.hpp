@@ -76,7 +76,7 @@ struct LabPbrUvConflict {
 };
 
 struct LabPbrCompositionResult {
-  TextureImage specular;
+  SharedTextureImage specular;
   bool specular_materialization_deferred = false;
   int deferred_width = 0;
   int deferred_height = 0;
@@ -86,7 +86,7 @@ struct LabPbrCompositionResult {
 
   [[nodiscard]] bool exportable() const noexcept {
     const bool has_specular =
-        specular.valid() ||
+        (specular != nullptr && specular->valid()) ||
         (specular_materialization_deferred && deferred_width > 0 &&
          deferred_height > 0);
     return has_specular && conflicts.empty() && errors.empty();
@@ -95,13 +95,14 @@ struct LabPbrCompositionResult {
 
 struct ReadOnlyIrisNormalAsset {
   std::filesystem::path source_path;
-  std::vector<std::uint8_t> original_file_bytes;
+  std::shared_ptr<const std::vector<std::uint8_t>> original_file_bytes;
   std::string sha256;
-  TextureImage decoded;
+  SharedTextureImage decoded;
 
   [[nodiscard]] bool valid() const noexcept {
-    return decoded.valid() && decoded.source_channels == 4 &&
-           !original_file_bytes.empty() && sha256.size() == 64u;
+    return decoded != nullptr && decoded->valid() &&
+           decoded->source_channels == 4 && original_file_bytes != nullptr &&
+           !original_file_bytes->empty() && sha256.size() == 64u;
   }
   void clear() { *this = {}; }
 };
@@ -127,7 +128,7 @@ bool rasterizeLabPbrUvCoverage(const StaticIndexedModelMesh &mesh, int width,
                                std::string *error = nullptr);
 
 [[nodiscard]] LabPbrCompositionResult composeLabPbrSpecular(
-    int width, int height, const TextureImage *imported_specular,
+    int width, int height, SharedTextureImage imported_specular,
     const LabPbrUvCoverage &coverage,
     const std::map<std::string, GroupLabPbrOverride> &overrides);
 
@@ -136,6 +137,15 @@ bool materializeLabPbrSpecular(int width, int height,
                                TextureImage &out,
                                std::string *error = nullptr);
 
+bool buildAuthoredResolvedMaterial(
+    SharedTextureImage base, const ResolvedMaterialTable &source,
+    SharedTextureImage authored_normal,
+    SharedTextureImage authored_specular, ResolvedMaterialTable &out,
+    std::string *error = nullptr,
+    std::uint64_t maximum_peak_bytes = kLabPbrDefaultPeakBudgetBytes);
+
+// Small-call compatibility overload. Product and import paths use the shared
+// overload above so no decoded image is copied.
 bool buildAuthoredResolvedMaterial(
     const TextureImage &base, const ResolvedMaterialTable &source,
     const TextureImage *authored_normal,

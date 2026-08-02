@@ -110,6 +110,11 @@ struct TextureImage {
     }
 };
 
+// Model-material images are immutable after a successful transaction. Keep
+// sharing local to the LabPBR ownership chain instead of changing the storage
+// semantics of TextureImage throughout the project.
+using SharedTextureImage = std::shared_ptr<const TextureImage>;
+
 bool loadTextureImage(const std::filesystem::path& path, TextureImage& out,
                       std::string* err = nullptr,
                       TextureDecodeLimits limits = {});

@@ -605,7 +605,7 @@ bool materializeLabPbrSpecular(int width, int height,
 }
 
 LabPbrCompositionResult composeLabPbrSpecular(
-    int width, int height, const TextureImage *imported_specular,
+    int width, int height, SharedTextureImage imported_specular,
     const LabPbrUvCoverage &coverage,
     const std::map<std::string, GroupLabPbrOverride> &overrides) {
   LabPbrCompositionResult result;
@@ -632,9 +632,13 @@ LabPbrCompositionResult composeLabPbrSpecular(
     }
   }
   if (overrides.empty()) {
-    result.specular_materialization_deferred = true;
     result.deferred_width = width;
     result.deferred_height = height;
+    if (imported_specular != nullptr && imported_specular->valid()) {
+      result.specular = std::move(imported_specular);
+    } else {
+      result.specular_materialization_deferred = true;
+    }
     return result;
   }
   if (!coverage.valid() || coverage.width != width ||
@@ -643,8 +647,9 @@ LabPbrCompositionResult composeLabPbrSpecular(
     return result;
   }
   std::string materialize_error;
-  if (!materializeLabPbrSpecular(width, height, imported_specular,
-                                 result.specular, &materialize_error)) {
+  TextureImage authored_specular;
+  if (!materializeLabPbrSpecular(width, height, imported_specular.get(),
+                                 authored_specular, &materialize_error)) {
     result.errors.push_back(std::move(materialize_error));
     return result;
   }
@@ -676,13 +681,13 @@ LabPbrCompositionResult composeLabPbrSpecular(
         if (override_value.roughness_enabled) {
           claimChannel(texel, LabPbrOverrideChannel::Roughness,
                        encodeLabPbrRoughness(override_value.roughness),
-                       group_name, result.specular, claims);
+                       group_name, authored_specular, claims);
         }
         if (override_value.metal_enabled) {
           claimChannel(texel, LabPbrOverrideChannel::Metal,
                        override_value.metal ? override_value.metal_code
                                             : override_value.dielectric_f0,
-                       group_name, result.specular, claims);
+                       group_name, authored_specular, claims);
         }
         if (override_value.porosity_enabled) {
           claimChannel(texel, LabPbrOverrideChannel::Porosity,
@@ -690,12 +695,12 @@ LabPbrCompositionResult composeLabPbrSpecular(
                            ? encodeLabPbrSubsurface(
                                  override_value.subsurface)
                            : encodeLabPbrPorosity(override_value.porosity),
-                       group_name, result.specular, claims);
+                       group_name, authored_specular, claims);
         }
         if (override_value.emission_enabled) {
           claimChannel(texel, LabPbrOverrideChannel::Emission,
                        encodeLabPbrEmission(override_value.emission),
-                       group_name, result.specular, claims);
+                       group_name, authored_specular, claims);
         }
         if (x == run.x1) {
           break;
@@ -716,36 +721,47 @@ LabPbrCompositionResult composeLabPbrSpecular(
     conflict.encoded_values.assign(claim.values.begin(), claim.values.end());
     result.conflicts.push_back(std::move(conflict));
   }
+  try {
+    result.specular =
+        std::make_shared<const TextureImage>(std::move(authored_specular));
+  } catch (const std::bad_alloc &) {
+    result.errors.emplace_back(
+        "specular atlas publication exceeded the memory budget");
+  } catch (const std::length_error &) {
+    result.errors.emplace_back("specular atlas publication size is invalid");
+  }
   return result;
 }
 
 bool buildAuthoredResolvedMaterial(
-    const TextureImage &base, const ResolvedMaterialTable &source,
-    const TextureImage *authored_normal,
-    const TextureImage *authored_specular, ResolvedMaterialTable &out,
+    SharedTextureImage base, const ResolvedMaterialTable &source,
+    SharedTextureImage authored_normal,
+    SharedTextureImage authored_specular, ResolvedMaterialTable &out,
     std::string *error, std::uint64_t maximum_peak_bytes) {
-  if (!base.valid() ||
+  const bool has_authored_normal = authored_normal != nullptr;
+  const bool has_authored_specular = authored_specular != nullptr;
+  if (base == nullptr || !base->valid() ||
       (authored_specular != nullptr &&
        (!authored_specular->valid() ||
-        authored_specular->width != base.width ||
-        authored_specular->height != base.height ||
+        authored_specular->width != base->width ||
+        authored_specular->height != base->height ||
         authored_specular->source_channels != 4))) {
     if (error != nullptr) {
       *error = "authored specular image does not match the base atlas";
     }
     return false;
   }
-  const TextureImage *normal = authored_normal;
+  SharedTextureImage normal = std::move(authored_normal);
   if (normal == nullptr && source.normal_map_active) {
-    normal = &source.normal_image;
+    normal = source.normalImageAsset();
   }
-  const TextureImage *specular = authored_specular;
+  SharedTextureImage specular = std::move(authored_specular);
   if (specular == nullptr && source.specular_map_active) {
-    specular = &source.specular_image;
+    specular = source.specularImageAsset();
   }
   if (normal != nullptr &&
-      (!normal->valid() || normal->width != base.width ||
-       normal->height != base.height || normal->source_channels < 3)) {
+      (!normal->valid() || normal->width != base->width ||
+       normal->height != base->height || normal->source_channels < 3)) {
     if (error != nullptr) {
       *error = "normal image does not match the base atlas or lacks RGB";
     }
@@ -753,19 +769,23 @@ bool buildAuthoredResolvedMaterial(
   }
 
   LabPbrMemoryEstimateRequest memory_request;
-  memory_request.width = static_cast<std::uint64_t>(base.width);
-  memory_request.height = static_cast<std::uint64_t>(base.height);
-  memory_request.resident_rgba_image_count =
-      1u + (normal != nullptr ? 1u : 0u) +
-      (specular != nullptr ? 1u : 0u);
-  memory_request.candidate_rgba_image_count =
-      memory_request.resident_rgba_image_count;
+  memory_request.width = static_cast<std::uint64_t>(base->width);
+  memory_request.height = static_cast<std::uint64_t>(base->height);
   memory_request.resolved_texel_bytes_per_pixel =
       kLabPbrResolvedTexelBytesPerPixel;
-  const TextureImage *old_images[] = {
-      &out.base_image, &out.normal_image, &out.specular_image};
-  for (const TextureImage *old_image : old_images) {
-    if (old_image->rgba.capacity() >
+  const SharedTextureImage assets[] = {
+      base, normal, specular, out.baseImageAsset(), out.normalImageAsset(),
+      out.specularImageAsset()};
+  const TextureImage *counted[std::size(assets)]{};
+  std::size_t counted_size = 0;
+  for (const auto &asset : assets) {
+    if (asset == nullptr ||
+        std::find(counted, counted + counted_size, asset.get()) !=
+            counted + counted_size) {
+      continue;
+    }
+    counted[counted_size++] = asset.get();
+    if (asset->rgba.capacity() >
         (std::numeric_limits<std::uint64_t>::max)() -
             memory_request.resident_fixed_bytes) {
       if (error != nullptr) {
@@ -774,7 +794,7 @@ bool buildAuthoredResolvedMaterial(
       return false;
     }
     memory_request.resident_fixed_bytes +=
-        static_cast<std::uint64_t>(old_image->rgba.capacity());
+        static_cast<std::uint64_t>(asset->rgba.capacity());
   }
   LabPbrMemoryEstimate memory_estimate;
   if (!preflightLabPbrMemory(memory_request, maximum_peak_bytes,
@@ -784,17 +804,15 @@ bool buildAuthoredResolvedMaterial(
 
   try {
     ResolvedMaterialTable material = source;
-    material.width = base.width;
-    material.height = base.height;
-    material.base_image = base;
-    if (authored_normal != nullptr || authored_specular != nullptr) {
+    material.width = base->width;
+    material.height = base->height;
+    if (has_authored_normal || has_authored_specular) {
       material.format = LabPbrFormat::LabPbr13;
     }
     material.normal_map_active = normal != nullptr;
-    material.normal_image = normal == nullptr ? TextureImage{} : *normal;
     material.specular_map_active = specular != nullptr;
-    material.specular_image =
-        specular == nullptr ? TextureImage{} : *specular;
+    material.setImageAssets(std::move(base), std::move(normal),
+                            std::move(specular));
     out = std::move(material);
     if (error != nullptr) {
       error->clear();
@@ -803,6 +821,59 @@ bool buildAuthoredResolvedMaterial(
   } catch (const std::bad_alloc &) {
     if (error != nullptr) {
       *error = "LabPBR budget stage failed while allocating compact material images";
+    }
+    return false;
+  } catch (const std::length_error &exception) {
+    if (error != nullptr) {
+      *error = std::string("LabPBR budget stage failed: ") + exception.what();
+    }
+    return false;
+  }
+}
+
+bool buildAuthoredResolvedMaterial(
+    const TextureImage &base, const ResolvedMaterialTable &source,
+    const TextureImage *authored_normal,
+    const TextureImage *authored_specular, ResolvedMaterialTable &out,
+    std::string *error, std::uint64_t maximum_peak_bytes) {
+  if (!base.valid()) {
+    if (error != nullptr) {
+      *error = "authored specular image does not match the base atlas";
+    }
+    return false;
+  }
+  LabPbrMemoryEstimateRequest memory_request;
+  memory_request.width = static_cast<std::uint64_t>(base.width);
+  memory_request.height = static_cast<std::uint64_t>(base.height);
+  memory_request.resident_rgba_image_count =
+      1u + (authored_normal != nullptr ? 1u : 0u) +
+      (authored_specular != nullptr ? 1u : 0u);
+  memory_request.candidate_rgba_image_count =
+      memory_request.resident_rgba_image_count;
+  memory_request.resolved_texel_bytes_per_pixel =
+      kLabPbrResolvedTexelBytesPerPixel;
+  LabPbrMemoryEstimate memory_estimate;
+  if (!preflightLabPbrMemory(memory_request, maximum_peak_bytes,
+                             memory_estimate, error)) {
+    return false;
+  }
+  try {
+    auto base_asset = std::make_shared<const TextureImage>(base);
+    auto normal_asset = authored_normal != nullptr
+                            ? std::make_shared<const TextureImage>(
+                                  *authored_normal)
+                            : SharedTextureImage{};
+    auto specular_asset = authored_specular != nullptr
+                              ? std::make_shared<const TextureImage>(
+                                    *authored_specular)
+                              : SharedTextureImage{};
+    return buildAuthoredResolvedMaterial(
+        std::move(base_asset), source, std::move(normal_asset),
+        std::move(specular_asset), out, error, maximum_peak_bytes);
+  } catch (const std::bad_alloc &) {
+    if (error != nullptr) {
+      *error =
+          "LabPBR budget stage failed while allocating compact material images";
     }
     return false;
   } catch (const std::length_error &exception) {
@@ -839,8 +910,10 @@ bool importReadOnlyIrisNormal(const std::filesystem::path &path,
       limits.retained_resident_bytes += bytes;
       return true;
     };
-    if (!add_retained(out.original_file_bytes.capacity()) ||
-        !add_retained(out.decoded.rgba.capacity())) {
+    if ((out.original_file_bytes != nullptr &&
+         !add_retained(out.original_file_bytes->capacity())) ||
+        (out.decoded != nullptr &&
+         !add_retained(out.decoded->rgba.capacity()))) {
       if (error != nullptr) {
         *error =
             "Iris Normal budget stage failed before snapshot: retained byte overflow";
@@ -893,33 +966,13 @@ bool importReadOnlyIrisNormal(const std::filesystem::path &path,
       return false;
     }
 
-    std::size_t copy_peak = limits.retained_resident_bytes;
-    const auto add_copy_peak = [&copy_peak](std::size_t bytes) {
-      if (bytes >
-          (std::numeric_limits<std::size_t>::max)() - copy_peak) {
-        return false;
-      }
-      copy_peak += bytes;
-      return true;
-    };
-    if (!add_copy_peak(snapshot.bytes->capacity()) ||
-        !add_copy_peak(decoded.rgba.capacity()) ||
-        !add_copy_peak(snapshot.bytes->size()) ||
-        copy_peak > effective_peak) {
-      if (error != nullptr) {
-        *error =
-            "Iris Normal budget stage failed before encoded-byte copy: peak limit exceeded";
-      }
-      return false;
-    }
-
     ReadOnlyIrisNormalAsset imported;
     imported.source_path = snapshot.path;
-    imported.original_file_bytes.assign(snapshot.bytes->begin(),
-                                        snapshot.bytes->end());
-    imported.sha256 = sha256Hex(imported.original_file_bytes);
-    imported.decoded = std::move(decoded);
-    imported.decoded.path = pathUtf8String(snapshot.path);
+    imported.original_file_bytes = snapshot.bytes;
+    imported.sha256 = sha256Hex(*imported.original_file_bytes);
+    decoded.path = pathUtf8String(snapshot.path);
+    imported.decoded =
+        std::make_shared<const TextureImage>(std::move(decoded));
     out = std::move(imported);
     if (error != nullptr) {
       error->clear();

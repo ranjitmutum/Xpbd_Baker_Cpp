@@ -77,12 +77,32 @@ struct ResolvedMaterialTexel {
 };
 
 struct ResolvedMaterialTable {
+private:
+  SharedTextureImage base_image_asset_;
+  SharedTextureImage normal_image_asset_;
+  SharedTextureImage specular_image_asset_;
+
+  [[nodiscard]] static const TextureImage &
+  imageOrEmpty(const SharedTextureImage &asset) noexcept;
+
+public:
+  ResolvedMaterialTable() noexcept;
+  explicit ResolvedMaterialTable(
+      SharedTextureImage base_image_asset,
+      SharedTextureImage normal_image_asset = {},
+      SharedTextureImage specular_image_asset = {}) noexcept;
+  ResolvedMaterialTable(const ResolvedMaterialTable &other);
+  ResolvedMaterialTable(ResolvedMaterialTable &&other) noexcept;
+  ResolvedMaterialTable &operator=(const ResolvedMaterialTable &other);
+  ResolvedMaterialTable &operator=(ResolvedMaterialTable &&other) noexcept;
+  ~ResolvedMaterialTable() = default;
+
   int width = 0;
   int height = 0;
   // Keep compact source images and decode a single texel on demand. The
   // former width*height ResolvedMaterialTexel expansion was 108 bytes per
   // pixel on the supported MSVC x64 build.
-  TextureImage base_image;
+  const TextureImage &base_image;
 
   LabPbrAssetPaths assets;
   LabPbrFormat format = LabPbrFormat::Fallback;
@@ -90,9 +110,22 @@ struct ResolvedMaterialTable {
   bool format_declared = false;
   bool normal_map_active = false;
   bool specular_map_active = false;
-  TextureImage normal_image;
-  TextureImage specular_image;
+  const TextureImage &normal_image;
+  const TextureImage &specular_image;
   std::vector<std::string> warnings;
+
+  [[nodiscard]] const SharedTextureImage &baseImageAsset() const noexcept {
+    return base_image_asset_;
+  }
+  [[nodiscard]] const SharedTextureImage &normalImageAsset() const noexcept {
+    return normal_image_asset_;
+  }
+  [[nodiscard]] const SharedTextureImage &specularImageAsset() const noexcept {
+    return specular_image_asset_;
+  }
+  void setImageAssets(SharedTextureImage base_image_asset,
+                      SharedTextureImage normal_image_asset = {},
+                      SharedTextureImage specular_image_asset = {});
 
   [[nodiscard]] bool valid() const noexcept;
   void clear();

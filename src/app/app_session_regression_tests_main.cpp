@@ -36,6 +36,14 @@ bool sameTexture(const xpbd::gfx::TextureImage &lhs,
          lhs.source_channels == rhs.source_channels && lhs.rgba == rhs.rgba;
 }
 
+bool sameTexture(const xpbd::gfx::SharedTextureImage &lhs,
+                 const xpbd::gfx::SharedTextureImage &rhs) {
+  if (lhs == rhs) {
+    return true;
+  }
+  return lhs != nullptr && rhs != nullptr && sameTexture(*lhs, *rhs);
+}
+
 bool sameSourceFile(const xpbd::gfx::LabPbrSourceFile &lhs,
                     const xpbd::gfx::LabPbrSourceFile &rhs) {
   const bool same_bytes =
@@ -75,7 +83,7 @@ bool sameImportedNormal(const xpbd::gfx::ReadOnlyIrisNormalAsset &lhs,
 }
 
 struct MaterialSessionSnapshot {
-  xpbd::gfx::TextureImage texture;
+  xpbd::gfx::SharedTextureImage texture;
   xpbd::gfx::ResolvedUvDomain domain;
   xpbd::gfx::ResolvedMaterialTable material;
   xpbd::gfx::LabPbrUvCoverage coverage;
@@ -705,10 +713,20 @@ void testTransactionalLabPbrSuiteImport() {
   session.clearTexture();
   expect(session.requestLabPbrSuiteImport(base_path),
          "AppSession commits a complete strict LabPBR suite");
-  expect(session.labpbr_suite_source.valid() &&
+  expect(session.labpbr_suite_source.metadataValid() &&
+             !session.labpbr_suite_source.base.original_bytes &&
+             !session.labpbr_suite_source.specular.original_bytes &&
+             !session.labpbr_suite_source.normal.original_bytes &&
+             !session.labpbr_suite_source.properties.original_bytes &&
              session.resolved_material.valid() &&
-             session.labpbr_imported_normal.valid(),
-         "AppSession retains committed source/material/normal state");
+             session.labpbr_imported_normal.valid() &&
+             session.model_texture ==
+                 session.resolved_material.baseImageAsset() &&
+             session.labpbr_imported_normal.decoded ==
+                 session.resolved_material.normalImageAsset() &&
+             session.labpbr_composition.specular ==
+                 session.resolved_material.specularImageAsset(),
+         "AppSession retains metadata-only source and shared material assets");
 
   auto committed = snapshot(session);
   expect(readBytes(base_path) == base_png &&
@@ -729,7 +747,8 @@ void testTransactionalLabPbrSuiteImport() {
              session.resolved_material.normal_map_active &&
              session.materialGeneration() == generation_before_normal + 1u,
          "dedicated Iris normal import updates resolved GPU material state");
-  expect(session.labpbr_imported_normal.original_file_bytes == normal_png,
+  expect(session.labpbr_imported_normal.original_file_bytes != nullptr &&
+             *session.labpbr_imported_normal.original_file_bytes == normal_png,
          "dedicated Iris normal import retains exact source bytes");
 
   const std::vector<std::uint8_t> direct_specular_rgba{
@@ -761,9 +780,10 @@ void testTransactionalLabPbrSuiteImport() {
   expect(!session.labpbr_uv_coverage.valid() &&
              session.labpbr_uv_coverage.group_runs.empty() &&
              session.labpbr_composition.exportable() &&
-             session.labpbr_composition.specular_materialization_deferred &&
-             session.labpbr_composition.specular.rgba.empty(),
-         "no Override keeps AppSession Coverage and duplicate Composition nonresident");
+             !session.labpbr_composition.specular_materialization_deferred &&
+             session.labpbr_composition.specular ==
+                 session.resolved_material.specularImageAsset(),
+         "no Override keeps Coverage nonresident and shares Source Specular");
   const auto direct_committed = snapshot(session);
   const fs::path mismatched_specular_path =
       directory / "mismatched_specular.png";
@@ -969,7 +989,10 @@ void testUnicodeLongPathTextureTransactions() {
          "Base path decode counts resident output and preserves it on budget failure");
 
   const auto strict = xpbd::gfx::importLabPbrSuite(base_path, false);
-  expect(strict.imported() && strict.suite.base_image.rgba == base_rgba &&
+  expect(strict.imported() && strict.suite.base_image != nullptr &&
+             strict.suite.base_image->rgba == base_rgba &&
+             strict.suite.base_image ==
+                 strict.suite.material.baseImageAsset() &&
              *strict.suite.source.base.original_bytes == base_png &&
              *strict.suite.source.specular.original_bytes == specular_png &&
              *strict.suite.source.normal.original_bytes == normal_png &&
@@ -980,9 +1003,10 @@ void testUnicodeLongPathTextureTransactions() {
   xpbd::gfx::ReadOnlyIrisNormalAsset iris;
   expect(xpbd::gfx::importReadOnlyIrisNormal(normal_path, 2, 1, iris,
                                              &error) &&
-             iris.original_file_bytes == normal_png &&
-             iris.decoded.rgba == normal_rgba &&
-             iris.decoded.path == xpbd::gfx::pathUtf8String(normal_path),
+             iris.original_file_bytes != nullptr &&
+             *iris.original_file_bytes == normal_png &&
+             iris.decoded != nullptr && iris.decoded->rgba == normal_rgba &&
+             iris.decoded->path == xpbd::gfx::pathUtf8String(normal_path),
          "read-only Iris import accepts Unicode long paths and exact bytes");
 
   auto &session = xpbd::app::AppSession::instance();
@@ -992,11 +1016,14 @@ void testUnicodeLongPathTextureTransactions() {
              session.texture_path == xpbd::gfx::pathUtf8String(base_path),
          "AppSession commits a Base texture from a Unicode long path");
   expect(session.requestLabPbrSuiteImport(base_path) &&
-             session.labpbr_suite_source.valid() &&
+             session.labpbr_suite_source.metadataValid() &&
+             !session.labpbr_suite_source.base.original_bytes &&
+             !session.labpbr_suite_source.specular.original_bytes &&
              session.texture_path == xpbd::gfx::pathUtf8String(base_path),
          "AppSession commits a strict suite from a Unicode long path");
   expect(session.importLabPbrNormal(normal_path) &&
-             session.labpbr_imported_normal.original_file_bytes == normal_png,
+             session.labpbr_imported_normal.original_file_bytes != nullptr &&
+             *session.labpbr_imported_normal.original_file_bytes == normal_png,
          "AppSession commits a read-only Iris normal from a Unicode long path");
   const auto committed = snapshot(session);
 
@@ -1189,9 +1216,11 @@ void testLargeUvModelMaterialTransactions() {
          "real suite entry commits one Recovered Domain for all channels");
   expect(!session.labpbr_uv_coverage.valid() &&
              session.labpbr_uv_coverage.group_runs.empty() &&
-             session.labpbr_composition.specular_materialization_deferred &&
-             session.labpbr_composition.specular.rgba.empty(),
-         "large-UV suite without Overrides keeps Coverage and Composition nonresident");
+             !session.labpbr_composition.specular_materialization_deferred &&
+             session.labpbr_composition.specular ==
+                 session.resolved_material.specularImageAsset(),
+         "large-UV suite without Overrides shares Source Specular");
+  const auto source_specular = session.labpbr_composition.specular;
   session.selected_bone_name = "eye_left";
   session.loadSelectedLabPbrDraft();
   session.labpbr_draft.roughness_enabled = true;
@@ -1204,9 +1233,24 @@ void testLargeUvModelMaterialTransactions() {
   expect(session.labpbr_uv_coverage.valid() &&
              left_coverage != nullptr && !left_coverage->empty() &&
              right_coverage != nullptr && !right_coverage->empty() &&
-             session.labpbr_composition.specular.valid() &&
+             session.labpbr_composition.specular != nullptr &&
+             session.labpbr_composition.specular->valid() &&
+             session.labpbr_composition.specular != source_specular &&
+             session.labpbr_composition.specular ==
+                 session.resolved_material.specularImageAsset() &&
              !session.labpbr_composition.specular_materialization_deferred,
          "first Override materializes run Coverage for both large-UV eyes");
+  std::weak_ptr<const xpbd::gfx::TextureImage> authored_specular =
+      session.labpbr_composition.specular;
+  expect(session.restoreSelectedLabPbrFromTexture() &&
+             session.labpbr_composition.specular == source_specular &&
+             authored_specular.expired(),
+         "clearing the last Override releases the authored COW image");
+  session.labpbr_draft.roughness_enabled = true;
+  session.labpbr_draft.roughness = 0.25f;
+  session.markLabPbrDraftDirty();
+  expect(session.applySelectedLabPbrDraft(),
+         "large-UV Override can be reapplied after COW release");
 
   std::vector<std::uint8_t> small_rgba(16u * 16u * 4u, 255u);
   std::vector<std::uint8_t> small_png;
@@ -1307,7 +1351,7 @@ void testExternalLabPbrSuite(const std::filesystem::path &base_path) {
          "external suite pauses for missing-properties confirmation");
   session.confirmLabPbrSuiteImport(true);
 
-  expect(session.labpbr_suite_source.valid() &&
+  expect(session.labpbr_suite_source.metadataValid() &&
              session.labpbr_suite_source.base.path == normalized_base,
          "external suite commits through the real AppSession path");
   expect(session.labpbr_suite_source
@@ -1315,26 +1359,25 @@ void testExternalLabPbrSuite(const std::filesystem::path &base_path) {
              session.resolved_material.specular_map_active &&
              session.resolved_material.normal_map_active,
          "external suite activates confirmed LabPBR specular and normal maps");
-  expect(session.model_texture.width == 1024 &&
-             session.model_texture.height == 1024,
+  expect(session.model_texture != nullptr &&
+             session.model_texture->width == 1024 &&
+             session.model_texture->height == 1024,
          "external suite preserves expected 1024x1024 dimensions");
   expect(session.materialGeneration() > generation_before,
          "external suite advances material generation on first commit");
-  expect(session.labpbr_suite_source.base.original_bytes &&
-             *session.labpbr_suite_source.base.original_bytes == base_bytes &&
-             session.labpbr_suite_source.specular.original_bytes &&
-             *session.labpbr_suite_source.specular.original_bytes ==
-                 specular_bytes &&
-             session.labpbr_suite_source.normal.original_bytes &&
-             *session.labpbr_suite_source.normal.original_bytes == normal_bytes,
-         "external suite retains exact original source bytes");
+  expect(!session.labpbr_suite_source.base.original_bytes &&
+             !session.labpbr_suite_source.specular.original_bytes &&
+             !session.labpbr_suite_source.normal.original_bytes &&
+             session.labpbr_imported_normal.original_file_bytes != nullptr &&
+             *session.labpbr_imported_normal.original_file_bytes ==
+                 normal_bytes,
+         "external Session retains metadata and only the Iris encoded asset");
 
   auto committed = snapshot(session);
-  expect(session.reloadLabPbrSuite() && session.labpbr_last_import_cache_hit,
-         "external suite reload reuses the checksum cache");
-  committed.last_import_cache_hit = true;
+  expect(session.reloadLabPbrSuite() && !session.labpbr_last_import_cache_hit,
+         "external suite reload bypasses the disabled pre-LRU cache");
   expect(unchanged(session, committed),
-         "cached external reload leaves committed material generation stable");
+         "uncached external reload leaves committed material generation stable");
   expect(readBytes(normalized_base) == base_bytes &&
              readBytes(specular_path) == specular_bytes &&
              readBytes(normal_path) == normal_bytes,

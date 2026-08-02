@@ -10,7 +10,8 @@
 | 2026-08-02 | S03 resumed | COMPLETE | texture snapshot/decode, strict Suite/Iris import, COM dialogs, AppSession/viewport regressions, planning files | Affected Release app + viewport + AppSession targets PASS; related CTest 2/2 PASS (1.45 s); source contracts and `git diff --check` PASS | `a9b955d` | Gate A: full Release build and full CTest |
 | 2026-08-02 | Gate A | COMPLETE | planning files only after S03 commit `a9b955d` | Full Release preset PASS; SPIR-V 27-shader verification PASS; full CTest 5/5 PASS (4.30 s); CPU/reference/source contracts PASS | no gate commit by plan | S04: remove resolved-texel expansion and add final-model budget preflight |
 | 2026-08-02 | S04 | COMPLETE | compact material images/on-demand decode; checked pre-decode/final-model budgets; Suite/Iris/cache accounting; AppSession/viewport regressions; planning files | Release app + viewport + AppSession targets PASS; related CTest 2/2 PASS (1.35 s); actual 2K + 8K arithmetic-only gates PASS; `git diff --check` and scope audit PASS | `d01a428` | S05: lazy Coverage/Composition and run encoding |
-| 2026-08-02 | S05 | COMPLETE | lazy Coverage/Composition; `UvRun`; marked/touched/sort/merge; deferred export; AppSession/UI accessors; regressions; planning files | Release app + viewport + AppSession targets PASS; related CTest 2/2 PASS (1.70 s); actual 2K + 8K arithmetic-only gates PASS; `git diff --check` and scope audit PASS; repair 1/2 | this isolated phase commit | S06: shared immutable images/Iris bytes and copy-on-write Composition |
+| 2026-08-02 | S05 | COMPLETE | lazy Coverage/Composition; `UvRun`; marked/touched/sort/merge; deferred export; AppSession/UI accessors; regressions; planning files | Release app + viewport + AppSession targets PASS; related CTest 2/2 PASS (1.70 s); actual 2K + 8K arithmetic-only gates PASS; `git diff --check` and scope audit PASS; repair 1/2 | `58445da` | S06: shared immutable images/Iris bytes and copy-on-write Composition |
+| 2026-08-02 | S06 | COMPLETE | shared immutable Base/Normal/Specular/Iris assets; metadata-only Session source; Composition COW; unique resident accounting; import/export/AppSession regressions; planning files | Release app + viewport + AppSession targets PASS; related CTest 2/2 PASS (1.48 s); actual 2K handle-identity stress PASS; `git diff --check` and scope audit PASS; repair 1/2 | pending isolated commit | S07: 256 MiB byte-bounded shared LRU cache |
 
 - Resumed implementation: restored the shared snapshot API declaration and removed the filename-based stb branch; subsequent patches are reapplying the previously compiled candidate without altering its scope.
 
@@ -244,6 +245,115 @@
 
 - S05 final pre-stage status contains exactly 14 task-owned code/test/planning paths plus the unchanged protected baseline; staged state is still empty and final `git diff --check` passes.
 
+- S05 post-commit recovery: session catch-up found only the commit-boundary tool/status messages; `HEAD` is expected at `58445da`. The first status audit shows only the protected pre-existing tracked manifest and untracked artifact/document baseline, with no task-owned code left dirty. S06 is active; complete findings, Git-history/diff, commit-scope, and latest-test verification continues before design edits.
+
+- S06 recovery findings checkpoint: `findings.md` lines 1-140 were re-read exactly. They reconfirm S06 must share only the LabPBR-local immutable image/encoded-byte chain, implement authored Specular copy-on-write, avoid Vulkan/backend changes, and preserve the protected baseline; lines 141-end remain before code inventory.
+
+- S06 recovery findings COMPLETE: exact lines 141-284 were re-read without truncation. All three planning files are now recovered; the remaining recovery checks are HEAD/history, complete staged/unstaged diffs, S05 commit scope, and the newest affected-test log before any S06 production edit.
+
+- S06 recovery COMPLETE: `HEAD=58445da`; its 14-path commit scope matches the audited S05 phase, staged diff is empty, and unstaged task changes are planning-only beside the untouched protected manifest. The latest affected log records viewport/AppSession 2/2 PASS ending 2026-08-02 14:32 CST. S06 starts from a green phase boundary with repair count 0/2.
+
+- S06 ownership inventory started: all decoded-image duplicates and Iris encoded-byte duplication are mapped. The next design check is the exact `TextureImage`/material/import/authoring API and value-use surface so sharing can remain LabPBR-local and backend-free.
+
+- S06 header audit: the shared alias can live beside `TextureImage`; import, authoring, and Session fields are locally migratable. The unresolved compatibility point is `ResolvedMaterialTable`'s read-only field syntax consumed by forbidden backend code; inspect its constructors/assignment and all mutation sites before selecting the handle/view representation.
+
+- S06 material/import audit: Vulkan access can stay source-identical if the table owns shared handles behind explicit copy/move semantics and exposes rebound const image references. Strict import's three decoded locals are the natural point to create the shared handles; cache behavior remains unchanged until S07.
+
+- S06 AppSession/preflight audit: change Base ownership to a shared handle, deduplicate resident accounting by pointer identity, strip committed Suite source snapshots to metadata, and count only real authored-COW allocations. Import/cache snapshot ownership stays valid for S07.
+
+- S06 authoring/import audit: implement COW by editing a local Specular then publishing an immutable handle; Iris shares the exact suite/file snapshot and decoded handle. Preflight arithmetic must remove now-nonexistent decoded/encoded/cache copies while preserving actual decode and authored-allocation peaks.
+
+- S06 compatibility design fixed: `ResolvedMaterialTable` will own three shared handles, expose unchanged read-only image references for backend consumers, and provide explicit handle getters plus transactional image replacement. No Vulkan file needs modification.
+
+- S06 original-plan/test audit complete: tests will prove pointer identity across each required owner, exact Iris snapshot sharing, metadata-only Session sources, no-Override Source sharing, first-Override COW, failure preservation, and release after clear. Existing value-mutation fixtures will publish immutable candidates instead.
+
+- S06 implementation begins with the shared alias and material-table ownership core; sidecar resolution already stages mutable locals, so immutable publication will preserve its current validation and warnings.
+
+- S06 implementation part 1: added the LabPBR-local `SharedTextureImage` alias and converted `ResolvedMaterialTable` to three immutable shared owners with backend-compatible const image references, explicit copy/move rebinding, and transactional asset replacement. No backend file changed.
+
+- S06 API route: retain small value-call compatibility but add shared-handle authoring for product/import paths; migrate the actual 2K stress to that overload and assert pointer identity/three-image residency.
+
+- S06 implementation part 2: material resolution now publishes shared handles; Composition, Iris decoded/encoded ownership, Import Result Base, and shared authoring declarations are converted to immutable handles. Source metadata validity is split from full snapshot validity for the later Session strip.
+
+- S06 implementation part 3: Composition now shares Source Specular with no Override and publishes a private authored candidate only after COW edits; shared material authoring deduplicates input/output image identities; Iris directly shares its snapshot and publishes one immutable decoded handle. The value overload remains for small compatibility callers.
+
+- S06 implementation part 4: strict import now publishes exactly one shared decoded asset per channel and its by-value cache copies only handles; preflight removes obsolete material/cache/Iris copies. Source validation distinguishes full import snapshots from metadata-only Session state, and cache residency deduplicates shared identities pending S07's bounded LRU.
+
+- Planning record patch mismatch: one multi-file append expected the phrase `Source metadata validity`, while the committed progress line says `Source validation`; `apply_patch` made no partial change. The exact tail was re-read and this corrected append records the error without affecting S06 code or repair count.
+
+- S06 export/commit audit: export changes are pointer-only and retain the current transaction order. AppSession suite commit will wire exact Base/Normal identities first, then replace full snapshots with metadata-only descriptors at the final Session swap.
+
+- S06 export migration: resident/deferred Specular and Iris validation/write paths now dereference immutable handles while retaining overwrite-before-materialization and staged round-trip rollback. A post-edit read caught and corrected boolean grouping in the byte-content comparison before any build.
+
+- S06 AppSession core part 1: Base-facing material construction now accepts a shared handle, counts each candidate image identity once, allocates only one authored Specular when Overrides exist, and passes raw immutable views to the unchanged mesh builder. Session residency uses fixed-capacity identity sets and includes Source/Resolved/Composition/Iris without double counting.
+
+- AppSession call-site batch patch mismatch: generic repeated hunks did not match every wrapped invocation, so `apply_patch` made no partial edit. Exact `rg -C` contexts were captured; replacements will be split by signature family. This is an orchestration edit mismatch, not an S06 compile/test repair.
+
+- S06 AppSession core part 2: all resident/decode/import preflight calls now include the private Source material so identity accounting covers both original and authored assets. The public Base-handle migration is confined to AppSession, main render-loop pointer extraction, two read-only panels, and AppSession regressions.
+
+- S06 suite/Base commit design finalized: suite Normal reuses both snapshot and decoded pointers, Session source commits metadata only, and the old product cache is dormant until S07. Direct Base load publishes one handle after decode and shares retained sidecars without pixel copies.
+
+- S06 AppSession implementation part 3: strict Suite commit now shares the exact Base/Normal assets, strips all committed source snapshots to metadata, disables/clears the old product cache only on success, and direct Base load publishes one immutable handle while retaining compatible sidecars by identity.
+
+- Tool-wrapper parse error: one pointer-syntax patch was not invoked because its JavaScript string literal was malformed. No repository edit occurred; subsequent source patches use raw multiline input. This is orchestration-only and does not consume an S06 repair round.
+
+- S06 AppSession pointer audit: every Base validity/dimension/path use now dereferences the immutable handle, while all material helper calls already accept the handle directly. Three remaining source-sidecar mutation sites will be replaced with shared asset publication/removal.
+
+- S06 sidecar audit complete: direct Specular has one publication point; Specular/Normal removal each need one shared-asset replacement preserving the other handles. No mutable access to published pixels remains.
+
+- Planning tool-wrapper parse error: Markdown backticks inside one raw JavaScript template terminated it before the patch call. No edit occurred; the corrected record avoids embedded backticks. This is orchestration-only and does not consume an S06 repair round.
+
+- S06 AppSession implementation part 4: direct Specular publishes one immutable asset, removals release only the selected Source handle, and all app/render/panel Base reads now use the shared pointer. Production search finds no remaining value-style Base access; Vulkan remains untouched.
+
+- S06 production ownership wiring complete: import/material/authoring/export/AppSession/render/UI compile surfaces now use immutable handles or the table's read-only compatibility view. Regression migration and source-contract/identity assertions are next.
+
+- S06 AppSession regression inventory: snapshot/oracle ownership becomes shallow shared handles while semantic equality still compares pixels; eight direct Iris/Composition/Base assertions need dereferencing. Identity and metadata-only assertions will be added beside the existing real suite/large-UV transactions.
+
+- AppSession regression helper patch mismatch: a two-hunk patch did not match its second visible anchor and made no partial edit. Exact numbered lines were re-read; the helper overload and snapshot type will be patched separately. This is an edit-context issue, not a test repair round.
+
+- S06 AppSession regression migration started: transaction snapshots now retain shared handles and compare semantic pixels. Suite/Unicode assertions will require metadata-only committed sources, pointer-aligned Base/Normal/Specular, and dereferenced exact bytes.
+
+- S06 remaining AppSession regression audit: large-UV no-Override now expects shared Source Specular rather than an empty deferred image. The optional external-suite path must temporarily expect metadata-only sources and a cache miss/redecode until S07 re-enables bounded caching.
+
+- S06 AppSession regressions migrated: real suite/Unicode/large-UV/external paths now dereference handles, assert metadata-only sources and pointer alignment, exercise first-Override COW, prove authored-image release on last-Override clear, and expect the product cache to remain disabled until S07. No stale value-style ownership assertion remains.
+
+- S06 viewport authoring test audit: null Source calls need explicit empty shared handles to avoid overload ambiguity; Source cases will publish one shared fixture, assert no-Override pointer identity, and verify Override Composition owns a distinct immutable COW image while preserving untouched channels.
+
+- S06 structural-test audit: the actual 2K material stress will transfer its three generated images into shared handles and require exact handle identity, proving no hidden fourth-through-sixth copy. The single mutable clamp fixture will publish its tiny Base through the table setter.
+
+- S06 Iris/export test audit: convert the old copy-budget failure into a tight-budget success, retain exact handle rollback checks, and publish new immutable export candidates instead of mutating shared pixels.
+
+- S06 viewport regression migration checkpoint: COW/2K/clamp/Iris/export cases now use handles. Final stale syntax is limited to a failed-import null check and deferred-default null check; strict cache identity assertions remain to be strengthened.
+
+- S06 strict-import test audit: add direct Import Result-to-Material identity and cache-hit identity assertions while retaining all checksum/source-change/failure semantics. Cache policy/eviction tests remain reserved for S07.
+
+- S06 regression ownership search is clean: all Composition/Base/Iris accesses now use handles, strict import/cache copies assert exact decoded-image identity, and the only direct encoded-byte comparisons correctly dereference non-null shared snapshots.
+
+- S06 source-contract addition planned: assert direct Iris snapshot sharing, metadata snapshot reset, shared alias presence, and temporary product-cache disablement alongside the existing runtime identity tests.
+
+- S06 pre-build ownership scan: no stale value-style Session/Composition/Iris/Import Result access, raw-address-of shared handle, or ambiguous null Composition call remains. Runtime/source contracts now cover each required sharing edge; proceeding to format and compile preflight.
+
+- S06 pre-build format/scope checkpoint: git diff check passes (line-ending warnings only); the task diff is confined to LabPBR ownership/import/authoring/export, AppSession data access, two read-only UI accessors, render-loop pointer extraction, regressions, and planning. No forbidden backend/shader/physics/protocol path is modified.
+
+- S06 repair 1/2: first affected Release build produced the app and viewport regression targets, then AppSession test compilation found one nonexistent test-only call named restoreSelectedLabPbrGroup. The existing public method is restoreSelectedLabPbrFromTexture; replace only that call and rebuild the same target. Production translation units compiled successfully.
+
+- Repair-record tool-wrapper parse error: Markdown backticks terminated the raw JavaScript patch before invocation. No edit occurred; this corrected record uses plain identifiers and does not change the 1/2 repair count.
+
+- S06 affected Release build is GREEN after repair 1/2: app, viewport regression, and rebuilt AppSession regression targets all compile/link. Only pre-existing third-party warnings remain; proceeding to the two related CTest cases.
+
 ## Resume protocol
 
 Read all three planning files, then `git status --short`, `git log -10 --oneline`, `git diff`, `git diff --cached`, and the newest recorded test result. Resume the first non-complete phase; never infer repository state from chat history.
+- 2026-08-02: Context recovery completed via planning-with-files session catchup. S06 implementation remains at pre-commit diff review; affected Release targets pass and related CTest is 2/2 passing (1.48 s). Next: re-read planning/Git/test state, finish scope audit, then close S06.
+- Recovery checkpoint: task plan, full progress log, and all 315 findings lines were re-read in bounded windows. They confirm S06 is the first incomplete phase, repair usage is 1/2, affected Release targets are green, and related CTest is 2/2 passing. Git/diff/test-log recovery remains before closing S06.
+- Recovery tool-wrapper parse error: the combined bounded findings read and progress patch was rejected before invocation by the JavaScript wrapper. A subsequent log patch omitted the Markdown hyphen from its context and also made no edit. A later combined Git/test command had the same pre-invocation wrapper parse issue and was retried as a joined command array. None changed the repository or consumes an S06 repair round.
+- Recovery Git/test checkpoint: branch xpbdRT remains at HEAD 58445da (ahead 6, behind 3); staged diff is empty; the task-owned S06 files are separable from the unchanged protected baseline. LastTest.log is current at 15:23 and ends with the AppSession regression passing.
+- S06 budget audit correction applied: current Session and candidate handles are now one pointer-identity union, eliminating duplicate shared-image peak accounting. Regression diffs are fully reviewed and preserve/strengthen transaction and identity assertions.
+- S06 post-audit affected Release build is GREEN: xpbd_baker_app, xpbd_viewport_regression_tests, and xpbd_app_session_regression_tests compile/link successfully; only pre-existing third-party warnings remain.
+- S06 post-audit related CTest is GREEN 2/2 in 1.48 s (viewport 1.36 s, AppSession 0.11 s), including the actual 2K shared-handle stress, COW release, metadata-only Session source, Unicode/Iris ownership, and transaction regressions.
+- S06 COMPLETE scope audit: exactly 18 task-owned code/test/planning paths; no Vulkan/backend/path-tracer/shader/physics/Bullet/protocol path, no UI layout change, and no file >=1 MiB. git diff check passes, staged state is empty, protected user paths remain excluded, and repair usage is 1/2. Preparing the isolated phase commit.
+- Planning phase-close patch errors: the first attempt omitted required diff prefixes on table lines; the second used console-mojibake instead of the UTF-8 em dash in task_plan.md. Both made no edit. Corrected smaller patches were applied; these are orchestration-only and do not consume an S06 repair round.
+- Read-only audit error: the memory estimator is header-only, so the probe for src/gfx/labpbr_memory.cpp reported a missing path after successfully reading the real header. No repository state changed.
+- Planning patch context error: the first export/AppSession review record again omitted the Markdown hyphen in diff context and made no edit. This corrected patch records it; it is orchestration-only and does not consume an S06 repair round.
+- Planning patch context error: the first authoring/import review record omitted the Markdown hyphen in its diff context and made no edit. This corrected patch records it; it is orchestration-only and does not consume an S06 repair round.
+- Planning patch syntax error: the first two-file review-record patch omitted diff context prefixes and made no edit. This corrected patch records it; it is orchestration-only and does not consume an S06 repair round.

@@ -682,7 +682,7 @@ public:
 
 
   bool use_mcbe_coords = true;
-  gfx::TextureImage model_texture;
+  gfx::SharedTextureImage model_texture;
   gfx::ResolvedUvDomain model_uv_domain;
   gfx::ResolvedMaterialTable resolved_material;
   // Product import/authoring preflight ceiling. Public for deterministic

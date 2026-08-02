@@ -277,19 +277,19 @@ std::string sourceCacheKey(const LabPbrSuiteSource &source) {
   return key;
 }
 
-bool buildMaterial(const TextureImage &base, const TextureImage &specular,
-                   const TextureImage *normal,
+bool buildMaterial(SharedTextureImage base, SharedTextureImage specular,
+                   SharedTextureImage normal,
                    const LabPbrSuiteSource &source,
                    ResolvedMaterialTable &out, std::string &error,
                    std::uint64_t maximum_peak_bytes) {
-  if (!base.valid() || !specular.valid() ||
-      (normal != nullptr && !normal->valid())) {
+  if (base == nullptr || specular == nullptr || !base->valid() ||
+      !specular->valid() || (normal != nullptr && !normal->valid())) {
     error = "cannot build material from invalid decoded images";
     return false;
   }
   ResolvedMaterialTable material;
-  material.width = base.width;
-  material.height = base.height;
+  material.width = base->width;
+  material.height = base->height;
   material.assets.base = source.base.path;
   material.assets.specular = source.specular.path;
   material.assets.normal = source.normal.path;
@@ -300,8 +300,9 @@ bool buildMaterial(const TextureImage &base, const TextureImage &specular,
   material.format = LabPbrFormat::LabPbr13;
   material.declared_format = "lab-pbr/1.3";
   material.format_declared = source.properties.present;
-  if (!buildAuthoredResolvedMaterial(base, material, normal, &specular, out,
-                                     &error, maximum_peak_bytes)) {
+  if (!buildAuthoredResolvedMaterial(
+          std::move(base), material, std::move(normal), std::move(specular),
+          out, &error, maximum_peak_bytes)) {
     return false;
   }
   return true;
@@ -381,22 +382,32 @@ void compareSourceFile(const LabPbrSourceFile &expected,
 
 } // namespace
 
-bool LabPbrSourceFile::valid() const noexcept {
+bool LabPbrSourceFile::metadataValid() const noexcept {
   return present && !path.empty() && size <= kMaxImportFileBytes &&
-         sha256.size() == 64u && original_bytes != nullptr &&
+         sha256.size() == 64u;
+}
+
+bool LabPbrSourceFile::valid() const noexcept {
+  return metadataValid() && original_bytes != nullptr &&
          original_bytes->size() == size;
 }
 
-bool LabPbrSuiteSource::valid() const noexcept {
-  return base.valid() && specular.valid() &&
-         (!normal.present || normal.valid()) &&
-         (!properties.present || properties.valid()) &&
+bool LabPbrSuiteSource::metadataValid() const noexcept {
+  return base.metadataValid() && specular.metadataValid() &&
+         (!normal.present || normal.metadataValid()) &&
+         (!properties.present || properties.metadataValid()) &&
          (properties.present || confirmed_labpbr13_without_properties) &&
          !cache_key.empty();
 }
 
+bool LabPbrSuiteSource::valid() const noexcept {
+  return metadataValid() && base.valid() && specular.valid() &&
+         (!normal.present || normal.valid()) &&
+         (!properties.present || properties.valid());
+}
+
 bool ImportedLabPbrSuite::valid() const noexcept {
-  return base_image.valid() && material.valid() &&
+  return base_image != nullptr && base_image->valid() && material.valid() &&
          material.format == LabPbrFormat::LabPbr13 &&
          material.specular_map_active && source.valid();
 }
@@ -423,6 +434,8 @@ void LabPbrSuiteImportCache::store(const ImportedLabPbrSuite &suite) {
 
 std::uint64_t LabPbrSuiteImportCache::residentBytes() const noexcept {
   std::uint64_t total = 0;
+  std::vector<const TextureImage *> counted_images;
+  std::vector<const std::vector<std::uint8_t> *> counted_sources;
   const auto add = [&total](std::size_t bytes) {
     const auto value = static_cast<std::uint64_t>(bytes);
     if (value > (std::numeric_limits<std::uint64_t>::max)() - total) {
@@ -431,24 +444,42 @@ std::uint64_t LabPbrSuiteImportCache::residentBytes() const noexcept {
       total += value;
     }
   };
-  const auto add_image = [&add](const TextureImage &image) {
-    add(image.rgba.capacity());
-  };
-  const auto add_source = [&add](const LabPbrSourceFile &source) {
-    if (source.original_bytes != nullptr) {
-      add(source.original_bytes->capacity());
+  const auto add_image = [&add, &counted_images](
+                             const SharedTextureImage &image) {
+    if (image == nullptr ||
+        std::find(counted_images.begin(), counted_images.end(), image.get()) !=
+            counted_images.end()) {
+      return;
     }
+    counted_images.push_back(image.get());
+    add(image->rgba.capacity());
   };
-  for (const auto &[key, suite] : entries_) {
-    add(key.capacity());
-    add_image(suite.base_image);
-    add_image(suite.material.base_image);
-    add_image(suite.material.normal_image);
-    add_image(suite.material.specular_image);
-    add_source(suite.source.base);
-    add_source(suite.source.normal);
-    add_source(suite.source.specular);
-    add_source(suite.source.properties);
+  const auto add_source = [&add, &counted_sources](
+                              const LabPbrSourceFile &source) {
+    if (source.original_bytes == nullptr ||
+        std::find(counted_sources.begin(), counted_sources.end(),
+                  source.original_bytes.get()) != counted_sources.end()) {
+      return;
+    }
+    counted_sources.push_back(source.original_bytes.get());
+    add(source.original_bytes->capacity());
+  };
+  try {
+    for (const auto &[key, suite] : entries_) {
+      add(key.capacity());
+      add_image(suite.base_image);
+      add_image(suite.material.baseImageAsset());
+      add_image(suite.material.normalImageAsset());
+      add_image(suite.material.specularImageAsset());
+      add_source(suite.source.base);
+      add_source(suite.source.normal);
+      add_source(suite.source.specular);
+      add_source(suite.source.properties);
+    }
+  } catch (const std::bad_alloc &) {
+    return (std::numeric_limits<std::uint64_t>::max)();
+  } catch (const std::length_error &) {
+    return (std::numeric_limits<std::uint64_t>::max)();
   }
   return total;
 }
@@ -688,26 +719,7 @@ LabPbrSuiteImportResult importLabPbrSuite(
   std::uint64_t coverage_bytes = 0;
   const std::uint64_t decoded_image_count =
       source.normal.present ? 3u : 2u;
-  const std::uint64_t suite_image_count = decoded_image_count + 1u;
-  std::uint64_t candidate_image_count = decoded_image_count * 2u;
-  if (cache != nullptr) {
-    if (!detail::checkedLabPbrMultiply(suite_image_count, 2u,
-                                       candidate_image_count) ||
-        !detail::checkedLabPbrAdd(candidate_image_count,
-                                  decoded_image_count,
-                                  candidate_image_count)) {
-      result.error =
-          "LabPBR budget preflight failed: candidate image count overflow";
-      return result;
-    }
-  }
-  if (source.normal.present && limits.copy_normal_to_iris_asset &&
-      !detail::checkedLabPbrAdd(candidate_image_count, 1u,
-                                candidate_image_count)) {
-    result.error =
-        "LabPBR budget preflight failed: Iris candidate image count overflow";
-    return result;
-  }
+  const std::uint64_t candidate_image_count = decoded_image_count;
   if (!detail::checkedLabPbrMultiply(
           static_cast<std::uint64_t>(base_header.width),
           static_cast<std::uint64_t>(base_header.height), pixels) ||
@@ -733,15 +745,6 @@ LabPbrSuiteImportResult importLabPbrSuite(
   memory_request.resident_fixed_bytes = limits.retained_resident_bytes;
   memory_request.candidate_fixed_bytes =
       limits.has_overrides ? rgba_bytes : 0u;
-  if (source.normal.present && limits.copy_normal_to_iris_asset &&
-      !detail::checkedLabPbrAdd(
-          memory_request.candidate_fixed_bytes,
-          static_cast<std::uint64_t>(source.normal.size),
-          memory_request.candidate_fixed_bytes)) {
-    result.error =
-        "LabPBR budget preflight failed: Iris encoded-byte count overflow";
-    return result;
-  }
   memory_request.encoded_snapshot_bytes = encoded_snapshot_bytes;
   memory_request.decoder_peak_bytes = rgba_bytes;
   memory_request.coverage_peak_bytes = coverage_bytes;
@@ -851,17 +854,33 @@ LabPbrSuiteImportResult importLabPbrSuite(
     return result;
   }
 
-  ResolvedMaterialTable material;
-  if (!buildMaterial(base, specular_image,
-                     source.normal.present ? &normal_image : nullptr,
-                     source, material, result.error, effective_peak)) {
+  ImportedLabPbrSuite imported;
+  try {
+    auto base_asset =
+        std::make_shared<const TextureImage>(std::move(base));
+    auto specular_asset =
+        std::make_shared<const TextureImage>(std::move(specular_image));
+    auto normal_asset = source.normal.present
+                            ? std::make_shared<const TextureImage>(
+                                  std::move(normal_image))
+                            : SharedTextureImage{};
+    ResolvedMaterialTable material;
+    if (!buildMaterial(base_asset, specular_asset, normal_asset, source,
+                       material, result.error, effective_peak)) {
+      return result;
+    }
+    imported.base_image = std::move(base_asset);
+    imported.material = std::move(material);
+    imported.source = std::move(source);
+  } catch (const std::bad_alloc &) {
+    result.error =
+        "LabPBR budget stage failed while publishing shared image assets";
+    return result;
+  } catch (const std::length_error &exception) {
+    result.error = std::string("LabPBR budget stage failed: ") +
+                   exception.what();
     return result;
   }
-
-  ImportedLabPbrSuite imported;
-  imported.base_image = std::move(base);
-  imported.material = std::move(material);
-  imported.source = std::move(source);
   if (!imported.valid()) {
     result.error = "strict LabPBR import produced invalid state";
     return result;
@@ -878,9 +897,9 @@ LabPbrSuiteImportResult importLabPbrSuite(
 LabPbrSourceChangeReport
 checkLabPbrSuiteSourceChanges(const LabPbrSuiteSource &source) {
   LabPbrSourceChangeReport report;
-  if (!source.valid()) {
+  if (!source.metadataValid()) {
     report.availability_changed = true;
-    report.error = "active LabPBR source snapshot is invalid";
+    report.error = "active LabPBR source metadata is invalid";
     return report;
   }
   compareSourceFile(source.base, report);
