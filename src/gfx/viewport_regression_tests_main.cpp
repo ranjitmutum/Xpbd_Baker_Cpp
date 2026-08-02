@@ -408,14 +408,38 @@ void testSelectionOutlineTemporalContract() {
           compact_backend.find("rs.depthBiasEnable=VK_TRUE;") !=
               std::string::npos &&
           compact_backend.find(
-              "ds.depthWriteEnable=(ui||mesh_trans||overlay_lines)?"
-              "VK_FALSE:VK_TRUE;") != std::string::npos &&
+              "ds.depthWriteEnable=(ui||mesh_trans||overlay_lines||"
+              "temporal_hud_lines)?VK_FALSE:VK_TRUE;") !=
+              std::string::npos &&
           compact_backend.find(
               "ds.depthCompareOp=overlay_lines?"
               "VK_COMPARE_OP_LESS_OR_EQUAL:VK_COMPARE_OP_LESS;") !=
               std::string::npos,
       "selection overlays use tolerant non-writing depth without disabling "
       "foreground occlusion");
+
+  expect(
+      compact_backend.find(
+          "VkPipelinemesh_pipeline_temporal_hud_lines_=VK_NULL_HANDLE;") !=
+              std::string::npos &&
+          compact_backend.find(
+              "ds.depthTestEnable=(ui||temporal_hud_lines)?"
+              "VK_FALSE:VK_TRUE;") != std::string::npos &&
+          compact_backend.find(
+              "if(ui||mesh_trans||temporal_hud_lines){"
+              "blend.blendEnable=VK_TRUE;") != std::string::npos,
+      "temporal selection HUD pipeline blends without depth test or writes");
+
+  expect(
+      compact_backend.find(
+          "constbooltemporal_selection_active="
+          "pt_dlss_active||fg_frame_candidate;") != std::string::npos &&
+          compact_backend.find(
+              "draw_selection_lines(temporal_selection_active?"
+              "mesh_pipeline_temporal_hud_lines_:"
+              "mesh_pipeline_overlay_lines_);") != std::string::npos,
+      "temporal selection uses the HUD pipeline while native selection keeps "
+      "the original depth-aware pipeline");
 
   const auto composite_position =
       backend.find("path_tracer.recordComposite(");
@@ -430,6 +454,35 @@ void testSelectionOutlineTemporalContract() {
              overlay_position < grid_position,
          "selection overlay remains post-reconstruction and grid keeps its "
          "original depth pipeline");
+
+  const auto fg_candidate_position =
+      backend.find("const bool fg_frame_candidate");
+  const auto hudless_copy_position =
+      backend.find("vkCmdCopyImage(", fg_candidate_position);
+  const auto fg_ui_pass_position = backend.find(
+      "fg_ui_rp.renderPass = fg_ui_render_pass_", hudless_copy_position);
+  const auto fg_ui_selection_position = backend.find(
+      "draw_selection_lines(mesh_pipeline_temporal_hud_lines_);",
+      fg_ui_pass_position);
+  const auto fg_overlay_pass_position = backend.find(
+      "fg_overlay_rp.renderPass = fg_overlay_render_pass_",
+      fg_ui_selection_position);
+  const auto fg_overlay_selection_position = backend.find(
+      "draw_selection_lines(mesh_pipeline_temporal_hud_lines_);",
+      fg_ui_selection_position + 1);
+  expect(fg_candidate_position != std::string::npos &&
+             hudless_copy_position != std::string::npos &&
+             fg_ui_pass_position != std::string::npos &&
+             fg_ui_selection_position != std::string::npos &&
+             fg_overlay_pass_position != std::string::npos &&
+             fg_overlay_selection_position != std::string::npos &&
+             fg_candidate_position < hudless_copy_position &&
+             hudless_copy_position < fg_ui_pass_position &&
+             fg_ui_pass_position < fg_ui_selection_position &&
+             fg_ui_selection_position < fg_overlay_pass_position &&
+             fg_overlay_pass_position < fg_overlay_selection_position,
+         "FG copies HUDLess before routing selection to UI recomposition and "
+         "the real-frame overlay");
 }
 
 void testLogicalFramebufferViewportContract() {
