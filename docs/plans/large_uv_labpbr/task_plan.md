@@ -2,7 +2,7 @@
 
 ## Current phase
 
-Gate A — full Release build and CTest correctness gate (`PENDING`; S03 is green and ready for its isolated commit).
+S04 — remove persistent resolved-texel expansion and add final-model budget preflight (`COMPLETE`; next: S05).
 
 ## Phases and dependencies
 
@@ -12,8 +12,8 @@ Gate A — full Release build and CTest correctness gate (`PENDING`; S03 is gree
 | S01 | Pure double-precision face UV parsing, bounds, and `ResolvedUvDomain` | S00 | COMPLETE |
 | S02 | Apply one domain to mesh/material consumers; atlas clamp; transaction/history behavior | S01 | COMPLETE |
 | S03 | Unicode/long-path snapshot-and-memory image import | S02 | COMPLETE |
-| Gate A | Release app build and full CTest correctness gate | S00–S03 | PENDING |
-| S04 | Remove persistent resolved-texel expansion; final-model budget preflight | Gate A | PENDING |
+| Gate A | Release app build and full CTest correctness gate | S00–S03 | COMPLETE |
+| S04 | Remove persistent resolved-texel expansion; final-model budget preflight | Gate A | COMPLETE |
 | S05 | Lazy Coverage/Composition and compact run encoding | S04 | PENDING |
 | S06 | Shared immutable texture and Iris byte ownership; copy-on-write composition | S05 | PENDING |
 | S07 | Shared-asset byte-bounded LRU import cache | S06 | PENDING |

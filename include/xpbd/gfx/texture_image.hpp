@@ -34,6 +34,16 @@ struct TextureDecodeLimits {
     std::size_t retained_resident_bytes = 0;
 };
 
+struct TextureImageHeader {
+    int width = 0;
+    int height = 0;
+    int source_channels = 0;
+
+    [[nodiscard]] bool valid() const noexcept {
+        return width > 0 && height > 0 && source_channels > 0;
+    }
+};
+
 [[nodiscard]] bool checkedTextureRgbaByteCount(
     std::size_t width, std::size_t height,
     std::size_t& byte_count) noexcept;
@@ -107,5 +117,12 @@ bool loadTextureImage(const std::filesystem::path& path, TextureImage& out,
 bool loadTextureImageFromMemory(const void* data, int size, TextureImage& out,
                                  std::string* err = nullptr,
                                  TextureDecodeLimits limits = {});
+
+// Reads and validates dimensions/channels/budgets without allocating decoded
+// pixels. `out` is replaced only after all checks succeed.
+bool inspectTextureImageFromMemory(const void* data, int size,
+                                   TextureImageHeader& out,
+                                   std::string* err = nullptr,
+                                   TextureDecodeLimits limits = {});
 
 }

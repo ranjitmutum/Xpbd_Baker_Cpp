@@ -1,5 +1,6 @@
 #pragma once
 
+#include "xpbd/gfx/labpbr_memory.hpp"
 #include "xpbd/gfx/labpbr_material.hpp"
 #include "xpbd/gfx/viewport_mesh.hpp"
 
@@ -111,7 +112,8 @@ bool buildAuthoredResolvedMaterial(
     const TextureImage &base, const ResolvedMaterialTable &source,
     const TextureImage *authored_normal,
     const TextureImage *authored_specular, ResolvedMaterialTable &out,
-    std::string *error = nullptr);
+    std::string *error = nullptr,
+    std::uint64_t maximum_peak_bytes = kLabPbrDefaultPeakBudgetBytes);
 
 [[nodiscard]] std::string
 sha256Hex(std::span<const std::uint8_t> bytes);
@@ -119,7 +121,8 @@ sha256Hex(std::span<const std::uint8_t> bytes);
 bool importReadOnlyIrisNormal(const std::filesystem::path &path,
                               int expected_width, int expected_height,
                               ReadOnlyIrisNormalAsset &out,
-                              std::string *error = nullptr);
+                              std::string *error = nullptr,
+                              TextureDecodeLimits limits = {});
 
 bool encodePngRgba8(int width, int height,
                     std::span<const std::uint8_t> rgba,

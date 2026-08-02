@@ -1,6 +1,7 @@
 #pragma once
 
 #include "xpbd/gfx/labpbr_material.hpp"
+#include "xpbd/gfx/labpbr_memory.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -58,6 +59,13 @@ struct LabPbrSuiteImportResult {
   }
 };
 
+struct LabPbrSuiteImportLimits {
+  std::uint64_t maximum_peak_bytes = kLabPbrDefaultPeakBudgetBytes;
+  std::uint64_t retained_resident_bytes = 0;
+  std::uint64_t cache_bytes = 0;
+  bool copy_normal_to_iris_asset = false;
+};
+
 class LabPbrSuiteImportCache {
 public:
   [[nodiscard]] bool find(std::string_view key,
@@ -65,6 +73,7 @@ public:
   void store(const ImportedLabPbrSuite &suite);
   void clear() { entries_.clear(); }
   [[nodiscard]] std::size_t size() const noexcept { return entries_.size(); }
+  [[nodiscard]] std::uint64_t residentBytes() const noexcept;
 
 private:
   std::map<std::string, ImportedLabPbrSuite, std::less<>> entries_;
@@ -89,7 +98,8 @@ discoverLabPbrSuiteCandidates(const std::filesystem::path &folder,
 [[nodiscard]] LabPbrSuiteImportResult importLabPbrSuite(
     const std::filesystem::path &base_path,
     bool confirm_labpbr13_without_properties,
-    LabPbrSuiteImportCache *cache = nullptr);
+    LabPbrSuiteImportCache *cache = nullptr,
+    LabPbrSuiteImportLimits limits = {});
 
 [[nodiscard]] LabPbrSourceChangeReport
 checkLabPbrSuiteSourceChanges(const LabPbrSuiteSource &source);

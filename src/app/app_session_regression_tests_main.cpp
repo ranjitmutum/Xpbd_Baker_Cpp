@@ -863,9 +863,8 @@ void testTransactionalLabPbrSuiteImport() {
              session.importLabPbrSpecular(rgb_pbr_path) &&
              session.resolved_material.specular_map_active &&
              session.resolved_material.specular_image.source_channels == 3 &&
-             !session.resolved_material.texels.empty() &&
-             session.resolved_material.texels.front().emission_strength ==
-                 0.0f,
+             session.resolved_material.sample(0.5f, 0.5f).emission_strength ==
+                  0.0f,
          "direct RGB PBR image imports as a no-emission LabPBR map");
   expect(session.loadTexture(rgb_base_path) &&
              session.resolved_material.specular_map_active &&
@@ -988,6 +987,14 @@ void testUnicodeLongPathTextureTransactions() {
              session.labpbr_imported_normal.original_file_bytes == normal_png,
          "AppSession commits a read-only Iris normal from a Unicode long path");
   const auto committed = snapshot(session);
+
+  const auto saved_peak_budget = session.labpbr_peak_memory_budget_bytes;
+  session.labpbr_peak_memory_budget_bytes = 1u;
+  const bool budget_rejected = !session.loadTexture(base_path);
+  session.labpbr_peak_memory_budget_bytes = saved_peak_budget;
+  expect(budget_rejected && unchanged(session, committed) &&
+             session.last_error.find("budget") != std::string::npos,
+         "product LabPBR budget failure preserves Session Generation and material state");
 
   const fs::path missing_base = directory / fs::path(L"不存在_基础.png");
   expect(!session.loadTexture(missing_base) && unchanged(session, committed) &&

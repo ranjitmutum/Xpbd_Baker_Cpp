@@ -79,7 +79,10 @@ struct ResolvedMaterialTexel {
 struct ResolvedMaterialTable {
   int width = 0;
   int height = 0;
-  std::vector<ResolvedMaterialTexel> texels;
+  // Keep compact source images and decode a single texel on demand. The
+  // former width*height ResolvedMaterialTexel expansion was 108 bytes per
+  // pixel on the supported MSVC x64 build.
+  TextureImage base_image;
 
   LabPbrAssetPaths assets;
   LabPbrFormat format = LabPbrFormat::Fallback;

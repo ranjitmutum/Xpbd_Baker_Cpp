@@ -685,6 +685,10 @@ public:
   gfx::TextureImage model_texture;
   gfx::ResolvedUvDomain model_uv_domain;
   gfx::ResolvedMaterialTable resolved_material;
+  // Product import/authoring preflight ceiling. Public for deterministic
+  // regression injection; no UI setting or layout is introduced.
+  std::uint64_t labpbr_peak_memory_budget_bytes =
+      gfx::kLabPbrDefaultPeakBudgetBytes;
   gfx::LabPbrDebugView labpbr_debug_view = gfx::LabPbrDebugView::Shaded;
   gfx::RtDebugView rt_debug_view = gfx::RtDebugView::Off;
   gfx::PathTraceSettings path_trace_settings{};

@@ -478,6 +478,7 @@ constexpr unsigned char kWhitePng[] = {
 void testTextureFromMemory() {
   using xpbd::gfx::TextureDecodeLimits;
   using xpbd::gfx::TextureImage;
+  using xpbd::gfx::TextureImageHeader;
   using xpbd::gfx::checkedTextureRgbaByteCount;
   using xpbd::gfx::kTextureDecodeMaximumPixels;
 
@@ -489,6 +490,13 @@ void testTextureFromMemory() {
   expect(img.valid(), "texture valid after load");
   expect(img.width == 1 && img.height == 1, "texture size 1x1");
   expect(img.source_channels == 3, "source RGB channel count retained");
+  TextureImageHeader inspected_header;
+  expect(xpbd::gfx::inspectTextureImageFromMemory(
+             kWhitePng, static_cast<int>(sizeof(kWhitePng)),
+             inspected_header, &err) &&
+             inspected_header.width == 1 && inspected_header.height == 1 &&
+             inspected_header.source_channels == 3,
+         "texture header inspection validates without decoding pixels");
   if (img.valid()) {
     float r = 0, g = 0, b = 0, a = 0;
     img.sample(0.5f, 0.5f, r, g, b, a);
@@ -541,6 +549,13 @@ void testTextureFromMemory() {
   const std::array<unsigned char, 12> damaged_png{
       0x89u, 0x50u, 0x4eu, 0x47u, 0x0du, 0x0au,
       0x1au, 0x0au, 0x00u, 0x00u, 0x00u, 0x0du};
+  inspected_header = {7, 9, 4};
+  expect(!xpbd::gfx::inspectTextureImageFromMemory(
+             damaged_png.data(), static_cast<int>(damaged_png.size()),
+             inspected_header, &err) &&
+             inspected_header.width == 7 && inspected_header.height == 9 &&
+             inspected_header.source_channels == 4,
+         "failed texture header inspection preserves its output");
   expect(!xpbd::gfx::loadTextureImageFromMemory(
              damaged_png.data(), static_cast<int>(damaged_png.size()),
              preserved, &err) &&
@@ -602,7 +617,11 @@ void testSyntheticLargeUvFixtureAndMemoryBaseline() {
   using xpbd::gfx::LabPbrMemoryEstimate;
   using xpbd::gfx::LabPbrMemoryEstimateRequest;
   using xpbd::gfx::ResolvedMaterialTexel;
+  using xpbd::gfx::buildAuthoredResolvedMaterial;
   using xpbd::gfx::estimateLabPbrMemory;
+  using xpbd::gfx::kLabPbrDefaultPeakBudgetBytes;
+  using xpbd::gfx::kLabPbrResolvedTexelBytesPerPixel;
+  using xpbd::gfx::preflightLabPbrMemory;
   using xpbd::test_support::SyntheticLabPbrSuitePaths;
   using xpbd::test_support::SyntheticLargeUvFixture;
   using xpbd::test_support::buildSyntheticLargeUvFixture;
@@ -676,38 +695,50 @@ void testSyntheticLargeUvFixtureAndMemoryBaseline() {
   for (const std::uint64_t side : {1'024u, 2'048u, 4'096u}) {
     const std::uint64_t pixels = side * side;
     const std::uint64_t rgba_bytes = pixels * 4u;
-    LabPbrMemoryEstimateRequest request;
-    request.width = side;
-    request.height = side;
-    request.resident_rgba_image_count = 3u;
-    request.candidate_rgba_image_count = 3u;
-    request.resolved_texel_bytes_per_pixel =
+    LabPbrMemoryEstimateRequest legacy_request;
+    legacy_request.width = side;
+    legacy_request.height = side;
+    legacy_request.resident_rgba_image_count = 3u;
+    legacy_request.candidate_rgba_image_count = 3u;
+    legacy_request.resolved_texel_bytes_per_pixel =
         sizeof(ResolvedMaterialTexel);
-    request.encoded_snapshot_bytes = rgba_bytes * 3u;
-    request.decoder_peak_bytes = rgba_bytes;
-    request.coverage_peak_bytes = pixels * sizeof(std::uint32_t);
-    request.cache_bytes = rgba_bytes * 3u;
-    LabPbrMemoryEstimate estimate;
-    expect(estimateLabPbrMemory(request, estimate, &error) &&
-               estimate.resident_bytes ==
+    legacy_request.encoded_snapshot_bytes = rgba_bytes * 3u;
+    legacy_request.decoder_peak_bytes = rgba_bytes;
+    legacy_request.coverage_peak_bytes =
+        pixels * sizeof(std::uint32_t);
+    legacy_request.cache_bytes = rgba_bytes * 3u;
+    LabPbrMemoryEstimate legacy_estimate;
+    LabPbrMemoryEstimate compact_estimate;
+    auto compact_request = legacy_request;
+    compact_request.resolved_texel_bytes_per_pixel =
+        kLabPbrResolvedTexelBytesPerPixel;
+    expect(estimateLabPbrMemory(legacy_request, legacy_estimate, &error) &&
+               estimateLabPbrMemory(compact_request, compact_estimate,
+                                    &error) &&
+               legacy_estimate.resident_bytes ==
                    rgba_bytes * 3u +
                        pixels * sizeof(ResolvedMaterialTexel) &&
-               estimate.coverage_peak_bytes ==
+               compact_estimate.resident_bytes == rgba_bytes * 3u &&
+               legacy_estimate.resident_bytes -
+                       compact_estimate.resident_bytes ==
+                   pixels * sizeof(ResolvedMaterialTexel) &&
+               compact_estimate.coverage_peak_bytes ==
                    pixels * sizeof(std::uint32_t) &&
-               estimate.cache_bytes == rgba_bytes * 3u &&
-               estimate.peak_bytes ==
-                   estimate.resident_bytes + rgba_bytes * 10u +
-                       estimate.coverage_peak_bytes,
-           "checked LabPBR baseline estimate matches explicit components");
+               compact_estimate.cache_bytes == rgba_bytes * 3u &&
+               compact_estimate.peak_bytes ==
+                   compact_estimate.resident_bytes + rgba_bytes * 10u +
+                       compact_estimate.coverage_peak_bytes,
+           "checked compact LabPBR estimate removes all resolved texel bytes");
     std::printf(
-        "memory-baseline: side=%llu resolved-texel-size=%llu resident=%llu "
-        "peak=%llu coverage-peak=%llu cache=%llu\n",
+        "memory-compact: side=%llu resolved-texel-size=%llu legacy-resident=%llu "
+        "resident=%llu peak=%llu coverage-peak=%llu cache=%llu\n",
         static_cast<unsigned long long>(side),
         static_cast<unsigned long long>(sizeof(ResolvedMaterialTexel)),
-        static_cast<unsigned long long>(estimate.resident_bytes),
-        static_cast<unsigned long long>(estimate.peak_bytes),
-        static_cast<unsigned long long>(estimate.coverage_peak_bytes),
-        static_cast<unsigned long long>(estimate.cache_bytes));
+        static_cast<unsigned long long>(legacy_estimate.resident_bytes),
+        static_cast<unsigned long long>(compact_estimate.resident_bytes),
+        static_cast<unsigned long long>(compact_estimate.peak_bytes),
+        static_cast<unsigned long long>(compact_estimate.coverage_peak_bytes),
+        static_cast<unsigned long long>(compact_estimate.cache_bytes));
   }
 
   const LabPbrMemoryEstimate preserved{11u, 22u, 33u, 44u};
@@ -720,6 +751,49 @@ void testSyntheticLargeUvFixtureAndMemoryBaseline() {
              error.find("overflow") != std::string::npos &&
              overflow_output == preserved,
          "LabPBR estimate rejects overflow without changing output");
+
+  LabPbrMemoryEstimateRequest eight_k_request;
+  eight_k_request.width = 8'192u;
+  eight_k_request.height = 8'192u;
+  eight_k_request.resident_rgba_image_count = 3u;
+  eight_k_request.candidate_rgba_image_count = 3u;
+  eight_k_request.resolved_texel_bytes_per_pixel =
+      kLabPbrResolvedTexelBytesPerPixel;
+  eight_k_request.encoded_snapshot_bytes = 3u * 8'192u * 8'192u * 4u;
+  eight_k_request.decoder_peak_bytes = 8'192u * 8'192u * 4u;
+  eight_k_request.coverage_peak_bytes = 8'192u * 8'192u * 4u;
+  eight_k_request.candidate_fixed_bytes = 8'192u * 8'192u * 4u;
+  eight_k_request.cache_bytes = 3u * 8'192u * 8'192u * 4u;
+  LabPbrMemoryEstimate eight_k_output = preserved;
+  expect(!preflightLabPbrMemory(eight_k_request,
+                                kLabPbrDefaultPeakBudgetBytes,
+                                eight_k_output, &error) &&
+             error.find("budget preflight") != std::string::npos &&
+             eight_k_output == preserved,
+         "8K LabPBR budget rejects by arithmetic without allocating images");
+
+  constexpr int kStressSide = 2'048;
+  const std::size_t stress_bytes =
+      static_cast<std::size_t>(kStressSide) * kStressSide * 4u;
+  xpbd::gfx::TextureImage stress_base;
+  stress_base.width = kStressSide;
+  stress_base.height = kStressSide;
+  stress_base.source_channels = 4;
+  stress_base.rgba.assign(stress_bytes, 192u);
+  xpbd::gfx::TextureImage stress_normal = stress_base;
+  stress_normal.rgba.assign(stress_bytes, 128u);
+  xpbd::gfx::TextureImage stress_specular = stress_base;
+  stress_specular.rgba.assign(stress_bytes, 64u);
+  xpbd::gfx::ResolvedMaterialTable stress_material;
+  expect(buildAuthoredResolvedMaterial(
+             stress_base, {}, &stress_normal, &stress_specular,
+             stress_material, &error) &&
+             stress_material.valid() &&
+             stress_material.base_image.rgba.size() == stress_bytes &&
+             stress_material.normal_image.rgba.size() == stress_bytes &&
+             stress_material.specular_image.rgba.size() == stress_bytes &&
+             kLabPbrResolvedTexelBytesPerPixel == 0u,
+         "2K compact material stress retains three RGBA images and zero resolved texel bytes");
 }
 
 void testBedrockUvDomainResolution() {
@@ -1092,13 +1166,17 @@ void testResolvedUvDomainMaterialConsumers() {
   ResolvedMaterialTable clamp_table;
   clamp_table.width = 2;
   clamp_table.height = 1;
-  clamp_table.texels.resize(2u);
-  clamp_table.texels[0].opacity = 0.25f;
-  clamp_table.texels[1].opacity = 0.75f;
-  expectNear(clamp_table.sample(-0.25f, 0.5f).opacity, 0.25f, 1.0e-6f,
-             "resolved material clamps the lower atlas edge");
-  expectNear(clamp_table.sample(1.25f, 0.5f).opacity, 0.75f, 1.0e-6f,
-             "resolved material clamps the upper atlas edge");
+  clamp_table.base_image.width = 2;
+  clamp_table.base_image.height = 1;
+  clamp_table.base_image.source_channels = 4;
+  clamp_table.base_image.rgba =
+      {255u, 255u, 255u, 64u, 255u, 255u, 255u, 191u};
+  expectNear(clamp_table.sample(-0.25f, 0.5f).opacity, 64.0f / 255.0f,
+              1.0e-6f,
+              "resolved material clamps the lower atlas edge");
+  expectNear(clamp_table.sample(1.25f, 0.5f).opacity, 191.0f / 255.0f,
+              1.0e-6f,
+              "resolved material clamps the upper atlas edge");
 
   ResolvedMaterialTable resolved;
   expect(xpbd::gfx::buildAuthoredResolvedMaterial(
@@ -1119,6 +1197,30 @@ void testResolvedUvDomainMaterialConsumers() {
           static_cast<float>(fixture.base.height));
   expect(sampled == expected,
          "CPU material reference samples Base Normal Specular at one eye texel");
+
+  bool all_compact_samples_match = true;
+  for (int y = 0; y < fixture.base.height && all_compact_samples_match; ++y) {
+    for (int x = 0; x < fixture.base.width; ++x) {
+      const std::array<int, 2> coordinate{x, y};
+      const auto base_reference = fixtureTexel(fixture.base, coordinate);
+      const auto normal_reference = fixtureTexel(fixture.normal, coordinate);
+      const auto specular_reference =
+          fixtureTexel(fixture.specular, coordinate);
+      const auto reference = xpbd::gfx::decodeLabPbrTexel(
+          base_reference, &normal_reference, &specular_reference);
+      const auto compact = resolved.sample(
+          (static_cast<float>(x) + 0.5f) /
+              static_cast<float>(fixture.base.width),
+          (static_cast<float>(y) + 0.5f) /
+              static_cast<float>(fixture.base.height));
+      if (compact != reference) {
+        all_compact_samples_match = false;
+        break;
+      }
+    }
+  }
+  expect(all_compact_samples_match,
+         "compact on-demand material matches the legacy decoder at every small-fixture texel");
 }
 
 void testCc0PreviewSceneAssets() {
@@ -1523,8 +1625,8 @@ void testLabPbrDiscoveryAndFallback() {
              (xpbd::gfx::kLabPbrNormalMapActive |
               xpbd::gfx::kLabPbrSpecularMapActive),
          "resolved GPU feature bits match active sidecars");
-  expectNear(material.texels[0].emission_strength, 0.0f, 1.0e-6f,
-             "RGB sidecar synthesized alpha does not emit");
+  expectNear(material.sample(0.5f, 0.5f).emission_strength, 0.0f, 1.0e-6f,
+              "RGB sidecar synthesized alpha does not emit");
 
   const std::string unsupported = "format=lab-pbr/1.2\n";
   expect(writeBytes(properties_path, unsupported.data(), unsupported.size()),
@@ -1624,6 +1726,21 @@ void testStrictLabPbrSuiteImport() {
          "folder discovery retains both stems without guessing");
 
   xpbd::gfx::LabPbrSuiteImportCache cache;
+  xpbd::gfx::LabPbrSuiteImportLimits predecode_limits;
+  predecode_limits.maximum_peak_bytes =
+      static_cast<std::uint64_t>(base_png.size() + specular_png.size() +
+                                 normal_png.size() +
+                                 properties_bytes.size() + 1u);
+  predecode_limits.copy_normal_to_iris_asset = true;
+  const auto predecode_rejected = xpbd::gfx::importLabPbrSuite(
+      base_path, false, &cache, predecode_limits);
+  expect(predecode_rejected.status == LabPbrSuiteImportStatus::Failed &&
+             predecode_rejected.error.find("budget preflight") !=
+                 std::string::npos &&
+             !predecode_rejected.suite.base_image.valid() &&
+             cache.size() == 0u,
+         "strict Suite rejects the final-model budget after Header and before pixel decode");
+
   auto imported =
       xpbd::gfx::importLabPbrSuite(base_path, false, &cache);
   expect(imported.imported() && !imported.suite.cache_hit,
@@ -1922,10 +2039,6 @@ void testLabPbrAuthoringEncodingAndCoverage() {
   xpbd::gfx::ResolvedMaterialTable fallback_source;
   fallback_source.width = 1;
   fallback_source.height = 1;
-  fallback_source.texels = {
-      xpbd::gfx::decodeLabPbrTexel(
-          std::array<std::uint8_t, 4>{255u, 255u, 255u, 255u},
-          nullptr, nullptr)};
   xpbd::gfx::ResolvedMaterialTable authored;
   expect(xpbd::gfx::buildAuthoredResolvedMaterial(
              base, fallback_source, nullptr, nullptr, authored,
@@ -1934,8 +2047,8 @@ void testLabPbrAuthoringEncodingAndCoverage() {
   expect(!authored.specular_map_active &&
              xpbd::gfx::labPbrFeatureFlags(&authored) == 0u,
          "no override preserves exact missing-specular feature state");
-  expectNear(authored.texels[0].dielectric_f0, 0.04f, 1.0e-6f,
-             "no override preserves exact dielectric fallback");
+  expectNear(authored.sample(0.5f, 0.5f).dielectric_f0, 0.04f, 1.0e-6f,
+              "no override preserves exact dielectric fallback");
   xpbd::gfx::TextureImage authored_specular;
   authored_specular.width = 1;
   authored_specular.height = 1;
@@ -1945,10 +2058,11 @@ void testLabPbrAuthoringEncodingAndCoverage() {
              base, fallback_source, nullptr, &authored_specular, authored,
              &validation_error),
          "rebuild resolved material with authored specular");
+  const auto authored_sample = authored.sample(0.5f, 0.5f);
   expect(authored.specular_map_active &&
-             authored.texels[0].metal_kind ==
+             authored_sample.metal_kind ==
                  xpbd::gfx::LabPbrMetalKind::Predefined &&
-             authored.texels[0].emission_strength > 0.99f,
+             authored_sample.emission_strength > 0.99f,
          "applied authored specular reaches resolved preview semantics");
   xpbd::gfx::TextureImage rgb_normal;
   rgb_normal.width = 1;
@@ -2086,6 +2200,19 @@ void testLabPbrPngChecksumAndNormalImport() {
 
   const auto preserved_bytes = normal.original_file_bytes;
   const auto preserved_hash = normal.sha256;
+  const auto preserved_decoded = normal.decoded.rgba;
+  xpbd::gfx::TextureDecodeLimits iris_copy_budget;
+  iris_copy_budget.maximum_peak_bytes =
+      normal.original_file_bytes.capacity() + normal.decoded.rgba.capacity() +
+      png.size() + normal.decoded.rgba.size() * 2u;
+  expect(!xpbd::gfx::importReadOnlyIrisNormal(
+             normal_path, 2, 1, normal, &error, iris_copy_budget) &&
+             error.find("encoded-byte copy") != std::string::npos &&
+             normal.original_file_bytes == preserved_bytes &&
+             normal.sha256 == preserved_hash &&
+             normal.decoded.rgba == preserved_decoded,
+         "Iris encoded-byte copy budget rejects before allocation and preserves output");
+
   const std::vector<std::uint8_t> rgb_png(
       std::begin(kWhitePng), std::end(kWhitePng));
   expect(write_bytes(normal_path, rgb_png),

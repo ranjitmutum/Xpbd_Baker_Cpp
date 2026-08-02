@@ -198,54 +198,74 @@ void setContextError(std::string* error, const char* summary,
     return true;
 }
 
+[[nodiscard]] bool inspectTextureSource(
+    const TextureDecodeSource& source, std::size_t encoded_bytes,
+    std::size_t previous_output_bytes, TextureImageHeader& out,
+    TextureDecodeContext& context, std::string* error,
+    TextureDecodeLimits requested_limits) noexcept {
+    context = {};
+    context.encoded_bytes = encoded_bytes;
+    context.previous_output_bytes = previous_output_bytes;
+    context.limits = effectiveLimits(requested_limits);
+
+    if (source.info(&context.width, &context.height,
+                    &context.source_channels) == 0 ||
+        context.width <= 0 || context.height <= 0) {
+        setContextError(error,
+                        "texture Header stage failed (stbi_info_from_memory)",
+                        context, stbi_failure_reason());
+        return false;
+    }
+
+    if (!checkedMultiply(static_cast<std::size_t>(context.width),
+                         static_cast<std::size_t>(context.height),
+                         context.pixels) ||
+        !checkedTextureRgbaByteCount(
+            static_cast<std::size_t>(context.width),
+            static_cast<std::size_t>(context.height),
+            context.decoded_bytes)) {
+        setContextError(error,
+                        "texture budget stage failed: size arithmetic overflow",
+                        context);
+        return false;
+    }
+
+    const bool peak_valid = computePeakBytes(context);
+    if (static_cast<std::uint32_t>(context.width) >
+            context.limits.maximum_width ||
+        static_cast<std::uint32_t>(context.height) >
+            context.limits.maximum_height ||
+        context.pixels > context.limits.maximum_pixels ||
+        context.decoded_bytes > context.limits.maximum_decoded_bytes ||
+        !peak_valid ||
+        context.required_peak_bytes > context.limits.maximum_peak_bytes) {
+        setContextError(error, "texture budget stage failed", context,
+                        !peak_valid ? "peak byte arithmetic overflow" : nullptr);
+        return false;
+    }
+
+    const TextureImageHeader candidate{
+        context.width, context.height, context.source_channels};
+    out = candidate;
+    if (error != nullptr) {
+        error->clear();
+    }
+    return true;
+}
+
 [[nodiscard]] bool decodeTexture(const TextureDecodeSource& source,
                                  std::size_t encoded_bytes,
                                  const std::string* decoded_path,
                                  TextureImage& out, std::string* error,
                                  TextureDecodeLimits requested_limits) {
     TextureDecodeContext context{};
-    context.encoded_bytes = encoded_bytes;
-    context.previous_output_bytes = out.rgba.capacity();
-    context.limits = effectiveLimits(requested_limits);
+    TextureImageHeader header;
+    if (!inspectTextureSource(source, encoded_bytes, out.rgba.capacity(),
+                              header, context, error, requested_limits)) {
+        return false;
+    }
 
     try {
-        if (source.info(&context.width, &context.height,
-                        &context.source_channels) == 0 ||
-            context.width <= 0 || context.height <= 0) {
-            setContextError(
-                error,
-                "texture Header stage failed (stbi_info_from_memory)",
-                context, stbi_failure_reason());
-            return false;
-        }
-
-        if (!checkedMultiply(static_cast<std::size_t>(context.width),
-                             static_cast<std::size_t>(context.height),
-                             context.pixels) ||
-            !checkedTextureRgbaByteCount(
-                static_cast<std::size_t>(context.width),
-                static_cast<std::size_t>(context.height),
-                context.decoded_bytes)) {
-            setContextError(error,
-                            "texture budget stage failed: size arithmetic overflow",
-                            context);
-            return false;
-        }
-
-        const bool peak_valid = computePeakBytes(context);
-        if (static_cast<std::uint32_t>(context.width) >
-                context.limits.maximum_width ||
-            static_cast<std::uint32_t>(context.height) >
-                context.limits.maximum_height ||
-            context.pixels > context.limits.maximum_pixels ||
-            context.decoded_bytes > context.limits.maximum_decoded_bytes ||
-            !peak_valid ||
-            context.required_peak_bytes > context.limits.maximum_peak_bytes) {
-            setContextError(error, "texture budget stage failed", context,
-                            !peak_valid ? "peak byte arithmetic overflow" : nullptr);
-            return false;
-        }
-
         int decoded_width = 0;
         int decoded_height = 0;
         int decoded_channels = 0;
@@ -526,6 +546,27 @@ bool loadTextureImageFromMemory(const void* data, int size, TextureImage& out,
                          err, limits);
 }
 
+bool inspectTextureImageFromMemory(const void* data, int size,
+                                   TextureImageHeader& out,
+                                   std::string* err,
+                                   TextureDecodeLimits limits) {
+    if (!data || size <= 0) {
+        setErrorNoThrow(
+            err,
+            "texture Header stage failed (stbi_info_from_memory): empty image buffer");
+        return false;
+    }
+    const TextureDecodeSource source{static_cast<const stbi_uc*>(data), size};
+    TextureDecodeContext context{};
+    TextureImageHeader candidate;
+    if (!inspectTextureSource(source, static_cast<std::size_t>(size), 0u,
+                              candidate, context, err, limits)) {
+        return false;
+    }
+    out = candidate;
+    return true;
+}
+
 bool loadTextureImage(const std::filesystem::path& path, TextureImage& out,
                       std::string* err, TextureDecodeLimits limits) {
     try {
@@ -540,9 +581,17 @@ bool loadTextureImage(const std::filesystem::path& path, TextureImage& out,
         limits.retained_resident_bytes = retained_with_previous_output;
 
         FileByteSnapshot snapshot;
-        const std::size_t snapshot_limit =
+        const std::size_t effective_peak_limit =
             (std::min)(limits.maximum_peak_bytes,
                        kTextureDecodeMaximumPeakBytes);
+        if (limits.retained_resident_bytes > effective_peak_limit) {
+            setErrorNoThrow(
+                err,
+                "Texture budget stage failed before snapshot: retained state already exceeds the peak limit");
+            return false;
+        }
+        const std::size_t snapshot_limit =
+            effective_peak_limit - limits.retained_resident_bytes;
         if (!snapshotFileBytes(path, snapshot, err, "Texture",
                                snapshot_limit)) {
             return false;

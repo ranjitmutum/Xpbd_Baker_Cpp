@@ -3,8 +3,14 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <utility>
 
 namespace xpbd::gfx {
+
+inline constexpr std::uint64_t kLabPbrDefaultPeakBudgetBytes =
+    std::uint64_t{1024} * 1024u * 1024u;
+inline constexpr std::uint64_t
+    kLabPbrResolvedTexelBytesPerPixel = 0u;
 
 struct LabPbrMemoryEstimate {
   std::uint64_t resident_bytes = 0;
@@ -116,6 +122,38 @@ namespace detail {
     }
   }
 
+  out = candidate;
+  if (error != nullptr) {
+    error->clear();
+  }
+  return true;
+}
+
+// Enforces a caller-selected peak ceiling while preserving `out` on every
+// arithmetic or budget failure. Production uses the same 1 GiB ceiling as the
+// texture decoder; tests may inject a smaller ceiling without allocating the
+// rejected candidate.
+[[nodiscard]] inline bool preflightLabPbrMemory(
+    const LabPbrMemoryEstimateRequest &request,
+    std::uint64_t maximum_peak_bytes, LabPbrMemoryEstimate &out,
+    std::string *error = nullptr) {
+  LabPbrMemoryEstimate candidate;
+  std::string estimate_error;
+  if (!estimateLabPbrMemory(request, candidate, &estimate_error)) {
+    if (error != nullptr) {
+      *error = std::move(estimate_error);
+    }
+    return false;
+  }
+  if (candidate.peak_bytes > maximum_peak_bytes) {
+    if (error != nullptr) {
+      *error = "LabPBR budget preflight failed: required peak " +
+               std::to_string(candidate.peak_bytes) +
+               " bytes exceeds maximum " +
+               std::to_string(maximum_peak_bytes) + " bytes";
+    }
+    return false;
+  }
   out = candidate;
   if (error != nullptr) {
     error->clear();

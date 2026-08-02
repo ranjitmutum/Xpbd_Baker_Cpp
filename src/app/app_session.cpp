@@ -114,6 +114,99 @@ bool hasTextureResourceState(const gfx::TextureImage &texture) noexcept {
   return texture.width != 0 || texture.height != 0 || !texture.rgba.empty();
 }
 
+void addLabPbrResidentBytes(std::uint64_t bytes,
+                            std::uint64_t &total) noexcept {
+  if (bytes > (std::numeric_limits<std::uint64_t>::max)() - total) {
+    total = (std::numeric_limits<std::uint64_t>::max)();
+  } else {
+    total += bytes;
+  }
+}
+
+void addLabPbrImageBytes(const gfx::TextureImage &image,
+                         std::uint64_t &total) noexcept {
+  addLabPbrResidentBytes(
+      static_cast<std::uint64_t>(image.rgba.capacity()), total);
+}
+
+void addLabPbrSourceBytes(const gfx::LabPbrSourceFile &source,
+                          std::uint64_t &total) noexcept {
+  if (source.original_bytes != nullptr) {
+    addLabPbrResidentBytes(
+        static_cast<std::uint64_t>(source.original_bytes->capacity()), total);
+  }
+}
+
+std::uint64_t sessionLabPbrResidentBytes(
+    const AppSession &session) noexcept {
+  std::uint64_t total = 0;
+  addLabPbrImageBytes(session.model_texture, total);
+  addLabPbrImageBytes(session.resolved_material.base_image, total);
+  addLabPbrImageBytes(session.resolved_material.normal_image, total);
+  addLabPbrImageBytes(session.resolved_material.specular_image, total);
+  addLabPbrImageBytes(session.labpbr_composition.specular, total);
+  addLabPbrImageBytes(session.labpbr_imported_normal.decoded, total);
+  addLabPbrResidentBytes(
+      static_cast<std::uint64_t>(
+          session.labpbr_imported_normal.original_file_bytes.capacity()),
+      total);
+  for (const auto &[group, texels] :
+       session.labpbr_uv_coverage.group_texels) {
+    addLabPbrResidentBytes(static_cast<std::uint64_t>(group.capacity()), total);
+    std::uint64_t texel_bytes = 0;
+    if (!gfx::detail::checkedLabPbrMultiply(
+            static_cast<std::uint64_t>(texels.capacity()),
+            static_cast<std::uint64_t>(sizeof(std::uint32_t)),
+            texel_bytes)) {
+      total = (std::numeric_limits<std::uint64_t>::max)();
+    } else {
+      addLabPbrResidentBytes(texel_bytes, total);
+    }
+  }
+  addLabPbrSourceBytes(session.labpbr_suite_source.base, total);
+  addLabPbrSourceBytes(session.labpbr_suite_source.normal, total);
+  addLabPbrSourceBytes(session.labpbr_suite_source.specular, total);
+  addLabPbrSourceBytes(session.labpbr_suite_source.properties, total);
+  return total;
+}
+
+std::size_t narrowLabPbrBytes(std::uint64_t bytes) noexcept {
+  return static_cast<std::size_t>((std::min)(
+      bytes, static_cast<std::uint64_t>(
+                 (std::numeric_limits<std::size_t>::max)())));
+}
+
+gfx::TextureDecodeLimits sessionTextureDecodeLimits(
+    const AppSession &session, std::uint64_t cache_bytes) noexcept {
+  std::uint64_t retained = sessionLabPbrResidentBytes(session);
+  addLabPbrResidentBytes(cache_bytes, retained);
+  gfx::TextureDecodeLimits limits;
+  limits.maximum_peak_bytes =
+      narrowLabPbrBytes(session.labpbr_peak_memory_budget_bytes);
+  limits.retained_resident_bytes = narrowLabPbrBytes(retained);
+  return limits;
+}
+
+gfx::LabPbrSuiteImportLimits sessionSuiteImportLimits(
+    const AppSession &session, std::uint64_t cache_bytes) noexcept {
+  return {
+      session.labpbr_peak_memory_budget_bytes,
+      sessionLabPbrResidentBytes(session),
+      cache_bytes,
+      true,
+  };
+}
+
+std::uint64_t suiteSnapshotBytes(
+    const gfx::LabPbrSuiteSource &source) noexcept {
+  std::uint64_t total = 0;
+  addLabPbrSourceBytes(source.base, total);
+  addLabPbrSourceBytes(source.normal, total);
+  addLabPbrSourceBytes(source.specular, total);
+  addLabPbrSourceBytes(source.properties, total);
+  return total;
+}
+
 bool buildSessionLabPbrMaterial(
     const loader::Geometry &geometry, const baker::BoneMapper &bone_mapper,
     const gfx::TextureImage &base,
@@ -123,7 +216,11 @@ bool buildSessionLabPbrMaterial(
     gfx::ResolvedUvDomain &domain,
     gfx::LabPbrUvCoverage &coverage,
     gfx::LabPbrCompositionResult &composition,
-    gfx::ResolvedMaterialTable &resolved, std::string *error) {
+    gfx::ResolvedMaterialTable &resolved, std::string *error,
+    std::uint64_t maximum_peak_bytes,
+    std::uint64_t retained_resident_bytes = 0,
+    std::uint64_t encoded_snapshot_bytes = 0,
+    std::uint64_t cache_bytes = 0) {
   if (!base.valid()) {
     domain = {};
     coverage = {};
@@ -133,6 +230,48 @@ bool buildSessionLabPbrMaterial(
       error->clear();
     }
     return true;
+  }
+
+  std::uint64_t pixels = 0;
+  std::uint64_t rgba_bytes = 0;
+  std::uint64_t coverage_bytes = 0;
+  if (!gfx::detail::checkedLabPbrMultiply(
+          static_cast<std::uint64_t>(base.width),
+          static_cast<std::uint64_t>(base.height), pixels) ||
+      !gfx::detail::checkedLabPbrMultiply(pixels, 4u, rgba_bytes) ||
+      !gfx::detail::checkedLabPbrMultiply(
+          pixels, static_cast<std::uint64_t>(sizeof(std::uint32_t)),
+          coverage_bytes)) {
+    if (error != nullptr) {
+      *error = "LabPBR budget preflight failed: atlas byte arithmetic overflow";
+    }
+    return false;
+  }
+  const bool has_imported_normal =
+      imported_normal != nullptr && imported_normal->valid();
+  const bool has_source_specular = source_material.specular_map_active;
+  gfx::LabPbrMemoryEstimateRequest memory_request;
+  memory_request.width = static_cast<std::uint64_t>(base.width);
+  memory_request.height = static_cast<std::uint64_t>(base.height);
+  memory_request.resident_rgba_image_count =
+      1u + (source_material.normal_map_active ? 1u : 0u) +
+      (has_source_specular ? 1u : 0u) +
+      (has_imported_normal ? 1u : 0u);
+  memory_request.candidate_rgba_image_count =
+      1u + (has_imported_normal ? 1u : 0u) +
+      (has_source_specular ? 1u : 0u);
+  memory_request.resolved_texel_bytes_per_pixel =
+      gfx::kLabPbrResolvedTexelBytesPerPixel;
+  memory_request.resident_fixed_bytes = retained_resident_bytes;
+  memory_request.candidate_fixed_bytes = rgba_bytes;
+  memory_request.encoded_snapshot_bytes = encoded_snapshot_bytes;
+  memory_request.decoder_peak_bytes = rgba_bytes;
+  memory_request.coverage_peak_bytes = coverage_bytes;
+  memory_request.cache_bytes = cache_bytes;
+  gfx::LabPbrMemoryEstimate memory_estimate;
+  if (!gfx::preflightLabPbrMemory(memory_request, maximum_peak_bytes,
+                                  memory_estimate, error)) {
+    return false;
   }
 
   gfx::StaticIndexedModelMesh mesh;
@@ -174,7 +313,7 @@ bool buildSessionLabPbrMaterial(
       overrides.empty() ? nullptr : &next_composition.specular;
   if (!gfx::buildAuthoredResolvedMaterial(
           base, source_material, normal, authored_specular,
-          next_resolved, error)) {
+          next_resolved, error, maximum_peak_bytes)) {
     return false;
   }
   domain = mesh.uv_domain;
@@ -2043,7 +2182,10 @@ void AppSession::loadModel(const std::filesystem::path &path) {
             labpbr_source_material_, no_overrides,
             labpbr_imported_normal.valid() ? &labpbr_imported_normal : nullptr,
             loaded_domain, loaded_coverage, loaded_composition,
-            loaded_resolved, &material_error)) {
+            loaded_resolved, &material_error,
+            labpbr_peak_memory_budget_bytes,
+            sessionLabPbrResidentBytes(*this), 0u,
+            labpbr_import_cache_.residentBytes())) {
       last_error = material_error.empty()
                        ? "Model UV/material preflight failed"
                        : material_error;
@@ -2319,7 +2461,9 @@ bool AppSession::importLabPbrSuiteInternal(
   }
 
   auto imported = gfx::importLabPbrSuite(
-      base_path, confirm_missing_properties, &labpbr_import_cache_);
+      base_path, confirm_missing_properties, &labpbr_import_cache_,
+      sessionSuiteImportLimits(*this,
+                               labpbr_import_cache_.residentBytes()));
   if (imported.status ==
       gfx::LabPbrSuiteImportStatus::NeedsLabPbr13Confirmation) {
     pending_labpbr_import_path_ = base_path;
@@ -2356,7 +2500,10 @@ bool AppSession::importLabPbrSuiteInternal(
           imported.suite.material, labpbr_group_overrides,
           imported_normal.valid() ? &imported_normal : nullptr,
           loaded_domain, loaded_coverage, loaded_composition, loaded_resolved,
-          &error)) {
+          &error, labpbr_peak_memory_budget_bytes,
+          sessionLabPbrResidentBytes(*this),
+          suiteSnapshotBytes(imported.suite.source),
+          labpbr_import_cache_.residentBytes())) {
     last_error = error.empty() ? "LabPBR authoring resolve failed" : error;
     status = relink ? "LabPBR relink failed" : "LabPBR suite import failed";
     return false;
@@ -2534,7 +2681,9 @@ bool AppSession::loadTexture(const std::filesystem::path &path) {
   }
   std::string err;
   gfx::TextureImage loaded_texture;
-  if (!gfx::loadTextureImage(path, loaded_texture, &err)) {
+  if (!gfx::loadTextureImage(path, loaded_texture, &err,
+                             sessionTextureDecodeLimits(
+                                 *this, labpbr_import_cache_.residentBytes()))) {
     last_error = err.empty() ? "Texture load failed" : err;
     status = "Texture load failed";
     return false;
@@ -2568,7 +2717,7 @@ bool AppSession::loadTexture(const std::filesystem::path &path) {
   gfx::ResolvedMaterialTable loaded_material;
   if (!gfx::buildAuthoredResolvedMaterial(
           loaded_texture, base_source, nullptr, nullptr, loaded_material,
-          &err)) {
+          &err, labpbr_peak_memory_budget_bytes)) {
     last_error = err.empty() ? "Base material resolve failed" : err;
     status = "Texture load failed";
     return false;
@@ -2582,7 +2731,9 @@ bool AppSession::loadTexture(const std::filesystem::path &path) {
           labpbr_group_overrides,
           keep_imported_normal ? &labpbr_imported_normal : nullptr,
           loaded_domain, loaded_coverage, loaded_composition, loaded_resolved,
-          &err)) {
+          &err, labpbr_peak_memory_budget_bytes,
+          sessionLabPbrResidentBytes(*this), 0u,
+          labpbr_import_cache_.residentBytes())) {
     last_error = err.empty() ? "LabPBR authoring resolve failed" : err;
     status = "Texture load failed";
     return false;
@@ -4073,7 +4224,10 @@ bool AppSession::refreshLabPbrAuthoring() {
           geometry, bone_mapper, model_texture, labpbr_source_material_,
           labpbr_group_overrides,
           labpbr_imported_normal.valid() ? &labpbr_imported_normal : nullptr,
-          domain, coverage, composition, resolved, &error)) {
+          domain, coverage, composition, resolved, &error,
+          labpbr_peak_memory_budget_bytes,
+          sessionLabPbrResidentBytes(*this), 0u,
+          labpbr_import_cache_.residentBytes())) {
     last_error =
         error.empty() ? "LabPBR authoring refresh failed" : error;
     return false;
@@ -4175,7 +4329,10 @@ bool AppSession::applySelectedLabPbrDraft() {
           geometry, bone_mapper, model_texture, labpbr_source_material_,
           overrides,
           labpbr_imported_normal.valid() ? &labpbr_imported_normal : nullptr,
-          domain, coverage, composition, resolved, &error)) {
+          domain, coverage, composition, resolved, &error,
+          labpbr_peak_memory_budget_bytes,
+          sessionLabPbrResidentBytes(*this), 0u,
+          labpbr_import_cache_.residentBytes())) {
     last_error = error;
     status = "LabPBR apply failed: " + error;
     return false;
@@ -4227,7 +4384,10 @@ bool AppSession::restoreSelectedLabPbrFromTexture() {
           geometry, bone_mapper, model_texture, labpbr_source_material_,
           overrides,
           labpbr_imported_normal.valid() ? &labpbr_imported_normal : nullptr,
-          domain, coverage, composition, resolved, &error)) {
+          domain, coverage, composition, resolved, &error,
+          labpbr_peak_memory_budget_bytes,
+          sessionLabPbrResidentBytes(*this), 0u,
+          labpbr_import_cache_.residentBytes())) {
     last_error = error;
     status = "LabPBR restore failed: " + error;
     return false;
@@ -4264,7 +4424,9 @@ bool AppSession::importLabPbrSpecular(const std::filesystem::path &path) {
 
   gfx::TextureImage imported;
   std::string error;
-  if (!gfx::loadTextureImage(path, imported, &error)) {
+  if (!gfx::loadTextureImage(path, imported, &error,
+                             sessionTextureDecodeLimits(
+                                 *this, labpbr_import_cache_.residentBytes()))) {
     last_error = error.empty() ? "LabPBR specular image decode failed" : error;
     status = "LabPBR specular import failed: " + last_error;
     return false;
@@ -4301,7 +4463,10 @@ bool AppSession::importLabPbrSpecular(const std::filesystem::path &path) {
           geometry, bone_mapper, model_texture, source,
           labpbr_group_overrides,
           labpbr_imported_normal.valid() ? &labpbr_imported_normal : nullptr,
-          domain, coverage, composition, resolved, &error)) {
+          domain, coverage, composition, resolved, &error,
+          labpbr_peak_memory_budget_bytes,
+          sessionLabPbrResidentBytes(*this), 0u,
+          labpbr_import_cache_.residentBytes())) {
     last_error = error.empty() ? "LabPBR specular resolve failed" : error;
     status = "LabPBR specular import failed: " + last_error;
     return false;
@@ -4354,7 +4519,10 @@ void AppSession::removeLabPbrSpecular() {
           geometry, bone_mapper, model_texture, source,
           labpbr_group_overrides,
           labpbr_imported_normal.valid() ? &labpbr_imported_normal : nullptr,
-          domain, coverage, composition, resolved, &error)) {
+          domain, coverage, composition, resolved, &error,
+          labpbr_peak_memory_budget_bytes,
+          sessionLabPbrResidentBytes(*this), 0u,
+          labpbr_import_cache_.residentBytes())) {
     last_error = error.empty() ? "LabPBR specular removal failed" : error;
     status = last_error;
     return;
@@ -4387,7 +4555,10 @@ bool AppSession::importLabPbrNormal(const std::filesystem::path &path) {
   std::string error;
   if (!gfx::importReadOnlyIrisNormal(path, model_texture.width,
                                      model_texture.height, imported,
-                                     &error)) {
+                                     &error,
+                                     sessionTextureDecodeLimits(
+                                         *this,
+                                         labpbr_import_cache_.residentBytes()))) {
     last_error = error;
     status = "Iris normal import failed: " + error;
     return false;
@@ -4399,7 +4570,9 @@ bool AppSession::importLabPbrNormal(const std::filesystem::path &path) {
   if (!buildSessionLabPbrMaterial(
           geometry, bone_mapper, model_texture, labpbr_source_material_,
           labpbr_group_overrides, &imported, domain, coverage, composition,
-          resolved, &error)) {
+          resolved, &error, labpbr_peak_memory_budget_bytes,
+          sessionLabPbrResidentBytes(*this), 0u,
+          labpbr_import_cache_.residentBytes())) {
     last_error = error;
     status = "Iris normal import failed: " + error;
     return false;
@@ -4440,7 +4613,9 @@ void AppSession::removeLabPbrNormal() {
   if (!buildSessionLabPbrMaterial(
           geometry, bone_mapper, model_texture, source_without_normal,
           labpbr_group_overrides, nullptr, domain, coverage, composition,
-          resolved, &error)) {
+          resolved, &error, labpbr_peak_memory_budget_bytes,
+          sessionLabPbrResidentBytes(*this), 0u,
+          labpbr_import_cache_.residentBytes())) {
     last_error = error;
     status = "Iris normal removal failed: " + error;
     return;

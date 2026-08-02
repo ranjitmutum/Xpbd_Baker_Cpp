@@ -162,13 +162,18 @@ void readFormatDeclaration(ResolvedMaterialTable &table) {
 } // namespace
 
 bool ResolvedMaterialTable::valid() const noexcept {
-  if (width <= 0 || height <= 0) {
+  if (width <= 0 || height <= 0 || !base_image.valid() ||
+      base_image.width != width || base_image.height != height) {
     return false;
   }
-  const auto w = static_cast<std::size_t>(width);
-  const auto h = static_cast<std::size_t>(height);
-  return w <= (std::numeric_limits<std::size_t>::max)() / h &&
-         texels.size() == w * h;
+  const auto compatible = [this](const TextureImage &image,
+                                 bool active) noexcept {
+    return !active ||
+           (image.valid() && image.width == width && image.height == height &&
+            image.source_channels >= 3);
+  };
+  return compatible(normal_image, normal_map_active) &&
+         compatible(specular_image, specular_map_active);
 }
 
 void ResolvedMaterialTable::clear() {
@@ -178,6 +183,7 @@ void ResolvedMaterialTable::clear() {
 const ResolvedMaterialTexel &ResolvedMaterialTable::sample(float u,
                                                             float v) const {
   static const ResolvedMaterialTexel kFallback{};
+  thread_local ResolvedMaterialTexel sampled;
   if (!valid()) {
     return kFallback;
   }
@@ -189,7 +195,28 @@ const ResolvedMaterialTexel &ResolvedMaterialTable::sample(float u,
   const auto y = std::min(
       static_cast<std::size_t>(v * static_cast<float>(height)),
       static_cast<std::size_t>(height - 1));
-  return texels[y * static_cast<std::size_t>(width) + x];
+  const std::size_t offset =
+      (y * static_cast<std::size_t>(width) + x) * 4u;
+  const std::array<std::uint8_t, 4> base_rgba{
+      base_image.rgba[offset], base_image.rgba[offset + 1u],
+      base_image.rgba[offset + 2u], base_image.rgba[offset + 3u]};
+  std::array<std::uint8_t, 4> normal_rgba{};
+  std::array<std::uint8_t, 4> specular_rgba{};
+  const std::array<std::uint8_t, 4> *normal = nullptr;
+  const std::array<std::uint8_t, 4> *specular = nullptr;
+  if (normal_map_active) {
+    std::copy_n(normal_image.rgba.data() + offset, 4u,
+                normal_rgba.begin());
+    normal = &normal_rgba;
+  }
+  if (specular_map_active) {
+    std::copy_n(specular_image.rgba.data() + offset, 4u,
+                specular_rgba.begin());
+    specular = &specular_rgba;
+  }
+  sampled = decodeLabPbrTexel(base_rgba, normal, specular,
+                              specular_image.source_channels);
+  return sampled;
 }
 
 LabPbrAssetPaths
@@ -400,6 +427,7 @@ bool resolveLabPbrMaterial(const TextureImage &base,
   }
   resolved.width = base.width;
   resolved.height = base.height;
+  resolved.base_image = base;
   resolved.assets = discoverLabPbrAssets(base_path);
   readFormatDeclaration(resolved);
 
@@ -436,38 +464,6 @@ bool resolveLabPbrMaterial(const TextureImage &base,
     }
   }
 
-  const auto width = static_cast<std::size_t>(base.width);
-  const auto height = static_cast<std::size_t>(base.height);
-  if (width > (std::numeric_limits<std::size_t>::max)() / height) {
-    if (error != nullptr) {
-      *error = "resolved material dimensions overflow";
-    }
-    return false;
-  }
-  const std::size_t texel_count = width * height;
-  resolved.texels.resize(texel_count);
-  for (std::size_t texel = 0; texel < texel_count; ++texel) {
-    const std::size_t offset = texel * 4u;
-    const std::array<std::uint8_t, 4> base_rgba{
-        base.rgba[offset], base.rgba[offset + 1u], base.rgba[offset + 2u],
-        base.rgba[offset + 3u]};
-    std::array<std::uint8_t, 4> normal_rgba{};
-    std::array<std::uint8_t, 4> specular_rgba{};
-    const std::array<std::uint8_t, 4> *normal = nullptr;
-    const std::array<std::uint8_t, 4> *specular = nullptr;
-    if (resolved.normal_map_active) {
-      std::copy_n(resolved.normal_image.rgba.data() + offset, 4u,
-                  normal_rgba.begin());
-      normal = &normal_rgba;
-    }
-    if (resolved.specular_map_active) {
-      std::copy_n(resolved.specular_image.rgba.data() + offset, 4u,
-                  specular_rgba.begin());
-      specular = &specular_rgba;
-    }
-    resolved.texels[texel] = decodeLabPbrTexel(
-        base_rgba, normal, specular, resolved.specular_image.source_channels);
-  }
   out = std::move(resolved);
   if (error != nullptr) {
     error->clear();
@@ -483,9 +479,9 @@ bool sameResolvedMaterialResource(const ResolvedMaterialTable &lhs,
          lhs.format_declared == rhs.format_declared &&
          lhs.normal_map_active == rhs.normal_map_active &&
          lhs.specular_map_active == rhs.specular_map_active &&
+         sameImagePixels(lhs.base_image, rhs.base_image) &&
          sameImagePixels(lhs.normal_image, rhs.normal_image) &&
-         sameImagePixels(lhs.specular_image, rhs.specular_image) &&
-         lhs.texels == rhs.texels;
+         sameImagePixels(lhs.specular_image, rhs.specular_image);
 }
 
 TangentFrame computeTangentFrame(

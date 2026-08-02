@@ -18,6 +18,20 @@ namespace {
 constexpr std::uintmax_t kMaxImportFileBytes =
     kFileByteSnapshotMaximumBytes;
 
+[[nodiscard]] std::uint64_t effectiveImportPeakBytes(
+    const LabPbrSuiteImportLimits &limits) noexcept {
+  return (std::min)(limits.maximum_peak_bytes,
+                    static_cast<std::uint64_t>(
+                        kTextureDecodeMaximumPeakBytes));
+}
+
+[[nodiscard]] std::size_t narrowTextureBytes(
+    std::uint64_t bytes) noexcept {
+  return static_cast<std::size_t>((std::min)(
+      bytes, static_cast<std::uint64_t>(
+                 (std::numeric_limits<std::size_t>::max)())));
+}
+
 std::string lowerAscii(std::string value) {
   std::transform(value.begin(), value.end(), value.begin(), [](char c) {
     return static_cast<char>(
@@ -126,11 +140,13 @@ LabPbrSourceFile absentSource(const std::filesystem::path &path) {
 }
 
 bool snapshotFile(const std::filesystem::path &path, LabPbrSourceFile &out,
-                   std::string &error, std::string_view label) {
+                   std::string &error, std::string_view label,
+                   std::uintmax_t maximum_bytes = kMaxImportFileBytes) {
   try {
     FileByteSnapshot bytes;
     if (!snapshotFileBytes(path, bytes, &error, label,
-                           kMaxImportFileBytes)) {
+                           (std::min)(maximum_bytes,
+                                      kMaxImportFileBytes))) {
       return false;
     }
     LabPbrSourceFile snapshot;
@@ -153,8 +169,32 @@ bool snapshotFile(const std::filesystem::path &path, LabPbrSourceFile &out,
   }
 }
 
+bool inspectSnapshot(const LabPbrSourceFile &source, const char *label,
+                     TextureImageHeader &out, std::string &error) {
+  if (!source.valid() ||
+      source.original_bytes->size() >
+          static_cast<std::size_t>((std::numeric_limits<int>::max)())) {
+    error = std::string(label) +
+            " read stage failed: source snapshot is invalid";
+    return false;
+  }
+  TextureImageHeader header;
+  std::string inspect_detail;
+  if (!inspectTextureImageFromMemory(
+          source.original_bytes->data(),
+          static_cast<int>(source.original_bytes->size()), header,
+          &inspect_detail)) {
+    error = std::string(label) + " Header stage failed: " +
+            (inspect_detail.empty() ? "invalid image" : inspect_detail);
+    return false;
+  }
+  out = header;
+  return true;
+}
+
 bool decodeSnapshot(const LabPbrSourceFile &source, const char *label,
-                    TextureImage &out, std::string &error) {
+                    TextureImage &out, std::string &error,
+                    TextureDecodeLimits limits = {}) {
   if (!source.valid() ||
       source.original_bytes->size() >
           static_cast<std::size_t>((std::numeric_limits<int>::max)())) {
@@ -166,7 +206,7 @@ bool decodeSnapshot(const LabPbrSourceFile &source, const char *label,
   if (!loadTextureImageFromMemory(
           source.original_bytes->data(),
           static_cast<int>(source.original_bytes->size()), decoded,
-          &decode_detail)) {
+          &decode_detail, limits)) {
     error = std::string(label) + " Decode stage failed: " +
             (decode_detail.empty() ? "invalid image" : decode_detail);
     return false;
@@ -240,19 +280,13 @@ std::string sourceCacheKey(const LabPbrSuiteSource &source) {
 bool buildMaterial(const TextureImage &base, const TextureImage &specular,
                    const TextureImage *normal,
                    const LabPbrSuiteSource &source,
-                   ResolvedMaterialTable &out, std::string &error) {
+                   ResolvedMaterialTable &out, std::string &error,
+                   std::uint64_t maximum_peak_bytes) {
   if (!base.valid() || !specular.valid() ||
       (normal != nullptr && !normal->valid())) {
     error = "cannot build material from invalid decoded images";
     return false;
   }
-  const auto width = static_cast<std::size_t>(base.width);
-  const auto height = static_cast<std::size_t>(base.height);
-  if (width > (std::numeric_limits<std::size_t>::max)() / height) {
-    error = "resolved material dimensions overflow";
-    return false;
-  }
-
   ResolvedMaterialTable material;
   material.width = base.width;
   material.height = base.height;
@@ -266,35 +300,10 @@ bool buildMaterial(const TextureImage &base, const TextureImage &specular,
   material.format = LabPbrFormat::LabPbr13;
   material.declared_format = "lab-pbr/1.3";
   material.format_declared = source.properties.present;
-  material.specular_map_active = true;
-  material.specular_image = specular;
-  material.normal_map_active = normal != nullptr;
-  if (normal != nullptr) {
-    material.normal_image = *normal;
+  if (!buildAuthoredResolvedMaterial(base, material, normal, &specular, out,
+                                     &error, maximum_peak_bytes)) {
+    return false;
   }
-
-  const std::size_t texel_count = width * height;
-  material.texels.resize(texel_count);
-  for (std::size_t texel = 0; texel < texel_count; ++texel) {
-    const std::size_t offset = texel * 4u;
-    const std::array<std::uint8_t, 4> base_rgba{
-        base.rgba[offset], base.rgba[offset + 1u], base.rgba[offset + 2u],
-        base.rgba[offset + 3u]};
-    const std::array<std::uint8_t, 4> specular_rgba{
-        specular.rgba[offset], specular.rgba[offset + 1u],
-        specular.rgba[offset + 2u], specular.rgba[offset + 3u]};
-    std::array<std::uint8_t, 4> normal_rgba{};
-    const std::array<std::uint8_t, 4> *normal_ptr = nullptr;
-    if (normal != nullptr) {
-      normal_rgba = {normal->rgba[offset], normal->rgba[offset + 1u],
-                     normal->rgba[offset + 2u],
-                     normal->rgba[offset + 3u]};
-      normal_ptr = &normal_rgba;
-    }
-    material.texels[texel] =
-        decodeLabPbrTexel(base_rgba, normal_ptr, &specular_rgba, 4);
-  }
-  out = std::move(material);
   return true;
 }
 
@@ -412,6 +421,38 @@ void LabPbrSuiteImportCache::store(const ImportedLabPbrSuite &suite) {
   entries_.insert_or_assign(cached.source.cache_key, std::move(cached));
 }
 
+std::uint64_t LabPbrSuiteImportCache::residentBytes() const noexcept {
+  std::uint64_t total = 0;
+  const auto add = [&total](std::size_t bytes) {
+    const auto value = static_cast<std::uint64_t>(bytes);
+    if (value > (std::numeric_limits<std::uint64_t>::max)() - total) {
+      total = (std::numeric_limits<std::uint64_t>::max)();
+    } else {
+      total += value;
+    }
+  };
+  const auto add_image = [&add](const TextureImage &image) {
+    add(image.rgba.capacity());
+  };
+  const auto add_source = [&add](const LabPbrSourceFile &source) {
+    if (source.original_bytes != nullptr) {
+      add(source.original_bytes->capacity());
+    }
+  };
+  for (const auto &[key, suite] : entries_) {
+    add(key.capacity());
+    add_image(suite.base_image);
+    add_image(suite.material.base_image);
+    add_image(suite.material.normal_image);
+    add_image(suite.material.specular_image);
+    add_source(suite.source.base);
+    add_source(suite.source.normal);
+    add_source(suite.source.specular);
+    add_source(suite.source.properties);
+  }
+  return total;
+}
+
 std::vector<std::filesystem::path>
 discoverLabPbrSuiteCandidates(const std::filesystem::path &folder,
                               std::string *error) {
@@ -479,7 +520,8 @@ discoverLabPbrSuiteCandidates(const std::filesystem::path &folder,
 LabPbrSuiteImportResult importLabPbrSuite(
     const std::filesystem::path &base_path,
     bool confirm_labpbr13_without_properties,
-    LabPbrSuiteImportCache *cache) {
+    LabPbrSuiteImportCache *cache,
+    LabPbrSuiteImportLimits limits) {
   LabPbrSuiteImportResult result;
   const auto normalized_base = normalizedPath(base_path);
   const auto lower_extension =
@@ -517,17 +559,59 @@ LabPbrSuiteImportResult importLabPbrSuite(
 
   LabPbrSuiteSource source;
   std::string snapshot_error;
-  if (!snapshotFile(normalized_base, source.base, snapshot_error, "Base") ||
-      !snapshotFile(*specular, source.specular, snapshot_error,
-                    "Specular Sidecar")) {
+  const std::uint64_t effective_peak = effectiveImportPeakBytes(limits);
+  std::uint64_t encoded_snapshot_bytes = 0;
+  const auto snapshot_with_budget =
+      [&](const std::filesystem::path &path, LabPbrSourceFile &out,
+          std::string_view label) {
+        std::uint64_t resident_and_cache = 0;
+        std::uint64_t already_resident = 0;
+        if (!detail::checkedLabPbrAdd(limits.retained_resident_bytes,
+                                      limits.cache_bytes,
+                                      resident_and_cache) ||
+            !detail::checkedLabPbrAdd(resident_and_cache,
+                                      encoded_snapshot_bytes,
+                                      already_resident)) {
+          snapshot_error = std::string(label) +
+                           " budget stage failed before snapshot: byte arithmetic overflow";
+          return false;
+        }
+        if (already_resident > effective_peak) {
+          snapshot_error = std::string(label) +
+                           " budget stage failed before snapshot: retained state exceeds the peak limit";
+          return false;
+        }
+        const auto remaining = effective_peak - already_resident;
+        if (!snapshotFile(
+                path, out, snapshot_error, label,
+                static_cast<std::uintmax_t>((std::min)(
+                    remaining,
+                    static_cast<std::uint64_t>(
+                        (std::numeric_limits<std::uintmax_t>::max)()))))) {
+          return false;
+        }
+        std::uint64_t next_encoded = 0;
+        if (!detail::checkedLabPbrAdd(
+                encoded_snapshot_bytes,
+                static_cast<std::uint64_t>(out.size), next_encoded)) {
+          snapshot_error = std::string(label) +
+                           " budget stage failed after snapshot: encoded byte overflow";
+          return false;
+        }
+        encoded_snapshot_bytes = next_encoded;
+        return true;
+      };
+  if (!snapshot_with_budget(normalized_base, source.base, "Base") ||
+      !snapshot_with_budget(*specular, source.specular,
+                            "Specular Sidecar")) {
     result.error = std::move(snapshot_error);
     return result;
   }
   source.normal =
       normal ? LabPbrSourceFile{} :
                absentSource(parent / normal_name);
-  if (normal && !snapshotFile(*normal, source.normal, snapshot_error,
-                              "Normal Sidecar")) {
+  if (normal && !snapshot_with_budget(*normal, source.normal,
+                                      "Normal Sidecar")) {
     result.error = std::move(snapshot_error);
     return result;
   }
@@ -535,8 +619,8 @@ LabPbrSuiteImportResult importLabPbrSuite(
       properties ? LabPbrSourceFile{} :
                    absentSource(parent / properties_name);
   if (properties &&
-      !snapshotFile(*properties, source.properties, snapshot_error,
-                    "Properties Sidecar")) {
+      !snapshot_with_budget(*properties, source.properties,
+                            "Properties Sidecar")) {
     result.error = std::move(snapshot_error);
     return result;
   }
@@ -544,13 +628,175 @@ LabPbrSuiteImportResult importLabPbrSuite(
       !source.properties.present &&
       confirm_labpbr13_without_properties;
 
+  TextureImageHeader base_header;
+  TextureImageHeader specular_header;
+  TextureImageHeader normal_header;
+  std::string inspect_error;
+  if (!inspectSnapshot(source.base, "Base", base_header, inspect_error) ||
+      !inspectSnapshot(source.specular, "Specular Sidecar",
+                       specular_header, inspect_error)) {
+    result.error = std::move(inspect_error);
+    return result;
+  }
+  if (base_header.source_channels < 3) {
+    result.error =
+        "Base Decode stage failed: image must contain RGB or RGBA channels";
+    return result;
+  }
+  if (specular_header.source_channels != 4) {
+    result.error =
+        "Specular Sidecar Decode stage failed: _s.png must be an RGBA image";
+    return result;
+  }
+  if (base_header.width != specular_header.width ||
+      base_header.height != specular_header.height) {
+    result.error =
+        "LabPBR Domain stage failed: _s.png dimensions do not match the base image";
+    return result;
+  }
+  if (source.normal.present) {
+    if (!inspectSnapshot(source.normal, "Normal Sidecar", normal_header,
+                         inspect_error)) {
+      result.error = std::move(inspect_error);
+      return result;
+    }
+    if (normal_header.source_channels != 4) {
+      result.error =
+          "Normal Sidecar Decode stage failed: _n.png must be an RGBA image";
+      return result;
+    }
+    if (base_header.width != normal_header.width ||
+        base_header.height != normal_header.height) {
+      result.error =
+          "LabPBR Domain stage failed: _n.png dimensions do not match the base image";
+      return result;
+    }
+  }
+
+  if (!source.properties.present &&
+      !confirm_labpbr13_without_properties) {
+    result.status =
+        LabPbrSuiteImportStatus::NeedsLabPbr13Confirmation;
+    result.error =
+        "Properties Sidecar stage requires explicit LabPBR 1.3 confirmation "
+        "because texture.properties is missing";
+    return result;
+  }
+
+  std::uint64_t pixels = 0;
+  std::uint64_t rgba_bytes = 0;
+  std::uint64_t coverage_bytes = 0;
+  const std::uint64_t decoded_image_count =
+      source.normal.present ? 3u : 2u;
+  const std::uint64_t suite_image_count = decoded_image_count + 1u;
+  std::uint64_t candidate_image_count = decoded_image_count * 2u;
+  if (cache != nullptr) {
+    if (!detail::checkedLabPbrMultiply(suite_image_count, 2u,
+                                       candidate_image_count) ||
+        !detail::checkedLabPbrAdd(candidate_image_count,
+                                  decoded_image_count,
+                                  candidate_image_count)) {
+      result.error =
+          "LabPBR budget preflight failed: candidate image count overflow";
+      return result;
+    }
+  }
+  if (source.normal.present && limits.copy_normal_to_iris_asset &&
+      !detail::checkedLabPbrAdd(candidate_image_count, 1u,
+                                candidate_image_count)) {
+    result.error =
+        "LabPBR budget preflight failed: Iris candidate image count overflow";
+    return result;
+  }
+  if (!detail::checkedLabPbrMultiply(
+          static_cast<std::uint64_t>(base_header.width),
+          static_cast<std::uint64_t>(base_header.height), pixels) ||
+      !detail::checkedLabPbrMultiply(pixels, 4u, rgba_bytes) ||
+      !detail::checkedLabPbrMultiply(
+          pixels, static_cast<std::uint64_t>(sizeof(std::uint32_t)),
+          coverage_bytes)) {
+    result.error =
+        "LabPBR budget preflight failed: atlas byte arithmetic overflow";
+    return result;
+  }
+  LabPbrMemoryEstimateRequest memory_request;
+  memory_request.width = static_cast<std::uint64_t>(base_header.width);
+  memory_request.height = static_cast<std::uint64_t>(base_header.height);
+  memory_request.candidate_rgba_image_count = candidate_image_count;
+  memory_request.resolved_texel_bytes_per_pixel =
+      kLabPbrResolvedTexelBytesPerPixel;
+  memory_request.resident_fixed_bytes = limits.retained_resident_bytes;
+  memory_request.candidate_fixed_bytes = rgba_bytes;
+  if (source.normal.present && limits.copy_normal_to_iris_asset &&
+      !detail::checkedLabPbrAdd(
+          memory_request.candidate_fixed_bytes,
+          static_cast<std::uint64_t>(source.normal.size),
+          memory_request.candidate_fixed_bytes)) {
+    result.error =
+        "LabPBR budget preflight failed: Iris encoded-byte count overflow";
+    return result;
+  }
+  memory_request.encoded_snapshot_bytes = encoded_snapshot_bytes;
+  memory_request.decoder_peak_bytes = rgba_bytes;
+  memory_request.coverage_peak_bytes = coverage_bytes;
+  memory_request.cache_bytes = limits.cache_bytes;
+  LabPbrMemoryEstimate memory_estimate;
+  if (!preflightLabPbrMemory(memory_request, effective_peak,
+                             memory_estimate, &result.error)) {
+    return result;
+  }
+
+  if (source.properties.present) {
+    std::string declared_format;
+    if (!declaresLabPbr13(source.properties, declared_format,
+                          result.error)) {
+      result.error = "Properties Sidecar stage failed: " + result.error;
+      return result;
+    }
+  }
+
   TextureImage base;
   TextureImage specular_image;
   TextureImage normal_image;
   std::string decode_error;
-  if (!decodeSnapshot(source.base, "Base", base, decode_error) ||
-      !decodeSnapshot(source.specular, "Specular Sidecar", specular_image,
-                      decode_error)) {
+  std::uint64_t decoded_resident_bytes = 0;
+  const auto decode_with_budget =
+      [&](const LabPbrSourceFile &snapshot, const char *label,
+          TextureImage &out) {
+        std::uint64_t retained = 0;
+        const std::uint64_t other_snapshots =
+            encoded_snapshot_bytes - static_cast<std::uint64_t>(snapshot.size);
+        if (!detail::checkedLabPbrAdd(limits.retained_resident_bytes,
+                                      limits.cache_bytes, retained) ||
+            !detail::checkedLabPbrAdd(retained, other_snapshots, retained) ||
+            !detail::checkedLabPbrAdd(retained, decoded_resident_bytes,
+                                      retained)) {
+          decode_error = std::string(label) +
+                         " budget stage failed before Decode: byte arithmetic overflow";
+          return false;
+        }
+        TextureDecodeLimits decode_limits;
+        decode_limits.maximum_peak_bytes = narrowTextureBytes(effective_peak);
+        decode_limits.retained_resident_bytes = narrowTextureBytes(retained);
+        if (!decodeSnapshot(snapshot, label, out, decode_error,
+                            decode_limits)) {
+          return false;
+        }
+        std::uint64_t next_decoded = 0;
+        if (!detail::checkedLabPbrAdd(
+                decoded_resident_bytes,
+                static_cast<std::uint64_t>(out.rgba.capacity()),
+                next_decoded)) {
+          decode_error = std::string(label) +
+                         " budget stage failed after Decode: resident byte overflow";
+          return false;
+        }
+        decoded_resident_bytes = next_decoded;
+        return true;
+      };
+  if (!decode_with_budget(source.base, "Base", base) ||
+      !decode_with_budget(source.specular, "Specular Sidecar",
+                          specular_image)) {
     result.error = std::move(decode_error);
     return result;
   }
@@ -571,8 +817,8 @@ LabPbrSuiteImportResult importLabPbrSuite(
     return result;
   }
   if (source.normal.present) {
-    if (!decodeSnapshot(source.normal, "Normal Sidecar", normal_image,
-                        decode_error)) {
+    if (!decode_with_budget(source.normal, "Normal Sidecar",
+                            normal_image)) {
       result.error = std::move(decode_error);
       return result;
     }
@@ -589,22 +835,6 @@ LabPbrSuiteImportResult importLabPbrSuite(
     }
   }
 
-  if (source.properties.present) {
-    std::string declared_format;
-    if (!declaresLabPbr13(source.properties, declared_format,
-                          result.error)) {
-      result.error = "Properties Sidecar stage failed: " + result.error;
-      return result;
-    }
-  } else if (!confirm_labpbr13_without_properties) {
-    result.status =
-        LabPbrSuiteImportStatus::NeedsLabPbr13Confirmation;
-    result.error =
-        "Properties Sidecar stage requires explicit LabPBR 1.3 confirmation "
-        "because texture.properties is missing";
-    return result;
-  }
-
   source.cache_key = sourceCacheKey(source);
   if (cache != nullptr && cache->find(source.cache_key, result.suite)) {
     result.suite.source = source;
@@ -618,7 +848,7 @@ LabPbrSuiteImportResult importLabPbrSuite(
   ResolvedMaterialTable material;
   if (!buildMaterial(base, specular_image,
                      source.normal.present ? &normal_image : nullptr,
-                     source, material, result.error)) {
+                     source, material, result.error, effective_peak)) {
     return result;
   }
 
