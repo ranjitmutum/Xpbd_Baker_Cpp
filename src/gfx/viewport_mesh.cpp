@@ -3,6 +3,7 @@
 #include "xpbd/baker/bone_pose_calculator.hpp"
 #include "xpbd/baker/cube_geometry.hpp"
 #include "xpbd/gfx/labpbr_material.hpp"
+#include "xpbd/gfx/uv_domain.hpp"
 
 #include <algorithm>
 #include <array>
@@ -49,29 +50,10 @@ constexpr int kCubeFaces[6][4] = {
 
 
 
-struct FaceTexelUV {
-  float u0 = 0, v0 = 0, u1 = 0, v1 = 0;
-  int rotation_quarter_turns = 0;
-  bool present = false;
-};
+using FaceTexelUV = ResolvedFaceUv;
 
-std::array<std::array<float, 2>, 4>
-faceCornerTexels(const FaceTexelUV &face_uv) {
-  const std::array<std::array<float, 2>, 4> base = {{
-      {{face_uv.u0, face_uv.v0}},
-      {{face_uv.u1, face_uv.v0}},
-      {{face_uv.u1, face_uv.v1}},
-      {{face_uv.u0, face_uv.v1}},
-  }};
-  std::array<std::array<float, 2>, 4> result{};
-  const int quarter_turns =
-      ((face_uv.rotation_quarter_turns % 4) + 4) % 4;
-  for (int corner = 0; corner < 4; ++corner) {
-    const int source = (corner + 4 - quarter_turns) % 4;
-    result[static_cast<std::size_t>(corner)] =
-        base[static_cast<std::size_t>(source)];
-  }
-  return result;
+FaceUvCorners faceCornerTexels(const FaceTexelUV &face_uv) noexcept {
+  return bedrockFaceUvCorners(face_uv);
 }
 
 bool skipCoincidentOppositeFace(const loader::Cube &cube,
@@ -550,131 +532,12 @@ void lerp3(const float a[3], const float b[3], float t, float o[3]) {
 
 FaceTexelUV resolveCubeFaceUV(const loader::Cube &cube, int face_i) {
   FaceTexelUV out;
-  auto fromLoader = [](const loader::FaceUV &f, float default_u,
-                       float default_v,
-                       bool reverse_bedrock_top_bottom = false)
-      -> FaceTexelUV {
-    FaceTexelUV r;
-    if (!f.present) {
-      return r;
-    }
-    r.u0 = static_cast<float>(f.u);
-    r.v0 = static_cast<float>(f.v);
-    const float size_u = f.size_explicit
-                             ? static_cast<float>(f.size_u)
-                             : default_u;
-    const float size_v = f.size_explicit
-                             ? static_cast<float>(f.size_v)
-                             : default_v;
-    r.u1 = r.u0 + size_u;
-    r.v1 = r.v0 + size_v;
-    // Bedrock serializes Up/Down from the opposite rectangle corner. This is
-    // the same conversion Blockbench performs when importing geometry: both
-    // axes are reversed before any uv_rotation is applied. Without it,
-    // alpha-masked wedges (for example Baishui's Umberlla fabric) taper toward
-    // the wrong end and appear as missing transparent panels.
-    if (reverse_bedrock_top_bottom) {
-      std::swap(r.u0, r.u1);
-      std::swap(r.v0, r.v1);
-    }
-    r.rotation_quarter_turns =
-        ((f.rotation_degrees % 360) + 360) % 360 / 90;
-    r.present = true;
-    return r;
-  };
-
-  if (cube.uv_mode == loader::CubeUVMode::PerFace) {
-    switch (static_cast<StaticModelFaceDirection>(face_i)) {
-    case StaticModelFaceDirection::West:
-      return fromLoader(cube.uv_west,
-                        static_cast<float>(std::abs(cube.size[2])),
-                        static_cast<float>(std::abs(cube.size[1])));
-    case StaticModelFaceDirection::East:
-      return fromLoader(cube.uv_east,
-                        static_cast<float>(std::abs(cube.size[2])),
-                        static_cast<float>(std::abs(cube.size[1])));
-    case StaticModelFaceDirection::Down:
-      return fromLoader(cube.uv_down,
-                        static_cast<float>(std::abs(cube.size[0])),
-                        static_cast<float>(std::abs(cube.size[2])), true);
-    case StaticModelFaceDirection::Up:
-      return fromLoader(cube.uv_up,
-                        static_cast<float>(std::abs(cube.size[0])),
-                        static_cast<float>(std::abs(cube.size[2])), true);
-    case StaticModelFaceDirection::North:
-      return fromLoader(cube.uv_north,
-                        static_cast<float>(std::abs(cube.size[0])),
-                        static_cast<float>(std::abs(cube.size[1])));
-    case StaticModelFaceDirection::South:
-      return fromLoader(cube.uv_south,
-                        static_cast<float>(std::abs(cube.size[0])),
-                        static_cast<float>(std::abs(cube.size[1])));
-    }
-    return out;
+  std::string error;
+  if (!resolveBedrockFaceUv(
+          cube, static_cast<BedrockUvFace>(face_i), out, &error)) {
+    throw std::invalid_argument(error.empty() ? "Bedrock face UV is invalid"
+                                              : error);
   }
-
-
-
-  const float w = static_cast<float>(std::floor(std::abs(cube.size[0]) + 1e-6));
-  const float h = static_cast<float>(std::floor(std::abs(cube.size[1]) + 1e-6));
-  const float d = static_cast<float>(std::floor(std::abs(cube.size[2]) + 1e-6));
-  float ou = static_cast<float>(cube.uv_box[0]);
-  float ov = static_cast<float>(cube.uv_box[1]);
-  if (cube.uv_mode == loader::CubeUVMode::None) {
-    ou = 0.0f;
-    ov = 0.0f;
-  }
-
-  struct BoxFace {
-    float fu, fv, su, sv;
-  };
-
-  const BoxFace west{0.0f, d, d, h};
-  const BoxFace east{d + w, d, d, h};
-  const BoxFace down{d + w, 0.0f, w, d};
-
-  const BoxFace up{d, d, w, -d};
-  const BoxFace north{d, d, w, h};
-  const BoxFace south{d * 2.0f + w, d, w, h};
-
-  BoxFace bf{};
-  switch (static_cast<StaticModelFaceDirection>(face_i)) {
-  case StaticModelFaceDirection::West:
-    bf = west;
-    break;
-  case StaticModelFaceDirection::East:
-    bf = east;
-    break;
-  case StaticModelFaceDirection::Down:
-    bf = down;
-    break;
-  case StaticModelFaceDirection::Up:
-    bf = up;
-    break;
-  case StaticModelFaceDirection::North:
-    bf = north;
-    break;
-  case StaticModelFaceDirection::South:
-    bf = south;
-    break;
-  }
-
-
-  if (cube.mirror) {
-    if (face_i == static_cast<int>(StaticModelFaceDirection::East)) {
-      bf = west;
-    } else if (face_i == static_cast<int>(StaticModelFaceDirection::West)) {
-      bf = east;
-    }
-    bf.fu += bf.su;
-    bf.su = -bf.su;
-  }
-
-  out.u0 = ou + bf.fu;
-  out.v0 = ov + bf.fv;
-  out.u1 = ou + bf.fu + bf.su;
-  out.v1 = ov + bf.fv + bf.sv;
-  out.present = true;
   return out;
 }
 
@@ -687,9 +550,9 @@ void pushTexturedFace(std::vector<MeshVertex> &solid,
                       std::vector<MeshVertex> &transparent, const float p[4][3],
                       float nx, float ny, float nz, Rgba base,
                       const TextureImage *tex, const FaceTexelUV &face_uv,
-                      float tex_w, float tex_h) {
+                      double tex_w, double tex_h) {
   const bool textured = tex != nullptr && tex->valid() && face_uv.present &&
-                        tex_w > 0.0f && tex_h > 0.0f;
+                        tex_w > 0.0 && tex_h > 0.0;
 
   const int seg = textured ? 8 : 1;
 
@@ -739,16 +602,22 @@ void pushTexturedFace(std::vector<MeshVertex> &solid,
   };
 
   auto sampleUV = [&](float su, float sv, float &ou, float &ov) {
-    const float u_a =
-        corner_uv[0][0] + (corner_uv[1][0] - corner_uv[0][0]) * su;
-    const float v_a =
-        corner_uv[0][1] + (corner_uv[1][1] - corner_uv[0][1]) * su;
-    const float u_b =
-        corner_uv[3][0] + (corner_uv[2][0] - corner_uv[3][0]) * su;
-    const float v_b =
-        corner_uv[3][1] + (corner_uv[2][1] - corner_uv[3][1]) * su;
-    ou = (u_a + (u_b - u_a) * sv) / tex_w;
-    ov = (v_a + (v_b - v_a) * sv) / tex_h;
+    const double u_a =
+        corner_uv[0][0] +
+        (corner_uv[1][0] - corner_uv[0][0]) * static_cast<double>(su);
+    const double v_a =
+        corner_uv[0][1] +
+        (corner_uv[1][1] - corner_uv[0][1]) * static_cast<double>(su);
+    const double u_b =
+        corner_uv[3][0] +
+        (corner_uv[2][0] - corner_uv[3][0]) * static_cast<double>(su);
+    const double v_b =
+        corner_uv[3][1] +
+        (corner_uv[2][1] - corner_uv[3][1]) * static_cast<double>(su);
+    ou = static_cast<float>(
+        (u_a + (u_b - u_a) * static_cast<double>(sv)) / tex_w);
+    ov = static_cast<float>(
+        (v_a + (v_b - v_a) * static_cast<double>(sv)) / tex_h);
   };
 
   for (int j = 0; j < seg; ++j) {
@@ -866,14 +735,14 @@ void ViewportMeshBuilder::buildStaticIndexedModel(
     out.bone_names.push_back(bone.name);
   }
 
-  float tex_w =
-      static_cast<float>(std::max(1, geometry_->description.texture_width));
-  float tex_h =
-      static_cast<float>(std::max(1, geometry_->description.texture_height));
-  if (!geometry_->description.has_texture_size && texture_ != nullptr &&
+  double tex_w =
+      static_cast<double>(std::max(1, geometry_->description.texture_width));
+  double tex_h =
+      static_cast<double>(std::max(1, geometry_->description.texture_height));
+  if (!geometry_->description.hasCompleteTextureSize() && texture_ != nullptr &&
       texture_->valid()) {
-    tex_w = static_cast<float>(std::max(1, texture_->width));
-    tex_h = static_cast<float>(std::max(1, texture_->height));
+    tex_w = static_cast<double>(std::max(1, texture_->width));
+    tex_h = static_cast<double>(std::max(1, texture_->height));
   }
 
   const auto max_u32 =
@@ -942,12 +811,14 @@ void ViewportMeshBuilder::buildStaticIndexedModel(
         const auto face_uv_corners = faceCornerTexels(face_uv);
         float uvs[4][2]{};
         for (int corner = 0; corner < 4; ++corner) {
-          uvs[corner][0] = textured
-                               ? face_uv_corners[corner][0] / tex_w
-                               : 0.0f;
-          uvs[corner][1] = textured
-                               ? face_uv_corners[corner][1] / tex_h
-                               : 0.0f;
+          uvs[corner][0] =
+              textured ? static_cast<float>(
+                             face_uv_corners[corner][0] / tex_w)
+                       : 0.0f;
+          uvs[corner][1] =
+              textured ? static_cast<float>(
+                             face_uv_corners[corner][1] / tex_h)
+                       : 0.0f;
         }
         const TangentFrame tangent = computeTangentFrame(
             {positions[0][0], positions[0][1], positions[0][2]},
@@ -1028,14 +899,14 @@ void ViewportMeshBuilder::buildFromPoses(
 
 
 
-  float tex_w =
-      static_cast<float>(std::max(1, geometry_->description.texture_width));
-  float tex_h =
-      static_cast<float>(std::max(1, geometry_->description.texture_height));
-  if (!geometry_->description.has_texture_size && texture_ != nullptr &&
+  double tex_w =
+      static_cast<double>(std::max(1, geometry_->description.texture_width));
+  double tex_h =
+      static_cast<double>(std::max(1, geometry_->description.texture_height));
+  if (!geometry_->description.hasCompleteTextureSize() && texture_ != nullptr &&
       texture_->valid()) {
-    tex_w = static_cast<float>(std::max(1, texture_->width));
-    tex_h = static_cast<float>(std::max(1, texture_->height));
+    tex_w = static_cast<double>(std::max(1, texture_->width));
+    tex_h = static_cast<double>(std::max(1, texture_->height));
   }
 
   for (const auto &bone : geometry_->bones) {

@@ -2037,7 +2037,7 @@ void AppSession::loadModel(const std::filesystem::path &path) {
         "Model loaded — select physics bones and play to bake");
     status = "Model: " + path.filename().string() + " (" +
              std::to_string(geometry.bones.size()) + " bones)";
-    if (geometry.description.has_texture_size) {
+    if (geometry.description.hasCompleteTextureSize()) {
       status += " UV " + std::to_string(geometry.description.texture_width) +
                 "x" + std::to_string(geometry.description.texture_height);
     }
@@ -2572,7 +2572,7 @@ bool AppSession::loadTexture(const std::filesystem::path &path) {
   }
 
 
-  if (geometry.description.has_texture_size &&
+  if (geometry.description.hasCompleteTextureSize() &&
       (model_texture.width != geometry.description.texture_width ||
        model_texture.height != geometry.description.texture_height)) {
     status += "  [!] model UV " +

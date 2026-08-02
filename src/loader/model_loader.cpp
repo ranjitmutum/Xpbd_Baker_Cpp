@@ -53,16 +53,35 @@ Geometry ModelLoader::parseGeometryRoot(const nlohmann::json& root) {
             g.description.identifier = desc.at("identifier").get<std::string>();
         }
 
-        if (desc.contains("texture_width") && desc.at("texture_width").is_number()) {
-            g.description.texture_width =
-                std::max(1, static_cast<int>(desc.at("texture_width").get<double>()));
-            g.description.has_texture_size = true;
-        }
-        if (desc.contains("texture_height") && desc.at("texture_height").is_number()) {
-            g.description.texture_height =
-                std::max(1, static_cast<int>(desc.at("texture_height").get<double>()));
-            g.description.has_texture_size = true;
-        }
+        const auto parseTextureDimension =
+            [&](const char* key, int& value, bool& present) {
+                if (!desc.contains(key)) {
+                    return;
+                }
+                const auto& declaration = desc.at(key);
+                if (!declaration.is_number()) {
+                    throw std::invalid_argument(
+                        std::string("description.") + key +
+                        " must be a finite positive integer");
+                }
+                const double parsed = declaration.get<double>();
+                const double rounded = std::round(parsed);
+                if (!std::isfinite(parsed) || parsed <= 0.0 ||
+                    parsed != rounded ||
+                    rounded > static_cast<double>(
+                                  kBedrockTextureDimensionMaximum)) {
+                    throw std::invalid_argument(
+                        std::string("description.") + key +
+                        " must be a finite positive integer no greater than " +
+                        std::to_string(kBedrockTextureDimensionMaximum));
+                }
+                value = static_cast<int>(rounded);
+                present = true;
+            };
+        parseTextureDimension("texture_width", g.description.texture_width,
+                              g.description.has_texture_width);
+        parseTextureDimension("texture_height", g.description.texture_height,
+                              g.description.has_texture_height);
     }
     if (json.contains("bones") && json.at("bones").is_array()) {
         for (const auto& boneJson : json.at("bones")) {

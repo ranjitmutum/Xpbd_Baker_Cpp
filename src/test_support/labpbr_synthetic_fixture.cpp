@@ -70,7 +70,8 @@ loader::Geometry makeGeometry(std::string identifier,
       SyntheticLargeUvFixture::kDeclaredWidth;
   geometry.description.texture_height =
       SyntheticLargeUvFixture::kDeclaredHeight;
-  geometry.description.has_texture_size = true;
+  geometry.description.has_texture_width = true;
+  geometry.description.has_texture_height = true;
   for (auto &[name, cube] : cubes) {
     loader::Bone bone;
     bone.name = std::move(name);

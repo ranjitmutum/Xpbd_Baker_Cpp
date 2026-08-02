@@ -402,6 +402,7 @@ if(XPBD_BUILD_TESTS)
     add_executable(xpbd_viewport_regression_tests
         src/gfx/viewport_regression_tests_main.cpp
         src/test_support/labpbr_synthetic_fixture.cpp
+        src/gfx/uv_domain.cpp
         src/gfx/viewport_mesh.cpp
         src/gfx/texture_image.cpp
         src/gfx/labpbr_material.cpp
@@ -516,6 +517,7 @@ if(XPBD_BUILD_APP)
         src/gfx/gpu_backend_factory.cpp
         src/gfx/ray_tracing.cpp
         src/gfx/world_environment.cpp
+        src/gfx/uv_domain.cpp
         src/gfx/viewport_mesh.cpp
         src/gfx/preview_scene.cpp
         src/gfx/preview_surfaces.cpp
@@ -643,6 +645,7 @@ if(XPBD_BUILD_APP)
             src/app/app_session.cpp
             src/app/native_dialog.cpp
             src/app/log.cpp
+            src/gfx/uv_domain.cpp
             src/gfx/viewport_mesh.cpp
             src/gfx/texture_image.cpp
             src/gfx/labpbr_material.cpp

@@ -2,14 +2,14 @@
 
 ## Current phase
 
-S00 — baseline, synthetic fixtures, and compact memory estimate (`COMPLETE`).
+S01 — pure double-precision face UV parsing, bounds, and `ResolvedUvDomain` (`COMPLETE`).
 
 ## Phases and dependencies
 
 | Phase | Scope | Depends on | Status |
 |---|---|---|---|
 | S00 | Baseline; runtime synthetic fixtures; checked compact-memory estimate | — | COMPLETE |
-| S01 | Pure double-precision face UV parsing, bounds, and `ResolvedUvDomain` | S00 | PENDING |
+| S01 | Pure double-precision face UV parsing, bounds, and `ResolvedUvDomain` | S00 | COMPLETE |
 | S02 | Apply one domain to mesh/material consumers; atlas clamp; transaction/history behavior | S01 | PENDING |
 | S03 | Unicode/long-path snapshot-and-memory image import | S02 | PENDING |
 | Gate A | Release app build and full CTest correctness gate | S00–S03 | PENDING |

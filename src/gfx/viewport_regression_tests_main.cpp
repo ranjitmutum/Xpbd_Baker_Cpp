@@ -15,12 +15,14 @@
 #include "xpbd/gfx/rt_scene_generations.hpp"
 #include "xpbd/gfx/static_model_draw_plan.hpp"
 #include "xpbd/gfx/texture_image.hpp"
+#include "xpbd/gfx/uv_domain.hpp"
 #include "xpbd/gfx/vulkan_queue_selection.hpp"
 #include "xpbd/gfx/viewport_mesh.hpp"
 #include "xpbd/gfx/world_environment.hpp"
 #include "xpbd/baker/cube_geometry.hpp"
 #include "xpbd/loader/bedrock_animation_data.hpp"
 #include "xpbd/loader/bedrock_model_data.hpp"
+#include "xpbd/loader/model_loader.hpp"
 #include "xpbd/render/skeleton_viewport.hpp"
 #include "test_support/labpbr_synthetic_fixture.hpp"
 
@@ -687,6 +689,196 @@ void testSyntheticLargeUvFixtureAndMemoryBaseline() {
              error.find("overflow") != std::string::npos &&
              overflow_output == preserved,
          "LabPBR estimate rejects overflow without changing output");
+}
+
+void testBedrockUvDomainResolution() {
+  using xpbd::gfx::BedrockUvFace;
+  using xpbd::gfx::ResolvedFaceUv;
+  using xpbd::gfx::ResolvedUvDomain;
+  using xpbd::gfx::UvBounds;
+  using xpbd::gfx::UvDomainKind;
+  using xpbd::gfx::bedrockFaceUvCorners;
+  using xpbd::gfx::resolveBedrockFaceUv;
+  using xpbd::gfx::resolveGeometryUvDomain;
+  using xpbd::gfx::resolveUvDomain;
+  using xpbd::gfx::scanGeometryUvBounds;
+  using xpbd::loader::ModelLoader;
+  using xpbd::test_support::SyntheticLargeUvFixture;
+  using xpbd::test_support::buildSyntheticLargeUvFixture;
+
+  SyntheticLargeUvFixture fixture;
+  std::string error;
+  expect(buildSyntheticLargeUvFixture(fixture, &error),
+         "UV Domain table uses the shared synthetic fixture");
+
+  UvBounds large_bounds;
+  ResolvedUvDomain large_domain;
+  expect(scanGeometryUvBounds(fixture.large_uv_geometry, large_bounds,
+                              &error) &&
+             large_bounds.face_count == 3u && large_bounds.min_u == 0.0 &&
+             large_bounds.min_v == 0.0 && large_bounds.max_u == 224.0 &&
+             large_bounds.max_v == 16.0 &&
+             resolveUvDomain(fixture.large_uv_geometry.description,
+                             large_bounds, 256, 256, large_domain, &error) &&
+             large_domain.kind == UvDomainKind::Recovered &&
+             large_domain.width == 256.0 &&
+             large_domain.height == 256.0,
+         "large eye UV bounds recover to the imported 256x256 atlas");
+
+  ResolvedUvDomain protected_domain;
+  expect(resolveGeometryUvDomain(fixture.high_resolution_geometry, 256, 256,
+                                 protected_domain, &error) &&
+             protected_domain.kind == UvDomainKind::Declared &&
+             protected_domain.width == 16.0 &&
+             protected_domain.height == 16.0,
+         "high-resolution texture keeps reliable 16x16 declared UV domain");
+
+  xpbd::loader::GeometryDescription no_declaration;
+  ResolvedUvDomain imported_domain;
+  expect(resolveUvDomain(no_declaration, protected_domain.bounds, 256, 256,
+                         imported_domain, &error) &&
+             imported_domain.kind == UvDomainKind::ImportedTexture &&
+             imported_domain.width == 256.0,
+         "missing declaration resolves against imported texture dimensions");
+  auto width_only = no_declaration;
+  width_only.texture_width = 16;
+  width_only.has_texture_width = true;
+  auto height_only = no_declaration;
+  height_only.texture_height = 16;
+  height_only.has_texture_height = true;
+  ResolvedUvDomain width_only_domain;
+  ResolvedUvDomain height_only_domain;
+  expect(resolveUvDomain(width_only, protected_domain.bounds, 256, 256,
+                         width_only_domain, &error) &&
+             resolveUvDomain(height_only, protected_domain.bounds, 256, 256,
+                             height_only_domain, &error) &&
+             width_only_domain.kind == UvDomainKind::ImportedTexture &&
+             height_only_domain.kind == UvDomainKind::ImportedTexture &&
+             !width_only_domain.declaration_reliable &&
+             !height_only_domain.declaration_reliable,
+         "one-axis declarations remain recorded but are not reliable domains");
+
+  ResolvedUvDomain preserved_domain;
+  preserved_domain.kind = UvDomainKind::Declared;
+  preserved_domain.width = 7.0;
+  preserved_domain.height = 9.0;
+  preserved_domain.imported_width = 7;
+  preserved_domain.imported_height = 9;
+  const ResolvedUvDomain domain_before_failure = preserved_domain;
+  expect(!resolveGeometryUvDomain(fixture.out_of_bounds_geometry, 256, 256,
+                                  preserved_domain, &error) &&
+             error.find("exceed") != std::string::npos &&
+             preserved_domain == domain_before_failure,
+         "UV outside declared and imported domains is rejected transactionally");
+
+  bool all_special_cases_match = true;
+  for (const auto &test_case : fixture.uv_cases) {
+    UvBounds bounds{1.0, 2.0, 3.0, 4.0, 5u};
+    const UvBounds bounds_before = bounds;
+    error.clear();
+    const bool scanned =
+        scanGeometryUvBounds(test_case.geometry, bounds, &error);
+    if (test_case.name == "non_finite") {
+      all_special_cases_match &= !scanned && bounds == bounds_before &&
+                                 error.find("non-finite") !=
+                                     std::string::npos;
+      continue;
+    }
+    all_special_cases_match &= scanned && !bounds.empty();
+    ResolvedUvDomain domain = domain_before_failure;
+    error.clear();
+    const bool resolved =
+        scanned && resolveUvDomain(test_case.geometry.description, bounds,
+                                   test_case.imported_width,
+                                   test_case.imported_height, domain, &error);
+    all_special_cases_match &=
+        resolved == test_case.expected_domain_success;
+    if (!resolved) {
+      all_special_cases_match &= domain == domain_before_failure;
+    }
+  }
+  expect(all_special_cases_match,
+         "Box Per-Face mirror rotation negative-size Up/Down precision and invalid UV table matches");
+
+  const auto find_case = [&](std::string_view name)
+      -> const xpbd::test_support::SyntheticUvCase * {
+    const auto found = std::find_if(
+        fixture.uv_cases.begin(), fixture.uv_cases.end(),
+        [&](const auto &test_case) { return test_case.name == name; });
+    return found == fixture.uv_cases.end() ? nullptr : &*found;
+  };
+  const auto *rotation_case = find_case("per_face_rotation");
+  const auto *negative_case = find_case("negative_uv_size");
+  const auto *up_down_case = find_case("up_down_corners");
+  ResolvedFaceUv rotation_face;
+  ResolvedFaceUv negative_face;
+  ResolvedFaceUv up_face;
+  const bool exact_faces =
+      rotation_case != nullptr && negative_case != nullptr &&
+      up_down_case != nullptr &&
+      resolveBedrockFaceUv(rotation_case->geometry.bones[0].cubes[0],
+                           BedrockUvFace::North, rotation_face, &error) &&
+      resolveBedrockFaceUv(negative_case->geometry.bones[0].cubes[0],
+                           BedrockUvFace::North, negative_face, &error) &&
+      resolveBedrockFaceUv(up_down_case->geometry.bones[0].cubes[0],
+                           BedrockUvFace::Up, up_face, &error);
+  const auto rotation_corners = bedrockFaceUvCorners(rotation_face);
+  expect(exact_faces && rotation_face.rotation_quarter_turns == 1 &&
+             rotation_corners[0] == std::array<double, 2>{32.0, 24.0} &&
+             negative_face.u0 == 64.0 && negative_face.u1 == 48.0 &&
+             up_face.u0 == 104.0 && up_face.v0 == 36.0 &&
+             up_face.u1 == 96.0 && up_face.v1 == 32.0,
+         "double Face UV parser preserves rotation negative size and opposite Up corner exactly");
+
+  const auto geometry_json = [](std::string_view description_members) {
+    return std::string(
+               R"({"minecraft:geometry":[{"description":{"identifier":"geometry.uv_test")") +
+           (description_members.empty()
+                ? std::string{}
+                : std::string(",") + std::string(description_members)) +
+           R"(},"bones":[{"name":"root","pivot":[0,0,0],"cubes":[]}]}]})";
+  };
+  const auto full_declaration = ModelLoader::loadFromString(
+      geometry_json(R"("texture_width":16,"texture_height":32)"));
+  const auto parsed_width_only = ModelLoader::loadFromString(
+      geometry_json(R"("texture_width":16)"));
+  const auto parsed_height_only = ModelLoader::loadFromString(
+      geometry_json(R"("texture_height":32)"));
+  expect(full_declaration.description.hasCompleteTextureSize() &&
+             full_declaration.description.texture_width == 16 &&
+             full_declaration.description.texture_height == 32 &&
+             parsed_width_only.description.has_texture_width &&
+             !parsed_width_only.description.has_texture_height &&
+             !parsed_width_only.description.hasCompleteTextureSize() &&
+             !parsed_height_only.description.has_texture_width &&
+             parsed_height_only.description.has_texture_height,
+         "loader records width and height declaration presence independently");
+
+  bool invalid_declarations_rejected = true;
+  const std::array<std::string_view, 6> invalid_declarations{
+      R"("texture_width":0)",
+      R"("texture_width":-1)",
+      R"("texture_width":16.5)",
+      R"("texture_width":16385)",
+      R"("texture_width":"16")",
+      R"("texture_height":null)",
+  };
+  for (const std::string_view declaration : invalid_declarations) {
+    try {
+      (void)ModelLoader::loadFromString(geometry_json(declaration));
+      invalid_declarations_rejected = false;
+    } catch (const std::exception &) {
+    }
+  }
+  expect(invalid_declarations_rejected,
+         "loader rejects non-positive fractional oversized and nonnumeric texture declarations");
+  const auto maximum_declaration = ModelLoader::loadFromString(
+      geometry_json(
+          R"("texture_width":16384,"texture_height":16384)"));
+  expect(maximum_declaration.description.hasCompleteTextureSize() &&
+             maximum_declaration.description.texture_width == 16'384 &&
+             maximum_declaration.description.texture_height == 16'384,
+         "loader accepts the 16384 precision boundary exactly");
 }
 
 void testCc0PreviewSceneAssets() {
@@ -2805,7 +2997,8 @@ void testFrontFacingFlatCubePicking() {
 
 void testCanonicalCubeAndRtSceneRecords() {
   xpbd::loader::Geometry geometry;
-  geometry.description.has_texture_size = true;
+  geometry.description.has_texture_width = true;
+  geometry.description.has_texture_height = true;
   geometry.description.texture_width = 16;
   geometry.description.texture_height = 16;
   xpbd::loader::Bone root;
@@ -2843,7 +3036,8 @@ void testCanonicalCubeAndRtSceneRecords() {
   expect(flat_normals, "canonical cube preserves one flat normal per face");
 
   xpbd::loader::Geometry transformed_geometry;
-  transformed_geometry.description.has_texture_size = true;
+  transformed_geometry.description.has_texture_width = true;
+  transformed_geometry.description.has_texture_height = true;
   transformed_geometry.description.texture_width = 16;
   transformed_geometry.description.texture_height = 16;
   xpbd::loader::Bone transformed_bone;
@@ -2901,7 +3095,8 @@ void testCanonicalCubeAndRtSceneRecords() {
          "mirrored Box UV reverses U and tangent handedness");
 
   xpbd::loader::Geometry per_face_geometry;
-  per_face_geometry.description.has_texture_size = true;
+  per_face_geometry.description.has_texture_width = true;
+  per_face_geometry.description.has_texture_height = true;
   per_face_geometry.description.texture_width = 16;
   per_face_geometry.description.texture_height = 16;
   xpbd::loader::Bone per_face_bone;
@@ -4022,6 +4217,7 @@ int main() {
   testVulkanQueueFamilySelection();
   testTextureFromMemory();
   testSyntheticLargeUvFixtureAndMemoryBaseline();
+  testBedrockUvDomainResolution();
   testCc0PreviewSceneAssets();
   testEmptyTextureSample();
   testLabPbrDecode();
