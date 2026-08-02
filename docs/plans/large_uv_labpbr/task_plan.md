@@ -2,7 +2,7 @@
 
 ## Current phase
 
-Gate B — Release/full CTest plus actual 2K and one-time 4K memory gate (`IN_PROGRESS`).
+Delivery complete (`COMPLETE`).
 
 ## Phases and dependencies
 
@@ -17,9 +17,11 @@ Gate B — Release/full CTest plus actual 2K and one-time 4K memory gate (`IN_PR
 | S05 | Lazy Coverage/Composition and compact run encoding | S04 | COMPLETE |
 | S06 | Shared immutable texture and Iris byte ownership; copy-on-write composition | S05 | COMPLETE |
 | S07 | Shared-asset byte-bounded LRU import cache | S06 | COMPLETE |
-| Gate B | Release app build, full CTest, 2K and one 4K memory gate | S07 | IN_PROGRESS |
-| Final | Final Release/CTest regression, scope audit, clean task diff, report | Gate B | PENDING |
-| Delivery | Create a clean code-only delivery commit, push `xpbdRT`, and package a runnable Release build on the user's Desktop | Final | PENDING |
+| Gate B | Release app build, full CTest, 2K and one 4K memory gate | S07 | COMPLETE |
+| Final | Final Release/CTest regression, scope audit, clean task diff, report | Gate B | COMPLETE |
+| S08 | Preserve valid planar Cube UVs when Z thickness is zero; targeted code-only correction | Final | COMPLETE |
+| S09 | Prefer the authored North/front UV for zero-Z Per-Face eye planes when both North and South exist | S08 | COMPLETE |
+| Delivery | Create a clean code-only delivery commit, push `xpbdRT`, and package a runnable Release build on the user's Desktop | S09 | COMPLETE |
 
 ## Gates
 
