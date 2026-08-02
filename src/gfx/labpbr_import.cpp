@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <iterator>
 #include <limits>
 #include <new>
 #include <optional>
@@ -412,27 +413,173 @@ bool ImportedLabPbrSuite::valid() const noexcept {
          material.specular_map_active && source.valid();
 }
 
+namespace {
+
+std::uint64_t cacheEntryCharge(const std::string &key,
+                               const ImportedLabPbrSuite &suite) noexcept {
+  std::uint64_t total = 0;
+  std::array<const TextureImage *, 4> counted_images{};
+  std::size_t image_count = 0;
+  std::array<const std::vector<std::uint8_t> *, 4> counted_sources{};
+  std::size_t source_count = 0;
+  const auto add = [&total](std::size_t bytes) {
+    const auto value = static_cast<std::uint64_t>(bytes);
+    if (value > (std::numeric_limits<std::uint64_t>::max)() - total) {
+      total = (std::numeric_limits<std::uint64_t>::max)();
+    } else {
+      total += value;
+    }
+  };
+  const auto add_image = [&](const SharedTextureImage &image) {
+    if (image == nullptr ||
+        std::find(counted_images.begin(),
+                  counted_images.begin() + image_count,
+                  image.get()) != counted_images.begin() + image_count) {
+      return;
+    }
+    if (image_count >= counted_images.size()) {
+      total = (std::numeric_limits<std::uint64_t>::max)();
+      return;
+    }
+    counted_images[image_count++] = image.get();
+    add(image->rgba.capacity());
+  };
+  const auto add_source = [&](const LabPbrSourceFile &source) {
+    if (source.original_bytes == nullptr ||
+        std::find(counted_sources.begin(),
+                  counted_sources.begin() + source_count,
+                  source.original_bytes.get()) !=
+            counted_sources.begin() + source_count) {
+      return;
+    }
+    if (source_count >= counted_sources.size()) {
+      total = (std::numeric_limits<std::uint64_t>::max)();
+      return;
+    }
+    counted_sources[source_count++] = source.original_bytes.get();
+    add(source.original_bytes->capacity());
+  };
+  add(key.capacity());
+  add(key.capacity());
+  add(suite.source.cache_key.capacity());
+  add_image(suite.base_image);
+  add_image(suite.material.baseImageAsset());
+  add_image(suite.material.normalImageAsset());
+  add_image(suite.material.specularImageAsset());
+  add_source(suite.source.base);
+  add_source(suite.source.normal);
+  add_source(suite.source.specular);
+  add_source(suite.source.properties);
+  return total;
+}
+
+} // namespace
+
 bool LabPbrSuiteImportCache::find(std::string_view key,
-                                  ImportedLabPbrSuite &out) const {
-  const auto found = entries_.find(key);
-  if (found == entries_.end()) {
+                                  ImportedLabPbrSuite &out) noexcept {
+  const auto found = index_.find(key);
+  if (found == index_.end() || found->second->suite == nullptr) {
     return false;
   }
-  out = found->second;
-  out.cache_hit = true;
+  try {
+    ImportedLabPbrSuite candidate = *found->second->suite;
+    candidate.cache_hit = true;
+    out = std::move(candidate);
+  } catch (...) {
+    return false;
+  }
+  entries_.splice(entries_.begin(), entries_, found->second);
   return true;
 }
 
-void LabPbrSuiteImportCache::store(const ImportedLabPbrSuite &suite) {
+bool LabPbrSuiteImportCache::store(
+    const ImportedLabPbrSuite &suite) noexcept {
   if (!suite.valid()) {
-    return;
+    return false;
   }
-  auto cached = suite;
-  cached.cache_hit = false;
-  entries_.insert_or_assign(cached.source.cache_key, std::move(cached));
+  try {
+    ImportedLabPbrSuite cached = suite;
+    cached.cache_hit = false;
+    std::string key = cached.source.cache_key;
+    auto owned =
+        std::make_shared<const ImportedLabPbrSuite>(std::move(cached));
+    const std::uint64_t charge = cacheEntryCharge(key, *owned);
+    if (charge > maximum_bytes_) {
+      return false;
+    }
+
+    const auto existing = index_.find(key);
+    if (existing != index_.end()) {
+      auto entry = existing->second;
+      const std::uint64_t without_existing =
+          charged_bytes_ >= entry->charged_bytes
+              ? charged_bytes_ - entry->charged_bytes
+              : 0u;
+      std::uint64_t next_charge = 0;
+      if (!detail::checkedLabPbrAdd(without_existing, charge, next_charge)) {
+        return false;
+      }
+      entry->suite = std::move(owned);
+      entry->charged_bytes = charge;
+      charged_bytes_ = next_charge;
+      entries_.splice(entries_.begin(), entries_, entry);
+      evictToBudget();
+      return true;
+    }
+
+    std::uint64_t next_charge = 0;
+    if (!detail::checkedLabPbrAdd(charged_bytes_, charge, next_charge)) {
+      return false;
+    }
+    entries_.push_front(
+        Entry{std::move(key), std::move(owned), charge});
+    try {
+      const auto [index_entry, inserted] =
+          index_.emplace(entries_.front().key, entries_.begin());
+      (void)index_entry;
+      if (!inserted) {
+        entries_.pop_front();
+        return false;
+      }
+    } catch (...) {
+      entries_.pop_front();
+      throw;
+    }
+    charged_bytes_ = next_charge;
+    evictToBudget();
+    return true;
+  } catch (...) {
+    return false;
+  }
 }
 
-std::uint64_t LabPbrSuiteImportCache::residentBytes() const noexcept {
+void LabPbrSuiteImportCache::evictToBudget() noexcept {
+  while (charged_bytes_ > maximum_bytes_ && !entries_.empty()) {
+    auto victim = std::prev(entries_.end());
+    charged_bytes_ = charged_bytes_ >= victim->charged_bytes
+                         ? charged_bytes_ - victim->charged_bytes
+                         : 0u;
+    index_.erase(victim->key);
+    entries_.erase(victim);
+  }
+}
+
+void LabPbrSuiteImportCache::clear() noexcept {
+  index_.clear();
+  entries_.clear();
+  charged_bytes_ = 0;
+}
+
+void LabPbrSuiteImportCache::setMaximumBytes(
+    std::uint64_t maximum_bytes) noexcept {
+  maximum_bytes_ = maximum_bytes;
+  evictToBudget();
+}
+
+std::uint64_t LabPbrSuiteImportCache::residentBytes(
+    std::span<const TextureImage *const> excluded_images,
+    std::span<const std::vector<std::uint8_t> *const> excluded_sources)
+    const noexcept {
   std::uint64_t total = 0;
   std::vector<const TextureImage *> counted_images;
   std::vector<const std::vector<std::uint8_t> *> counted_sources;
@@ -465,8 +612,28 @@ std::uint64_t LabPbrSuiteImportCache::residentBytes() const noexcept {
     add(source.original_bytes->capacity());
   };
   try {
-    for (const auto &[key, suite] : entries_) {
-      add(key.capacity());
+    for (const auto *image : excluded_images) {
+      if (image != nullptr &&
+          std::find(counted_images.begin(), counted_images.end(), image) ==
+              counted_images.end()) {
+        counted_images.push_back(image);
+      }
+    }
+    for (const auto *source : excluded_sources) {
+      if (source != nullptr &&
+          std::find(counted_sources.begin(), counted_sources.end(), source) ==
+              counted_sources.end()) {
+        counted_sources.push_back(source);
+      }
+    }
+    for (const auto &entry : entries_) {
+      if (entry.suite == nullptr) {
+        return (std::numeric_limits<std::uint64_t>::max)();
+      }
+      const auto &suite = *entry.suite;
+      add(entry.key.capacity());
+      add(entry.key.capacity());
+      add(suite.source.cache_key.capacity());
       add_image(suite.base_image);
       add_image(suite.material.baseImageAsset());
       add_image(suite.material.normalImageAsset());
@@ -476,9 +643,7 @@ std::uint64_t LabPbrSuiteImportCache::residentBytes() const noexcept {
       add_source(suite.source.specular);
       add_source(suite.source.properties);
     }
-  } catch (const std::bad_alloc &) {
-    return (std::numeric_limits<std::uint64_t>::max)();
-  } catch (const std::length_error &) {
+  } catch (...) {
     return (std::numeric_limits<std::uint64_t>::max)();
   }
   return total;
@@ -714,6 +879,18 @@ LabPbrSuiteImportResult importLabPbrSuite(
     return result;
   }
 
+  source.cache_key = sourceCacheKey(source);
+  if (cache != nullptr && cache->find(source.cache_key, result.suite)) {
+    result.suite.source = std::move(source);
+    result.suite.cache_hit = true;
+    if (!limits.defer_cache_store) {
+      (void)cache->store(result.suite);
+    }
+    result.status = LabPbrSuiteImportStatus::Imported;
+    result.error.clear();
+    return result;
+  }
+
   std::uint64_t pixels = 0;
   std::uint64_t rgba_bytes = 0;
   std::uint64_t coverage_bytes = 0;
@@ -844,16 +1021,6 @@ LabPbrSuiteImportResult importLabPbrSuite(
     }
   }
 
-  source.cache_key = sourceCacheKey(source);
-  if (cache != nullptr && cache->find(source.cache_key, result.suite)) {
-    result.suite.source = source;
-    result.suite.cache_hit = true;
-    cache->store(result.suite);
-    result.status = LabPbrSuiteImportStatus::Imported;
-    result.error.clear();
-    return result;
-  }
-
   ImportedLabPbrSuite imported;
   try {
     auto base_asset =
@@ -885,8 +1052,8 @@ LabPbrSuiteImportResult importLabPbrSuite(
     result.error = "strict LabPBR import produced invalid state";
     return result;
   }
-  if (cache != nullptr) {
-    cache->store(imported);
+  if (cache != nullptr && !limits.defer_cache_store) {
+    (void)cache->store(imported);
   }
   result.status = LabPbrSuiteImportStatus::Imported;
   result.suite = std::move(imported);

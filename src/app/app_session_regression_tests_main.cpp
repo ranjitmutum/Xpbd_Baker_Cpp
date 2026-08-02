@@ -728,6 +728,21 @@ void testTransactionalLabPbrSuiteImport() {
                  session.resolved_material.specularImageAsset(),
          "AppSession retains metadata-only source and shared material assets");
 
+  const auto cached_base = session.model_texture;
+  const auto cached_normal =
+      session.resolved_material.normalImageAsset();
+  const auto cached_specular =
+      session.resolved_material.specularImageAsset();
+  const auto generation_before_cache_hit = session.materialGeneration();
+  expect(session.reloadLabPbrSuite() &&
+             session.labpbr_last_import_cache_hit &&
+             session.model_texture == cached_base &&
+             session.resolved_material.normalImageAsset() == cached_normal &&
+             session.resolved_material.specularImageAsset() ==
+                 cached_specular &&
+             session.materialGeneration() == generation_before_cache_hit,
+         "AppSession checksum reload hits the shared LRU without changing material generation");
+
   auto committed = snapshot(session);
   expect(readBytes(base_path) == base_png &&
              readBytes(specular_path) == specular_png &&
@@ -1374,10 +1389,11 @@ void testExternalLabPbrSuite(const std::filesystem::path &base_path) {
          "external Session retains metadata and only the Iris encoded asset");
 
   auto committed = snapshot(session);
-  expect(session.reloadLabPbrSuite() && !session.labpbr_last_import_cache_hit,
-         "external suite reload bypasses the disabled pre-LRU cache");
+  expect(session.reloadLabPbrSuite() && session.labpbr_last_import_cache_hit,
+         "external suite reload reuses the shared byte-bounded LRU cache");
+  committed.last_import_cache_hit = true;
   expect(unchanged(session, committed),
-         "uncached external reload leaves committed material generation stable");
+         "cached external reload leaves committed material generation stable");
   expect(readBytes(normalized_base) == base_bytes &&
              readBytes(specular_path) == specular_bytes &&
              readBytes(normal_path) == normal_bytes,

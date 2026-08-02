@@ -47,6 +47,35 @@ namespace {
 
 int g_failures = 0;
 
+constexpr int kDefaultLabPbrStressSide = 2'048;
+int g_labpbr_stress_side = kDefaultLabPbrStressSide;
+
+bool configureLabPbrStressSide(int argc, char **argv) noexcept {
+  if (argc == 1) {
+    return true;
+  }
+  if (argc == 2 && argv[1] != nullptr) {
+    const std::string_view option(argv[1]);
+    if (option == "--labpbr-stress-side=2048") {
+      g_labpbr_stress_side = 2'048;
+      return true;
+    }
+    if (option == "--labpbr-stress-side=4096") {
+      g_labpbr_stress_side = 4'096;
+      return true;
+    }
+  }
+  std::fprintf(
+      stderr,
+      "usage: xpbd_viewport_regression_tests "
+      "[--labpbr-stress-side=2048|--labpbr-stress-side=4096]\n");
+  return false;
+}
+
+int labPbrStressSide() noexcept {
+  return g_labpbr_stress_side;
+}
+
 std::set<std::uint32_t> expandCoverageRuns(
     const xpbd::gfx::LabPbrUvCoverage &coverage,
     std::string_view group_name);
@@ -780,12 +809,13 @@ void testSyntheticLargeUvFixtureAndMemoryBaseline() {
              eight_k_output == preserved,
          "8K LabPBR budget rejects by arithmetic without allocating images");
 
-  constexpr int kStressSide = 2'048;
+  const int stress_side = labPbrStressSide();
   const std::size_t stress_bytes =
-      static_cast<std::size_t>(kStressSide) * kStressSide * 4u;
+      static_cast<std::size_t>(stress_side) *
+      static_cast<std::size_t>(stress_side) * 4u;
   xpbd::gfx::TextureImage stress_base;
-  stress_base.width = kStressSide;
-  stress_base.height = kStressSide;
+  stress_base.width = stress_side;
+  stress_base.height = stress_side;
   stress_base.source_channels = 4;
   stress_base.rgba.assign(stress_bytes, 192u);
   xpbd::gfx::TextureImage stress_normal = stress_base;
@@ -811,7 +841,48 @@ void testSyntheticLargeUvFixtureAndMemoryBaseline() {
              stress_material.normal_image.rgba.size() == stress_bytes &&
              stress_material.specular_image.rgba.size() == stress_bytes &&
              kLabPbrResolvedTexelBytesPerPixel == 0u,
-         "2K compact material stress retains three RGBA images and zero resolved texel bytes");
+         "runtime compact material stress retains three shared RGBA images and zero resolved texel bytes");
+
+  const auto make_source_file = [](const char *name,
+                                   std::uint8_t sentinel) {
+    xpbd::gfx::LabPbrSourceFile source;
+    source.path = std::filesystem::path(name);
+    source.present = true;
+    source.original_bytes =
+        std::make_shared<const std::vector<std::uint8_t>>(
+            std::vector<std::uint8_t>{sentinel});
+    source.size = source.original_bytes->size();
+    source.sha256 = std::string(64u, "0123456789abcdef"[sentinel & 0x0fu]);
+    return source;
+  };
+  xpbd::gfx::ImportedLabPbrSuite stress_suite;
+  stress_suite.base_image = stress_base_asset;
+  stress_suite.material = stress_material;
+  stress_suite.source.base = make_source_file("stress.png", 1u);
+  stress_suite.source.specular = make_source_file("stress_s.png", 2u);
+  stress_suite.source.normal = make_source_file("stress_n.png", 3u);
+  stress_suite.source.confirmed_labpbr13_without_properties = true;
+  stress_suite.source.cache_key =
+      "runtime-labpbr-stress-" + std::to_string(stress_side);
+  xpbd::gfx::LabPbrSuiteImportCache stress_cache;
+  xpbd::gfx::ImportedLabPbrSuite cached_stress;
+  expect(stress_suite.valid() && stress_cache.store(stress_suite) &&
+             stress_cache.residentBytes() <= stress_cache.maximumBytes() &&
+             stress_cache.find(stress_suite.source.cache_key, cached_stress) &&
+             cached_stress.base_image == stress_base_asset &&
+             cached_stress.material.baseImageAsset() == stress_base_asset &&
+             cached_stress.material.normalImageAsset() == stress_normal_asset &&
+             cached_stress.material.specularImageAsset() ==
+                 stress_specular_asset &&
+             cached_stress.source.normal.original_bytes ==
+                 stress_suite.source.normal.original_bytes,
+         "runtime shared material fits the byte-bounded cache without image or Iris snapshot copies");
+  std::printf(
+      "labpbr-material-cache-stress: side=%d image-bytes=%zu cache-bytes=%llu "
+      "cache-budget=%llu\n",
+      stress_side, stress_bytes,
+      static_cast<unsigned long long>(stress_cache.residentBytes()),
+      static_cast<unsigned long long>(stress_cache.maximumBytes()));
 }
 
 void testBedrockUvDomainResolution() {
@@ -1813,6 +1884,96 @@ void testStrictLabPbrSuiteImport() {
              unchanged.error.empty(),
          "unchanged strict source snapshot stays current");
 
+  const xpbd::gfx::TextureImage *excluded_images[] = {
+      imported.suite.base_image.get(),
+      imported.suite.material.normalImageAsset().get(),
+      imported.suite.material.specularImageAsset().get(),
+  };
+  const std::vector<std::uint8_t> *excluded_sources[] = {
+      imported.suite.source.base.original_bytes.get(),
+      imported.suite.source.normal.original_bytes.get(),
+      imported.suite.source.specular.original_bytes.get(),
+      imported.suite.source.properties.original_bytes.get(),
+  };
+  const auto full_cache_bytes = cache.residentBytes();
+  const auto metadata_only_cache_bytes =
+      cache.residentBytes(excluded_images, excluded_sources);
+  expect(cache.maximumBytes() ==
+             xpbd::gfx::kLabPbrDefaultImportCacheBudgetBytes &&
+             full_cache_bytes <= cache.maximumBytes() &&
+             metadata_only_cache_bytes < full_cache_bytes,
+         "cache byte accounting excludes Session-shared image and source identities");
+
+  const fs::path third_base = directory / "brick.png";
+  const fs::path third_specular = directory / "brick_s.png";
+  const fs::path fourth_base = directory / "grass.png";
+  const fs::path fourth_specular = directory / "grass_s.png";
+  expect(writeBytes(third_base, base_png) &&
+             writeBytes(third_specular, specular_png) &&
+             writeBytes(fourth_base, base_png) &&
+             writeBytes(fourth_specular, specular_png),
+         "write equal-charge LRU cache fixtures");
+
+  xpbd::gfx::LabPbrSuiteImportCache lru_cache;
+  auto lru_stone =
+      xpbd::gfx::importLabPbrSuite(second_base, false, &lru_cache);
+  auto lru_brick =
+      xpbd::gfx::importLabPbrSuite(third_base, false, &lru_cache);
+  const auto two_entry_budget = lru_cache.residentBytes();
+  lru_cache.setMaximumBytes(two_entry_budget);
+  xpbd::gfx::ImportedLabPbrSuite touched_stone;
+  expect(lru_stone.imported() && lru_brick.imported() &&
+             lru_cache.size() == 2u &&
+             lru_cache.find(lru_stone.suite.source.cache_key,
+                            touched_stone) &&
+             touched_stone.base_image == lru_stone.suite.base_image,
+         "cache Misses populate shared entries and find touches MRU identity");
+  auto lru_grass =
+      xpbd::gfx::importLabPbrSuite(fourth_base, false, &lru_cache);
+  xpbd::gfx::ImportedLabPbrSuite evicted_brick;
+  xpbd::gfx::ImportedLabPbrSuite retained_stone;
+  xpbd::gfx::ImportedLabPbrSuite retained_grass;
+  expect(lru_grass.imported() && lru_cache.size() == 2u &&
+             lru_cache.residentBytes() <= lru_cache.maximumBytes() &&
+             !lru_cache.find(lru_brick.suite.source.cache_key,
+                             evicted_brick) &&
+             lru_cache.find(lru_stone.suite.source.cache_key,
+                            retained_stone) &&
+             lru_cache.find(lru_grass.suite.source.cache_key,
+                            retained_grass) &&
+             retained_stone.base_image == lru_stone.suite.base_image &&
+             retained_grass.base_image == lru_grass.suite.base_image,
+         "LRU budget evicts the cold entry while retaining shared MRU assets");
+
+  xpbd::gfx::LabPbrSuiteImportCache one_entry_cache;
+  auto one_entry =
+      xpbd::gfx::importLabPbrSuite(second_base, false, &one_entry_cache);
+  const auto one_entry_bytes = one_entry_cache.residentBytes();
+  const auto oversize_budget =
+      one_entry_bytes > 0u ? one_entry_bytes - 1u : 0u;
+  xpbd::gfx::LabPbrSuiteImportCache oversize_cache(oversize_budget);
+  auto oversized =
+      xpbd::gfx::importLabPbrSuite(second_base, false, &oversize_cache);
+  expect(one_entry.imported() && one_entry_bytes > 0u &&
+             oversized.imported() && !oversized.suite.cache_hit &&
+             oversize_cache.size() == 0u &&
+             oversize_cache.residentBytes() == 0u,
+         "individually oversized Suite bypasses cache without failing import");
+
+  xpbd::gfx::LabPbrSuiteImportCache release_cache;
+  auto releasable =
+      xpbd::gfx::importLabPbrSuite(fourth_base, false, &release_cache);
+  std::weak_ptr<const xpbd::gfx::TextureImage> released_base =
+      releasable.suite.base_image;
+  releasable.suite = {};
+  expect(releasable.imported() == false && !released_base.expired() &&
+             release_cache.size() == 1u,
+         "cache owns the shared asset after the import result releases it");
+  release_cache.clear();
+  expect(released_base.expired() && release_cache.size() == 0u &&
+             release_cache.residentBytes() == 0u,
+         "cache Clear releases its final shared asset ownership");
+
   auto changed_specular_rgba = specular_rgba;
   changed_specular_rgba[0] = 127u;
   const auto changed_specular_png = encode(2, 1, changed_specular_rgba);
@@ -2018,8 +2179,16 @@ void testLabPbrAuthoringEncodingAndCoverage() {
          "production Coverage uses marked touched sort merge without texel Set nodes");
   const auto texture_header =
       readTestSource("include/xpbd/gfx/texture_image.hpp");
+  const auto import_header =
+      readTestSource("include/xpbd/gfx/labpbr_import.hpp");
+  const auto import_source =
+      readTestSource("src/gfx/labpbr_import.cpp");
   const auto app_session_source =
       readTestSource("src/app/app_session.cpp");
+  const auto early_cache_find =
+      import_source.find("cache->find(source.cache_key");
+  const auto first_pixel_decode =
+      import_source.find("TextureImage base;");
   expect(texture_header.find(
              "using SharedTextureImage = std::shared_ptr<const TextureImage>") !=
                  std::string::npos &&
@@ -2032,10 +2201,20 @@ void testLabPbrAuthoringEncodingAndCoverage() {
              app_session_source.find(
                  "metadata.base.original_bytes.reset();") !=
                  std::string::npos &&
+             import_header.find(
+                 "kLabPbrDefaultImportCacheBudgetBytes") !=
+                 std::string::npos &&
+             import_source.find(
+                 "entries_.splice(entries_.begin(), entries_,") !=
+                 std::string::npos &&
+             early_cache_find != std::string::npos &&
+             first_pixel_decode != std::string::npos &&
+             early_cache_find < first_pixel_decode &&
              app_session_source.find(
-                 "base_path, confirm_missing_properties, nullptr,") !=
+                 "base_path, confirm_missing_properties, "
+                 "&labpbr_import_cache_,") !=
                  std::string::npos,
-         "shared-image and Iris snapshot ownership source contract is explicit");
+         "shared-image Iris snapshot and byte-bounded LRU source contracts are explicit");
 
   expect(encodeLabPbrEmission(0.0f) == 0u,
          "LabPBR emission zero encodes to zero");
@@ -2126,31 +2305,42 @@ void testLabPbrAuthoringEncodingAndCoverage() {
 
   auto stress_mesh = makeOverlappingLabPbrMesh();
   stress_mesh.faces.resize(1u);
-  stress_mesh.uv_domain.width = 2048.0;
-  stress_mesh.uv_domain.height = 2048.0;
-  stress_mesh.uv_domain.imported_width = 2048;
-  stress_mesh.uv_domain.imported_height = 2048;
+  const auto stress_side =
+      static_cast<std::uint32_t>(labPbrStressSide());
+  stress_mesh.uv_domain.width = static_cast<double>(stress_side);
+  stress_mesh.uv_domain.height = static_cast<double>(stress_side);
+  stress_mesh.uv_domain.imported_width =
+      static_cast<int>(stress_side);
+  stress_mesh.uv_domain.imported_height =
+      static_cast<int>(stress_side);
   for (std::size_t i = 0; i < 4u; ++i) {
     stress_mesh.vertices[i].raw_u =
-        static_cast<double>(stress_mesh.vertices[i].u) * 2048.0;
+        static_cast<double>(stress_mesh.vertices[i].u) * stress_side;
     stress_mesh.vertices[i].raw_v =
-        static_cast<double>(stress_mesh.vertices[i].v) * 2048.0;
+        static_cast<double>(stress_mesh.vertices[i].v) * stress_side;
   }
   const auto stress_coverage =
-      xpbd::gfx::rasterizeLabPbrUvCoverage(stress_mesh, 2048, 2048);
+      xpbd::gfx::rasterizeLabPbrUvCoverage(
+          stress_mesh, static_cast<int>(stress_side),
+          static_cast<int>(stress_side));
   const auto *stress_runs = stress_coverage.find("group_a");
   bool exact_stress_runs = stress_runs != nullptr &&
-                           stress_runs->size() == 2048u;
+                           stress_runs->size() == stress_side;
   if (exact_stress_runs) {
-    for (std::uint32_t y = 0; y < 2048u; ++y) {
+    for (std::uint32_t y = 0; y < stress_side; ++y) {
       const auto &run = (*stress_runs)[y];
       exact_stress_runs &=
-          run.y == y && run.x0 == 0u && run.x1 == 2047u;
+          run.y == y && run.x0 == 0u && run.x1 == stress_side - 1u;
     }
   }
   expect(stress_coverage.valid() && exact_stress_runs &&
-             stress_coverage.texelCount("group_a") == 2048u * 2048u,
-         "runtime 2K full-atlas Coverage compacts to one run per row");
+             stress_coverage.texelCount("group_a") ==
+                 static_cast<std::uint64_t>(stress_side) * stress_side,
+         "runtime full-atlas Coverage compacts to one run per row");
+  std::printf("labpbr-coverage-stress: side=%u runs=%zu texels=%llu\n",
+              stress_side, stress_runs != nullptr ? stress_runs->size() : 0u,
+              static_cast<unsigned long long>(
+                  stress_coverage.texelCount("group_a")));
 
   std::uint64_t eight_k_coverage_peak = 0u;
   xpbd::gfx::LabPbrMemoryEstimateRequest eight_k_request;
@@ -4834,7 +5024,10 @@ void testVulkanPathTraceImplementationSelection() {
 
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
+  if (!configureLabPbrStressSide(argc, argv)) {
+    return 2;
+  }
   testLogicalFramebufferViewportContract();
   testVulkanQueueFamilySelection();
   testTextureFromMemory();
