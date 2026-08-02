@@ -404,13 +404,13 @@ float estimateScale(
 }
 
 
-Rgba sampleAlbedo(const TextureImage *tex, float u, float v,
+Rgba sampleAlbedo(const TextureImage *tex, double u, double v,
                   Rgba untextured_base) {
   if (tex == nullptr || !tex->valid()) {
     return untextured_base;
   }
   float tr = 1, tg = 1, tb = 1, ta = 1;
-  tex->sample(u, v, tr, tg, tb, ta);
+  tex->sampleModelAtlasClamp(u, v, tr, tg, tb, ta);
 
   if (ta < 0.02f) {
     return {tr, tg, tb, 0.0f};
@@ -601,7 +601,7 @@ void pushTexturedFace(std::vector<MeshVertex> &solid,
     lerp3(e0, e1, sv, o);
   };
 
-  auto sampleUV = [&](float su, float sv, float &ou, float &ov) {
+  auto sampleUV = [&](float su, float sv, double &ou, double &ov) {
     const double u_a =
         corner_uv[0][0] +
         (corner_uv[1][0] - corner_uv[0][0]) * static_cast<double>(su);
@@ -614,10 +614,8 @@ void pushTexturedFace(std::vector<MeshVertex> &solid,
     const double v_b =
         corner_uv[3][1] +
         (corner_uv[2][1] - corner_uv[3][1]) * static_cast<double>(su);
-    ou = static_cast<float>(
-        (u_a + (u_b - u_a) * static_cast<double>(sv)) / tex_w);
-    ov = static_cast<float>(
-        (v_a + (v_b - v_a) * static_cast<double>(sv)) / tex_h);
+    ou = (u_a + (u_b - u_a) * static_cast<double>(sv)) / tex_w;
+    ov = (v_a + (v_b - v_a) * static_cast<double>(sv)) / tex_h;
   };
 
   for (int j = 0; j < seg; ++j) {
@@ -636,7 +634,7 @@ void pushTexturedFace(std::vector<MeshVertex> &solid,
 
       Rgba cell = base;
       if (textured) {
-        float tu = 0, tv = 0;
+        double tu = 0.0, tv = 0.0;
         sampleUV(suc, svc, tu, tv);
         cell = sampleAlbedo(tex, tu, tv, base);
         // 与 base tint 相乘，让选中 / 悬停高亮在贴图模式下也生效。
@@ -739,10 +737,18 @@ void ViewportMeshBuilder::buildStaticIndexedModel(
       static_cast<double>(std::max(1, geometry_->description.texture_width));
   double tex_h =
       static_cast<double>(std::max(1, geometry_->description.texture_height));
-  if (!geometry_->description.hasCompleteTextureSize() && texture_ != nullptr &&
-      texture_->valid()) {
-    tex_w = static_cast<double>(std::max(1, texture_->width));
-    tex_h = static_cast<double>(std::max(1, texture_->height));
+  if (texture_ != nullptr && texture_->valid()) {
+    std::string domain_error;
+    ResolvedUvDomain domain;
+    if (!resolveGeometryUvDomain(*geometry_, texture_->width, texture_->height,
+                                 domain, &domain_error)) {
+      throw std::invalid_argument(domain_error.empty()
+                                      ? "model UV Domain resolution failed"
+                                      : domain_error);
+    }
+    out.uv_domain = domain;
+    tex_w = domain.width;
+    tex_h = domain.height;
   }
 
   const auto max_u32 =
@@ -836,6 +842,8 @@ void ViewportMeshBuilder::buildStaticIndexedModel(
           vertex.nz = nz;
           vertex.u = uvs[corner][0];
           vertex.v = uvs[corner][1];
+          vertex.raw_u = textured ? face_uv_corners[corner][0] : 0.0;
+          vertex.raw_v = textured ? face_uv_corners[corner][1] : 0.0;
           vertex.tx = tangent.tangent[0];
           vertex.ty = tangent.tangent[1];
           vertex.tz = tangent.tangent[2];
@@ -874,6 +882,17 @@ void ViewportMeshBuilder::buildFromPoses(
     const std::map<std::string, baker::BonePoseCalculator::Pose> &poses,
     bool baked_style, ViewportGpuScene &out, bool include_model) const {
   out.clear();
+  ResolvedUvDomain uv_domain;
+  if (include_model && geometry_ != nullptr && !poses.empty() &&
+      texture_ != nullptr && texture_->valid()) {
+    std::string domain_error;
+    if (!resolveGeometryUvDomain(*geometry_, texture_->width, texture_->height,
+                                 uv_domain, &domain_error)) {
+      throw std::invalid_argument(domain_error.empty()
+                                      ? "model UV Domain resolution failed"
+                                      : domain_error);
+    }
+  }
   if (show_ground_) {
     out = geometry_ == nullptr ? defaultGroundCache() : ground_cache_;
   }
@@ -903,10 +922,9 @@ void ViewportMeshBuilder::buildFromPoses(
       static_cast<double>(std::max(1, geometry_->description.texture_width));
   double tex_h =
       static_cast<double>(std::max(1, geometry_->description.texture_height));
-  if (!geometry_->description.hasCompleteTextureSize() && texture_ != nullptr &&
-      texture_->valid()) {
-    tex_w = static_cast<double>(std::max(1, texture_->width));
-    tex_h = static_cast<double>(std::max(1, texture_->height));
+  if (uv_domain.valid()) {
+    tex_w = uv_domain.width;
+    tex_h = uv_domain.height;
   }
 
   for (const auto &bone : geometry_->bones) {

@@ -9789,9 +9789,9 @@ private:
     static_sampler_info.magFilter = VK_FILTER_NEAREST;
     static_sampler_info.minFilter = VK_FILTER_NEAREST;
     static_sampler_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    static_sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    static_sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    static_sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    static_sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    static_sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    static_sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     static_sampler_info.minLod = 0.0f;
     static_sampler_info.maxLod = 0.0f;
     if (vkCreateSampler(device_, &static_sampler_info, nullptr,

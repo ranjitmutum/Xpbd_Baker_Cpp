@@ -291,6 +291,32 @@ void TextureImage::sample(float u, float v, float& r, float& g, float& b, float&
     a = p[3] / 255.0f;
 }
 
+void TextureImage::sampleModelAtlasClamp(double u, double v, float& r,
+                                         float& g, float& b, float& a) const {
+    if (!valid() || !std::isfinite(u) || !std::isfinite(v)) {
+        r = g = b = a = 1.0f;
+        return;
+    }
+
+    const double clamped_u = std::clamp(u, 0.0, 1.0);
+    const double clamped_v = std::clamp(v, 0.0, 1.0);
+    const int x = std::clamp(
+        static_cast<int>(std::floor(clamped_u * static_cast<double>(width))),
+        0, width - 1);
+    const int y = std::clamp(
+        static_cast<int>(std::floor(clamped_v * static_cast<double>(height))),
+        0, height - 1);
+    const std::uint8_t* p =
+        rgba.data() +
+        (static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
+         static_cast<std::size_t>(x)) *
+            4u;
+    r = p[0] / 255.0f;
+    g = p[1] / 255.0f;
+    b = p[2] / 255.0f;
+    a = p[3] / 255.0f;
+}
+
 bool loadTextureImageFromMemory(const void* data, int size, TextureImage& out,
                                 std::string* err,
                                 TextureDecodeLimits limits) {

@@ -58,6 +58,11 @@ struct TextureImage {
 
     void sample(float u, float v, float& r, float& g, float& b, float& a) const;
 
+    // Model atlases have a resolved finite UV domain. Sampling outside the
+    // normalized edge must never wrap into an unrelated atlas cell.
+    void sampleModelAtlasClamp(double u, double v, float& r, float& g,
+                               float& b, float& a) const;
+
     void sample(float u, float v, float& r, float& g, float& b) const {
         float a = 1.0f;
         sample(u, v, r, g, b, a);

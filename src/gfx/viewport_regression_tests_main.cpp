@@ -176,6 +176,37 @@ void testPathTracePbrSourceContracts() {
                        "si.minFilter = VK_FILTER_LINEAR;") == 0u,
          "Raster and path tracing keep every pixel-atlas channel "
          "nearest-filtered");
+  expect(countText(
+             backend,
+             "static_sampler_info.addressModeU = "
+             "VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;") == 1u &&
+             countText(
+                 backend,
+                 "static_sampler_info.addressModeV = "
+                 "VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;") == 1u &&
+             countText(
+                 backend,
+                 "static_sampler_info.addressModeW = "
+                 "VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;") == 1u &&
+             countText(path_tracer,
+                       "si.addressModeU = "
+                       "VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;") == 1u &&
+             countText(path_tracer,
+                       "si.addressModeV = "
+                       "VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;") == 1u &&
+             countText(path_tracer,
+                       "si.addressModeW = "
+                       "VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;") == 1u &&
+             countText(path_tracer,
+                       "si.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;") ==
+                 0u &&
+             countText(path_tracer,
+                       "si.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;") ==
+                 0u &&
+             countText(path_tracer,
+                       "si.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;") ==
+                 0u,
+         "Raster, RT, and path tracing clamp model atlas channels at edges");
 
   const std::string compact_forward = compactTestSource(forward);
   const std::string compact_forward_rt = compactTestSource(forward_rt);
@@ -881,6 +912,215 @@ void testBedrockUvDomainResolution() {
          "loader accepts the 16384 precision boundary exactly");
 }
 
+void testResolvedUvDomainMaterialConsumers() {
+  using xpbd::gfx::LabPbrUvCoverage;
+  using xpbd::gfx::ResolvedMaterialTable;
+  using xpbd::gfx::StaticIndexedModelMesh;
+  using xpbd::gfx::StaticModelFace;
+  using xpbd::gfx::StaticModelMaterialClass;
+  using xpbd::gfx::TextureImage;
+  using xpbd::gfx::UvDomainKind;
+  using xpbd::gfx::ViewportGpuScene;
+  using xpbd::gfx::ViewportMeshBuilder;
+  using xpbd::test_support::SyntheticLargeUvFixture;
+  using xpbd::test_support::buildSyntheticLargeUvFixture;
+  using xpbd::test_support::fixtureTexel;
+
+  SyntheticLargeUvFixture fixture;
+  std::string error;
+  expect(buildSyntheticLargeUvFixture(fixture, &error),
+         "material consumers use the shared large-UV fixture");
+
+  ViewportMeshBuilder builder;
+  builder.setGeometry(&fixture.large_uv_geometry);
+  builder.setTexture(&fixture.base);
+  StaticIndexedModelMesh mesh;
+  builder.buildStaticIndexedModel(mesh);
+  expect(mesh.uv_domain.valid() &&
+             mesh.uv_domain.kind == UvDomainKind::Recovered &&
+             mesh.uv_domain.width == 256.0 &&
+             mesh.uv_domain.height == 256.0,
+         "static mesh owns the recovered imported-atlas Domain");
+
+  const auto face_uv_range = [&](std::string_view group, double &raw_min,
+                                 double &raw_max, double &normalized_min,
+                                 double &normalized_max) {
+    bool found = false;
+    raw_min = normalized_min =
+        (std::numeric_limits<double>::max)();
+    raw_max = normalized_max =
+        (std::numeric_limits<double>::lowest)();
+    for (const auto &face : mesh.faces) {
+      if (face.bone_index >= mesh.bone_names.size() ||
+          mesh.bone_names[face.bone_index] != group) {
+        continue;
+      }
+      for (std::uint32_t local = 0; local < face.vertex_count; ++local) {
+        const auto &vertex = mesh.vertices[face.first_vertex + local];
+        raw_min = std::min(raw_min, vertex.raw_u);
+        raw_max = std::max(raw_max, vertex.raw_u);
+        normalized_min =
+            std::min(normalized_min, static_cast<double>(vertex.u));
+        normalized_max =
+            std::max(normalized_max, static_cast<double>(vertex.u));
+        found = true;
+      }
+    }
+    return found;
+  };
+  double left_raw_min = 0.0, left_raw_max = 0.0, left_min = 0.0,
+         left_max = 0.0;
+  double right_raw_min = 0.0, right_raw_max = 0.0, right_min = 0.0,
+         right_max = 0.0;
+  expect(face_uv_range("eye_left", left_raw_min, left_raw_max, left_min,
+                       left_max) &&
+             face_uv_range("eye_right", right_raw_min, right_raw_max,
+                           right_min, right_max) &&
+             left_raw_min == 192.0 && left_raw_max == 208.0 &&
+             right_raw_min == 208.0 && right_raw_max == 224.0,
+         "static mesh preserves exact double raw UVs for both eyes");
+  expectNear(static_cast<float>(left_min), 192.0f / 256.0f, 1.0e-7f,
+             "left eye normalizes through recovered Domain");
+  expectNear(static_cast<float>(left_max), 208.0f / 256.0f, 1.0e-7f,
+             "left eye normalized maximum remains in its atlas cell");
+  expectNear(static_cast<float>(right_min), 208.0f / 256.0f, 1.0e-7f,
+             "right eye normalizes through recovered Domain");
+  expectNear(static_cast<float>(right_max), 224.0f / 256.0f, 1.0e-7f,
+             "right eye normalized maximum remains in its atlas cell");
+
+  LabPbrUvCoverage coverage;
+  expect(xpbd::gfx::rasterizeLabPbrUvCoverage(
+             mesh, fixture.base.width, fixture.base.height, coverage,
+             &error) &&
+             error.empty(),
+         "Coverage accepts the mesh-owned Domain and imported atlas extent");
+  const auto contains_fixture_texel = [&](std::string_view group,
+                                          const std::array<int, 2> &pixel) {
+    const auto *texels = coverage.find(group);
+    const auto index = static_cast<std::uint32_t>(
+        pixel[1] * fixture.base.width + pixel[0]);
+    return texels != nullptr &&
+           std::binary_search(texels->begin(), texels->end(), index);
+  };
+  expect(contains_fixture_texel("eye_left", fixture.left_eye_texel) &&
+             contains_fixture_texel("eye_right", fixture.right_eye_texel) &&
+             !contains_fixture_texel("eye_left", fixture.repeat_trap_texel),
+         "Coverage aligns both eye groups and excludes the Repeat trap");
+  LabPbrUvCoverage preserved_coverage{7, 9, {{"keep", {3u}}}};
+  const auto coverage_before_failure = preserved_coverage;
+  expect(!xpbd::gfx::rasterizeLabPbrUvCoverage(
+             mesh, fixture.base.width - 1, fixture.base.height,
+             preserved_coverage, &error) &&
+             error.find("match") != std::string::npos &&
+             preserved_coverage.width == coverage_before_failure.width &&
+             preserved_coverage.height == coverage_before_failure.height &&
+             preserved_coverage.group_texels ==
+                 coverage_before_failure.group_texels,
+         "Coverage mismatch rejects without replacing the caller candidate");
+
+  builder.setShowGround(false);
+  builder.setShowBones(false);
+  ViewportGpuScene dynamic_scene;
+  builder.buildRest(dynamic_scene);
+  bool saw_left_green = false;
+  bool saw_right_blue = false;
+  for (const auto &vertex : dynamic_scene.solid) {
+    saw_left_green |= vertex.g > 0.75f && vertex.r < 0.2f && vertex.b < 0.3f;
+    saw_right_blue |= vertex.b > 0.75f && vertex.r < 0.2f && vertex.g < 0.3f;
+  }
+  expect(saw_left_green && saw_right_blue && dynamic_scene.transparent.empty(),
+         "dynamic preview keeps both opaque eye cells visible without Repeat");
+
+  ViewportMeshBuilder protected_builder;
+  protected_builder.setGeometry(&fixture.high_resolution_geometry);
+  protected_builder.setTexture(&fixture.base);
+  StaticIndexedModelMesh protected_mesh;
+  protected_builder.buildStaticIndexedModel(protected_mesh);
+  expect(protected_mesh.uv_domain.kind == UvDomainKind::Declared &&
+             protected_mesh.uv_domain.width == 16.0 &&
+             protected_mesh.uv_domain.imported_width == 256,
+         "high-resolution atlas preserves the reliable declared Domain");
+
+  ViewportMeshBuilder rejected_builder;
+  rejected_builder.setGeometry(&fixture.out_of_bounds_geometry);
+  rejected_builder.setTexture(&fixture.base);
+  StaticIndexedModelMesh rejected_mesh;
+  rejected_mesh.bone_names = {"preserved only until candidate clear"};
+  bool rejected = false;
+  try {
+    rejected_builder.buildStaticIndexedModel(rejected_mesh);
+  } catch (const std::invalid_argument &exception) {
+    rejected = std::string_view(exception.what()).find("exceed") !=
+               std::string_view::npos;
+  }
+  expect(rejected && rejected_mesh.vertices.empty() &&
+             rejected_mesh.faces.empty() && !rejected_mesh.uv_domain.valid(),
+         "true out-of-domain UV fails before publishing a static mesh");
+
+  TextureImage edge_texture;
+  edge_texture.width = 2;
+  edge_texture.height = 1;
+  edge_texture.source_channels = 4;
+  edge_texture.rgba = {255u, 0u, 0u, 0u, 0u, 0u, 255u, 255u};
+  float r = 0.0f, g = 0.0f, b = 0.0f, a = 0.0f;
+  edge_texture.sampleModelAtlasClamp(-0.25, 0.5, r, g, b, a);
+  const bool left_clamped = r > 0.9f && b < 0.1f && a < 0.1f;
+  edge_texture.sampleModelAtlasClamp(1.25, 0.5, r, g, b, a);
+  const bool right_clamped = b > 0.9f && r < 0.1f && a > 0.9f;
+  edge_texture.sample(-0.25f, 0.5f, r, g, b, a);
+  expect(left_clamped && right_clamped && b > 0.9f,
+         "model atlas clamps at both edges while generic sampling stays Repeat");
+
+  StaticIndexedModelMesh alpha_mesh;
+  alpha_mesh.bone_names = {"edge"};
+  alpha_mesh.vertices.resize(4u);
+  for (auto &vertex : alpha_mesh.vertices) {
+    vertex.u = 1.25f;
+    vertex.v = 0.5f;
+  }
+  alpha_mesh.indices = {0u, 1u, 2u, 0u, 2u, 3u};
+  StaticModelFace alpha_face;
+  alpha_face.vertex_count = 4u;
+  alpha_face.index_count = 6u;
+  alpha_face.textured = true;
+  alpha_mesh.faces.push_back(alpha_face);
+  expect(xpbd::gfx::staticModelFaceMaterial(
+             alpha_mesh, alpha_mesh.faces.front(), &edge_texture) ==
+             StaticModelMaterialClass::Opaque,
+         "static Alpha classification clamps instead of wrapping to cutout");
+
+  ResolvedMaterialTable clamp_table;
+  clamp_table.width = 2;
+  clamp_table.height = 1;
+  clamp_table.texels.resize(2u);
+  clamp_table.texels[0].opacity = 0.25f;
+  clamp_table.texels[1].opacity = 0.75f;
+  expectNear(clamp_table.sample(-0.25f, 0.5f).opacity, 0.25f, 1.0e-6f,
+             "resolved material clamps the lower atlas edge");
+  expectNear(clamp_table.sample(1.25f, 0.5f).opacity, 0.75f, 1.0e-6f,
+             "resolved material clamps the upper atlas edge");
+
+  ResolvedMaterialTable resolved;
+  expect(xpbd::gfx::buildAuthoredResolvedMaterial(
+             fixture.base, ResolvedMaterialTable{}, &fixture.normal,
+             &fixture.specular, resolved, &error),
+         "Base Normal and Specular build one aligned resolved material");
+  const auto base_texel = fixtureTexel(fixture.base, fixture.left_eye_texel);
+  const auto normal_texel =
+      fixtureTexel(fixture.normal, fixture.left_eye_texel);
+  const auto specular_texel =
+      fixtureTexel(fixture.specular, fixture.left_eye_texel);
+  const auto expected = xpbd::gfx::decodeLabPbrTexel(
+      base_texel, &normal_texel, &specular_texel);
+  const auto &sampled = resolved.sample(
+      (static_cast<float>(fixture.left_eye_texel[0]) + 0.5f) /
+          static_cast<float>(fixture.base.width),
+      (static_cast<float>(fixture.left_eye_texel[1]) + 0.5f) /
+          static_cast<float>(fixture.base.height));
+  expect(sampled == expected,
+         "CPU material reference samples Base Normal Specular at one eye texel");
+}
+
 void testCc0PreviewSceneAssets() {
   using xpbd::gfx::PreviewSceneId;
   using xpbd::gfx::ViewportRasterScene;
@@ -1520,6 +1760,10 @@ void testStrictLabPbrSuiteImport() {
 
 xpbd::gfx::StaticIndexedModelMesh makeOverlappingLabPbrMesh() {
   xpbd::gfx::StaticIndexedModelMesh mesh;
+  mesh.uv_domain.width = 2.0;
+  mesh.uv_domain.height = 2.0;
+  mesh.uv_domain.imported_width = 2;
+  mesh.uv_domain.imported_height = 2;
   mesh.bone_names = {"group_a", "group_b", "untextured"};
   const auto add_quad = [&mesh](std::uint32_t bone_index, bool mirrored,
                                 bool textured) {
@@ -1545,6 +1789,8 @@ xpbd::gfx::StaticIndexedModelMesh makeOverlappingLabPbrMesh() {
       auto &vertex = mesh.vertices[first_vertex + i];
       vertex.u = uvs[i][0];
       vertex.v = uvs[i][1];
+      vertex.raw_u = static_cast<double>(uvs[i][0]) * 2.0;
+      vertex.raw_v = static_cast<double>(uvs[i][1]) * 2.0;
       vertex.bone_index = bone_index;
     }
     mesh.indices.insert(mesh.indices.end(),
@@ -1648,9 +1894,13 @@ void testLabPbrAuthoringEncodingAndCoverage() {
          "mirrored group coverage deduplicates triangle texels");
   expect(coverage.find("untextured") == nullptr,
          "untextured faces do not enter LabPBR coverage");
+  xpbd::gfx::StaticIndexedModelMesh empty_mesh;
+  empty_mesh.uv_domain.width = 2.0;
+  empty_mesh.uv_domain.height = 2.0;
+  empty_mesh.uv_domain.imported_width = 2;
+  empty_mesh.uv_domain.imported_height = 2;
   const auto empty_coverage =
-      xpbd::gfx::rasterizeLabPbrUvCoverage(
-          xpbd::gfx::StaticIndexedModelMesh{}, 2, 2);
+      xpbd::gfx::rasterizeLabPbrUvCoverage(empty_mesh, 2, 2);
   expect(empty_coverage.valid() && empty_coverage.group_texels.empty(),
          "empty model produces valid empty LabPBR coverage");
   GroupLabPbrOverride missing_group;
@@ -4218,6 +4468,7 @@ int main() {
   testTextureFromMemory();
   testSyntheticLargeUvFixtureAndMemoryBaseline();
   testBedrockUvDomainResolution();
+  testResolvedUvDomainMaterialConsumers();
   testCc0PreviewSceneAssets();
   testEmptyTextureSample();
   testLabPbrDecode();

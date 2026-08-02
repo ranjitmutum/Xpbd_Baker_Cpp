@@ -258,30 +258,55 @@ bool validGroupLabPbrOverride(const GroupLabPbrOverride &override_value,
   return message == nullptr;
 }
 
-LabPbrUvCoverage
-rasterizeLabPbrUvCoverage(const StaticIndexedModelMesh &mesh, int width,
-                          int height) {
-  LabPbrUvCoverage result;
+bool rasterizeLabPbrUvCoverage(const StaticIndexedModelMesh &mesh, int width,
+                               int height, LabPbrUvCoverage &out,
+                               std::string *error) {
+  const auto fail_coverage = [&](std::string message) {
+    if (error != nullptr) {
+      *error = std::move(message);
+    }
+    return false;
+  };
   if (width <= 0 || height <= 0) {
-    return result;
+    return fail_coverage("UV coverage dimensions must be positive");
   }
-  const std::size_t texel_count =
-      static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
-  if (texel_count >
-      static_cast<std::size_t>(
-          (std::numeric_limits<std::uint32_t>::max)())) {
-    return result;
+  if (!mesh.uv_domain.valid()) {
+    return fail_coverage("UV coverage requires a resolved model UV Domain");
   }
+  if (mesh.uv_domain.imported_width != width ||
+      mesh.uv_domain.imported_height != height) {
+    return fail_coverage(
+        "UV coverage dimensions do not match the resolved imported atlas");
+  }
+  const std::size_t width_size = static_cast<std::size_t>(width);
+  const std::size_t height_size = static_cast<std::size_t>(height);
+  if (width_size > (std::numeric_limits<std::size_t>::max)() / height_size) {
+    return fail_coverage("UV coverage dimensions overflow");
+  }
+  const std::size_t texel_count = width_size * height_size;
+  if (texel_count > static_cast<std::size_t>(
+                        (std::numeric_limits<std::uint32_t>::max)())) {
+    return fail_coverage("UV coverage texel indices exceed uint32 range");
+  }
+  LabPbrUvCoverage result;
   result.width = width;
   result.height = height;
   std::map<std::string, std::set<std::uint32_t>> covered;
   constexpr double kInsideEpsilon = 1.0e-9;
+  constexpr double kDomainEpsilon = 1.0e-9;
 
   for (const StaticModelFace &face : mesh.faces) {
-    if (!face.textured || face.bone_index >= mesh.bone_names.size() ||
-        face.first_index > mesh.indices.size() ||
-        face.index_count > mesh.indices.size() - face.first_index) {
+    if (!face.textured) {
       continue;
+    }
+    if (face.bone_index >= mesh.bone_names.size() ||
+        face.first_vertex > mesh.vertices.size() ||
+        face.vertex_count > mesh.vertices.size() - face.first_vertex ||
+        face.vertex_count == 0u ||
+        face.first_index > mesh.indices.size() ||
+        face.index_count > mesh.indices.size() - face.first_index ||
+        face.index_count == 0u || face.index_count % 3u != 0u) {
+      return fail_coverage("UV coverage mesh face ranges are invalid");
     }
     auto &group = covered[mesh.bone_names[face.bone_index]];
     for (std::uint32_t local = 0; local + 2u < face.index_count;
@@ -291,17 +316,46 @@ rasterizeLabPbrUvCoverage(const StaticIndexedModelMesh &mesh, int width,
       const std::uint32_t ic = mesh.indices[face.first_index + local + 2u];
       if (ia >= mesh.vertices.size() || ib >= mesh.vertices.size() ||
           ic >= mesh.vertices.size()) {
-        continue;
+        return fail_coverage("UV coverage mesh index is out of range");
+      }
+      const std::size_t vertex_end =
+          static_cast<std::size_t>(face.first_vertex) + face.vertex_count;
+      if (ia < face.first_vertex || ia >= vertex_end ||
+          ib < face.first_vertex || ib >= vertex_end ||
+          ic < face.first_vertex || ic >= vertex_end ||
+          mesh.vertices[ia].bone_index != face.bone_index ||
+          mesh.vertices[ib].bone_index != face.bone_index ||
+          mesh.vertices[ic].bone_index != face.bone_index) {
+        return fail_coverage(
+            "UV coverage mesh face ownership is inconsistent");
       }
       const auto &a = mesh.vertices[ia];
       const auto &b = mesh.vertices[ib];
       const auto &c = mesh.vertices[ic];
-      const double ax = static_cast<double>(a.u) * width;
-      const double ay = static_cast<double>(a.v) * height;
-      const double bx = static_cast<double>(b.u) * width;
-      const double by = static_cast<double>(b.v) * height;
-      const double cx = static_cast<double>(c.u) * width;
-      const double cy = static_cast<double>(c.v) * height;
+      const auto atlas_coordinate = [&](double raw_u, double raw_v,
+                                        double &x, double &y) {
+        const double normalized_u = mesh.uv_domain.normalizeU(raw_u);
+        const double normalized_v = mesh.uv_domain.normalizeV(raw_v);
+        if (!std::isfinite(normalized_u) || !std::isfinite(normalized_v) ||
+            normalized_u < -kDomainEpsilon ||
+            normalized_u > 1.0 + kDomainEpsilon ||
+            normalized_v < -kDomainEpsilon ||
+            normalized_v > 1.0 + kDomainEpsilon) {
+          return false;
+        }
+        x = std::clamp(normalized_u, 0.0, 1.0) *
+            static_cast<double>(width);
+        y = std::clamp(normalized_v, 0.0, 1.0) *
+            static_cast<double>(height);
+        return true;
+      };
+      double ax = 0.0, ay = 0.0, bx = 0.0, by = 0.0, cx = 0.0, cy = 0.0;
+      if (!atlas_coordinate(a.raw_u, a.raw_v, ax, ay) ||
+          !atlas_coordinate(b.raw_u, b.raw_v, bx, by) ||
+          !atlas_coordinate(c.raw_u, c.raw_v, cx, cy)) {
+        return fail_coverage(
+            "UV coverage vertex lies outside the resolved model Domain");
+      }
       const double area = edge(ax, ay, bx, by, cx, cy);
       if (!std::isfinite(area) || std::abs(area) <= kInsideEpsilon) {
         continue;
@@ -354,6 +408,18 @@ rasterizeLabPbrUvCoverage(const StaticIndexedModelMesh &mesh, int width,
         std::move(group),
         std::vector<std::uint32_t>(texels.begin(), texels.end()));
   }
+  out = std::move(result);
+  if (error != nullptr) {
+    error->clear();
+  }
+  return true;
+}
+
+LabPbrUvCoverage
+rasterizeLabPbrUvCoverage(const StaticIndexedModelMesh &mesh, int width,
+                          int height) {
+  LabPbrUvCoverage result;
+  rasterizeLabPbrUvCoverage(mesh, width, height, result, nullptr);
   return result;
 }
 

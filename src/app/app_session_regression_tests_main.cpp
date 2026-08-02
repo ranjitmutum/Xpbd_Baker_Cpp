@@ -4,6 +4,7 @@
 #include "xpbd/gfx/labpbr_authoring.hpp"
 #include "xpbd/gfx/labpbr_material.hpp"
 #include "xpbd/gfx/still_image_export.hpp"
+#include "test_support/labpbr_synthetic_fixture.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -74,6 +75,7 @@ bool sameImportedNormal(const xpbd::gfx::ReadOnlyIrisNormalAsset &lhs,
 
 struct MaterialSessionSnapshot {
   xpbd::gfx::TextureImage texture;
+  xpbd::gfx::ResolvedUvDomain domain;
   xpbd::gfx::ResolvedMaterialTable material;
   xpbd::gfx::LabPbrUvCoverage coverage;
   std::map<std::string, xpbd::gfx::GroupLabPbrOverride> overrides;
@@ -90,6 +92,7 @@ struct MaterialSessionSnapshot {
 MaterialSessionSnapshot snapshot(const xpbd::app::AppSession &session) {
   return {
       session.model_texture,
+      session.model_uv_domain,
       session.resolved_material,
       session.labpbr_uv_coverage,
       session.labpbr_group_overrides,
@@ -107,6 +110,7 @@ MaterialSessionSnapshot snapshot(const xpbd::app::AppSession &session) {
 bool unchanged(const xpbd::app::AppSession &session,
                const MaterialSessionSnapshot &before) {
   return sameTexture(session.model_texture, before.texture) &&
+         session.model_uv_domain == before.domain &&
          sameResolvedMaterial(session.resolved_material, before.material) &&
          session.labpbr_uv_coverage.width == before.coverage.width &&
          session.labpbr_uv_coverage.height == before.coverage.height &&
@@ -870,6 +874,144 @@ void testTransactionalLabPbrSuiteImport() {
   expect(!filesystem_error, "remove isolated AppSession fixture directory");
 }
 
+void testLargeUvModelMaterialTransactions() {
+  namespace fs = std::filesystem;
+  using xpbd::gfx::UvDomainKind;
+  using xpbd::test_support::SyntheticLabPbrSuitePaths;
+  using xpbd::test_support::SyntheticLargeUvFixture;
+
+  const auto nonce =
+      std::chrono::steady_clock::now().time_since_epoch().count();
+  const fs::path directory =
+      fs::temp_directory_path() / fs::path(L"xpbd会话_大UV_事务") /
+      std::to_string(nonce);
+  std::error_code filesystem_error;
+  fs::create_directories(directory, filesystem_error);
+  expect(!filesystem_error,
+         "create Unicode large-UV AppSession fixture directory");
+  if (filesystem_error) {
+    return;
+  }
+
+  SyntheticLargeUvFixture fixture;
+  std::string error;
+  expect(xpbd::test_support::buildSyntheticLargeUvFixture(fixture, &error),
+         "build AppSession large-UV runtime fixture");
+  SyntheticLabPbrSuitePaths suite_paths;
+  expect(xpbd::test_support::writeSyntheticLabPbrSuite(
+             fixture, directory, fs::path(L"角色材质_眼睛.png"),
+             suite_paths, &error),
+         "write Unicode Base Normal Specular suite for AppSession");
+
+  static constexpr std::string_view kLargeModel = R"json(
+{"format_version":"1.12.0","minecraft:geometry":[{"description":{"identifier":"geometry.session_large_uv","texture_width":16,"texture_height":16},"bones":[
+{"name":"body","pivot":[0,0,0],"cubes":[{"origin":[0,0,0],"size":[16,16,1],"uv":{"north":{"uv":[0,0],"uv_size":[16,16]}}}]},
+{"name":"eye_left","pivot":[0,0,0],"cubes":[{"origin":[0,0,0],"size":[16,16,1],"uv":{"north":{"uv":[192,0],"uv_size":[16,16]}}}]},
+{"name":"eye_right","pivot":[0,0,0],"cubes":[{"origin":[0,0,0],"size":[16,16,1],"uv":{"north":{"uv":[208,0],"uv_size":[16,16]}}}]}
+]}]})json";
+  static constexpr std::string_view kOutOfBoundsModel = R"json(
+{"format_version":"1.12.0","minecraft:geometry":[{"description":{"identifier":"geometry.session_out_of_bounds","texture_width":16,"texture_height":16},"bones":[
+{"name":"outside","pivot":[0,0,0],"cubes":[{"origin":[0,0,0],"size":[16,16,1],"uv":{"north":{"uv":[300,0],"uv_size":[16,16]}}}]}
+]}]})json";
+  const fs::path large_model_path = directory / fs::path(L"角色_大UV.geo.json");
+  const fs::path out_of_bounds_model_path =
+      directory / fs::path(L"角色_真正越界.geo.json");
+  expect(writeBytes(
+             large_model_path,
+             std::vector<std::uint8_t>(kLargeModel.begin(),
+                                       kLargeModel.end())) &&
+             writeBytes(
+                 out_of_bounds_model_path,
+                 std::vector<std::uint8_t>(kOutOfBoundsModel.begin(),
+                                           kOutOfBoundsModel.end())),
+         "write Unicode runtime model fixtures");
+
+  auto &session = xpbd::app::AppSession::instance();
+  session.labpbr_draft_dirty = false;
+  session.clearTexture();
+  session.loadModel(large_model_path);
+  expect(session.last_error.empty() &&
+             session.geometry.description.identifier ==
+                 "geometry.session_large_uv" &&
+             session.geometry.bones.size() == 3u,
+         "real AppSession model entry commits valid large-UV geometry");
+  expect(session.requestLabPbrSuiteImport(suite_paths.base) &&
+             session.model_uv_domain.kind == UvDomainKind::Recovered &&
+             session.model_uv_domain.width == 256.0 &&
+             session.resolved_material.normal_map_active &&
+             session.resolved_material.specular_map_active,
+         "real suite entry commits one Recovered Domain for all channels");
+  const auto *left_coverage = session.labpbr_uv_coverage.find("eye_left");
+  const auto *right_coverage = session.labpbr_uv_coverage.find("eye_right");
+  expect(left_coverage != nullptr && !left_coverage->empty() &&
+             right_coverage != nullptr && !right_coverage->empty(),
+         "AppSession commits Coverage for both large-UV eye groups");
+
+  std::vector<std::uint8_t> small_rgba(16u * 16u * 4u, 255u);
+  std::vector<std::uint8_t> small_png;
+  expect(xpbd::gfx::encodePngRgba8(16, 16, small_rgba, small_png, &error),
+         "encode runtime smaller-atlas rejection fixture");
+  const fs::path small_texture_path =
+      directory / fs::path(L"错误的小贴图_16x16.png");
+  expect(writeBytes(small_texture_path, small_png),
+         "write runtime smaller-atlas rejection fixture");
+  const auto material_before_small_texture = snapshot(session);
+  expect(!session.loadTexture(small_texture_path) &&
+             session.last_error.find("exceed") != std::string::npos &&
+             unchanged(session, material_before_small_texture),
+         "smaller atlas Domain failure preserves Session and GPU material");
+
+  const auto material_before_bad_model = snapshot(session);
+  const std::string model_path_before = session.model_path;
+  const std::string identifier_before =
+      session.geometry.description.identifier;
+  const std::vector<std::string> bone_names_before{
+      session.geometry.bones[0].name,
+      session.geometry.bones[1].name,
+      session.geometry.bones[2].name,
+  };
+  const double left_uv_before =
+      session.geometry.bones[1].cubes[0].uv_north.u;
+  const auto model_generation_before = session.modelGeneration();
+  const auto physics_generation_before = session.physicsGeneration();
+  const auto material_generation_before = session.materialGeneration();
+  const auto appearance_generation_before =
+      session.viewportAppearanceGeneration();
+  const auto visibility_generation_before =
+      session.viewportVisibilityGeneration();
+  const auto scene_generation_before = session.scene_selection.generation;
+  const auto pt_reset_before = session.path_trace_settings.reset_generation;
+  session.loadModel(out_of_bounds_model_path);
+  const bool same_bones =
+      session.geometry.bones.size() == bone_names_before.size() &&
+      session.geometry.bones[0].name == bone_names_before[0] &&
+      session.geometry.bones[1].name == bone_names_before[1] &&
+      session.geometry.bones[2].name == bone_names_before[2];
+  expect(session.last_error.find("exceed") != std::string::npos &&
+             session.model_path == model_path_before &&
+             session.geometry.description.identifier == identifier_before &&
+             same_bones &&
+             session.geometry.bones[1].cubes[0].uv_north.u == left_uv_before &&
+             unchanged(session, material_before_bad_model),
+         "out-of-domain model load preserves committed model and material");
+  expect(session.modelGeneration() == model_generation_before &&
+             session.physicsGeneration() == physics_generation_before &&
+             session.materialGeneration() == material_generation_before &&
+             session.viewportAppearanceGeneration() ==
+                 appearance_generation_before &&
+             session.viewportVisibilityGeneration() ==
+                 visibility_generation_before &&
+             session.scene_selection.generation == scene_generation_before &&
+             session.path_trace_settings.reset_generation == pt_reset_before,
+         "failed model preflight preserves every renderer/history generation");
+
+  session.labpbr_draft_dirty = false;
+  session.clearTexture();
+  fs::remove_all(directory, filesystem_error);
+  expect(!filesystem_error,
+         "remove Unicode large-UV AppSession fixture directory");
+}
+
 void testExternalLabPbrSuite(const std::filesystem::path &base_path) {
   namespace fs = std::filesystem;
 
@@ -1298,6 +1440,7 @@ int main(int argc, char **argv) {
   testPathTraceSettingsPersistenceAndClassification();
   testStillRenderSnapshotAndOutput();
   testTransactionalLabPbrSuiteImport();
+  testLargeUvModelMaterialTransactions();
   if (argc >= 2) {
     testExternalLabPbrSuite(std::filesystem::path(argv[1]));
   }

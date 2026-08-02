@@ -2,7 +2,7 @@
 
 ## Current phase
 
-S01 — pure double-precision face UV parsing, bounds, and `ResolvedUvDomain` (`COMPLETE`).
+S02 — apply one Domain to material consumers and clamp model atlases (`COMPLETE`; isolated commit pending).
 
 ## Phases and dependencies
 
@@ -10,7 +10,7 @@ S01 — pure double-precision face UV parsing, bounds, and `ResolvedUvDomain` (`
 |---|---|---|---|
 | S00 | Baseline; runtime synthetic fixtures; checked compact-memory estimate | — | COMPLETE |
 | S01 | Pure double-precision face UV parsing, bounds, and `ResolvedUvDomain` | S00 | COMPLETE |
-| S02 | Apply one domain to mesh/material consumers; atlas clamp; transaction/history behavior | S01 | PENDING |
+| S02 | Apply one domain to mesh/material consumers; atlas clamp; transaction/history behavior | S01 | COMPLETE |
 | S03 | Unicode/long-path snapshot-and-memory image import | S02 | PENDING |
 | Gate A | Release app build and full CTest correctness gate | S00–S03 | PENDING |
 | S04 | Remove persistent resolved-texel expansion; final-model budget preflight | Gate A | PENDING |

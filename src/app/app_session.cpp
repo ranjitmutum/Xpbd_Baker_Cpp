@@ -120,10 +120,12 @@ bool buildSessionLabPbrMaterial(
     const gfx::ResolvedMaterialTable &source_material,
     const std::map<std::string, gfx::GroupLabPbrOverride> &overrides,
     const gfx::ReadOnlyIrisNormalAsset *imported_normal,
+    gfx::ResolvedUvDomain &domain,
     gfx::LabPbrUvCoverage &coverage,
     gfx::LabPbrCompositionResult &composition,
     gfx::ResolvedMaterialTable &resolved, std::string *error) {
   if (!base.valid()) {
+    domain = {};
     coverage = {};
     composition = {};
     resolved = source_material;
@@ -133,14 +135,24 @@ bool buildSessionLabPbrMaterial(
     return true;
   }
 
-  gfx::ViewportMeshBuilder builder;
-  builder.setGeometry(&geometry);
-  builder.setBoneMapper(&bone_mapper);
-  builder.setTexture(&base);
   gfx::StaticIndexedModelMesh mesh;
-  builder.buildStaticIndexedModel(mesh);
-  auto next_coverage =
-      gfx::rasterizeLabPbrUvCoverage(mesh, base.width, base.height);
+  try {
+    gfx::ViewportMeshBuilder builder;
+    builder.setGeometry(&geometry);
+    builder.setBoneMapper(&bone_mapper);
+    builder.setTexture(&base);
+    builder.buildStaticIndexedModel(mesh);
+  } catch (const std::exception &exception) {
+    if (error != nullptr) {
+      *error = exception.what();
+    }
+    return false;
+  }
+  gfx::LabPbrUvCoverage next_coverage;
+  if (!gfx::rasterizeLabPbrUvCoverage(
+          mesh, base.width, base.height, next_coverage, error)) {
+    return false;
+  }
   const gfx::TextureImage *source_specular =
       source_material.specular_map_active
           ? &source_material.specular_image
@@ -165,6 +177,7 @@ bool buildSessionLabPbrMaterial(
           next_resolved, error)) {
     return false;
   }
+  domain = mesh.uv_domain;
   coverage = std::move(next_coverage);
   composition = std::move(next_composition);
   resolved = std::move(next_resolved);
@@ -2004,23 +2017,72 @@ void AppSession::setLoopMode(int mode) {
 void AppSession::loadModel(const std::filesystem::path &path) {
   try {
     auto loaded_geometry = loader::ModelLoader::load(path);
-    geometry = std::move(loaded_geometry);
-    model_path = path.string();
-    bone_mapper.replaceModelBones(geometry.bones);
-    for (auto it = transition_follow_weights.begin();
-         it != transition_follow_weights.end();) {
-      const bool exists =
-          std::any_of(geometry.bones.begin(), geometry.bones.end(),
-                      [&](const auto &bone) { return bone.name == it->first; });
+    auto loaded_bone_mapper = bone_mapper;
+    loaded_bone_mapper.replaceModelBones(loaded_geometry.bones);
+    auto loaded_transition_follow_weights = transition_follow_weights;
+    for (auto it = loaded_transition_follow_weights.begin();
+         it != loaded_transition_follow_weights.end();) {
+      const bool exists = std::any_of(
+          loaded_geometry.bones.begin(), loaded_geometry.bones.end(),
+          [&](const auto &bone) { return bone.name == it->first; });
       if (exists) {
         ++it;
       } else {
-        it = transition_follow_weights.erase(it);
+        it = loaded_transition_follow_weights.erase(it);
       }
     }
+
+    gfx::ResolvedUvDomain loaded_domain;
+    gfx::LabPbrUvCoverage loaded_coverage;
+    gfx::LabPbrCompositionResult loaded_composition;
+    gfx::ResolvedMaterialTable loaded_resolved;
+    std::string material_error;
+    const std::map<std::string, gfx::GroupLabPbrOverride> no_overrides;
+    if (!buildSessionLabPbrMaterial(
+            loaded_geometry, loaded_bone_mapper, model_texture,
+            labpbr_source_material_, no_overrides,
+            labpbr_imported_normal.valid() ? &labpbr_imported_normal : nullptr,
+            loaded_domain, loaded_coverage, loaded_composition,
+            loaded_resolved, &material_error)) {
+      last_error = material_error.empty()
+                       ? "Model UV/material preflight failed"
+                       : material_error;
+      status = "Model load failed";
+      return;
+    }
+    const bool material_changed =
+        !labpbr_group_overrides.empty() ||
+        !gfx::sameResolvedMaterialResource(resolved_material,
+                                           loaded_resolved);
+    const std::string loaded_model_path = path.string();
+    std::string loaded_status =
+        "Model: " + path.filename().string() + " (" +
+        std::to_string(loaded_geometry.bones.size()) + " bones)";
+    if (loaded_geometry.description.hasCompleteTextureSize()) {
+      loaded_status +=
+          " UV " +
+          std::to_string(loaded_geometry.description.texture_width) + "x" +
+          std::to_string(loaded_geometry.description.texture_height);
+    }
+    if (model_texture.valid()) {
+      loaded_status += " tex " + std::to_string(model_texture.width) + "x" +
+                       std::to_string(model_texture.height);
+      loaded_status += " domain=";
+      loaded_status += gfx::uvDomainKindName(loaded_domain.kind);
+    }
+
+    geometry = std::move(loaded_geometry);
+    model_path = loaded_model_path;
+    bone_mapper = std::move(loaded_bone_mapper);
+    transition_follow_weights =
+        std::move(loaded_transition_follow_weights);
     selected_bone_name.clear();
     hovered_bone_name.clear();
     labpbr_group_overrides.clear();
+    model_uv_domain = loaded_domain;
+    labpbr_uv_coverage = std::move(loaded_coverage);
+    labpbr_composition = std::move(loaded_composition);
+    resolved_material = std::move(loaded_resolved);
     labpbr_draft = {};
     labpbr_draft_dirty = false;
     hidden_bone_names.clear();
@@ -2035,17 +2097,11 @@ void AppSession::loadModel(const std::filesystem::path &path) {
     invalidatePhysicsArtifacts(
         InvalidationReason::Model,
         "Model loaded — select physics bones and play to bake");
-    status = "Model: " + path.filename().string() + " (" +
-             std::to_string(geometry.bones.size()) + " bones)";
-    if (geometry.description.hasCompleteTextureSize()) {
-      status += " UV " + std::to_string(geometry.description.texture_width) +
-                "x" + std::to_string(geometry.description.texture_height);
-    }
-    if (model_texture.valid()) {
-      status += " tex " + std::to_string(model_texture.width) + "x" +
-                std::to_string(model_texture.height);
-    }
+    status = std::move(loaded_status);
     advanceGeneration(model_generation_);
+    if (material_changed) {
+      advanceGeneration(material_generation_);
+    }
     advanceGeneration(viewport_appearance_generation_);
     advanceGeneration(viewport_visibility_generation_);
     scene_selection.source_identity = model_path;
@@ -2056,9 +2112,6 @@ void AppSession::loadModel(const std::filesystem::path &path) {
     }
     advanceGeneration(scene_selection.generation);
     resetPathTraceAccumulation();
-    if (model_texture.valid() && !refreshLabPbrAuthoring()) {
-      status += " [!] LabPBR coverage refresh failed";
-    }
   } catch (const std::exception &e) {
     last_error = e.what();
     status = "Model load failed";
@@ -2293,6 +2346,7 @@ bool AppSession::importLabPbrSuiteInternal(
     imported_normal.decoded = imported.suite.material.normal_image;
   }
 
+  gfx::ResolvedUvDomain loaded_domain;
   gfx::LabPbrUvCoverage loaded_coverage;
   gfx::LabPbrCompositionResult loaded_composition;
   gfx::ResolvedMaterialTable loaded_resolved;
@@ -2301,7 +2355,8 @@ bool AppSession::importLabPbrSuiteInternal(
           geometry, bone_mapper, imported.suite.base_image,
           imported.suite.material, labpbr_group_overrides,
           imported_normal.valid() ? &imported_normal : nullptr,
-          loaded_coverage, loaded_composition, loaded_resolved, &error)) {
+          loaded_domain, loaded_coverage, loaded_composition, loaded_resolved,
+          &error)) {
     last_error = error.empty() ? "LabPBR authoring resolve failed" : error;
     status = relink ? "LabPBR relink failed" : "LabPBR suite import failed";
     return false;
@@ -2316,6 +2371,7 @@ bool AppSession::importLabPbrSuiteInternal(
       labpbr_imported_normal.sha256 != imported_normal.sha256;
 
   model_texture = std::move(imported.suite.base_image);
+  model_uv_domain = loaded_domain;
   labpbr_source_material_ = std::move(imported.suite.material);
   resolved_material = std::move(loaded_resolved);
   labpbr_uv_coverage = std::move(loaded_coverage);
@@ -2515,6 +2571,7 @@ bool AppSession::loadTexture(const std::filesystem::path &path) {
     status = "Texture load failed";
     return false;
   }
+  gfx::ResolvedUvDomain loaded_domain;
   gfx::LabPbrUvCoverage loaded_coverage;
   gfx::LabPbrCompositionResult loaded_composition;
   gfx::ResolvedMaterialTable loaded_resolved;
@@ -2522,7 +2579,8 @@ bool AppSession::loadTexture(const std::filesystem::path &path) {
           geometry, bone_mapper, loaded_texture, loaded_material,
           labpbr_group_overrides,
           keep_imported_normal ? &labpbr_imported_normal : nullptr,
-          loaded_coverage, loaded_composition, loaded_resolved, &err)) {
+          loaded_domain, loaded_coverage, loaded_composition, loaded_resolved,
+          &err)) {
     last_error = err.empty() ? "LabPBR authoring resolve failed" : err;
     status = "Texture load failed";
     return false;
@@ -2534,6 +2592,7 @@ bool AppSession::loadTexture(const std::filesystem::path &path) {
       (labpbr_source_material_.specular_map_active &&
        !keep_imported_specular);
   model_texture = std::move(loaded_texture);
+  model_uv_domain = loaded_domain;
   labpbr_source_material_ = std::move(loaded_material);
   resolved_material = std::move(loaded_resolved);
   labpbr_uv_coverage = std::move(loaded_coverage);
@@ -3975,6 +4034,7 @@ void AppSession::clearTexture() {
   const bool texture_changed = hasTextureResourceState(model_texture) ||
                                resolved_material.valid();
   model_texture.clear();
+  model_uv_domain = {};
   resolved_material.clear();
   labpbr_source_material_.clear();
   labpbr_uv_coverage = {};
@@ -4002,6 +4062,7 @@ void AppSession::clearTexture() {
 }
 
 bool AppSession::refreshLabPbrAuthoring() {
+  gfx::ResolvedUvDomain domain;
   gfx::LabPbrUvCoverage coverage;
   gfx::LabPbrCompositionResult composition;
   gfx::ResolvedMaterialTable resolved;
@@ -4010,11 +4071,12 @@ bool AppSession::refreshLabPbrAuthoring() {
           geometry, bone_mapper, model_texture, labpbr_source_material_,
           labpbr_group_overrides,
           labpbr_imported_normal.valid() ? &labpbr_imported_normal : nullptr,
-          coverage, composition, resolved, &error)) {
+          domain, coverage, composition, resolved, &error)) {
     last_error =
         error.empty() ? "LabPBR authoring refresh failed" : error;
     return false;
   }
+  model_uv_domain = domain;
   labpbr_uv_coverage = std::move(coverage);
   labpbr_composition = std::move(composition);
   resolved_material = std::move(resolved);
@@ -4103,6 +4165,7 @@ bool AppSession::applySelectedLabPbrDraft() {
     overrides.erase(selected_bone_name);
   }
 
+  gfx::ResolvedUvDomain domain;
   gfx::LabPbrUvCoverage coverage;
   gfx::LabPbrCompositionResult composition;
   gfx::ResolvedMaterialTable resolved;
@@ -4110,7 +4173,7 @@ bool AppSession::applySelectedLabPbrDraft() {
           geometry, bone_mapper, model_texture, labpbr_source_material_,
           overrides,
           labpbr_imported_normal.valid() ? &labpbr_imported_normal : nullptr,
-          coverage, composition, resolved, &error)) {
+          domain, coverage, composition, resolved, &error)) {
     last_error = error;
     status = "LabPBR apply failed: " + error;
     return false;
@@ -4119,6 +4182,7 @@ bool AppSession::applySelectedLabPbrDraft() {
       overrides != labpbr_group_overrides ||
       !gfx::sameResolvedMaterialResource(resolved_material, resolved);
   labpbr_group_overrides = std::move(overrides);
+  model_uv_domain = domain;
   labpbr_uv_coverage = std::move(coverage);
   labpbr_composition = std::move(composition);
   resolved_material = std::move(resolved);
@@ -4153,6 +4217,7 @@ bool AppSession::restoreSelectedLabPbrFromTexture() {
   auto overrides = labpbr_group_overrides;
   const bool removed = overrides.erase(selected_bone_name) != 0u;
   std::string error;
+  gfx::ResolvedUvDomain domain;
   gfx::LabPbrUvCoverage coverage;
   gfx::LabPbrCompositionResult composition;
   gfx::ResolvedMaterialTable resolved;
@@ -4160,7 +4225,7 @@ bool AppSession::restoreSelectedLabPbrFromTexture() {
           geometry, bone_mapper, model_texture, labpbr_source_material_,
           overrides,
           labpbr_imported_normal.valid() ? &labpbr_imported_normal : nullptr,
-          coverage, composition, resolved, &error)) {
+          domain, coverage, composition, resolved, &error)) {
     last_error = error;
     status = "LabPBR restore failed: " + error;
     return false;
@@ -4169,6 +4234,7 @@ bool AppSession::restoreSelectedLabPbrFromTexture() {
       removed ||
       !gfx::sameResolvedMaterialResource(resolved_material, resolved);
   labpbr_group_overrides = std::move(overrides);
+  model_uv_domain = domain;
   labpbr_uv_coverage = std::move(coverage);
   labpbr_composition = std::move(composition);
   resolved_material = std::move(resolved);
@@ -4225,6 +4291,7 @@ bool AppSession::importLabPbrSpecular(const std::filesystem::path &path) {
   source.specular_map_active = true;
   source.specular_image = imported;
 
+  gfx::ResolvedUvDomain domain;
   gfx::LabPbrUvCoverage coverage;
   gfx::LabPbrCompositionResult composition;
   gfx::ResolvedMaterialTable resolved;
@@ -4232,7 +4299,7 @@ bool AppSession::importLabPbrSpecular(const std::filesystem::path &path) {
           geometry, bone_mapper, model_texture, source,
           labpbr_group_overrides,
           labpbr_imported_normal.valid() ? &labpbr_imported_normal : nullptr,
-          coverage, composition, resolved, &error)) {
+          domain, coverage, composition, resolved, &error)) {
     last_error = error.empty() ? "LabPBR specular resolve failed" : error;
     status = "LabPBR specular import failed: " + last_error;
     return false;
@@ -4242,6 +4309,7 @@ bool AppSession::importLabPbrSpecular(const std::filesystem::path &path) {
       !sameTextureResource(labpbr_source_material_.specular_image, imported) ||
       !gfx::sameResolvedMaterialResource(resolved_material, resolved);
   labpbr_source_material_ = std::move(source);
+  model_uv_domain = domain;
   labpbr_uv_coverage = std::move(coverage);
   labpbr_composition = std::move(composition);
   resolved_material = std::move(resolved);
@@ -4275,6 +4343,7 @@ void AppSession::removeLabPbrSpecular() {
   source.assets.specular.clear();
   source.assets.specular_exists = false;
   std::string error;
+  gfx::ResolvedUvDomain domain;
   gfx::LabPbrUvCoverage coverage;
   gfx::LabPbrCompositionResult composition;
   gfx::ResolvedMaterialTable resolved;
@@ -4282,13 +4351,14 @@ void AppSession::removeLabPbrSpecular() {
           geometry, bone_mapper, model_texture, source,
           labpbr_group_overrides,
           labpbr_imported_normal.valid() ? &labpbr_imported_normal : nullptr,
-          coverage, composition, resolved, &error)) {
+          domain, coverage, composition, resolved, &error)) {
     last_error = error.empty() ? "LabPBR specular removal failed" : error;
     status = last_error;
     return;
   }
 
   labpbr_source_material_ = std::move(source);
+  model_uv_domain = domain;
   labpbr_uv_coverage = std::move(coverage);
   labpbr_composition = std::move(composition);
   resolved_material = std::move(resolved);
@@ -4319,13 +4389,14 @@ bool AppSession::importLabPbrNormal(const std::filesystem::path &path) {
     status = "Iris normal import failed: " + error;
     return false;
   }
+  gfx::ResolvedUvDomain domain;
   gfx::LabPbrUvCoverage coverage;
   gfx::LabPbrCompositionResult composition;
   gfx::ResolvedMaterialTable resolved;
   if (!buildSessionLabPbrMaterial(
           geometry, bone_mapper, model_texture, labpbr_source_material_,
-          labpbr_group_overrides, &imported, coverage, composition, resolved,
-          &error)) {
+          labpbr_group_overrides, &imported, domain, coverage, composition,
+          resolved, &error)) {
     last_error = error;
     status = "Iris normal import failed: " + error;
     return false;
@@ -4334,6 +4405,7 @@ bool AppSession::importLabPbrNormal(const std::filesystem::path &path) {
       imported.sha256 != labpbr_imported_normal.sha256 ||
       !gfx::sameResolvedMaterialResource(resolved_material, resolved);
   labpbr_imported_normal = std::move(imported);
+  model_uv_domain = domain;
   labpbr_uv_coverage = std::move(coverage);
   labpbr_composition = std::move(composition);
   resolved_material = std::move(resolved);
@@ -4358,19 +4430,21 @@ void AppSession::removeLabPbrNormal() {
   source_without_normal.normal_map_active = false;
   source_without_normal.normal_image.clear();
   std::string error;
+  gfx::ResolvedUvDomain domain;
   gfx::LabPbrUvCoverage coverage;
   gfx::LabPbrCompositionResult composition;
   gfx::ResolvedMaterialTable resolved;
   if (!buildSessionLabPbrMaterial(
           geometry, bone_mapper, model_texture, source_without_normal,
-          labpbr_group_overrides, nullptr, coverage, composition, resolved,
-          &error)) {
+          labpbr_group_overrides, nullptr, domain, coverage, composition,
+          resolved, &error)) {
     last_error = error;
     status = "Iris normal removal failed: " + error;
     return;
   }
   labpbr_imported_normal.clear();
   labpbr_source_material_ = std::move(source_without_normal);
+  model_uv_domain = domain;
   labpbr_uv_coverage = std::move(coverage);
   labpbr_composition = std::move(composition);
   resolved_material = std::move(resolved);

@@ -98,6 +98,10 @@ validGroupLabPbrOverride(const GroupLabPbrOverride &override_value,
 rasterizeLabPbrUvCoverage(const StaticIndexedModelMesh &mesh, int width,
                           int height);
 
+bool rasterizeLabPbrUvCoverage(const StaticIndexedModelMesh &mesh, int width,
+                               int height, LabPbrUvCoverage &out,
+                               std::string *error = nullptr);
+
 [[nodiscard]] LabPbrCompositionResult composeLabPbrSpecular(
     int width, int height, const TextureImage *imported_specular,
     const LabPbrUvCoverage &coverage,

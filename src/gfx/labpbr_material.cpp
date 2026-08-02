@@ -181,14 +181,8 @@ const ResolvedMaterialTexel &ResolvedMaterialTable::sample(float u,
   if (!valid()) {
     return kFallback;
   }
-  u -= std::floor(u);
-  v -= std::floor(v);
-  if (u < 0.0f) {
-    u += 1.0f;
-  }
-  if (v < 0.0f) {
-    v += 1.0f;
-  }
+  u = std::clamp(u, 0.0f, 1.0f);
+  v = std::clamp(v, 0.0f, 1.0f);
   const auto x = std::min(
       static_cast<std::size_t>(u * static_cast<float>(width)),
       static_cast<std::size_t>(width - 1));
