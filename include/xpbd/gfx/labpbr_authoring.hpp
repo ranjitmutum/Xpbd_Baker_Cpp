@@ -1,13 +1,16 @@
 #pragma once
 
+#include "xpbd/gfx/labpbr_memory.hpp"
 #include "xpbd/gfx/labpbr_material.hpp"
 #include "xpbd/gfx/viewport_mesh.hpp"
 
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace xpbd::gfx {
@@ -41,14 +44,28 @@ struct GroupLabPbrOverride {
   bool operator==(const GroupLabPbrOverride &) const = default;
 };
 
+struct UvRun {
+  std::uint32_t y = 0;
+  std::uint32_t x0 = 0;
+  std::uint32_t x1 = 0;
+
+  bool operator==(const UvRun &) const = default;
+};
+
+static_assert(sizeof(UvRun) == kLabPbrUvRunBytes);
+
 struct LabPbrUvCoverage {
   int width = 0;
   int height = 0;
-  std::map<std::string, std::vector<std::uint32_t>> group_texels;
+  std::map<std::string, std::vector<UvRun>, std::less<>> group_runs;
 
   [[nodiscard]] bool valid() const noexcept;
-  [[nodiscard]] const std::vector<std::uint32_t> *
+  [[nodiscard]] const std::vector<UvRun> *
   find(std::string_view group_name) const;
+  [[nodiscard]] std::uint64_t texelCount(
+      std::string_view group_name) const noexcept;
+  [[nodiscard]] std::optional<std::uint32_t> firstTexel(
+      std::string_view group_name) const noexcept;
 };
 
 struct LabPbrUvConflict {
@@ -59,25 +76,33 @@ struct LabPbrUvConflict {
 };
 
 struct LabPbrCompositionResult {
-  TextureImage specular;
+  SharedTextureImage specular;
+  bool specular_materialization_deferred = false;
+  int deferred_width = 0;
+  int deferred_height = 0;
   std::vector<LabPbrUvConflict> conflicts;
   std::vector<std::string> errors;
   std::vector<std::string> warnings;
 
   [[nodiscard]] bool exportable() const noexcept {
-    return specular.valid() && conflicts.empty() && errors.empty();
+    const bool has_specular =
+        (specular != nullptr && specular->valid()) ||
+        (specular_materialization_deferred && deferred_width > 0 &&
+         deferred_height > 0);
+    return has_specular && conflicts.empty() && errors.empty();
   }
 };
 
 struct ReadOnlyIrisNormalAsset {
   std::filesystem::path source_path;
-  std::vector<std::uint8_t> original_file_bytes;
+  std::shared_ptr<const std::vector<std::uint8_t>> original_file_bytes;
   std::string sha256;
-  TextureImage decoded;
+  SharedTextureImage decoded;
 
   [[nodiscard]] bool valid() const noexcept {
-    return decoded.valid() && decoded.source_channels == 4 &&
-           !original_file_bytes.empty() && sha256.size() == 64u;
+    return decoded != nullptr && decoded->valid() &&
+           decoded->source_channels == 4 && original_file_bytes != nullptr &&
+           !original_file_bytes->empty() && sha256.size() == 64u;
   }
   void clear() { *this = {}; }
 };
@@ -98,16 +123,35 @@ validGroupLabPbrOverride(const GroupLabPbrOverride &override_value,
 rasterizeLabPbrUvCoverage(const StaticIndexedModelMesh &mesh, int width,
                           int height);
 
+bool rasterizeLabPbrUvCoverage(const StaticIndexedModelMesh &mesh, int width,
+                               int height, LabPbrUvCoverage &out,
+                               std::string *error = nullptr);
+
 [[nodiscard]] LabPbrCompositionResult composeLabPbrSpecular(
-    int width, int height, const TextureImage *imported_specular,
+    int width, int height, SharedTextureImage imported_specular,
     const LabPbrUvCoverage &coverage,
     const std::map<std::string, GroupLabPbrOverride> &overrides);
 
+bool materializeLabPbrSpecular(int width, int height,
+                               const TextureImage *imported_specular,
+                               TextureImage &out,
+                               std::string *error = nullptr);
+
+bool buildAuthoredResolvedMaterial(
+    SharedTextureImage base, const ResolvedMaterialTable &source,
+    SharedTextureImage authored_normal,
+    SharedTextureImage authored_specular, ResolvedMaterialTable &out,
+    std::string *error = nullptr,
+    std::uint64_t maximum_peak_bytes = kLabPbrDefaultPeakBudgetBytes);
+
+// Small-call compatibility overload. Product and import paths use the shared
+// overload above so no decoded image is copied.
 bool buildAuthoredResolvedMaterial(
     const TextureImage &base, const ResolvedMaterialTable &source,
     const TextureImage *authored_normal,
     const TextureImage *authored_specular, ResolvedMaterialTable &out,
-    std::string *error = nullptr);
+    std::string *error = nullptr,
+    std::uint64_t maximum_peak_bytes = kLabPbrDefaultPeakBudgetBytes);
 
 [[nodiscard]] std::string
 sha256Hex(std::span<const std::uint8_t> bytes);
@@ -115,7 +159,8 @@ sha256Hex(std::span<const std::uint8_t> bytes);
 bool importReadOnlyIrisNormal(const std::filesystem::path &path,
                               int expected_width, int expected_height,
                               ReadOnlyIrisNormalAsset &out,
-                              std::string *error = nullptr);
+                              std::string *error = nullptr,
+                              TextureDecodeLimits limits = {});
 
 bool encodePngRgba8(int width, int height,
                     std::span<const std::uint8_t> rgba,

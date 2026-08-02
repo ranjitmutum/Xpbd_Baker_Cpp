@@ -1801,9 +1801,6 @@ bool VulkanPathTracer::createPipelines(VkRenderPass render_pass) {
   if (vkCreateSampler(device_, &si, nullptr, &sampler_) != VK_SUCCESS) {
     return false;
   }
-  si.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-  si.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-  si.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
   if (vkCreateSampler(device_, &si, nullptr, &albedo_sampler_) != VK_SUCCESS) {
     return false;
   }

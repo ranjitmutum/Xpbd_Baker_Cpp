@@ -2022,7 +2022,9 @@ int app_main(int argc, char **argv) {
         session.currentPreviewReferenceTime();
     const auto *preview_frame = session.currentPreviewFrame();
     const auto *model_texture =
-        session.model_texture.valid() ? &session.model_texture : nullptr;
+        session.model_texture != nullptr && session.model_texture->valid()
+            ? session.model_texture.get()
+            : nullptr;
     if (use_static_model && render_loaded_scene) {
       static_mesh_builder.setBoneMapper(&session.bone_mapper);
       static_mesh_builder.setSelectedBone(session.selected_bone_name);

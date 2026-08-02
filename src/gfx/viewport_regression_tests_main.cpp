@@ -8,19 +8,23 @@
 #include "xpbd/gfx/labpbr_export.hpp"
 #include "xpbd/gfx/labpbr_import.hpp"
 #include "xpbd/gfx/labpbr_material.hpp"
+#include "xpbd/gfx/labpbr_memory.hpp"
 #include "xpbd/gfx/path_trace_aov.hpp"
 #include "xpbd/gfx/preview_scene.hpp"
 #include "xpbd/gfx/rt_scene_records.hpp"
 #include "xpbd/gfx/rt_scene_generations.hpp"
 #include "xpbd/gfx/static_model_draw_plan.hpp"
 #include "xpbd/gfx/texture_image.hpp"
+#include "xpbd/gfx/uv_domain.hpp"
 #include "xpbd/gfx/vulkan_queue_selection.hpp"
 #include "xpbd/gfx/viewport_mesh.hpp"
 #include "xpbd/gfx/world_environment.hpp"
 #include "xpbd/baker/cube_geometry.hpp"
 #include "xpbd/loader/bedrock_animation_data.hpp"
 #include "xpbd/loader/bedrock_model_data.hpp"
+#include "xpbd/loader/model_loader.hpp"
 #include "xpbd/render/skeleton_viewport.hpp"
+#include "test_support/labpbr_synthetic_fixture.hpp"
 
 #include <array>
 #include <algorithm>
@@ -34,6 +38,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -41,6 +46,42 @@
 namespace {
 
 int g_failures = 0;
+
+constexpr int kDefaultLabPbrStressSide = 2'048;
+int g_labpbr_stress_side = kDefaultLabPbrStressSide;
+
+bool configureLabPbrStressSide(int argc, char **argv) noexcept {
+  if (argc == 1) {
+    return true;
+  }
+  if (argc == 2 && argv[1] != nullptr) {
+    const std::string_view option(argv[1]);
+    if (option == "--labpbr-stress-side=2048") {
+      g_labpbr_stress_side = 2'048;
+      return true;
+    }
+    if (option == "--labpbr-stress-side=4096") {
+      g_labpbr_stress_side = 4'096;
+      return true;
+    }
+  }
+  std::fprintf(
+      stderr,
+      "usage: xpbd_viewport_regression_tests "
+      "[--labpbr-stress-side=2048|--labpbr-stress-side=4096]\n");
+  return false;
+}
+
+int labPbrStressSide() noexcept {
+  return g_labpbr_stress_side;
+}
+
+std::set<std::uint32_t> expandCoverageRuns(
+    const xpbd::gfx::LabPbrUvCoverage &coverage,
+    std::string_view group_name);
+bool coverageContains(const xpbd::gfx::LabPbrUvCoverage &coverage,
+                      std::string_view group_name,
+                      std::uint32_t texel);
 
 void expect(bool cond, const char *label) {
   if (!cond) {
@@ -172,6 +213,37 @@ void testPathTracePbrSourceContracts() {
                        "si.minFilter = VK_FILTER_LINEAR;") == 0u,
          "Raster and path tracing keep every pixel-atlas channel "
          "nearest-filtered");
+  expect(countText(
+             backend,
+             "static_sampler_info.addressModeU = "
+             "VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;") == 1u &&
+             countText(
+                 backend,
+                 "static_sampler_info.addressModeV = "
+                 "VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;") == 1u &&
+             countText(
+                 backend,
+                 "static_sampler_info.addressModeW = "
+                 "VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;") == 1u &&
+             countText(path_tracer,
+                       "si.addressModeU = "
+                       "VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;") == 1u &&
+             countText(path_tracer,
+                       "si.addressModeV = "
+                       "VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;") == 1u &&
+             countText(path_tracer,
+                       "si.addressModeW = "
+                       "VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;") == 1u &&
+             countText(path_tracer,
+                       "si.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;") ==
+                 0u &&
+             countText(path_tracer,
+                       "si.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;") ==
+                 0u &&
+             countText(path_tracer,
+                       "si.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;") ==
+                 0u,
+         "Raster, RT, and path tracing clamp model atlas channels at edges");
 
   const std::string compact_forward = compactTestSource(forward);
   const std::string compact_forward_rt = compactTestSource(forward_rt);
@@ -443,6 +515,7 @@ constexpr unsigned char kWhitePng[] = {
 void testTextureFromMemory() {
   using xpbd::gfx::TextureDecodeLimits;
   using xpbd::gfx::TextureImage;
+  using xpbd::gfx::TextureImageHeader;
   using xpbd::gfx::checkedTextureRgbaByteCount;
   using xpbd::gfx::kTextureDecodeMaximumPixels;
 
@@ -454,6 +527,13 @@ void testTextureFromMemory() {
   expect(img.valid(), "texture valid after load");
   expect(img.width == 1 && img.height == 1, "texture size 1x1");
   expect(img.source_channels == 3, "source RGB channel count retained");
+  TextureImageHeader inspected_header;
+  expect(xpbd::gfx::inspectTextureImageFromMemory(
+             kWhitePng, static_cast<int>(sizeof(kWhitePng)),
+             inspected_header, &err) &&
+             inspected_header.width == 1 && inspected_header.height == 1 &&
+             inspected_header.source_channels == 3,
+         "texture header inspection validates without decoding pixels");
   if (img.valid()) {
     float r = 0, g = 0, b = 0, a = 0;
     img.sample(0.5f, 0.5f, r, g, b, a);
@@ -506,6 +586,13 @@ void testTextureFromMemory() {
   const std::array<unsigned char, 12> damaged_png{
       0x89u, 0x50u, 0x4eu, 0x47u, 0x0du, 0x0au,
       0x1au, 0x0au, 0x00u, 0x00u, 0x00u, 0x0du};
+  inspected_header = {7, 9, 4};
+  expect(!xpbd::gfx::inspectTextureImageFromMemory(
+             damaged_png.data(), static_cast<int>(damaged_png.size()),
+             inspected_header, &err) &&
+             inspected_header.width == 7 && inspected_header.height == 9 &&
+             inspected_header.source_channels == 4,
+         "failed texture header inspection preserves its output");
   expect(!xpbd::gfx::loadTextureImageFromMemory(
              damaged_png.data(), static_cast<int>(damaged_png.size()),
              preserved, &err) &&
@@ -561,6 +648,670 @@ void testTextureFromMemory() {
              err.find("peak byte arithmetic overflow") != std::string::npos &&
              outputWasPreserved(),
          "texture peak-budget addition rejects size_t overflow");
+}
+
+void testSyntheticLargeUvFixtureAndMemoryBaseline() {
+  using xpbd::gfx::LabPbrMemoryEstimate;
+  using xpbd::gfx::LabPbrMemoryEstimateRequest;
+  using xpbd::gfx::ResolvedMaterialTexel;
+  using xpbd::gfx::buildAuthoredResolvedMaterial;
+  using xpbd::gfx::estimateLabPbrMemory;
+  using xpbd::gfx::kLabPbrDefaultPeakBudgetBytes;
+  using xpbd::gfx::kLabPbrResolvedTexelBytesPerPixel;
+  using xpbd::gfx::preflightLabPbrMemory;
+  using xpbd::test_support::SyntheticLabPbrSuitePaths;
+  using xpbd::test_support::SyntheticLargeUvFixture;
+  using xpbd::test_support::buildSyntheticLargeUvFixture;
+  using xpbd::test_support::fixtureTexel;
+  using xpbd::test_support::writeSyntheticLabPbrSuite;
+
+  SyntheticLargeUvFixture fixture;
+  std::string error;
+  expect(buildSyntheticLargeUvFixture(fixture, &error) && error.empty(),
+         "runtime synthetic large-UV fixture builds");
+  expect(fixture.base.valid() && fixture.normal.valid() &&
+             fixture.specular.valid() &&
+             fixture.base.width == SyntheticLargeUvFixture::kAtlasWidth &&
+             fixture.base.height == SyntheticLargeUvFixture::kAtlasHeight,
+         "synthetic Base Normal and Specular atlases share 256x256 extent");
+  expect(fixture.large_uv_geometry.description.texture_width == 16 &&
+             fixture.large_uv_geometry.description.texture_height == 16 &&
+             fixture.large_uv_geometry.bones.size() == 3u &&
+             fixture.large_uv_geometry.bones[1].name == "eye_left" &&
+             fixture.large_uv_geometry.bones[2].name == "eye_right",
+         "synthetic eye model declares 16x16 and authors distinct large UVs");
+
+  const auto body = fixtureTexel(fixture.base, fixture.body_texel);
+  const auto left = fixtureTexel(fixture.base, fixture.left_eye_texel);
+  const auto right = fixtureTexel(fixture.base, fixture.right_eye_texel);
+  const auto repeat_trap =
+      fixtureTexel(fixture.base, fixture.repeat_trap_texel);
+  expect(body == std::array<std::uint8_t, 4>{220u, 40u, 20u, 255u} &&
+             left ==
+                 std::array<std::uint8_t, 4>{20u, 220u, 40u, 255u} &&
+             right ==
+                 std::array<std::uint8_t, 4>{20u, 40u, 220u, 255u} &&
+             repeat_trap[3] == 0u,
+         "synthetic body and eyes are distinct while Repeat trap is transparent");
+  expect(fixtureTexel(fixture.normal, fixture.left_eye_texel) !=
+                 fixtureTexel(fixture.normal, fixture.right_eye_texel) &&
+             fixtureTexel(fixture.specular, fixture.left_eye_texel) !=
+                 fixtureTexel(fixture.specular, fixture.right_eye_texel),
+         "synthetic eye Normal and Specular texels have distinct sentinels");
+  expect(fixture.high_resolution_geometry.bones.size() == 1u &&
+             fixture.out_of_bounds_geometry.bones.size() == 1u &&
+             fixture.uv_cases.size() >= 7u,
+         "fixture includes high-resolution protection, out-of-bounds, and special UV cases");
+
+  const auto nonce =
+      std::chrono::steady_clock::now().time_since_epoch().count();
+  const std::filesystem::path suite_directory =
+      std::filesystem::temp_directory_path() /
+      std::filesystem::path(L"xpbd测试_希尔达_材质") /
+      std::to_string(nonce);
+  SyntheticLabPbrSuitePaths paths;
+  expect(writeSyntheticLabPbrSuite(fixture, suite_directory,
+                                   std::filesystem::path(L"默认材质.png"),
+                                   paths, &error) &&
+             error.empty(),
+         "runtime fixture writes Unicode Base Normal Specular and properties");
+  std::error_code filesystem_error;
+  expect(std::filesystem::is_regular_file(paths.base, filesystem_error) &&
+             std::filesystem::file_size(paths.base, filesystem_error) > 0u &&
+             std::filesystem::is_regular_file(paths.normal,
+                                              filesystem_error) &&
+             std::filesystem::is_regular_file(paths.specular,
+                                              filesystem_error) &&
+             std::filesystem::is_regular_file(paths.properties,
+                                              filesystem_error),
+         "synthetic Unicode suite consists only of runtime-generated files");
+  std::filesystem::remove_all(
+      suite_directory.parent_path(), filesystem_error);
+  expect(!filesystem_error, "remove runtime synthetic Unicode suite");
+
+  for (const std::uint64_t side : {1'024u, 2'048u, 4'096u}) {
+    const std::uint64_t pixels = side * side;
+    const std::uint64_t rgba_bytes = pixels * 4u;
+    LabPbrMemoryEstimateRequest legacy_request;
+    legacy_request.width = side;
+    legacy_request.height = side;
+    legacy_request.resident_rgba_image_count = 3u;
+    legacy_request.candidate_rgba_image_count = 3u;
+    legacy_request.resolved_texel_bytes_per_pixel =
+        sizeof(ResolvedMaterialTexel);
+    legacy_request.encoded_snapshot_bytes = rgba_bytes * 3u;
+    legacy_request.decoder_peak_bytes = rgba_bytes;
+    legacy_request.coverage_peak_bytes =
+        pixels * sizeof(std::uint32_t);
+    legacy_request.cache_bytes = rgba_bytes * 3u;
+    LabPbrMemoryEstimate legacy_estimate;
+    LabPbrMemoryEstimate compact_estimate;
+    auto compact_request = legacy_request;
+    compact_request.resolved_texel_bytes_per_pixel =
+        kLabPbrResolvedTexelBytesPerPixel;
+    expect(estimateLabPbrMemory(legacy_request, legacy_estimate, &error) &&
+               estimateLabPbrMemory(compact_request, compact_estimate,
+                                    &error) &&
+               legacy_estimate.resident_bytes ==
+                   rgba_bytes * 3u +
+                       pixels * sizeof(ResolvedMaterialTexel) &&
+               compact_estimate.resident_bytes == rgba_bytes * 3u &&
+               legacy_estimate.resident_bytes -
+                       compact_estimate.resident_bytes ==
+                   pixels * sizeof(ResolvedMaterialTexel) &&
+               compact_estimate.coverage_peak_bytes ==
+                   pixels * sizeof(std::uint32_t) &&
+               compact_estimate.cache_bytes == rgba_bytes * 3u &&
+               compact_estimate.peak_bytes ==
+                   compact_estimate.resident_bytes + rgba_bytes * 10u +
+                       compact_estimate.coverage_peak_bytes,
+           "checked compact LabPBR estimate removes all resolved texel bytes");
+    std::printf(
+        "memory-compact: side=%llu resolved-texel-size=%llu legacy-resident=%llu "
+        "resident=%llu peak=%llu coverage-peak=%llu cache=%llu\n",
+        static_cast<unsigned long long>(side),
+        static_cast<unsigned long long>(sizeof(ResolvedMaterialTexel)),
+        static_cast<unsigned long long>(legacy_estimate.resident_bytes),
+        static_cast<unsigned long long>(compact_estimate.resident_bytes),
+        static_cast<unsigned long long>(compact_estimate.peak_bytes),
+        static_cast<unsigned long long>(compact_estimate.coverage_peak_bytes),
+        static_cast<unsigned long long>(compact_estimate.cache_bytes));
+  }
+
+  const LabPbrMemoryEstimate preserved{11u, 22u, 33u, 44u};
+  LabPbrMemoryEstimate overflow_output = preserved;
+  LabPbrMemoryEstimateRequest overflow_request;
+  overflow_request.width =
+      (std::numeric_limits<std::uint64_t>::max)();
+  overflow_request.height = 2u;
+  expect(!estimateLabPbrMemory(overflow_request, overflow_output, &error) &&
+             error.find("overflow") != std::string::npos &&
+             overflow_output == preserved,
+         "LabPBR estimate rejects overflow without changing output");
+
+  LabPbrMemoryEstimateRequest eight_k_request;
+  eight_k_request.width = 8'192u;
+  eight_k_request.height = 8'192u;
+  eight_k_request.resident_rgba_image_count = 3u;
+  eight_k_request.candidate_rgba_image_count = 3u;
+  eight_k_request.resolved_texel_bytes_per_pixel =
+      kLabPbrResolvedTexelBytesPerPixel;
+  eight_k_request.encoded_snapshot_bytes = 3u * 8'192u * 8'192u * 4u;
+  eight_k_request.decoder_peak_bytes = 8'192u * 8'192u * 4u;
+  eight_k_request.coverage_peak_bytes = 8'192u * 8'192u * 4u;
+  eight_k_request.candidate_fixed_bytes = 8'192u * 8'192u * 4u;
+  eight_k_request.cache_bytes = 3u * 8'192u * 8'192u * 4u;
+  LabPbrMemoryEstimate eight_k_output = preserved;
+  expect(!preflightLabPbrMemory(eight_k_request,
+                                kLabPbrDefaultPeakBudgetBytes,
+                                eight_k_output, &error) &&
+             error.find("budget preflight") != std::string::npos &&
+             eight_k_output == preserved,
+         "8K LabPBR budget rejects by arithmetic without allocating images");
+
+  const int stress_side = labPbrStressSide();
+  const std::size_t stress_bytes =
+      static_cast<std::size_t>(stress_side) *
+      static_cast<std::size_t>(stress_side) * 4u;
+  xpbd::gfx::TextureImage stress_base;
+  stress_base.width = stress_side;
+  stress_base.height = stress_side;
+  stress_base.source_channels = 4;
+  stress_base.rgba.assign(stress_bytes, 192u);
+  xpbd::gfx::TextureImage stress_normal = stress_base;
+  stress_normal.rgba.assign(stress_bytes, 128u);
+  xpbd::gfx::TextureImage stress_specular = stress_base;
+  stress_specular.rgba.assign(stress_bytes, 64u);
+  const auto stress_base_asset =
+      std::make_shared<const xpbd::gfx::TextureImage>(std::move(stress_base));
+  const auto stress_normal_asset =
+      std::make_shared<const xpbd::gfx::TextureImage>(std::move(stress_normal));
+  const auto stress_specular_asset =
+      std::make_shared<const xpbd::gfx::TextureImage>(
+          std::move(stress_specular));
+  xpbd::gfx::ResolvedMaterialTable stress_material;
+  expect(buildAuthoredResolvedMaterial(
+             stress_base_asset, {}, stress_normal_asset, stress_specular_asset,
+             stress_material, &error) &&
+             stress_material.valid() &&
+             stress_material.baseImageAsset() == stress_base_asset &&
+             stress_material.normalImageAsset() == stress_normal_asset &&
+             stress_material.specularImageAsset() == stress_specular_asset &&
+             stress_material.base_image.rgba.size() == stress_bytes &&
+             stress_material.normal_image.rgba.size() == stress_bytes &&
+             stress_material.specular_image.rgba.size() == stress_bytes &&
+             kLabPbrResolvedTexelBytesPerPixel == 0u,
+         "runtime compact material stress retains three shared RGBA images and zero resolved texel bytes");
+
+  const auto make_source_file = [](const char *name,
+                                   std::uint8_t sentinel) {
+    xpbd::gfx::LabPbrSourceFile source;
+    source.path = std::filesystem::path(name);
+    source.present = true;
+    source.original_bytes =
+        std::make_shared<const std::vector<std::uint8_t>>(
+            std::vector<std::uint8_t>{sentinel});
+    source.size = source.original_bytes->size();
+    source.sha256 = std::string(64u, "0123456789abcdef"[sentinel & 0x0fu]);
+    return source;
+  };
+  xpbd::gfx::ImportedLabPbrSuite stress_suite;
+  stress_suite.base_image = stress_base_asset;
+  stress_suite.material = stress_material;
+  stress_suite.source.base = make_source_file("stress.png", 1u);
+  stress_suite.source.specular = make_source_file("stress_s.png", 2u);
+  stress_suite.source.normal = make_source_file("stress_n.png", 3u);
+  stress_suite.source.confirmed_labpbr13_without_properties = true;
+  stress_suite.source.cache_key =
+      "runtime-labpbr-stress-" + std::to_string(stress_side);
+  xpbd::gfx::LabPbrSuiteImportCache stress_cache;
+  xpbd::gfx::ImportedLabPbrSuite cached_stress;
+  expect(stress_suite.valid() && stress_cache.store(stress_suite) &&
+             stress_cache.residentBytes() <= stress_cache.maximumBytes() &&
+             stress_cache.find(stress_suite.source.cache_key, cached_stress) &&
+             cached_stress.base_image == stress_base_asset &&
+             cached_stress.material.baseImageAsset() == stress_base_asset &&
+             cached_stress.material.normalImageAsset() == stress_normal_asset &&
+             cached_stress.material.specularImageAsset() ==
+                 stress_specular_asset &&
+             cached_stress.source.normal.original_bytes ==
+                 stress_suite.source.normal.original_bytes,
+         "runtime shared material fits the byte-bounded cache without image or Iris snapshot copies");
+  std::printf(
+      "labpbr-material-cache-stress: side=%d image-bytes=%zu cache-bytes=%llu "
+      "cache-budget=%llu\n",
+      stress_side, stress_bytes,
+      static_cast<unsigned long long>(stress_cache.residentBytes()),
+      static_cast<unsigned long long>(stress_cache.maximumBytes()));
+}
+
+void testBedrockUvDomainResolution() {
+  using xpbd::gfx::BedrockUvFace;
+  using xpbd::gfx::ResolvedFaceUv;
+  using xpbd::gfx::ResolvedUvDomain;
+  using xpbd::gfx::UvBounds;
+  using xpbd::gfx::UvDomainKind;
+  using xpbd::gfx::bedrockFaceUvCorners;
+  using xpbd::gfx::resolveBedrockFaceUv;
+  using xpbd::gfx::resolveGeometryUvDomain;
+  using xpbd::gfx::resolveUvDomain;
+  using xpbd::gfx::scanGeometryUvBounds;
+  using xpbd::loader::ModelLoader;
+  using xpbd::test_support::SyntheticLargeUvFixture;
+  using xpbd::test_support::buildSyntheticLargeUvFixture;
+
+  SyntheticLargeUvFixture fixture;
+  std::string error;
+  expect(buildSyntheticLargeUvFixture(fixture, &error),
+         "UV Domain table uses the shared synthetic fixture");
+
+  UvBounds large_bounds;
+  ResolvedUvDomain large_domain;
+  expect(scanGeometryUvBounds(fixture.large_uv_geometry, large_bounds,
+                              &error) &&
+             large_bounds.face_count == 3u && large_bounds.min_u == 0.0 &&
+             large_bounds.min_v == 0.0 && large_bounds.max_u == 224.0 &&
+             large_bounds.max_v == 16.0 &&
+             resolveUvDomain(fixture.large_uv_geometry.description,
+                             large_bounds, 256, 256, large_domain, &error) &&
+             large_domain.kind == UvDomainKind::Recovered &&
+             large_domain.width == 256.0 &&
+             large_domain.height == 256.0,
+         "large eye UV bounds recover to the imported 256x256 atlas");
+
+  ResolvedUvDomain protected_domain;
+  expect(resolveGeometryUvDomain(fixture.high_resolution_geometry, 256, 256,
+                                 protected_domain, &error) &&
+             protected_domain.kind == UvDomainKind::Declared &&
+             protected_domain.width == 16.0 &&
+             protected_domain.height == 16.0,
+         "high-resolution texture keeps reliable 16x16 declared UV domain");
+
+  xpbd::loader::GeometryDescription no_declaration;
+  ResolvedUvDomain imported_domain;
+  expect(resolveUvDomain(no_declaration, protected_domain.bounds, 256, 256,
+                         imported_domain, &error) &&
+             imported_domain.kind == UvDomainKind::ImportedTexture &&
+             imported_domain.width == 256.0,
+         "missing declaration resolves against imported texture dimensions");
+  auto width_only = no_declaration;
+  width_only.texture_width = 16;
+  width_only.has_texture_width = true;
+  auto height_only = no_declaration;
+  height_only.texture_height = 16;
+  height_only.has_texture_height = true;
+  ResolvedUvDomain width_only_domain;
+  ResolvedUvDomain height_only_domain;
+  expect(resolveUvDomain(width_only, protected_domain.bounds, 256, 256,
+                         width_only_domain, &error) &&
+             resolveUvDomain(height_only, protected_domain.bounds, 256, 256,
+                             height_only_domain, &error) &&
+             width_only_domain.kind == UvDomainKind::ImportedTexture &&
+             height_only_domain.kind == UvDomainKind::ImportedTexture &&
+             !width_only_domain.declaration_reliable &&
+             !height_only_domain.declaration_reliable,
+         "one-axis declarations remain recorded but are not reliable domains");
+
+  ResolvedUvDomain preserved_domain;
+  preserved_domain.kind = UvDomainKind::Declared;
+  preserved_domain.width = 7.0;
+  preserved_domain.height = 9.0;
+  preserved_domain.imported_width = 7;
+  preserved_domain.imported_height = 9;
+  const ResolvedUvDomain domain_before_failure = preserved_domain;
+  expect(!resolveGeometryUvDomain(fixture.out_of_bounds_geometry, 256, 256,
+                                  preserved_domain, &error) &&
+             error.find("exceed") != std::string::npos &&
+             preserved_domain == domain_before_failure,
+         "UV outside declared and imported domains is rejected transactionally");
+
+  bool all_special_cases_match = true;
+  for (const auto &test_case : fixture.uv_cases) {
+    UvBounds bounds{1.0, 2.0, 3.0, 4.0, 5u};
+    const UvBounds bounds_before = bounds;
+    error.clear();
+    const bool scanned =
+        scanGeometryUvBounds(test_case.geometry, bounds, &error);
+    if (test_case.name == "non_finite") {
+      all_special_cases_match &= !scanned && bounds == bounds_before &&
+                                 error.find("non-finite") !=
+                                     std::string::npos;
+      continue;
+    }
+    all_special_cases_match &= scanned && !bounds.empty();
+    ResolvedUvDomain domain = domain_before_failure;
+    error.clear();
+    const bool resolved =
+        scanned && resolveUvDomain(test_case.geometry.description, bounds,
+                                   test_case.imported_width,
+                                   test_case.imported_height, domain, &error);
+    all_special_cases_match &=
+        resolved == test_case.expected_domain_success;
+    if (!resolved) {
+      all_special_cases_match &= domain == domain_before_failure;
+    }
+  }
+  expect(all_special_cases_match,
+         "Box Per-Face mirror rotation negative-size Up/Down precision and invalid UV table matches");
+
+  const auto find_case = [&](std::string_view name)
+      -> const xpbd::test_support::SyntheticUvCase * {
+    const auto found = std::find_if(
+        fixture.uv_cases.begin(), fixture.uv_cases.end(),
+        [&](const auto &test_case) { return test_case.name == name; });
+    return found == fixture.uv_cases.end() ? nullptr : &*found;
+  };
+  const auto *rotation_case = find_case("per_face_rotation");
+  const auto *negative_case = find_case("negative_uv_size");
+  const auto *up_down_case = find_case("up_down_corners");
+  ResolvedFaceUv rotation_face;
+  ResolvedFaceUv negative_face;
+  ResolvedFaceUv up_face;
+  const bool exact_faces =
+      rotation_case != nullptr && negative_case != nullptr &&
+      up_down_case != nullptr &&
+      resolveBedrockFaceUv(rotation_case->geometry.bones[0].cubes[0],
+                           BedrockUvFace::North, rotation_face, &error) &&
+      resolveBedrockFaceUv(negative_case->geometry.bones[0].cubes[0],
+                           BedrockUvFace::North, negative_face, &error) &&
+      resolveBedrockFaceUv(up_down_case->geometry.bones[0].cubes[0],
+                           BedrockUvFace::Up, up_face, &error);
+  const auto rotation_corners = bedrockFaceUvCorners(rotation_face);
+  expect(exact_faces && rotation_face.rotation_quarter_turns == 1 &&
+             rotation_corners[0] == std::array<double, 2>{32.0, 24.0} &&
+             negative_face.u0 == 64.0 && negative_face.u1 == 48.0 &&
+             up_face.u0 == 104.0 && up_face.v0 == 36.0 &&
+             up_face.u1 == 96.0 && up_face.v1 == 32.0,
+         "double Face UV parser preserves rotation negative size and opposite Up corner exactly");
+
+  const auto geometry_json = [](std::string_view description_members) {
+    return std::string(
+               R"({"minecraft:geometry":[{"description":{"identifier":"geometry.uv_test")") +
+           (description_members.empty()
+                ? std::string{}
+                : std::string(",") + std::string(description_members)) +
+           R"(},"bones":[{"name":"root","pivot":[0,0,0],"cubes":[]}]}]})";
+  };
+  const auto full_declaration = ModelLoader::loadFromString(
+      geometry_json(R"("texture_width":16,"texture_height":32)"));
+  const auto parsed_width_only = ModelLoader::loadFromString(
+      geometry_json(R"("texture_width":16)"));
+  const auto parsed_height_only = ModelLoader::loadFromString(
+      geometry_json(R"("texture_height":32)"));
+  expect(full_declaration.description.hasCompleteTextureSize() &&
+             full_declaration.description.texture_width == 16 &&
+             full_declaration.description.texture_height == 32 &&
+             parsed_width_only.description.has_texture_width &&
+             !parsed_width_only.description.has_texture_height &&
+             !parsed_width_only.description.hasCompleteTextureSize() &&
+             !parsed_height_only.description.has_texture_width &&
+             parsed_height_only.description.has_texture_height,
+         "loader records width and height declaration presence independently");
+
+  bool invalid_declarations_rejected = true;
+  const std::array<std::string_view, 6> invalid_declarations{
+      R"("texture_width":0)",
+      R"("texture_width":-1)",
+      R"("texture_width":16.5)",
+      R"("texture_width":16385)",
+      R"("texture_width":"16")",
+      R"("texture_height":null)",
+  };
+  for (const std::string_view declaration : invalid_declarations) {
+    try {
+      (void)ModelLoader::loadFromString(geometry_json(declaration));
+      invalid_declarations_rejected = false;
+    } catch (const std::exception &) {
+    }
+  }
+  expect(invalid_declarations_rejected,
+         "loader rejects non-positive fractional oversized and nonnumeric texture declarations");
+  const auto maximum_declaration = ModelLoader::loadFromString(
+      geometry_json(
+          R"("texture_width":16384,"texture_height":16384)"));
+  expect(maximum_declaration.description.hasCompleteTextureSize() &&
+             maximum_declaration.description.texture_width == 16'384 &&
+             maximum_declaration.description.texture_height == 16'384,
+         "loader accepts the 16384 precision boundary exactly");
+}
+
+void testResolvedUvDomainMaterialConsumers() {
+  using xpbd::gfx::LabPbrUvCoverage;
+  using xpbd::gfx::ResolvedMaterialTable;
+  using xpbd::gfx::StaticIndexedModelMesh;
+  using xpbd::gfx::StaticModelFace;
+  using xpbd::gfx::StaticModelMaterialClass;
+  using xpbd::gfx::TextureImage;
+  using xpbd::gfx::UvDomainKind;
+  using xpbd::gfx::ViewportGpuScene;
+  using xpbd::gfx::ViewportMeshBuilder;
+  using xpbd::test_support::SyntheticLargeUvFixture;
+  using xpbd::test_support::buildSyntheticLargeUvFixture;
+  using xpbd::test_support::fixtureTexel;
+
+  SyntheticLargeUvFixture fixture;
+  std::string error;
+  expect(buildSyntheticLargeUvFixture(fixture, &error),
+         "material consumers use the shared large-UV fixture");
+
+  ViewportMeshBuilder builder;
+  builder.setGeometry(&fixture.large_uv_geometry);
+  builder.setTexture(&fixture.base);
+  StaticIndexedModelMesh mesh;
+  builder.buildStaticIndexedModel(mesh);
+  expect(mesh.uv_domain.valid() &&
+             mesh.uv_domain.kind == UvDomainKind::Recovered &&
+             mesh.uv_domain.width == 256.0 &&
+             mesh.uv_domain.height == 256.0,
+         "static mesh owns the recovered imported-atlas Domain");
+
+  const auto face_uv_range = [&](std::string_view group, double &raw_min,
+                                 double &raw_max, double &normalized_min,
+                                 double &normalized_max) {
+    bool found = false;
+    raw_min = normalized_min =
+        (std::numeric_limits<double>::max)();
+    raw_max = normalized_max =
+        (std::numeric_limits<double>::lowest)();
+    for (const auto &face : mesh.faces) {
+      if (face.bone_index >= mesh.bone_names.size() ||
+          mesh.bone_names[face.bone_index] != group) {
+        continue;
+      }
+      for (std::uint32_t local = 0; local < face.vertex_count; ++local) {
+        const auto &vertex = mesh.vertices[face.first_vertex + local];
+        raw_min = std::min(raw_min, vertex.raw_u);
+        raw_max = std::max(raw_max, vertex.raw_u);
+        normalized_min =
+            std::min(normalized_min, static_cast<double>(vertex.u));
+        normalized_max =
+            std::max(normalized_max, static_cast<double>(vertex.u));
+        found = true;
+      }
+    }
+    return found;
+  };
+  double left_raw_min = 0.0, left_raw_max = 0.0, left_min = 0.0,
+         left_max = 0.0;
+  double right_raw_min = 0.0, right_raw_max = 0.0, right_min = 0.0,
+         right_max = 0.0;
+  expect(face_uv_range("eye_left", left_raw_min, left_raw_max, left_min,
+                       left_max) &&
+             face_uv_range("eye_right", right_raw_min, right_raw_max,
+                           right_min, right_max) &&
+             left_raw_min == 192.0 && left_raw_max == 208.0 &&
+             right_raw_min == 208.0 && right_raw_max == 224.0,
+         "static mesh preserves exact double raw UVs for both eyes");
+  expectNear(static_cast<float>(left_min), 192.0f / 256.0f, 1.0e-7f,
+             "left eye normalizes through recovered Domain");
+  expectNear(static_cast<float>(left_max), 208.0f / 256.0f, 1.0e-7f,
+             "left eye normalized maximum remains in its atlas cell");
+  expectNear(static_cast<float>(right_min), 208.0f / 256.0f, 1.0e-7f,
+             "right eye normalizes through recovered Domain");
+  expectNear(static_cast<float>(right_max), 224.0f / 256.0f, 1.0e-7f,
+             "right eye normalized maximum remains in its atlas cell");
+
+  LabPbrUvCoverage coverage;
+  expect(xpbd::gfx::rasterizeLabPbrUvCoverage(
+             mesh, fixture.base.width, fixture.base.height, coverage,
+             &error) &&
+             error.empty(),
+         "Coverage accepts the mesh-owned Domain and imported atlas extent");
+  const auto contains_fixture_texel = [&](std::string_view group,
+                                          const std::array<int, 2> &pixel) {
+    const auto index = static_cast<std::uint32_t>(
+        pixel[1] * fixture.base.width + pixel[0]);
+    return coverageContains(coverage, group, index);
+  };
+  expect(contains_fixture_texel("eye_left", fixture.left_eye_texel) &&
+             contains_fixture_texel("eye_right", fixture.right_eye_texel) &&
+             !contains_fixture_texel("eye_left", fixture.repeat_trap_texel),
+         "Coverage aligns both eye groups and excludes the Repeat trap");
+  LabPbrUvCoverage preserved_coverage{
+      7, 9, {{"keep", {{0u, 3u, 3u}}}}};
+  const auto coverage_before_failure = preserved_coverage;
+  expect(!xpbd::gfx::rasterizeLabPbrUvCoverage(
+             mesh, fixture.base.width - 1, fixture.base.height,
+             preserved_coverage, &error) &&
+             error.find("match") != std::string::npos &&
+             preserved_coverage.width == coverage_before_failure.width &&
+             preserved_coverage.height == coverage_before_failure.height &&
+             preserved_coverage.group_runs ==
+                 coverage_before_failure.group_runs,
+         "Coverage mismatch rejects without replacing the caller candidate");
+
+  builder.setShowGround(false);
+  builder.setShowBones(false);
+  ViewportGpuScene dynamic_scene;
+  builder.buildRest(dynamic_scene);
+  bool saw_left_green = false;
+  bool saw_right_blue = false;
+  for (const auto &vertex : dynamic_scene.solid) {
+    saw_left_green |= vertex.g > 0.75f && vertex.r < 0.2f && vertex.b < 0.3f;
+    saw_right_blue |= vertex.b > 0.75f && vertex.r < 0.2f && vertex.g < 0.3f;
+  }
+  expect(saw_left_green && saw_right_blue && dynamic_scene.transparent.empty(),
+         "dynamic preview keeps both opaque eye cells visible without Repeat");
+
+  ViewportMeshBuilder protected_builder;
+  protected_builder.setGeometry(&fixture.high_resolution_geometry);
+  protected_builder.setTexture(&fixture.base);
+  StaticIndexedModelMesh protected_mesh;
+  protected_builder.buildStaticIndexedModel(protected_mesh);
+  expect(protected_mesh.uv_domain.kind == UvDomainKind::Declared &&
+             protected_mesh.uv_domain.width == 16.0 &&
+             protected_mesh.uv_domain.imported_width == 256,
+         "high-resolution atlas preserves the reliable declared Domain");
+
+  ViewportMeshBuilder rejected_builder;
+  rejected_builder.setGeometry(&fixture.out_of_bounds_geometry);
+  rejected_builder.setTexture(&fixture.base);
+  StaticIndexedModelMesh rejected_mesh;
+  rejected_mesh.bone_names = {"preserved only until candidate clear"};
+  bool rejected = false;
+  try {
+    rejected_builder.buildStaticIndexedModel(rejected_mesh);
+  } catch (const std::invalid_argument &exception) {
+    rejected = std::string_view(exception.what()).find("exceed") !=
+               std::string_view::npos;
+  }
+  expect(rejected && rejected_mesh.vertices.empty() &&
+             rejected_mesh.faces.empty() && !rejected_mesh.uv_domain.valid(),
+         "true out-of-domain UV fails before publishing a static mesh");
+
+  TextureImage edge_texture;
+  edge_texture.width = 2;
+  edge_texture.height = 1;
+  edge_texture.source_channels = 4;
+  edge_texture.rgba = {255u, 0u, 0u, 0u, 0u, 0u, 255u, 255u};
+  float r = 0.0f, g = 0.0f, b = 0.0f, a = 0.0f;
+  edge_texture.sampleModelAtlasClamp(-0.25, 0.5, r, g, b, a);
+  const bool left_clamped = r > 0.9f && b < 0.1f && a < 0.1f;
+  edge_texture.sampleModelAtlasClamp(1.25, 0.5, r, g, b, a);
+  const bool right_clamped = b > 0.9f && r < 0.1f && a > 0.9f;
+  edge_texture.sample(-0.25f, 0.5f, r, g, b, a);
+  expect(left_clamped && right_clamped && b > 0.9f,
+         "model atlas clamps at both edges while generic sampling stays Repeat");
+
+  StaticIndexedModelMesh alpha_mesh;
+  alpha_mesh.bone_names = {"edge"};
+  alpha_mesh.vertices.resize(4u);
+  for (auto &vertex : alpha_mesh.vertices) {
+    vertex.u = 1.25f;
+    vertex.v = 0.5f;
+  }
+  alpha_mesh.indices = {0u, 1u, 2u, 0u, 2u, 3u};
+  StaticModelFace alpha_face;
+  alpha_face.vertex_count = 4u;
+  alpha_face.index_count = 6u;
+  alpha_face.textured = true;
+  alpha_mesh.faces.push_back(alpha_face);
+  expect(xpbd::gfx::staticModelFaceMaterial(
+             alpha_mesh, alpha_mesh.faces.front(), &edge_texture) ==
+             StaticModelMaterialClass::Opaque,
+         "static Alpha classification clamps instead of wrapping to cutout");
+
+  ResolvedMaterialTable clamp_table;
+  clamp_table.width = 2;
+  clamp_table.height = 1;
+  xpbd::gfx::TextureImage clamp_base;
+  clamp_base.width = 2;
+  clamp_base.height = 1;
+  clamp_base.source_channels = 4;
+  clamp_base.rgba =
+      {255u, 255u, 255u, 64u, 255u, 255u, 255u, 191u};
+  clamp_table.setImageAssets(
+      std::make_shared<const xpbd::gfx::TextureImage>(std::move(clamp_base)));
+  expectNear(clamp_table.sample(-0.25f, 0.5f).opacity, 64.0f / 255.0f,
+              1.0e-6f,
+              "resolved material clamps the lower atlas edge");
+  expectNear(clamp_table.sample(1.25f, 0.5f).opacity, 191.0f / 255.0f,
+              1.0e-6f,
+              "resolved material clamps the upper atlas edge");
+
+  ResolvedMaterialTable resolved;
+  expect(xpbd::gfx::buildAuthoredResolvedMaterial(
+             fixture.base, ResolvedMaterialTable{}, &fixture.normal,
+             &fixture.specular, resolved, &error),
+         "Base Normal and Specular build one aligned resolved material");
+  const auto base_texel = fixtureTexel(fixture.base, fixture.left_eye_texel);
+  const auto normal_texel =
+      fixtureTexel(fixture.normal, fixture.left_eye_texel);
+  const auto specular_texel =
+      fixtureTexel(fixture.specular, fixture.left_eye_texel);
+  const auto expected = xpbd::gfx::decodeLabPbrTexel(
+      base_texel, &normal_texel, &specular_texel);
+  const auto &sampled = resolved.sample(
+      (static_cast<float>(fixture.left_eye_texel[0]) + 0.5f) /
+          static_cast<float>(fixture.base.width),
+      (static_cast<float>(fixture.left_eye_texel[1]) + 0.5f) /
+          static_cast<float>(fixture.base.height));
+  expect(sampled == expected,
+         "CPU material reference samples Base Normal Specular at one eye texel");
+
+  bool all_compact_samples_match = true;
+  for (int y = 0; y < fixture.base.height && all_compact_samples_match; ++y) {
+    for (int x = 0; x < fixture.base.width; ++x) {
+      const std::array<int, 2> coordinate{x, y};
+      const auto base_reference = fixtureTexel(fixture.base, coordinate);
+      const auto normal_reference = fixtureTexel(fixture.normal, coordinate);
+      const auto specular_reference =
+          fixtureTexel(fixture.specular, coordinate);
+      const auto reference = xpbd::gfx::decodeLabPbrTexel(
+          base_reference, &normal_reference, &specular_reference);
+      const auto compact = resolved.sample(
+          (static_cast<float>(x) + 0.5f) /
+              static_cast<float>(fixture.base.width),
+          (static_cast<float>(y) + 0.5f) /
+              static_cast<float>(fixture.base.height));
+      if (compact != reference) {
+        all_compact_samples_match = false;
+        break;
+      }
+    }
+  }
+  expect(all_compact_samples_match,
+         "compact on-demand material matches the legacy decoder at every small-fixture texel");
 }
 
 void testCc0PreviewSceneAssets() {
@@ -965,8 +1716,8 @@ void testLabPbrDiscoveryAndFallback() {
              (xpbd::gfx::kLabPbrNormalMapActive |
               xpbd::gfx::kLabPbrSpecularMapActive),
          "resolved GPU feature bits match active sidecars");
-  expectNear(material.texels[0].emission_strength, 0.0f, 1.0e-6f,
-             "RGB sidecar synthesized alpha does not emit");
+  expectNear(material.sample(0.5f, 0.5f).emission_strength, 0.0f, 1.0e-6f,
+              "RGB sidecar synthesized alpha does not emit");
 
   const std::string unsupported = "format=lab-pbr/1.2\n";
   expect(writeBytes(properties_path, unsupported.data(), unsupported.size()),
@@ -1066,14 +1817,42 @@ void testStrictLabPbrSuiteImport() {
          "folder discovery retains both stems without guessing");
 
   xpbd::gfx::LabPbrSuiteImportCache cache;
+  xpbd::gfx::LabPbrSuiteImportLimits predecode_limits;
+  predecode_limits.maximum_peak_bytes =
+      static_cast<std::uint64_t>(base_png.size() + specular_png.size() +
+                                 normal_png.size() +
+                                 properties_bytes.size() + 1u);
+  predecode_limits.copy_normal_to_iris_asset = true;
+  const auto predecode_rejected = xpbd::gfx::importLabPbrSuite(
+      base_path, false, &cache, predecode_limits);
+  expect(predecode_rejected.status == LabPbrSuiteImportStatus::Failed &&
+             predecode_rejected.error.find("budget preflight") !=
+                 std::string::npos &&
+             predecode_rejected.suite.base_image == nullptr &&
+             cache.size() == 0u,
+         "strict Suite rejects the final-model budget after Header and before pixel decode");
+
   auto imported =
       xpbd::gfx::importLabPbrSuite(base_path, false, &cache);
   expect(imported.imported() && !imported.suite.cache_hit,
          "strict complete LabPBR suite imports");
   expect(imported.suite.material.specular_map_active &&
              imported.suite.material.normal_map_active &&
-             imported.suite.material.format_declared,
-         "strict import activates RGBA sidecars and declaration");
+             imported.suite.material.format_declared &&
+             imported.suite.base_image ==
+                 imported.suite.material.baseImageAsset() &&
+             imported.suite.material.normalImageAsset() != nullptr &&
+             imported.suite.material.specularImageAsset() != nullptr,
+         "strict import activates sidecars and shares decoded image assets");
+  const auto imported_copy = imported.suite;
+  expect(imported_copy.base_image == imported.suite.base_image &&
+             imported_copy.material.baseImageAsset() ==
+                 imported.suite.material.baseImageAsset() &&
+             imported_copy.material.normalImageAsset() ==
+                 imported.suite.material.normalImageAsset() &&
+             imported_copy.material.specularImageAsset() ==
+                 imported.suite.material.specularImageAsset(),
+         "Imported Suite copies retain shared image identities");
   expect(imported.suite.source.base.valid() &&
              imported.suite.source.specular.valid() &&
              imported.suite.source.normal.valid() &&
@@ -1092,13 +1871,108 @@ void testStrictLabPbrSuiteImport() {
          "strict import never mutates source files");
 
   auto cached = xpbd::gfx::importLabPbrSuite(base_path, false, &cache);
-  expect(cached.imported() && cached.suite.cache_hit && cache.size() == 1u,
-         "same path and checksum reimport reuses cache");
+  expect(cached.imported() && cached.suite.cache_hit && cache.size() == 1u &&
+             cached.suite.base_image == imported.suite.base_image &&
+             cached.suite.material.normalImageAsset() ==
+                 imported.suite.material.normalImageAsset() &&
+             cached.suite.material.specularImageAsset() ==
+                 imported.suite.material.specularImageAsset(),
+         "same path and checksum reimport reuses shared cache assets");
   const auto unchanged =
       xpbd::gfx::checkLabPbrSuiteSourceChanges(cached.suite.source);
   expect(!unchanged.reloadRecommended() && !unchanged.metadata_changed &&
              unchanged.error.empty(),
          "unchanged strict source snapshot stays current");
+
+  const xpbd::gfx::TextureImage *excluded_images[] = {
+      imported.suite.base_image.get(),
+      imported.suite.material.normalImageAsset().get(),
+      imported.suite.material.specularImageAsset().get(),
+  };
+  const std::vector<std::uint8_t> *excluded_sources[] = {
+      imported.suite.source.base.original_bytes.get(),
+      imported.suite.source.normal.original_bytes.get(),
+      imported.suite.source.specular.original_bytes.get(),
+      imported.suite.source.properties.original_bytes.get(),
+  };
+  const auto full_cache_bytes = cache.residentBytes();
+  const auto metadata_only_cache_bytes =
+      cache.residentBytes(excluded_images, excluded_sources);
+  expect(cache.maximumBytes() ==
+             xpbd::gfx::kLabPbrDefaultImportCacheBudgetBytes &&
+             full_cache_bytes <= cache.maximumBytes() &&
+             metadata_only_cache_bytes < full_cache_bytes,
+         "cache byte accounting excludes Session-shared image and source identities");
+
+  const fs::path third_base = directory / "brick.png";
+  const fs::path third_specular = directory / "brick_s.png";
+  const fs::path fourth_base = directory / "grass.png";
+  const fs::path fourth_specular = directory / "grass_s.png";
+  expect(writeBytes(third_base, base_png) &&
+             writeBytes(third_specular, specular_png) &&
+             writeBytes(fourth_base, base_png) &&
+             writeBytes(fourth_specular, specular_png),
+         "write equal-charge LRU cache fixtures");
+
+  xpbd::gfx::LabPbrSuiteImportCache lru_cache;
+  auto lru_stone =
+      xpbd::gfx::importLabPbrSuite(second_base, false, &lru_cache);
+  auto lru_brick =
+      xpbd::gfx::importLabPbrSuite(third_base, false, &lru_cache);
+  const auto two_entry_budget = lru_cache.residentBytes();
+  lru_cache.setMaximumBytes(two_entry_budget);
+  xpbd::gfx::ImportedLabPbrSuite touched_stone;
+  expect(lru_stone.imported() && lru_brick.imported() &&
+             lru_cache.size() == 2u &&
+             lru_cache.find(lru_stone.suite.source.cache_key,
+                            touched_stone) &&
+             touched_stone.base_image == lru_stone.suite.base_image,
+         "cache Misses populate shared entries and find touches MRU identity");
+  auto lru_grass =
+      xpbd::gfx::importLabPbrSuite(fourth_base, false, &lru_cache);
+  xpbd::gfx::ImportedLabPbrSuite evicted_brick;
+  xpbd::gfx::ImportedLabPbrSuite retained_stone;
+  xpbd::gfx::ImportedLabPbrSuite retained_grass;
+  expect(lru_grass.imported() && lru_cache.size() == 2u &&
+             lru_cache.residentBytes() <= lru_cache.maximumBytes() &&
+             !lru_cache.find(lru_brick.suite.source.cache_key,
+                             evicted_brick) &&
+             lru_cache.find(lru_stone.suite.source.cache_key,
+                            retained_stone) &&
+             lru_cache.find(lru_grass.suite.source.cache_key,
+                            retained_grass) &&
+             retained_stone.base_image == lru_stone.suite.base_image &&
+             retained_grass.base_image == lru_grass.suite.base_image,
+         "LRU budget evicts the cold entry while retaining shared MRU assets");
+
+  xpbd::gfx::LabPbrSuiteImportCache one_entry_cache;
+  auto one_entry =
+      xpbd::gfx::importLabPbrSuite(second_base, false, &one_entry_cache);
+  const auto one_entry_bytes = one_entry_cache.residentBytes();
+  const auto oversize_budget =
+      one_entry_bytes > 0u ? one_entry_bytes - 1u : 0u;
+  xpbd::gfx::LabPbrSuiteImportCache oversize_cache(oversize_budget);
+  auto oversized =
+      xpbd::gfx::importLabPbrSuite(second_base, false, &oversize_cache);
+  expect(one_entry.imported() && one_entry_bytes > 0u &&
+             oversized.imported() && !oversized.suite.cache_hit &&
+             oversize_cache.size() == 0u &&
+             oversize_cache.residentBytes() == 0u,
+         "individually oversized Suite bypasses cache without failing import");
+
+  xpbd::gfx::LabPbrSuiteImportCache release_cache;
+  auto releasable =
+      xpbd::gfx::importLabPbrSuite(fourth_base, false, &release_cache);
+  std::weak_ptr<const xpbd::gfx::TextureImage> released_base =
+      releasable.suite.base_image;
+  releasable.suite = {};
+  expect(releasable.imported() == false && !released_base.expired() &&
+             release_cache.size() == 1u,
+         "cache owns the shared asset after the import result releases it");
+  release_cache.clear();
+  expect(released_base.expired() && release_cache.size() == 0u &&
+             release_cache.residentBytes() == 0u,
+         "cache Clear releases its final shared asset ownership");
 
   auto changed_specular_rgba = specular_rgba;
   changed_specular_rgba[0] = 127u;
@@ -1188,7 +2062,8 @@ void testStrictLabPbrSuiteImport() {
   const auto corrupt =
       xpbd::gfx::importLabPbrSuite(base_path, false, nullptr);
   expect(corrupt.status == LabPbrSuiteImportStatus::Failed &&
-             corrupt.error.find("decode failed") != std::string::npos,
+             corrupt.error.find("Specular Sidecar") != std::string::npos &&
+             corrupt.error.find("Header stage") != std::string::npos,
          "corrupt _s is rejected");
 
   const auto wrong_selection =
@@ -1202,6 +2077,10 @@ void testStrictLabPbrSuiteImport() {
 
 xpbd::gfx::StaticIndexedModelMesh makeOverlappingLabPbrMesh() {
   xpbd::gfx::StaticIndexedModelMesh mesh;
+  mesh.uv_domain.width = 2.0;
+  mesh.uv_domain.height = 2.0;
+  mesh.uv_domain.imported_width = 2;
+  mesh.uv_domain.imported_height = 2;
   mesh.bone_names = {"group_a", "group_b", "untextured"};
   const auto add_quad = [&mesh](std::uint32_t bone_index, bool mirrored,
                                 bool textured) {
@@ -1227,6 +2106,8 @@ xpbd::gfx::StaticIndexedModelMesh makeOverlappingLabPbrMesh() {
       auto &vertex = mesh.vertices[first_vertex + i];
       vertex.u = uvs[i][0];
       vertex.v = uvs[i][1];
+      vertex.raw_u = static_cast<double>(uvs[i][0]) * 2.0;
+      vertex.raw_v = static_cast<double>(uvs[i][1]) * 2.0;
       vertex.bone_index = bone_index;
     }
     mesh.indices.insert(mesh.indices.end(),
@@ -1248,6 +2129,32 @@ xpbd::gfx::StaticIndexedModelMesh makeOverlappingLabPbrMesh() {
   return mesh;
 }
 
+std::set<std::uint32_t> expandCoverageRuns(
+    const xpbd::gfx::LabPbrUvCoverage &coverage,
+    std::string_view group_name) {
+  std::set<std::uint32_t> texels;
+  const auto *runs = coverage.find(group_name);
+  if (runs == nullptr || coverage.width <= 0) {
+    return texels;
+  }
+  for (const xpbd::gfx::UvRun &run : *runs) {
+    for (std::uint32_t x = run.x0;; ++x) {
+      texels.insert(run.y * static_cast<std::uint32_t>(coverage.width) + x);
+      if (x == run.x1) {
+        break;
+      }
+    }
+  }
+  return texels;
+}
+
+bool coverageContains(const xpbd::gfx::LabPbrUvCoverage &coverage,
+                      std::string_view group_name,
+                      std::uint32_t texel) {
+  const auto expanded = expandCoverageRuns(coverage, group_name);
+  return expanded.contains(texel);
+}
+
 void testLabPbrAuthoringEncodingAndCoverage() {
   using xpbd::gfx::GroupLabPbrOverride;
   using xpbd::gfx::encodeLabPbrEmission;
@@ -1256,6 +2163,58 @@ void testLabPbrAuthoringEncodingAndCoverage() {
   using xpbd::gfx::encodeLabPbrSubsurface;
   using xpbd::gfx::validGroupLabPbrOverride;
   std::string validation_error;
+
+  const auto authoring_source =
+      readTestSource("src/gfx/labpbr_authoring.cpp");
+  expect(authoring_source.find("std::vector<std::uint8_t> marked") !=
+                 std::string::npos &&
+             authoring_source.find("std::vector<std::uint32_t> touched") !=
+                 std::string::npos &&
+             authoring_source.find("std::sort(touched.begin()") !=
+                 std::string::npos &&
+             authoring_source.find("std::set<std::uint32_t>") ==
+                 std::string::npos &&
+             authoring_source.find("std::unordered_set<std::uint32_t>") ==
+                 std::string::npos,
+         "production Coverage uses marked touched sort merge without texel Set nodes");
+  const auto texture_header =
+      readTestSource("include/xpbd/gfx/texture_image.hpp");
+  const auto import_header =
+      readTestSource("include/xpbd/gfx/labpbr_import.hpp");
+  const auto import_source =
+      readTestSource("src/gfx/labpbr_import.cpp");
+  const auto app_session_source =
+      readTestSource("src/app/app_session.cpp");
+  const auto early_cache_find =
+      import_source.find("cache->find(source.cache_key");
+  const auto first_pixel_decode =
+      import_source.find("TextureImage base;");
+  expect(texture_header.find(
+             "using SharedTextureImage = std::shared_ptr<const TextureImage>") !=
+                 std::string::npos &&
+             authoring_source.find(
+                 "imported.original_file_bytes = snapshot.bytes;") !=
+                 std::string::npos &&
+             app_session_source.find(
+                 "imported.suite.source.normal.original_bytes;") !=
+                 std::string::npos &&
+             app_session_source.find(
+                 "metadata.base.original_bytes.reset();") !=
+                 std::string::npos &&
+             import_header.find(
+                 "kLabPbrDefaultImportCacheBudgetBytes") !=
+                 std::string::npos &&
+             import_source.find(
+                 "entries_.splice(entries_.begin(), entries_,") !=
+                 std::string::npos &&
+             early_cache_find != std::string::npos &&
+             first_pixel_decode != std::string::npos &&
+             early_cache_find < first_pixel_decode &&
+             app_session_source.find(
+                 "base_path, confirm_missing_properties, "
+                 "&labpbr_import_cache_,") !=
+                 std::string::npos,
+         "shared-image Iris snapshot and byte-bounded LRU source contracts are explicit");
 
   expect(encodeLabPbrEmission(0.0f) == 0u,
          "LabPBR emission zero encodes to zero");
@@ -1293,11 +2252,12 @@ void testLabPbrAuthoringEncodingAndCoverage() {
   expect(validGroupLabPbrOverride(subsurface, &validation_error),
          "subsurface override validates as a unit interval");
   const auto sss_composition = xpbd::gfx::composeLabPbrSpecular(
-      1, 1, nullptr,
-      xpbd::gfx::LabPbrUvCoverage{1, 1, {{"sss", {0u}}}},
+      1, 1, xpbd::gfx::SharedTextureImage{},
+      xpbd::gfx::LabPbrUvCoverage{1, 1, {{"sss", {{0u, 0u, 0u}}}}},
       {{"sss", subsurface}});
   expect(sss_composition.exportable() &&
-             sss_composition.specular.rgba[2] == 160u,
+             sss_composition.specular != nullptr &&
+             sss_composition.specular->rgba[2] == 160u,
          "subsurface override writes the LabPBR SSS B range");
 
   GroupLabPbrOverride semantic;
@@ -1324,23 +2284,118 @@ void testLabPbrAuthoringEncodingAndCoverage() {
   expect(coverage.valid(), "LabPBR UV coverage dimensions are valid");
   const auto *group_a = coverage.find("group_a");
   const auto *group_b = coverage.find("group_b");
-  expect(group_a != nullptr && group_a->size() == 4u,
+  const std::set<std::uint32_t> reference_texels{0u, 1u, 2u, 3u};
+  expect(group_a != nullptr && coverage.texelCount("group_a") == 4u &&
+             expandCoverageRuns(coverage, "group_a") == reference_texels,
          "selected group rasterizes all covered atlas texels");
-  expect(group_b != nullptr && group_b->size() == 4u,
+  expect(group_b != nullptr && coverage.texelCount("group_b") == 4u &&
+             expandCoverageRuns(coverage, "group_b") == reference_texels,
          "mirrored group coverage deduplicates triangle texels");
   expect(coverage.find("untextured") == nullptr,
          "untextured faces do not enter LabPBR coverage");
+  xpbd::gfx::StaticIndexedModelMesh empty_mesh;
+  empty_mesh.uv_domain.width = 2.0;
+  empty_mesh.uv_domain.height = 2.0;
+  empty_mesh.uv_domain.imported_width = 2;
+  empty_mesh.uv_domain.imported_height = 2;
   const auto empty_coverage =
-      xpbd::gfx::rasterizeLabPbrUvCoverage(
-          xpbd::gfx::StaticIndexedModelMesh{}, 2, 2);
-  expect(empty_coverage.valid() && empty_coverage.group_texels.empty(),
+      xpbd::gfx::rasterizeLabPbrUvCoverage(empty_mesh, 2, 2);
+  expect(empty_coverage.valid() && empty_coverage.group_runs.empty(),
          "empty model produces valid empty LabPBR coverage");
+
+  auto stress_mesh = makeOverlappingLabPbrMesh();
+  stress_mesh.faces.resize(1u);
+  const auto stress_side =
+      static_cast<std::uint32_t>(labPbrStressSide());
+  stress_mesh.uv_domain.width = static_cast<double>(stress_side);
+  stress_mesh.uv_domain.height = static_cast<double>(stress_side);
+  stress_mesh.uv_domain.imported_width =
+      static_cast<int>(stress_side);
+  stress_mesh.uv_domain.imported_height =
+      static_cast<int>(stress_side);
+  for (std::size_t i = 0; i < 4u; ++i) {
+    stress_mesh.vertices[i].raw_u =
+        static_cast<double>(stress_mesh.vertices[i].u) * stress_side;
+    stress_mesh.vertices[i].raw_v =
+        static_cast<double>(stress_mesh.vertices[i].v) * stress_side;
+  }
+  const auto stress_coverage =
+      xpbd::gfx::rasterizeLabPbrUvCoverage(
+          stress_mesh, static_cast<int>(stress_side),
+          static_cast<int>(stress_side));
+  const auto *stress_runs = stress_coverage.find("group_a");
+  bool exact_stress_runs = stress_runs != nullptr &&
+                           stress_runs->size() == stress_side;
+  if (exact_stress_runs) {
+    for (std::uint32_t y = 0; y < stress_side; ++y) {
+      const auto &run = (*stress_runs)[y];
+      exact_stress_runs &=
+          run.y == y && run.x0 == 0u && run.x1 == stress_side - 1u;
+    }
+  }
+  expect(stress_coverage.valid() && exact_stress_runs &&
+             stress_coverage.texelCount("group_a") ==
+                 static_cast<std::uint64_t>(stress_side) * stress_side,
+         "runtime full-atlas Coverage compacts to one run per row");
+  std::printf("labpbr-coverage-stress: side=%u runs=%zu texels=%llu\n",
+              stress_side, stress_runs != nullptr ? stress_runs->size() : 0u,
+              static_cast<unsigned long long>(
+                  stress_coverage.texelCount("group_a")));
+
+  std::uint64_t eight_k_coverage_peak = 0u;
+  xpbd::gfx::LabPbrMemoryEstimateRequest eight_k_request;
+  eight_k_request.width = 8192u;
+  eight_k_request.height = 8192u;
+  xpbd::gfx::LabPbrMemoryEstimate preserved_estimate{11u, 22u, 33u, 44u};
+  auto rejected_estimate = preserved_estimate;
+  expect(xpbd::gfx::estimateLabPbrUvRunCoveragePeakBytes(
+             8192u, 8192u, eight_k_coverage_peak, &validation_error) &&
+             eight_k_coverage_peak == 8192u * 8192u * 17u,
+         "8K run Coverage peak uses checked arithmetic without allocation");
+  eight_k_request.coverage_peak_bytes = eight_k_coverage_peak;
+  expect(!xpbd::gfx::preflightLabPbrMemory(
+             eight_k_request, xpbd::gfx::kLabPbrDefaultPeakBudgetBytes,
+             rejected_estimate, &validation_error) &&
+             rejected_estimate == preserved_estimate,
+         "8K run Coverage rejects before allocation and preserves estimate output");
+
+  const auto lazy_default = xpbd::gfx::composeLabPbrSpecular(
+      2, 2, xpbd::gfx::SharedTextureImage{}, {}, {});
+  expect(lazy_default.exportable() &&
+             lazy_default.specular_materialization_deferred &&
+             lazy_default.deferred_width == 2 &&
+             lazy_default.deferred_height == 2 &&
+             lazy_default.specular == nullptr,
+         "no Override keeps default Specular and Coverage nonresident");
+  xpbd::gfx::TextureImage materialized_default;
+  expect(xpbd::gfx::materializeLabPbrSpecular(
+             2, 2, nullptr, materialized_default, &validation_error) &&
+             materialized_default.valid() &&
+             materialized_default.rgba[0] == 0u &&
+             materialized_default.rgba[1] == 10u,
+         "default Specular materializes transactionally only on demand");
+  const auto preserved_materialized = materialized_default;
+  xpbd::gfx::TextureImage mismatched_source;
+  mismatched_source.width = 1;
+  mismatched_source.height = 1;
+  mismatched_source.source_channels = 4;
+  mismatched_source.rgba = {0u, 10u, 0u, 0u};
+  expect(!xpbd::gfx::materializeLabPbrSpecular(
+             2, 2, &mismatched_source, materialized_default,
+             &validation_error) &&
+             materialized_default.width == preserved_materialized.width &&
+             materialized_default.height == preserved_materialized.height &&
+             materialized_default.source_channels ==
+                 preserved_materialized.source_channels &&
+             materialized_default.rgba == preserved_materialized.rgba,
+         "Composition materialization failure preserves caller output");
   GroupLabPbrOverride missing_group;
   missing_group.group_name = "missing";
   missing_group.emission_enabled = true;
   missing_group.emission = 1.0f;
   const auto empty_composition = xpbd::gfx::composeLabPbrSpecular(
-      2, 2, nullptr, empty_coverage, {{"missing", missing_group}});
+      2, 2, xpbd::gfx::SharedTextureImage{}, empty_coverage,
+      {{"missing", missing_group}});
   expect(empty_composition.exportable() &&
              empty_composition.warnings.size() == 1u,
          "selected group without textured UVs is a safe warned no-op");
@@ -1353,10 +2408,6 @@ void testLabPbrAuthoringEncodingAndCoverage() {
   xpbd::gfx::ResolvedMaterialTable fallback_source;
   fallback_source.width = 1;
   fallback_source.height = 1;
-  fallback_source.texels = {
-      xpbd::gfx::decodeLabPbrTexel(
-          std::array<std::uint8_t, 4>{255u, 255u, 255u, 255u},
-          nullptr, nullptr)};
   xpbd::gfx::ResolvedMaterialTable authored;
   expect(xpbd::gfx::buildAuthoredResolvedMaterial(
              base, fallback_source, nullptr, nullptr, authored,
@@ -1365,8 +2416,8 @@ void testLabPbrAuthoringEncodingAndCoverage() {
   expect(!authored.specular_map_active &&
              xpbd::gfx::labPbrFeatureFlags(&authored) == 0u,
          "no override preserves exact missing-specular feature state");
-  expectNear(authored.texels[0].dielectric_f0, 0.04f, 1.0e-6f,
-             "no override preserves exact dielectric fallback");
+  expectNear(authored.sample(0.5f, 0.5f).dielectric_f0, 0.04f, 1.0e-6f,
+              "no override preserves exact dielectric fallback");
   xpbd::gfx::TextureImage authored_specular;
   authored_specular.width = 1;
   authored_specular.height = 1;
@@ -1376,10 +2427,11 @@ void testLabPbrAuthoringEncodingAndCoverage() {
              base, fallback_source, nullptr, &authored_specular, authored,
              &validation_error),
          "rebuild resolved material with authored specular");
+  const auto authored_sample = authored.sample(0.5f, 0.5f);
   expect(authored.specular_map_active &&
-             authored.texels[0].metal_kind ==
+             authored_sample.metal_kind ==
                  xpbd::gfx::LabPbrMetalKind::Predefined &&
-             authored.texels[0].emission_strength > 0.99f,
+             authored_sample.emission_strength > 0.99f,
          "applied authored specular reaches resolved preview semantics");
   xpbd::gfx::TextureImage rgb_normal;
   rgb_normal.width = 1;
@@ -1409,6 +2461,21 @@ void testLabPbrCompositionAndConflicts() {
       1u, 2u, 3u, 4u,       5u, 6u, 7u, 8u,
       9u, 10u, 11u, 12u,    13u, 14u, 15u, 16u,
   };
+  const auto imported_asset =
+      std::make_shared<const xpbd::gfx::TextureImage>(imported);
+
+  const auto lazy_source = xpbd::gfx::composeLabPbrSpecular(
+      2, 2, imported_asset, {}, {});
+  xpbd::gfx::TextureImage materialized_source;
+  std::string materialize_error;
+  expect(lazy_source.exportable() &&
+             !lazy_source.specular_materialization_deferred &&
+             lazy_source.specular == imported_asset &&
+             xpbd::gfx::materializeLabPbrSpecular(
+                 2, 2, &imported, materialized_source,
+                 &materialize_error) &&
+             materialized_source.rgba == imported.rgba,
+         "no Override shares Source Specular until explicit materialization");
 
   GroupLabPbrOverride group_a;
   group_a.group_name = "group_a";
@@ -1417,17 +2484,18 @@ void testLabPbrCompositionAndConflicts() {
   std::map<std::string, GroupLabPbrOverride> overrides{
       {"group_a", group_a}};
   auto composed = xpbd::gfx::composeLabPbrSpecular(
-      2, 2, &imported, coverage, overrides);
-  expect(composed.exportable(),
+      2, 2, imported_asset, coverage, overrides);
+  expect(composed.exportable() && composed.specular != nullptr &&
+             composed.specular != imported_asset,
          "single selected-group override composes without conflict");
-  expect(composed.specular.rgba[0] == 191u &&
-             composed.specular.rgba[4] == 191u &&
-             composed.specular.rgba[8] == 191u &&
-             composed.specular.rgba[12] == 191u,
+  expect(composed.specular->rgba[0] == 191u &&
+             composed.specular->rgba[4] == 191u &&
+             composed.specular->rgba[8] == 191u &&
+             composed.specular->rgba[12] == 191u,
          "roughness override changes only covered R texels");
-  expect(composed.specular.rgba[1] == imported.rgba[1] &&
-             composed.specular.rgba[2] == imported.rgba[2] &&
-             composed.specular.rgba[3] == imported.rgba[3],
+  expect(composed.specular->rgba[1] == imported.rgba[1] &&
+             composed.specular->rgba[2] == imported.rgba[2] &&
+             composed.specular->rgba[3] == imported.rgba[3],
          "disabled channels preserve imported texture bytes");
 
   group_a = {};
@@ -1438,14 +2506,14 @@ void testLabPbrCompositionAndConflicts() {
   group_b.group_name = "group_b";
   overrides = {{"group_a", group_a}, {"group_b", group_b}};
   composed = xpbd::gfx::composeLabPbrSpecular(
-      2, 2, &imported, coverage, overrides);
+      2, 2, imported_asset, coverage, overrides);
   expect(composed.exportable() && composed.conflicts.empty(),
          "identical overlapping group values are exportable");
 
   group_b.emission = 1.0f;
   overrides["group_b"] = group_b;
   composed = xpbd::gfx::composeLabPbrSpecular(
-      2, 2, &imported, coverage, overrides);
+      2, 2, imported_asset, coverage, overrides);
   expect(!composed.exportable() && composed.conflicts.size() == 4u,
          "different overlapping group values block all conflict texels");
   if (!composed.conflicts.empty()) {
@@ -1511,12 +2579,28 @@ void testLabPbrPngChecksumAndNormalImport() {
   expect(xpbd::gfx::importReadOnlyIrisNormal(
              normal_path, 2, 1, normal, &error),
          "import matching RGBA Iris normal asset");
-  expect(normal.valid() && normal.original_file_bytes == png &&
+  expect(normal.valid() && normal.original_file_bytes != nullptr &&
+             *normal.original_file_bytes == png &&
              normal.sha256 == xpbd::gfx::sha256Hex(png),
          "Iris normal import preserves exact bytes and checksum");
 
   const auto preserved_bytes = normal.original_file_bytes;
   const auto preserved_hash = normal.sha256;
+  const auto preserved_decoded = normal.decoded;
+  xpbd::gfx::TextureDecodeLimits iris_shared_budget;
+  iris_shared_budget.maximum_peak_bytes =
+      normal.original_file_bytes->capacity() +
+      normal.decoded->rgba.capacity() + png.size() +
+      normal.decoded->rgba.size() * 2u;
+  expect(xpbd::gfx::importReadOnlyIrisNormal(
+             normal_path, 2, 1, normal, &error, iris_shared_budget) &&
+             normal.original_file_bytes != nullptr &&
+             *normal.original_file_bytes == png &&
+             normal.decoded != nullptr && normal.decoded->rgba == rgba,
+         "Iris sharing fits the peak that previously required an encoded-byte copy");
+  const auto committed_bytes = normal.original_file_bytes;
+  const auto committed_decoded = normal.decoded;
+
   const std::vector<std::uint8_t> rgb_png(
       std::begin(kWhitePng), std::end(kWhitePng));
   expect(write_bytes(normal_path, rgb_png),
@@ -1524,9 +2608,11 @@ void testLabPbrPngChecksumAndNormalImport() {
   expect(!xpbd::gfx::importReadOnlyIrisNormal(
              normal_path, 2, 1, normal, &error),
          "RGB Iris normal import is rejected");
-  expect(normal.original_file_bytes == preserved_bytes &&
-             normal.sha256 == preserved_hash,
-         "failed normal replacement preserves active imported bytes");
+  expect(normal.original_file_bytes == committed_bytes &&
+             normal.decoded == committed_decoded &&
+             normal.sha256 == preserved_hash &&
+             preserved_bytes != nullptr && preserved_decoded != nullptr,
+         "failed normal replacement preserves active shared Iris assets");
 
   fs::remove_all(directory, filesystem_error);
 }
@@ -1560,11 +2646,15 @@ void testLabPbrBundleExport() {
   };
 
   xpbd::gfx::LabPbrCompositionResult composition;
-  composition.specular.width = 2;
-  composition.specular.height = 1;
-  composition.specular.source_channels = 4;
-  composition.specular.rgba = {
+  xpbd::gfx::TextureImage composition_image;
+  composition_image.width = 2;
+  composition_image.height = 1;
+  composition_image.source_channels = 4;
+  composition_image.rgba = {
       255u, 229u, 64u, 254u, 0u, 255u, 0u, 0u};
+  composition.specular =
+      std::make_shared<const xpbd::gfx::TextureImage>(
+          std::move(composition_image));
   std::vector<std::uint8_t> base_png;
   const std::vector<std::uint8_t> base_rgba{
       240u, 220u, 200u, 255u, 120u, 140u, 160u, 255u};
@@ -1601,7 +2691,7 @@ void testLabPbrBundleExport() {
   expect(xpbd::gfx::loadTextureImage(
              exported.specular_path, exported_specular, &error) &&
              exported_specular.source_channels == 4 &&
-             exported_specular.rgba == composition.specular.rgba,
+             exported_specular.rgba == composition.specular->rgba,
          "exported specular PNG round-trips exact RGBA bytes");
   expect(read_bytes(exported.normal_path) == normal_png,
          "exported Iris normal preserves exact original file bytes");
@@ -1614,14 +2704,18 @@ void testLabPbrBundleExport() {
       xpbd::gfx::importLabPbrSuite(base_path, false, nullptr);
   expect(imported_before_edit.imported() &&
              imported_before_edit.suite.material.specular_image.rgba ==
-                 composition.specular.rgba &&
+                 composition.specular->rgba &&
              imported_before_edit.suite.source.normal.original_bytes &&
              *imported_before_edit.suite.source.normal.original_bytes ==
                  normal_png,
          "exported complete LabPBR suite imports before editing");
 
   const auto original_specular = exported_specular.rgba;
-  composition.specular.rgba[0] = 7u;
+  auto edited_composition_image = *composition.specular;
+  edited_composition_image.rgba[0] = 7u;
+  composition.specular =
+      std::make_shared<const xpbd::gfx::TextureImage>(
+          std::move(edited_composition_image));
   auto overwrite = xpbd::gfx::exportLabPbrBundle(
       directory / "skin_s.png", composition, &normal, false);
   expect(!overwrite.success && overwrite.overwrite_required &&
@@ -1638,18 +2732,54 @@ void testLabPbrBundleExport() {
          "approved LabPBR bundle overwrite completes");
   expect(xpbd::gfx::loadTextureImage(
              overwrite.specular_path, exported_specular, &error) &&
-             exported_specular.rgba == composition.specular.rgba,
+             exported_specular.rgba == composition.specular->rgba,
          "approved overwrite installs newly validated specular bytes");
   const auto reimported_after_edit =
       xpbd::gfx::importLabPbrSuite(base_path, false, nullptr);
   expect(reimported_after_edit.imported() &&
              reimported_after_edit.suite.material.specular_image.rgba ==
-                 composition.specular.rgba &&
+                 composition.specular->rgba &&
              reimported_after_edit.suite.source.normal.original_bytes &&
              *reimported_after_edit.suite.source.normal.original_bytes ==
                  normal_png &&
              reimported_after_edit.suite.material.format_declared,
          "import-edit-export-reimport round-trip preserves authored RGBA, exact _n bytes, and properties");
+
+  xpbd::gfx::LabPbrCompositionResult deferred;
+  deferred.specular_materialization_deferred = true;
+  deferred.deferred_width = 2;
+  deferred.deferred_height = 1;
+  const auto deferred_prompt = xpbd::gfx::exportLabPbrBundle(
+      directory / "skin_s.png", deferred, nullptr, false,
+      composition.specular.get());
+  expect(deferred_prompt.overwrite_required &&
+             deferred.specular == nullptr,
+         "deferred overwrite prompt does not materialize Source Specular");
+
+  const auto deferred_source_export = xpbd::gfx::exportLabPbrBundle(
+      directory / "lazy_source.png", deferred, nullptr, true,
+      composition.specular.get());
+  xpbd::gfx::TextureImage lazy_source_image;
+  expect(deferred_source_export.success &&
+             deferred.specular == nullptr &&
+             xpbd::gfx::loadTextureImage(
+                 deferred_source_export.specular_path, lazy_source_image,
+                 &error) &&
+             lazy_source_image.rgba == composition.specular->rgba,
+         "actual deferred export materializes exact Source Specular locally");
+
+  const auto deferred_default_export = xpbd::gfx::exportLabPbrBundle(
+      directory / "lazy_default.png", deferred, nullptr, true, nullptr);
+  xpbd::gfx::TextureImage lazy_default_image;
+  expect(deferred_default_export.success &&
+             deferred.specular == nullptr &&
+             xpbd::gfx::loadTextureImage(
+                 deferred_default_export.specular_path, lazy_default_image,
+                 &error) &&
+             lazy_default_image.rgba ==
+                 std::vector<std::uint8_t>{0u, 10u, 0u, 0u,
+                                           0u, 10u, 0u, 0u},
+         "missing Source Specular materializes the default map only for export");
 
   xpbd::gfx::LabPbrCompositionResult conflicting = composition;
   conflicting.conflicts.push_back({});
@@ -2679,7 +3809,8 @@ void testFrontFacingFlatCubePicking() {
 
 void testCanonicalCubeAndRtSceneRecords() {
   xpbd::loader::Geometry geometry;
-  geometry.description.has_texture_size = true;
+  geometry.description.has_texture_width = true;
+  geometry.description.has_texture_height = true;
   geometry.description.texture_width = 16;
   geometry.description.texture_height = 16;
   xpbd::loader::Bone root;
@@ -2717,7 +3848,8 @@ void testCanonicalCubeAndRtSceneRecords() {
   expect(flat_normals, "canonical cube preserves one flat normal per face");
 
   xpbd::loader::Geometry transformed_geometry;
-  transformed_geometry.description.has_texture_size = true;
+  transformed_geometry.description.has_texture_width = true;
+  transformed_geometry.description.has_texture_height = true;
   transformed_geometry.description.texture_width = 16;
   transformed_geometry.description.texture_height = 16;
   xpbd::loader::Bone transformed_bone;
@@ -2775,7 +3907,8 @@ void testCanonicalCubeAndRtSceneRecords() {
          "mirrored Box UV reverses U and tangent handedness");
 
   xpbd::loader::Geometry per_face_geometry;
-  per_face_geometry.description.has_texture_size = true;
+  per_face_geometry.description.has_texture_width = true;
+  per_face_geometry.description.has_texture_height = true;
   per_face_geometry.description.texture_width = 16;
   per_face_geometry.description.texture_height = 16;
   xpbd::loader::Bone per_face_bone;
@@ -3891,10 +5024,16 @@ void testVulkanPathTraceImplementationSelection() {
 
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
+  if (!configureLabPbrStressSide(argc, argv)) {
+    return 2;
+  }
   testLogicalFramebufferViewportContract();
   testVulkanQueueFamilySelection();
   testTextureFromMemory();
+  testSyntheticLargeUvFixtureAndMemoryBaseline();
+  testBedrockUvDomainResolution();
+  testResolvedUvDomainMaterialConsumers();
   testCc0PreviewSceneAssets();
   testEmptyTextureSample();
   testLabPbrDecode();

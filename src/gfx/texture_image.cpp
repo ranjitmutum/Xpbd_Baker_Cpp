@@ -9,10 +9,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <new>
 #include <stdexcept>
+#include <string_view>
 #include <system_error>
 #include <type_traits>
 #include <utility>
@@ -47,22 +49,17 @@ struct TextureDecodeContext {
 struct TextureDecodeSource {
     const stbi_uc* memory = nullptr;
     int memory_size = 0;
-    const char* filename = nullptr;
 
     [[nodiscard]] int info(int* width, int* height,
                            int* channels) const noexcept {
-        return filename != nullptr
-                   ? stbi_info(filename, width, height, channels)
-                   : stbi_info_from_memory(memory, memory_size, width, height,
-                                           channels);
+        return stbi_info_from_memory(memory, memory_size, width, height,
+                                     channels);
     }
 
     [[nodiscard]] stbi_uc* load(int* width, int* height,
                                 int* channels) const noexcept {
-        return filename != nullptr
-                   ? stbi_load(filename, width, height, channels, 4)
-                   : stbi_load_from_memory(memory, memory_size, width, height,
-                                           channels, 4);
+        return stbi_load_from_memory(memory, memory_size, width, height,
+                                     channels, 4);
     }
 };
 
@@ -118,6 +115,49 @@ void setErrorNoThrow(std::string* error, const char* message) noexcept {
     }
 }
 
+[[nodiscard]] std::filesystem::path
+normalizedPublicPath(const std::filesystem::path& path) {
+    std::filesystem::path ordinary = path;
+#if defined(_WIN32)
+    const auto native = ordinary.native();
+    constexpr std::wstring_view kExtendedPrefix = L"\\\\?\\";
+    constexpr std::wstring_view kExtendedUncPrefix = L"\\\\?\\UNC\\";
+    if (native.starts_with(kExtendedUncPrefix)) {
+        ordinary = std::filesystem::path(
+            std::wstring(L"\\\\") +
+            native.substr(kExtendedUncPrefix.size()));
+    } else if (native.starts_with(kExtendedPrefix)) {
+        ordinary = std::filesystem::path(
+            native.substr(kExtendedPrefix.size()));
+    }
+#endif
+    std::error_code error;
+    auto absolute = std::filesystem::absolute(ordinary, error);
+    if (error) {
+        return ordinary.lexically_normal();
+    }
+    return absolute.lexically_normal();
+}
+
+void setSnapshotError(std::string* error, std::string_view label,
+                      std::string_view stage,
+                      const std::filesystem::path& path,
+                      std::string_view detail) noexcept {
+    if (error == nullptr) {
+        return;
+    }
+    try {
+        *error = std::string(label) + " " + std::string(stage) +
+                 " stage failed for '" + pathUtf8String(path) + "'";
+        if (!detail.empty()) {
+            *error += ": ";
+            *error += detail;
+        }
+    } catch (...) {
+        setErrorNoThrow(error, "file snapshot error reporting failed");
+    }
+}
+
 void setContextError(std::string* error, const char* summary,
                      const TextureDecodeContext& context,
                      const char* detail = nullptr) noexcept {
@@ -147,6 +187,7 @@ void setContextError(std::string* error, const char* summary,
 [[nodiscard]] bool computePeakBytes(TextureDecodeContext& context) noexcept {
     std::size_t peak = context.limits.retained_resident_bytes;
     if (!checkedAdd(peak, context.previous_output_bytes, peak) ||
+        !checkedAdd(peak, context.encoded_bytes, peak) ||
         !checkedAdd(peak, context.decoded_bytes, peak) ||
         !checkedAdd(peak, context.decoded_bytes, peak)) {
         context.required_peak_bytes =
@@ -157,50 +198,74 @@ void setContextError(std::string* error, const char* summary,
     return true;
 }
 
+[[nodiscard]] bool inspectTextureSource(
+    const TextureDecodeSource& source, std::size_t encoded_bytes,
+    std::size_t previous_output_bytes, TextureImageHeader& out,
+    TextureDecodeContext& context, std::string* error,
+    TextureDecodeLimits requested_limits) noexcept {
+    context = {};
+    context.encoded_bytes = encoded_bytes;
+    context.previous_output_bytes = previous_output_bytes;
+    context.limits = effectiveLimits(requested_limits);
+
+    if (source.info(&context.width, &context.height,
+                    &context.source_channels) == 0 ||
+        context.width <= 0 || context.height <= 0) {
+        setContextError(error,
+                        "texture Header stage failed (stbi_info_from_memory)",
+                        context, stbi_failure_reason());
+        return false;
+    }
+
+    if (!checkedMultiply(static_cast<std::size_t>(context.width),
+                         static_cast<std::size_t>(context.height),
+                         context.pixels) ||
+        !checkedTextureRgbaByteCount(
+            static_cast<std::size_t>(context.width),
+            static_cast<std::size_t>(context.height),
+            context.decoded_bytes)) {
+        setContextError(error,
+                        "texture budget stage failed: size arithmetic overflow",
+                        context);
+        return false;
+    }
+
+    const bool peak_valid = computePeakBytes(context);
+    if (static_cast<std::uint32_t>(context.width) >
+            context.limits.maximum_width ||
+        static_cast<std::uint32_t>(context.height) >
+            context.limits.maximum_height ||
+        context.pixels > context.limits.maximum_pixels ||
+        context.decoded_bytes > context.limits.maximum_decoded_bytes ||
+        !peak_valid ||
+        context.required_peak_bytes > context.limits.maximum_peak_bytes) {
+        setContextError(error, "texture budget stage failed", context,
+                        !peak_valid ? "peak byte arithmetic overflow" : nullptr);
+        return false;
+    }
+
+    const TextureImageHeader candidate{
+        context.width, context.height, context.source_channels};
+    out = candidate;
+    if (error != nullptr) {
+        error->clear();
+    }
+    return true;
+}
+
 [[nodiscard]] bool decodeTexture(const TextureDecodeSource& source,
                                  std::size_t encoded_bytes,
                                  const std::string* decoded_path,
                                  TextureImage& out, std::string* error,
                                  TextureDecodeLimits requested_limits) {
     TextureDecodeContext context{};
-    context.encoded_bytes = encoded_bytes;
-    context.previous_output_bytes = out.rgba.capacity();
-    context.limits = effectiveLimits(requested_limits);
+    TextureImageHeader header;
+    if (!inspectTextureSource(source, encoded_bytes, out.rgba.capacity(),
+                              header, context, error, requested_limits)) {
+        return false;
+    }
 
     try {
-        if (source.info(&context.width, &context.height,
-                        &context.source_channels) == 0 ||
-            context.width <= 0 || context.height <= 0) {
-            setContextError(error, "texture stbi_info preflight failed", context,
-                            stbi_failure_reason());
-            return false;
-        }
-
-        if (!checkedMultiply(static_cast<std::size_t>(context.width),
-                             static_cast<std::size_t>(context.height),
-                             context.pixels) ||
-            !checkedTextureRgbaByteCount(
-                static_cast<std::size_t>(context.width),
-                static_cast<std::size_t>(context.height),
-                context.decoded_bytes)) {
-            setContextError(error, "texture size arithmetic overflow", context);
-            return false;
-        }
-
-        const bool peak_valid = computePeakBytes(context);
-        if (static_cast<std::uint32_t>(context.width) >
-                context.limits.maximum_width ||
-            static_cast<std::uint32_t>(context.height) >
-                context.limits.maximum_height ||
-            context.pixels > context.limits.maximum_pixels ||
-            context.decoded_bytes > context.limits.maximum_decoded_bytes ||
-            !peak_valid ||
-            context.required_peak_bytes > context.limits.maximum_peak_bytes) {
-            setContextError(error, "texture decode budget exceeded", context,
-                            !peak_valid ? "peak byte arithmetic overflow" : nullptr);
-            return false;
-        }
-
         int decoded_width = 0;
         int decoded_height = 0;
         int decoded_channels = 0;
@@ -208,7 +273,8 @@ void setContextError(std::string* error, const char* summary,
             source.load(&decoded_width, &decoded_height, &decoded_channels));
         if (!pixels || decoded_width != context.width ||
             decoded_height != context.height || decoded_channels <= 0) {
-            setContextError(error, "texture decode failed after preflight", context,
+            setContextError(error,
+                            "texture Decode stage failed after Header", context,
                             stbi_failure_reason());
             return false;
         }
@@ -223,7 +289,8 @@ void setContextError(std::string* error, const char* summary,
         candidate.rgba.assign(pixels.get(),
                               pixels.get() + context.decoded_bytes);
         if (!candidate.valid()) {
-            setContextError(error, "texture decode produced an invalid image",
+            setContextError(error,
+                            "texture Decode stage produced an invalid image",
                             context);
             return false;
         }
@@ -234,17 +301,165 @@ void setContextError(std::string* error, const char* summary,
         }
         return true;
     } catch (const std::bad_alloc&) {
-        setContextError(error, "texture decode allocation failed", context,
+        setContextError(error,
+                        "texture budget stage failed during Decode allocation",
+                        context,
                         "std::bad_alloc");
         return false;
     } catch (const std::length_error& exception) {
-        setContextError(error, "texture decode allocation failed", context,
+        setContextError(error,
+                        "texture budget stage failed during Decode allocation",
+                        context,
                         exception.what());
         return false;
     }
 }
 
 } // namespace
+
+std::string pathUtf8String(const std::filesystem::path& path) {
+    const auto utf8 = path.generic_u8string();
+    return std::string(reinterpret_cast<const char*>(utf8.data()), utf8.size());
+}
+
+std::filesystem::path
+pathForFilesystemIo(const std::filesystem::path& path) {
+#if defined(_WIN32)
+    auto preferred = path;
+    preferred.make_preferred();
+    const auto native = preferred.native();
+    constexpr std::wstring_view kExtendedPrefix = L"\\\\?\\";
+    if (native.starts_with(kExtendedPrefix) || !preferred.is_absolute()) {
+        return preferred;
+    }
+    if (native.starts_with(L"\\\\")) {
+        return std::filesystem::path(
+            std::wstring(L"\\\\?\\UNC\\") + native.substr(2u));
+    }
+    return std::filesystem::path(std::wstring(kExtendedPrefix) + native);
+#else
+    return path;
+#endif
+}
+
+bool snapshotFileBytes(const std::filesystem::path& path,
+                       FileByteSnapshot& out, std::string* error,
+                       std::string_view label,
+                       std::uintmax_t maximum_bytes) {
+    const auto normalized = normalizedPublicPath(path);
+    const auto io_path = pathForFilesystemIo(normalized);
+    try {
+        std::error_code filesystem_error;
+        if (!std::filesystem::is_regular_file(io_path, filesystem_error)) {
+            setSnapshotError(
+                error, label, "file-check", normalized,
+                filesystem_error ? filesystem_error.message()
+                                 : "path is missing or is not a regular file");
+            return false;
+        }
+
+        const auto initial_size =
+            std::filesystem::file_size(io_path, filesystem_error);
+        if (filesystem_error) {
+            setSnapshotError(error, label, "file-check", normalized,
+                             filesystem_error.message());
+            return false;
+        }
+        const auto effective_maximum =
+            (std::min)(maximum_bytes, kFileByteSnapshotMaximumBytes);
+        if (initial_size > effective_maximum) {
+            setSnapshotError(
+                error, label, "budget", normalized,
+                "encoded file is " + std::to_string(initial_size) +
+                    " bytes; maximum is " +
+                    std::to_string(effective_maximum) + " bytes");
+            return false;
+        }
+
+        const auto initial_time =
+            std::filesystem::last_write_time(io_path, filesystem_error);
+        if (filesystem_error) {
+            setSnapshotError(error, label, "file-check", normalized,
+                             filesystem_error.message());
+            return false;
+        }
+
+        std::ifstream input(io_path, std::ios::binary);
+        if (!input) {
+            setSnapshotError(error, label, "read", normalized,
+                             "could not open the file");
+            return false;
+        }
+        auto mutable_bytes = std::make_shared<std::vector<std::uint8_t>>(
+            static_cast<std::size_t>(initial_size));
+        if (!mutable_bytes->empty()) {
+            input.read(reinterpret_cast<char*>(mutable_bytes->data()),
+                       static_cast<std::streamsize>(mutable_bytes->size()));
+            if (!input ||
+                input.gcount() !=
+                    static_cast<std::streamsize>(mutable_bytes->size())) {
+                setSnapshotError(error, label, "read", normalized,
+                                 "file could not be read completely");
+                return false;
+            }
+        }
+
+        filesystem_error.clear();
+        const auto final_size =
+            std::filesystem::file_size(io_path, filesystem_error);
+        if (filesystem_error) {
+            setSnapshotError(error, label, "read", normalized,
+                             "size recheck failed: " +
+                                 filesystem_error.message());
+            return false;
+        }
+        filesystem_error.clear();
+        const auto final_time =
+            std::filesystem::last_write_time(io_path, filesystem_error);
+        if (filesystem_error || final_size != initial_size ||
+            final_time != initial_time) {
+            setSnapshotError(
+                error, label, "read", normalized,
+                filesystem_error
+                    ? "timestamp recheck failed: " +
+                          filesystem_error.message()
+                    : "file changed while it was being read");
+            return false;
+        }
+
+        FileByteSnapshot candidate;
+        candidate.path = normalized;
+        candidate.size = initial_size;
+        candidate.write_time = initial_time;
+        candidate.bytes = std::move(mutable_bytes);
+        if (!candidate.valid()) {
+            setSnapshotError(error, label, "read", normalized,
+                             "snapshot invariants are invalid");
+            return false;
+        }
+        out = std::move(candidate);
+        if (error != nullptr) {
+            error->clear();
+        }
+        return true;
+    } catch (const std::bad_alloc&) {
+        setSnapshotError(error, label, "budget", normalized,
+                         "std::bad_alloc");
+        return false;
+    } catch (const std::length_error& exception) {
+        setSnapshotError(error, label, "budget", normalized,
+                         exception.what());
+        return false;
+    } catch (const std::filesystem::filesystem_error& exception) {
+        setSnapshotError(error, label, "file-check", normalized,
+                         exception.what());
+        return false;
+    } catch (const std::exception& exception) {
+        setSnapshotError(error, label, "read", normalized,
+                         exception.what());
+        return false;
+    }
+}
 
 bool checkedTextureRgbaByteCount(std::size_t width, std::size_t height,
                                  std::size_t& byte_count) noexcept {
@@ -291,48 +506,127 @@ void TextureImage::sample(float u, float v, float& r, float& g, float& b, float&
     a = p[3] / 255.0f;
 }
 
+void TextureImage::sampleModelAtlasClamp(double u, double v, float& r,
+                                         float& g, float& b, float& a) const {
+    if (!valid() || !std::isfinite(u) || !std::isfinite(v)) {
+        r = g = b = a = 1.0f;
+        return;
+    }
+
+    const double clamped_u = std::clamp(u, 0.0, 1.0);
+    const double clamped_v = std::clamp(v, 0.0, 1.0);
+    const int x = std::clamp(
+        static_cast<int>(std::floor(clamped_u * static_cast<double>(width))),
+        0, width - 1);
+    const int y = std::clamp(
+        static_cast<int>(std::floor(clamped_v * static_cast<double>(height))),
+        0, height - 1);
+    const std::uint8_t* p =
+        rgba.data() +
+        (static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
+         static_cast<std::size_t>(x)) *
+            4u;
+    r = p[0] / 255.0f;
+    g = p[1] / 255.0f;
+    b = p[2] / 255.0f;
+    a = p[3] / 255.0f;
+}
+
 bool loadTextureImageFromMemory(const void* data, int size, TextureImage& out,
                                 std::string* err,
                                 TextureDecodeLimits limits) {
     if (!data || size <= 0) {
-        setErrorNoThrow(err, "empty image buffer");
+        setErrorNoThrow(
+            err,
+            "texture Header stage failed (stbi_info_from_memory): empty image buffer");
         return false;
     }
-    const TextureDecodeSource source{
-        static_cast<const stbi_uc*>(data), size, nullptr};
+    const TextureDecodeSource source{static_cast<const stbi_uc*>(data), size};
     return decodeTexture(source, static_cast<std::size_t>(size), nullptr, out,
                          err, limits);
+}
+
+bool inspectTextureImageFromMemory(const void* data, int size,
+                                   TextureImageHeader& out,
+                                   std::string* err,
+                                   TextureDecodeLimits limits) {
+    if (!data || size <= 0) {
+        setErrorNoThrow(
+            err,
+            "texture Header stage failed (stbi_info_from_memory): empty image buffer");
+        return false;
+    }
+    const TextureDecodeSource source{static_cast<const stbi_uc*>(data), size};
+    TextureDecodeContext context{};
+    TextureImageHeader candidate;
+    if (!inspectTextureSource(source, static_cast<std::size_t>(size), 0u,
+                              candidate, context, err, limits)) {
+        return false;
+    }
+    out = candidate;
+    return true;
 }
 
 bool loadTextureImage(const std::filesystem::path& path, TextureImage& out,
                       std::string* err, TextureDecodeLimits limits) {
     try {
-        const std::string decoded_path = path.string();
-        std::error_code file_size_error;
-        const std::uintmax_t raw_file_size =
-            std::filesystem::file_size(path, file_size_error);
-        const std::size_t encoded_bytes =
-            file_size_error
-                ? 0u
-                : raw_file_size >
-                          static_cast<std::uintmax_t>(
-                              (std::numeric_limits<std::size_t>::max)())
-                      ? (std::numeric_limits<std::size_t>::max)()
-                      : static_cast<std::size_t>(raw_file_size);
-        const TextureDecodeSource source{nullptr, 0, decoded_path.c_str()};
-        const bool loaded = decodeTexture(source, encoded_bytes, &decoded_path,
-                                          out, err, limits);
-        if (!loaded) {
+        std::size_t retained_with_previous_output = 0;
+        if (!checkedAdd(limits.retained_resident_bytes, out.rgba.capacity(),
+                        retained_with_previous_output)) {
+            setErrorNoThrow(
+                err,
+                "Texture budget stage failed: retained byte arithmetic overflow");
+            return false;
+        }
+        limits.retained_resident_bytes = retained_with_previous_output;
+
+        FileByteSnapshot snapshot;
+        const std::size_t effective_peak_limit =
+            (std::min)(limits.maximum_peak_bytes,
+                       kTextureDecodeMaximumPeakBytes);
+        if (limits.retained_resident_bytes > effective_peak_limit) {
+            setErrorNoThrow(
+                err,
+                "Texture budget stage failed before snapshot: retained state already exceeds the peak limit");
+            return false;
+        }
+        const std::size_t snapshot_limit =
+            effective_peak_limit - limits.retained_resident_bytes;
+        if (!snapshotFileBytes(path, snapshot, err, "Texture",
+                               snapshot_limit)) {
+            return false;
+        }
+
+        TextureImage candidate;
+        if (!loadTextureImageFromMemory(snapshot.bytes->data(),
+                                        static_cast<int>(snapshot.bytes->size()),
+                                        candidate, err, limits)) {
+            const std::string decoded_path = pathUtf8String(snapshot.path);
             std::fprintf(stderr, "texture load failed: %s (%s)\n",
                          decoded_path.c_str(),
                          err != nullptr && !err->empty() ? err->c_str() : "?");
+            return false;
         }
-        return loaded;
+        candidate.path = pathUtf8String(snapshot.path);
+        out = std::move(candidate);
+        if (err != nullptr) {
+            err->clear();
+        }
+        return true;
     } catch (const std::bad_alloc&) {
-        setErrorNoThrow(err, "texture decode allocation failed: std::bad_alloc");
+        setErrorNoThrow(
+            err,
+            "Texture budget stage failed: texture decode allocation failed: std::bad_alloc");
         return false;
     } catch (const std::filesystem::filesystem_error& exception) {
-        setErrorNoThrow(err, exception.what());
+        if (err != nullptr) {
+            try {
+                *err = std::string("Texture file-check stage failed: ") +
+                       exception.what();
+            } catch (...) {
+                setErrorNoThrow(err, "Texture file-check stage failed");
+            }
+        }
         return false;
     }
 }

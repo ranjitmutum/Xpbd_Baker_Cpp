@@ -4,8 +4,10 @@
 #include <cmath>
 #include <fstream>
 #include <limits>
+#include <new>
 #include <sstream>
 #include <string_view>
+#include <utility>
 
 namespace xpbd::gfx {
 namespace {
@@ -161,14 +163,114 @@ void readFormatDeclaration(ResolvedMaterialTable &table) {
 
 } // namespace
 
+const TextureImage &ResolvedMaterialTable::imageOrEmpty(
+    const SharedTextureImage &asset) noexcept {
+  static const TextureImage empty;
+  return asset != nullptr ? *asset : empty;
+}
+
+ResolvedMaterialTable::ResolvedMaterialTable() noexcept
+    : base_image(imageOrEmpty(base_image_asset_)),
+      normal_image(imageOrEmpty(normal_image_asset_)),
+      specular_image(imageOrEmpty(specular_image_asset_)) {}
+
+ResolvedMaterialTable::ResolvedMaterialTable(
+    SharedTextureImage base_image_asset,
+    SharedTextureImage normal_image_asset,
+    SharedTextureImage specular_image_asset) noexcept
+    : base_image_asset_(std::move(base_image_asset)),
+      normal_image_asset_(std::move(normal_image_asset)),
+      specular_image_asset_(std::move(specular_image_asset)),
+      base_image(imageOrEmpty(base_image_asset_)),
+      normal_image(imageOrEmpty(normal_image_asset_)),
+      specular_image(imageOrEmpty(specular_image_asset_)) {}
+
+ResolvedMaterialTable::ResolvedMaterialTable(
+    const ResolvedMaterialTable &other)
+    : base_image_asset_(other.base_image_asset_),
+      normal_image_asset_(other.normal_image_asset_),
+      specular_image_asset_(other.specular_image_asset_), width(other.width),
+      height(other.height), base_image(imageOrEmpty(base_image_asset_)),
+      assets(other.assets), format(other.format),
+      declared_format(other.declared_format),
+      format_declared(other.format_declared),
+      normal_map_active(other.normal_map_active),
+      specular_map_active(other.specular_map_active),
+      normal_image(imageOrEmpty(normal_image_asset_)),
+      specular_image(imageOrEmpty(specular_image_asset_)),
+      warnings(other.warnings) {}
+
+ResolvedMaterialTable::ResolvedMaterialTable(
+    ResolvedMaterialTable &&other) noexcept
+    // Copy the handles so the moved-from object's public image references
+    // remain valid for its remaining lifetime.
+    : base_image_asset_(other.base_image_asset_),
+      normal_image_asset_(other.normal_image_asset_),
+      specular_image_asset_(other.specular_image_asset_), width(other.width),
+      height(other.height), base_image(imageOrEmpty(base_image_asset_)),
+      assets(std::move(other.assets)), format(other.format),
+      declared_format(std::move(other.declared_format)),
+      format_declared(other.format_declared),
+      normal_map_active(other.normal_map_active),
+      specular_map_active(other.specular_map_active),
+      normal_image(imageOrEmpty(normal_image_asset_)),
+      specular_image(imageOrEmpty(specular_image_asset_)),
+      warnings(std::move(other.warnings)) {}
+
+ResolvedMaterialTable &ResolvedMaterialTable::operator=(
+    const ResolvedMaterialTable &other) {
+  if (this == &other) {
+    return *this;
+  }
+  ResolvedMaterialTable replacement(other);
+  this->~ResolvedMaterialTable();
+  ::new (static_cast<void *>(this))
+      ResolvedMaterialTable(std::move(replacement));
+  return *this;
+}
+
+ResolvedMaterialTable &ResolvedMaterialTable::operator=(
+    ResolvedMaterialTable &&other) noexcept {
+  if (this == &other) {
+    return *this;
+  }
+  this->~ResolvedMaterialTable();
+  ::new (static_cast<void *>(this)) ResolvedMaterialTable(std::move(other));
+  return *this;
+}
+
+void ResolvedMaterialTable::setImageAssets(
+    SharedTextureImage base_image_asset,
+    SharedTextureImage normal_image_asset,
+    SharedTextureImage specular_image_asset) {
+  ResolvedMaterialTable replacement(std::move(base_image_asset),
+                                    std::move(normal_image_asset),
+                                    std::move(specular_image_asset));
+  replacement.width = width;
+  replacement.height = height;
+  replacement.assets = assets;
+  replacement.format = format;
+  replacement.declared_format = declared_format;
+  replacement.format_declared = format_declared;
+  replacement.normal_map_active = normal_map_active;
+  replacement.specular_map_active = specular_map_active;
+  replacement.warnings = warnings;
+  *this = std::move(replacement);
+}
+
 bool ResolvedMaterialTable::valid() const noexcept {
-  if (width <= 0 || height <= 0) {
+  if (width <= 0 || height <= 0 || !base_image.valid() ||
+      base_image.width != width || base_image.height != height) {
     return false;
   }
-  const auto w = static_cast<std::size_t>(width);
-  const auto h = static_cast<std::size_t>(height);
-  return w <= (std::numeric_limits<std::size_t>::max)() / h &&
-         texels.size() == w * h;
+  const auto compatible = [this](const TextureImage &image,
+                                 bool active) noexcept {
+    return !active ||
+           (image.valid() && image.width == width && image.height == height &&
+            image.source_channels >= 3);
+  };
+  return compatible(normal_image, normal_map_active) &&
+         compatible(specular_image, specular_map_active);
 }
 
 void ResolvedMaterialTable::clear() {
@@ -178,24 +280,40 @@ void ResolvedMaterialTable::clear() {
 const ResolvedMaterialTexel &ResolvedMaterialTable::sample(float u,
                                                             float v) const {
   static const ResolvedMaterialTexel kFallback{};
+  thread_local ResolvedMaterialTexel sampled;
   if (!valid()) {
     return kFallback;
   }
-  u -= std::floor(u);
-  v -= std::floor(v);
-  if (u < 0.0f) {
-    u += 1.0f;
-  }
-  if (v < 0.0f) {
-    v += 1.0f;
-  }
+  u = std::clamp(u, 0.0f, 1.0f);
+  v = std::clamp(v, 0.0f, 1.0f);
   const auto x = std::min(
       static_cast<std::size_t>(u * static_cast<float>(width)),
       static_cast<std::size_t>(width - 1));
   const auto y = std::min(
       static_cast<std::size_t>(v * static_cast<float>(height)),
       static_cast<std::size_t>(height - 1));
-  return texels[y * static_cast<std::size_t>(width) + x];
+  const std::size_t offset =
+      (y * static_cast<std::size_t>(width) + x) * 4u;
+  const std::array<std::uint8_t, 4> base_rgba{
+      base_image.rgba[offset], base_image.rgba[offset + 1u],
+      base_image.rgba[offset + 2u], base_image.rgba[offset + 3u]};
+  std::array<std::uint8_t, 4> normal_rgba{};
+  std::array<std::uint8_t, 4> specular_rgba{};
+  const std::array<std::uint8_t, 4> *normal = nullptr;
+  const std::array<std::uint8_t, 4> *specular = nullptr;
+  if (normal_map_active) {
+    std::copy_n(normal_image.rgba.data() + offset, 4u,
+                normal_rgba.begin());
+    normal = &normal_rgba;
+  }
+  if (specular_map_active) {
+    std::copy_n(specular_image.rgba.data() + offset, 4u,
+                specular_rgba.begin());
+    specular = &specular_rgba;
+  }
+  sampled = decodeLabPbrTexel(base_rgba, normal, specular,
+                              specular_image.source_channels);
+  return sampled;
 }
 
 LabPbrAssetPaths
@@ -409,6 +527,9 @@ bool resolveLabPbrMaterial(const TextureImage &base,
   resolved.assets = discoverLabPbrAssets(base_path);
   readFormatDeclaration(resolved);
 
+  TextureImage normal_image;
+  TextureImage specular_image;
+
   const bool has_sidecar =
       resolved.assets.normal_exists || resolved.assets.specular_exists;
   if (resolved.format_declared) {
@@ -433,47 +554,24 @@ bool resolveLabPbrMaterial(const TextureImage &base,
     if (resolved.assets.normal_exists) {
       resolved.normal_map_active =
           loadCompatibleSidecar(resolved.assets.normal, base, "normal",
-                                resolved.normal_image, resolved);
+                                normal_image, resolved);
     }
     if (resolved.assets.specular_exists) {
       resolved.specular_map_active =
           loadCompatibleSidecar(resolved.assets.specular, base, "specular",
-                                resolved.specular_image, resolved);
+                                specular_image, resolved);
     }
   }
 
-  const auto width = static_cast<std::size_t>(base.width);
-  const auto height = static_cast<std::size_t>(base.height);
-  if (width > (std::numeric_limits<std::size_t>::max)() / height) {
-    if (error != nullptr) {
-      *error = "resolved material dimensions overflow";
-    }
-    return false;
-  }
-  const std::size_t texel_count = width * height;
-  resolved.texels.resize(texel_count);
-  for (std::size_t texel = 0; texel < texel_count; ++texel) {
-    const std::size_t offset = texel * 4u;
-    const std::array<std::uint8_t, 4> base_rgba{
-        base.rgba[offset], base.rgba[offset + 1u], base.rgba[offset + 2u],
-        base.rgba[offset + 3u]};
-    std::array<std::uint8_t, 4> normal_rgba{};
-    std::array<std::uint8_t, 4> specular_rgba{};
-    const std::array<std::uint8_t, 4> *normal = nullptr;
-    const std::array<std::uint8_t, 4> *specular = nullptr;
-    if (resolved.normal_map_active) {
-      std::copy_n(resolved.normal_image.rgba.data() + offset, 4u,
-                  normal_rgba.begin());
-      normal = &normal_rgba;
-    }
-    if (resolved.specular_map_active) {
-      std::copy_n(resolved.specular_image.rgba.data() + offset, 4u,
-                  specular_rgba.begin());
-      specular = &specular_rgba;
-    }
-    resolved.texels[texel] = decodeLabPbrTexel(
-        base_rgba, normal, specular, resolved.specular_image.source_channels);
-  }
+  resolved.setImageAssets(
+      std::make_shared<const TextureImage>(base),
+      resolved.normal_map_active
+          ? std::make_shared<const TextureImage>(std::move(normal_image))
+          : SharedTextureImage{},
+      resolved.specular_map_active
+          ? std::make_shared<const TextureImage>(std::move(specular_image))
+          : SharedTextureImage{});
+
   out = std::move(resolved);
   if (error != nullptr) {
     error->clear();
@@ -489,9 +587,9 @@ bool sameResolvedMaterialResource(const ResolvedMaterialTable &lhs,
          lhs.format_declared == rhs.format_declared &&
          lhs.normal_map_active == rhs.normal_map_active &&
          lhs.specular_map_active == rhs.specular_map_active &&
+         sameImagePixels(lhs.base_image, rhs.base_image) &&
          sameImagePixels(lhs.normal_image, rhs.normal_image) &&
-         sameImagePixels(lhs.specular_image, rhs.specular_image) &&
-         lhs.texels == rhs.texels;
+         sameImagePixels(lhs.specular_image, rhs.specular_image);
 }
 
 TangentFrame computeTangentFrame(

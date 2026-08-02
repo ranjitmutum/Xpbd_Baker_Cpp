@@ -1,11 +1,14 @@
 #pragma once
 
 #include "xpbd/gfx/labpbr_material.hpp"
+#include "xpbd/gfx/labpbr_memory.hpp"
 
 #include <cstdint>
 #include <filesystem>
+#include <list>
 #include <map>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -19,6 +22,7 @@ struct LabPbrSourceFile {
   std::string sha256;
   std::shared_ptr<const std::vector<std::uint8_t>> original_bytes;
 
+  [[nodiscard]] bool metadataValid() const noexcept;
   [[nodiscard]] bool valid() const noexcept;
 };
 
@@ -30,11 +34,12 @@ struct LabPbrSuiteSource {
   bool confirmed_labpbr13_without_properties = false;
   std::string cache_key;
 
+  [[nodiscard]] bool metadataValid() const noexcept;
   [[nodiscard]] bool valid() const noexcept;
 };
 
 struct ImportedLabPbrSuite {
-  TextureImage base_image;
+  SharedTextureImage base_image;
   ResolvedMaterialTable material;
   LabPbrSuiteSource source;
   bool cache_hit = false;
@@ -58,16 +63,55 @@ struct LabPbrSuiteImportResult {
   }
 };
 
+struct LabPbrSuiteImportLimits {
+  std::uint64_t maximum_peak_bytes = kLabPbrDefaultPeakBudgetBytes;
+  std::uint64_t retained_resident_bytes = 0;
+  std::uint64_t cache_bytes = 0;
+  bool copy_normal_to_iris_asset = false;
+  bool has_overrides = false;
+  bool defer_cache_store = false;
+};
+
+inline constexpr std::uint64_t kLabPbrDefaultImportCacheBudgetBytes =
+    std::uint64_t{256} * 1024u * 1024u;
+
 class LabPbrSuiteImportCache {
 public:
+  explicit LabPbrSuiteImportCache(
+      std::uint64_t maximum_bytes =
+          kLabPbrDefaultImportCacheBudgetBytes) noexcept
+      : maximum_bytes_(maximum_bytes) {}
+  LabPbrSuiteImportCache(const LabPbrSuiteImportCache &) = delete;
+  LabPbrSuiteImportCache &operator=(const LabPbrSuiteImportCache &) = delete;
+
   [[nodiscard]] bool find(std::string_view key,
-                          ImportedLabPbrSuite &out) const;
-  void store(const ImportedLabPbrSuite &suite);
-  void clear() { entries_.clear(); }
-  [[nodiscard]] std::size_t size() const noexcept { return entries_.size(); }
+                          ImportedLabPbrSuite &out) noexcept;
+  [[nodiscard]] bool store(const ImportedLabPbrSuite &suite) noexcept;
+  void clear() noexcept;
+  void setMaximumBytes(std::uint64_t maximum_bytes) noexcept;
+  [[nodiscard]] std::size_t size() const noexcept { return index_.size(); }
+  [[nodiscard]] std::uint64_t maximumBytes() const noexcept {
+    return maximum_bytes_;
+  }
+  [[nodiscard]] std::uint64_t residentBytes(
+      std::span<const TextureImage *const> excluded_images = {},
+      std::span<const std::vector<std::uint8_t> *const> excluded_sources = {})
+      const noexcept;
 
 private:
-  std::map<std::string, ImportedLabPbrSuite, std::less<>> entries_;
+  struct Entry {
+    std::string key;
+    std::shared_ptr<const ImportedLabPbrSuite> suite;
+    std::uint64_t charged_bytes = 0;
+  };
+  using EntryList = std::list<Entry>;
+
+  void evictToBudget() noexcept;
+
+  EntryList entries_;
+  std::map<std::string, EntryList::iterator, std::less<>> index_;
+  std::uint64_t charged_bytes_ = 0;
+  std::uint64_t maximum_bytes_ = kLabPbrDefaultImportCacheBudgetBytes;
 };
 
 struct LabPbrSourceChangeReport {
@@ -89,7 +133,8 @@ discoverLabPbrSuiteCandidates(const std::filesystem::path &folder,
 [[nodiscard]] LabPbrSuiteImportResult importLabPbrSuite(
     const std::filesystem::path &base_path,
     bool confirm_labpbr13_without_properties,
-    LabPbrSuiteImportCache *cache = nullptr);
+    LabPbrSuiteImportCache *cache = nullptr,
+    LabPbrSuiteImportLimits limits = {});
 
 [[nodiscard]] LabPbrSourceChangeReport
 checkLabPbrSuiteSourceChanges(const LabPbrSuiteSource &source);

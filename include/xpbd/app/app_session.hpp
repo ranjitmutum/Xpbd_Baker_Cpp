@@ -11,6 +11,7 @@
 #include "xpbd/gfx/preview_scene.hpp"
 #include "xpbd/gfx/ray_tracing.hpp"
 #include "xpbd/gfx/texture_image.hpp"
+#include "xpbd/gfx/uv_domain.hpp"
 #include "xpbd/gfx/world_environment.hpp"
 #include "xpbd/loader/animation_loader.hpp"
 #include "xpbd/loader/bedrock_animation_data.hpp"
@@ -681,8 +682,13 @@ public:
 
 
   bool use_mcbe_coords = true;
-  gfx::TextureImage model_texture;
+  gfx::SharedTextureImage model_texture;
+  gfx::ResolvedUvDomain model_uv_domain;
   gfx::ResolvedMaterialTable resolved_material;
+  // Product import/authoring preflight ceiling. Public for deterministic
+  // regression injection; no UI setting or layout is introduced.
+  std::uint64_t labpbr_peak_memory_budget_bytes =
+      gfx::kLabPbrDefaultPeakBudgetBytes;
   gfx::LabPbrDebugView labpbr_debug_view = gfx::LabPbrDebugView::Shaded;
   gfx::RtDebugView rt_debug_view = gfx::RtDebugView::Off;
   gfx::PathTraceSettings path_trace_settings{};

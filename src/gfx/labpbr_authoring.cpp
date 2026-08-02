@@ -5,9 +5,10 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
-#include <fstream>
 #include <limits>
+#include <new>
 #include <set>
+#include <stdexcept>
 #include <utility>
 
 namespace xpbd::gfx {
@@ -194,13 +195,76 @@ void claimChannel(
 } // namespace
 
 bool LabPbrUvCoverage::valid() const noexcept {
-  return width > 0 && height > 0;
+  if (width <= 0 || height <= 0) {
+    return false;
+  }
+  const auto texel_count = static_cast<std::uint64_t>(width) *
+                           static_cast<std::uint64_t>(height);
+  if (texel_count >
+      static_cast<std::uint64_t>(
+          (std::numeric_limits<std::uint32_t>::max)())) {
+    return false;
+  }
+  for (const auto &[group, runs] : group_runs) {
+    (void)group;
+    bool have_previous = false;
+    UvRun previous{};
+    for (const UvRun &run : runs) {
+      if (run.y >= static_cast<std::uint32_t>(height) || run.x0 > run.x1 ||
+          run.x1 >= static_cast<std::uint32_t>(width)) {
+        return false;
+      }
+      if (have_previous &&
+          (run.y < previous.y ||
+           (run.y == previous.y && run.x0 <= previous.x1 + 1u))) {
+        return false;
+      }
+      previous = run;
+      have_previous = true;
+    }
+  }
+  return true;
 }
 
-const std::vector<std::uint32_t> *
+const std::vector<UvRun> *
 LabPbrUvCoverage::find(std::string_view group_name) const {
-  const auto found = group_texels.find(std::string(group_name));
-  return found == group_texels.end() ? nullptr : &found->second;
+  const auto found = group_runs.find(group_name);
+  return found == group_runs.end() ? nullptr : &found->second;
+}
+
+std::uint64_t
+LabPbrUvCoverage::texelCount(std::string_view group_name) const noexcept {
+  const auto found = group_runs.find(group_name);
+  if (found == group_runs.end()) {
+    return 0u;
+  }
+  std::uint64_t count = 0u;
+  for (const UvRun &run : found->second) {
+    const std::uint64_t run_count =
+        static_cast<std::uint64_t>(run.x1) - run.x0 + 1u;
+    if (run_count > (std::numeric_limits<std::uint64_t>::max)() - count) {
+      return (std::numeric_limits<std::uint64_t>::max)();
+    }
+    count += run_count;
+  }
+  return count;
+}
+
+std::optional<std::uint32_t>
+LabPbrUvCoverage::firstTexel(std::string_view group_name) const noexcept {
+  const auto found = group_runs.find(group_name);
+  if (found == group_runs.end() || found->second.empty() || width <= 0) {
+    return std::nullopt;
+  }
+  const UvRun &run = found->second.front();
+  const auto texel = static_cast<std::uint64_t>(run.y) *
+                         static_cast<std::uint64_t>(width) +
+                     run.x0;
+  if (texel > static_cast<std::uint64_t>(
+                  (std::numeric_limits<std::uint32_t>::max)())) {
+    return std::nullopt;
+  }
+  return static_cast<std::uint32_t>(texel);
 }
 
 std::uint8_t encodeLabPbrEmission(float emission) noexcept {
@@ -258,113 +322,295 @@ bool validGroupLabPbrOverride(const GroupLabPbrOverride &override_value,
   return message == nullptr;
 }
 
+bool rasterizeLabPbrUvCoverage(const StaticIndexedModelMesh &mesh, int width,
+                               int height, LabPbrUvCoverage &out,
+                               std::string *error) {
+  const auto fail_coverage = [&](std::string message) {
+    if (error != nullptr) {
+      *error = std::move(message);
+    }
+    return false;
+  };
+  if (width <= 0 || height <= 0) {
+    return fail_coverage("UV coverage dimensions must be positive");
+  }
+  if (!mesh.uv_domain.valid()) {
+    return fail_coverage("UV coverage requires a resolved model UV Domain");
+  }
+  if (mesh.uv_domain.imported_width != width ||
+      mesh.uv_domain.imported_height != height) {
+    return fail_coverage(
+        "UV coverage dimensions do not match the resolved imported atlas");
+  }
+  const std::size_t width_size = static_cast<std::size_t>(width);
+  const std::size_t height_size = static_cast<std::size_t>(height);
+  if (width_size > (std::numeric_limits<std::size_t>::max)() / height_size) {
+    return fail_coverage("UV coverage dimensions overflow");
+  }
+  const std::size_t texel_count = width_size * height_size;
+  if (texel_count > static_cast<std::size_t>(
+                        (std::numeric_limits<std::uint32_t>::max)())) {
+    return fail_coverage("UV coverage texel indices exceed uint32 range");
+  }
+  try {
+    LabPbrUvCoverage result;
+    result.width = width;
+    result.height = height;
+    std::map<std::string, std::vector<const StaticModelFace *>, std::less<>>
+        grouped_faces;
+    for (const StaticModelFace &face : mesh.faces) {
+      if (!face.textured) {
+        continue;
+      }
+      if (face.bone_index >= mesh.bone_names.size() ||
+          face.first_vertex > mesh.vertices.size() ||
+          face.vertex_count > mesh.vertices.size() - face.first_vertex ||
+          face.vertex_count == 0u ||
+          face.first_index > mesh.indices.size() ||
+          face.index_count > mesh.indices.size() - face.first_index ||
+          face.index_count == 0u || face.index_count % 3u != 0u) {
+        return fail_coverage("UV coverage mesh face ranges are invalid");
+      }
+      grouped_faces[mesh.bone_names[face.bone_index]].push_back(&face);
+    }
+
+    if (grouped_faces.empty()) {
+      out = std::move(result);
+      if (error != nullptr) {
+        error->clear();
+      }
+      return true;
+    }
+
+    std::vector<std::uint8_t> marked(texel_count, 0u);
+    std::vector<std::uint32_t> touched;
+    touched.reserve(texel_count);
+    constexpr double kInsideEpsilon = 1.0e-9;
+    constexpr double kDomainEpsilon = 1.0e-9;
+
+    for (const auto &[group_name, faces] : grouped_faces) {
+      touched.clear();
+      for (const StaticModelFace *face_ptr : faces) {
+        const StaticModelFace &face = *face_ptr;
+        for (std::uint32_t local = 0; local + 2u < face.index_count;
+             local += 3u) {
+          const std::uint32_t ia = mesh.indices[face.first_index + local];
+          const std::uint32_t ib =
+              mesh.indices[face.first_index + local + 1u];
+          const std::uint32_t ic =
+              mesh.indices[face.first_index + local + 2u];
+          if (ia >= mesh.vertices.size() || ib >= mesh.vertices.size() ||
+              ic >= mesh.vertices.size()) {
+            return fail_coverage("UV coverage mesh index is out of range");
+          }
+          const std::size_t vertex_end =
+              static_cast<std::size_t>(face.first_vertex) +
+              face.vertex_count;
+          if (ia < face.first_vertex || ia >= vertex_end ||
+              ib < face.first_vertex || ib >= vertex_end ||
+              ic < face.first_vertex || ic >= vertex_end ||
+              mesh.vertices[ia].bone_index != face.bone_index ||
+              mesh.vertices[ib].bone_index != face.bone_index ||
+              mesh.vertices[ic].bone_index != face.bone_index) {
+            return fail_coverage(
+                "UV coverage mesh face ownership is inconsistent");
+          }
+          const auto &a = mesh.vertices[ia];
+          const auto &b = mesh.vertices[ib];
+          const auto &c = mesh.vertices[ic];
+          const auto atlas_coordinate = [&](double raw_u, double raw_v,
+                                            double &x, double &y) {
+            const double normalized_u = mesh.uv_domain.normalizeU(raw_u);
+            const double normalized_v = mesh.uv_domain.normalizeV(raw_v);
+            if (!std::isfinite(normalized_u) ||
+                !std::isfinite(normalized_v) ||
+                normalized_u < -kDomainEpsilon ||
+                normalized_u > 1.0 + kDomainEpsilon ||
+                normalized_v < -kDomainEpsilon ||
+                normalized_v > 1.0 + kDomainEpsilon) {
+              return false;
+            }
+            x = std::clamp(normalized_u, 0.0, 1.0) *
+                static_cast<double>(width);
+            y = std::clamp(normalized_v, 0.0, 1.0) *
+                static_cast<double>(height);
+            return true;
+          };
+          double ax = 0.0, ay = 0.0, bx = 0.0, by = 0.0, cx = 0.0,
+                 cy = 0.0;
+          if (!atlas_coordinate(a.raw_u, a.raw_v, ax, ay) ||
+              !atlas_coordinate(b.raw_u, b.raw_v, bx, by) ||
+              !atlas_coordinate(c.raw_u, c.raw_v, cx, cy)) {
+            return fail_coverage(
+                "UV coverage vertex lies outside the resolved model Domain");
+          }
+          const double area = edge(ax, ay, bx, by, cx, cy);
+          if (!std::isfinite(area) || std::abs(area) <= kInsideEpsilon) {
+            continue;
+          }
+          const int min_x =
+              std::clamp(static_cast<int>(std::floor(
+                             (std::min)({ax, bx, cx}))),
+                         0, width - 1);
+          const int max_x =
+              std::clamp(static_cast<int>(std::ceil(
+                             (std::max)({ax, bx, cx}))) -
+                             1,
+                         0, width - 1);
+          const int min_y =
+              std::clamp(static_cast<int>(std::floor(
+                             (std::min)({ay, by, cy}))),
+                         0, height - 1);
+          const int max_y =
+              std::clamp(static_cast<int>(std::ceil(
+                             (std::max)({ay, by, cy}))) -
+                             1,
+                         0, height - 1);
+          for (int y = min_y; y <= max_y; ++y) {
+            for (int x = min_x; x <= max_x; ++x) {
+              const double px = static_cast<double>(x) + 0.5;
+              const double py = static_cast<double>(y) + 0.5;
+              const double e0 = edge(ax, ay, bx, by, px, py);
+              const double e1 = edge(bx, by, cx, cy, px, py);
+              const double e2 = edge(cx, cy, ax, ay, px, py);
+              const bool inside =
+                  area > 0.0
+                      ? e0 >= -kInsideEpsilon &&
+                            e1 >= -kInsideEpsilon &&
+                            e2 >= -kInsideEpsilon
+                      : e0 <= kInsideEpsilon &&
+                            e1 <= kInsideEpsilon &&
+                            e2 <= kInsideEpsilon;
+              if (inside) {
+                const auto texel =
+                    static_cast<std::size_t>(y) * width_size +
+                    static_cast<std::size_t>(x);
+                if (marked[texel] == 0u) {
+                  marked[texel] = 1u;
+                  touched.push_back(static_cast<std::uint32_t>(texel));
+                }
+              }
+            }
+          }
+        }
+      }
+
+      std::sort(touched.begin(), touched.end());
+      std::size_t run_count = 0u;
+      std::uint32_t previous = 0u;
+      for (std::size_t i = 0; i < touched.size(); ++i) {
+        const std::uint32_t texel = touched[i];
+        if (i == 0u || texel / static_cast<std::uint32_t>(width) !=
+                           previous / static_cast<std::uint32_t>(width) ||
+            texel != previous + 1u) {
+          ++run_count;
+        }
+        previous = texel;
+      }
+      std::vector<UvRun> runs;
+      runs.reserve(run_count);
+      for (const std::uint32_t texel : touched) {
+        const std::uint32_t y =
+            texel / static_cast<std::uint32_t>(width);
+        const std::uint32_t x =
+            texel % static_cast<std::uint32_t>(width);
+        if (!runs.empty() && runs.back().y == y &&
+            x == runs.back().x1 + 1u) {
+          runs.back().x1 = x;
+        } else {
+          runs.push_back({y, x, x});
+        }
+      }
+      for (const std::uint32_t texel : touched) {
+        marked[texel] = 0u;
+      }
+      result.group_runs.emplace(group_name, std::move(runs));
+    }
+
+    out = std::move(result);
+    if (error != nullptr) {
+      error->clear();
+    }
+    return true;
+  } catch (const std::bad_alloc &) {
+    return fail_coverage("UV coverage allocation exceeded the memory budget");
+  } catch (const std::length_error &) {
+    return fail_coverage("UV coverage allocation size is invalid");
+  }
+}
+
 LabPbrUvCoverage
 rasterizeLabPbrUvCoverage(const StaticIndexedModelMesh &mesh, int width,
                           int height) {
   LabPbrUvCoverage result;
-  if (width <= 0 || height <= 0) {
-    return result;
-  }
-  const std::size_t texel_count =
-      static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
-  if (texel_count >
-      static_cast<std::size_t>(
-          (std::numeric_limits<std::uint32_t>::max)())) {
-    return result;
-  }
-  result.width = width;
-  result.height = height;
-  std::map<std::string, std::set<std::uint32_t>> covered;
-  constexpr double kInsideEpsilon = 1.0e-9;
-
-  for (const StaticModelFace &face : mesh.faces) {
-    if (!face.textured || face.bone_index >= mesh.bone_names.size() ||
-        face.first_index > mesh.indices.size() ||
-        face.index_count > mesh.indices.size() - face.first_index) {
-      continue;
-    }
-    auto &group = covered[mesh.bone_names[face.bone_index]];
-    for (std::uint32_t local = 0; local + 2u < face.index_count;
-         local += 3u) {
-      const std::uint32_t ia = mesh.indices[face.first_index + local];
-      const std::uint32_t ib = mesh.indices[face.first_index + local + 1u];
-      const std::uint32_t ic = mesh.indices[face.first_index + local + 2u];
-      if (ia >= mesh.vertices.size() || ib >= mesh.vertices.size() ||
-          ic >= mesh.vertices.size()) {
-        continue;
-      }
-      const auto &a = mesh.vertices[ia];
-      const auto &b = mesh.vertices[ib];
-      const auto &c = mesh.vertices[ic];
-      const double ax = static_cast<double>(a.u) * width;
-      const double ay = static_cast<double>(a.v) * height;
-      const double bx = static_cast<double>(b.u) * width;
-      const double by = static_cast<double>(b.v) * height;
-      const double cx = static_cast<double>(c.u) * width;
-      const double cy = static_cast<double>(c.v) * height;
-      const double area = edge(ax, ay, bx, by, cx, cy);
-      if (!std::isfinite(area) || std::abs(area) <= kInsideEpsilon) {
-        continue;
-      }
-      const int min_x =
-          std::clamp(static_cast<int>(std::floor(
-                         (std::min)({ax, bx, cx}))),
-                     0, width - 1);
-      const int max_x =
-          std::clamp(static_cast<int>(std::ceil(
-                         (std::max)({ax, bx, cx}))) -
-                         1,
-                     0, width - 1);
-      const int min_y =
-          std::clamp(static_cast<int>(std::floor(
-                         (std::min)({ay, by, cy}))),
-                     0, height - 1);
-      const int max_y =
-          std::clamp(static_cast<int>(std::ceil(
-                         (std::max)({ay, by, cy}))) -
-                         1,
-                     0, height - 1);
-      for (int y = min_y; y <= max_y; ++y) {
-        for (int x = min_x; x <= max_x; ++x) {
-          const double px = static_cast<double>(x) + 0.5;
-          const double py = static_cast<double>(y) + 0.5;
-          const double e0 = edge(ax, ay, bx, by, px, py);
-          const double e1 = edge(bx, by, cx, cy, px, py);
-          const double e2 = edge(cx, cy, ax, ay, px, py);
-          const bool inside =
-              area > 0.0
-                  ? e0 >= -kInsideEpsilon && e1 >= -kInsideEpsilon &&
-                        e2 >= -kInsideEpsilon
-                  : e0 <= kInsideEpsilon && e1 <= kInsideEpsilon &&
-                        e2 <= kInsideEpsilon;
-          if (inside) {
-            const auto texel =
-                static_cast<std::size_t>(y) *
-                    static_cast<std::size_t>(width) +
-                static_cast<std::size_t>(x);
-            group.insert(static_cast<std::uint32_t>(texel));
-          }
-        }
-      }
-    }
-  }
-
-  for (auto &[group, texels] : covered) {
-    result.group_texels.emplace(
-        std::move(group),
-        std::vector<std::uint32_t>(texels.begin(), texels.end()));
-  }
+  rasterizeLabPbrUvCoverage(mesh, width, height, result, nullptr);
   return result;
 }
 
+bool materializeLabPbrSpecular(int width, int height,
+                               const TextureImage *imported_specular,
+                               TextureImage &out, std::string *error) {
+  const auto fail = [&](std::string message) {
+    if (error != nullptr) {
+      *error = std::move(message);
+    }
+    return false;
+  };
+  if (width <= 0 || height <= 0) {
+    return fail("specular atlas dimensions must be positive");
+  }
+  const auto width_size = static_cast<std::size_t>(width);
+  const auto height_size = static_cast<std::size_t>(height);
+  if (width_size > (std::numeric_limits<std::size_t>::max)() / height_size) {
+    return fail("specular atlas dimensions overflow");
+  }
+  const std::size_t texel_count = width_size * height_size;
+  if (texel_count >
+          (std::numeric_limits<std::size_t>::max)() / 4u ||
+      texel_count > static_cast<std::size_t>(
+                        (std::numeric_limits<std::uint32_t>::max)())) {
+    return fail("specular atlas dimensions overflow");
+  }
+  if (imported_specular != nullptr && imported_specular->valid() &&
+      (imported_specular->width != width ||
+       imported_specular->height != height)) {
+    return fail("imported specular dimensions do not match atlas");
+  }
+  try {
+    TextureImage candidate;
+    candidate.width = width;
+    candidate.height = height;
+    candidate.source_channels = 4;
+    if (imported_specular != nullptr && imported_specular->valid()) {
+      candidate.rgba = imported_specular->rgba;
+    } else {
+      candidate.rgba.resize(texel_count * 4u);
+      for (std::size_t texel = 0; texel < texel_count; ++texel) {
+        candidate.rgba[texel * 4u + 0u] = 0u;
+        candidate.rgba[texel * 4u + 1u] = 10u;
+        candidate.rgba[texel * 4u + 2u] = 0u;
+        candidate.rgba[texel * 4u + 3u] = 0u;
+      }
+    }
+    out = std::move(candidate);
+    if (error != nullptr) {
+      error->clear();
+    }
+    return true;
+  } catch (const std::bad_alloc &) {
+    return fail("specular atlas allocation exceeded the memory budget");
+  } catch (const std::length_error &) {
+    return fail("specular atlas allocation size is invalid");
+  }
+}
+
 LabPbrCompositionResult composeLabPbrSpecular(
-    int width, int height, const TextureImage *imported_specular,
+    int width, int height, SharedTextureImage imported_specular,
     const LabPbrUvCoverage &coverage,
     const std::map<std::string, GroupLabPbrOverride> &overrides) {
   LabPbrCompositionResult result;
-  if (width <= 0 || height <= 0 || coverage.width != width ||
-      coverage.height != height) {
-    result.errors.emplace_back("invalid or mismatched UV coverage dimensions");
+  if (width <= 0 || height <= 0) {
+    result.errors.emplace_back("invalid specular atlas dimensions");
     return result;
   }
   const std::size_t texel_count =
@@ -377,16 +623,6 @@ LabPbrCompositionResult composeLabPbrSpecular(
     result.errors.emplace_back("specular atlas dimensions overflow");
     return result;
   }
-  result.specular.width = width;
-  result.specular.height = height;
-  result.specular.source_channels = 4;
-  result.specular.rgba.resize(texel_count * 4u);
-  for (std::size_t texel = 0; texel < texel_count; ++texel) {
-    result.specular.rgba[texel * 4u + 0u] = 0u;
-    result.specular.rgba[texel * 4u + 1u] = 10u;
-    result.specular.rgba[texel * 4u + 2u] = 0u;
-    result.specular.rgba[texel * 4u + 3u] = 0u;
-  }
   if (imported_specular != nullptr && imported_specular->valid()) {
     if (imported_specular->width != width ||
         imported_specular->height != height) {
@@ -394,7 +630,28 @@ LabPbrCompositionResult composeLabPbrSpecular(
           "imported specular dimensions do not match atlas");
       return result;
     }
-    result.specular.rgba = imported_specular->rgba;
+  }
+  if (overrides.empty()) {
+    result.deferred_width = width;
+    result.deferred_height = height;
+    if (imported_specular != nullptr && imported_specular->valid()) {
+      result.specular = std::move(imported_specular);
+    } else {
+      result.specular_materialization_deferred = true;
+    }
+    return result;
+  }
+  if (!coverage.valid() || coverage.width != width ||
+      coverage.height != height) {
+    result.errors.emplace_back("invalid or mismatched UV coverage dimensions");
+    return result;
+  }
+  std::string materialize_error;
+  TextureImage authored_specular;
+  if (!materializeLabPbrSpecular(width, height, imported_specular.get(),
+                                 authored_specular, &materialize_error)) {
+    result.errors.push_back(std::move(materialize_error));
+    return result;
   }
 
   std::map<std::uint64_t, ChannelClaim> claims;
@@ -404,41 +661,50 @@ LabPbrCompositionResult composeLabPbrSpecular(
       result.errors.push_back(group_name + ": " + validation_error);
       continue;
     }
-    const auto *texels = coverage.find(group_name);
-    if (texels == nullptr || texels->empty()) {
+    const auto *runs = coverage.find(group_name);
+    if (runs == nullptr || runs->empty()) {
       result.warnings.push_back(group_name +
                                 ": no textured UV texels are covered");
       continue;
     }
-    for (const std::uint32_t texel : *texels) {
-      if (texel >= texel_count) {
-        result.errors.push_back(group_name +
-                                ": UV coverage contains invalid texel");
-        break;
-      }
-      if (override_value.roughness_enabled) {
-        claimChannel(texel, LabPbrOverrideChannel::Roughness,
-                     encodeLabPbrRoughness(override_value.roughness),
-                     group_name, result.specular, claims);
-      }
-      if (override_value.metal_enabled) {
-        claimChannel(texel, LabPbrOverrideChannel::Metal,
-                     override_value.metal ? override_value.metal_code
-                                          : override_value.dielectric_f0,
-                     group_name, result.specular, claims);
-      }
-      if (override_value.porosity_enabled) {
-        claimChannel(texel, LabPbrOverrideChannel::Porosity,
-                     override_value.subsurface_scattering
-                         ? encodeLabPbrSubsurface(
-                               override_value.subsurface)
-                         : encodeLabPbrPorosity(override_value.porosity),
-                     group_name, result.specular, claims);
-      }
-      if (override_value.emission_enabled) {
-        claimChannel(texel, LabPbrOverrideChannel::Emission,
-                     encodeLabPbrEmission(override_value.emission),
-                     group_name, result.specular, claims);
+    for (const UvRun &run : *runs) {
+      for (std::uint32_t x = run.x0;; ++x) {
+        const auto texel64 = static_cast<std::uint64_t>(run.y) *
+                                 static_cast<std::uint64_t>(width) +
+                             x;
+        if (texel64 >= texel_count) {
+          result.errors.push_back(group_name +
+                                  ": UV coverage contains invalid texel");
+          break;
+        }
+        const auto texel = static_cast<std::uint32_t>(texel64);
+        if (override_value.roughness_enabled) {
+          claimChannel(texel, LabPbrOverrideChannel::Roughness,
+                       encodeLabPbrRoughness(override_value.roughness),
+                       group_name, authored_specular, claims);
+        }
+        if (override_value.metal_enabled) {
+          claimChannel(texel, LabPbrOverrideChannel::Metal,
+                       override_value.metal ? override_value.metal_code
+                                            : override_value.dielectric_f0,
+                       group_name, authored_specular, claims);
+        }
+        if (override_value.porosity_enabled) {
+          claimChannel(texel, LabPbrOverrideChannel::Porosity,
+                       override_value.subsurface_scattering
+                           ? encodeLabPbrSubsurface(
+                                 override_value.subsurface)
+                           : encodeLabPbrPorosity(override_value.porosity),
+                       group_name, authored_specular, claims);
+        }
+        if (override_value.emission_enabled) {
+          claimChannel(texel, LabPbrOverrideChannel::Emission,
+                       encodeLabPbrEmission(override_value.emission),
+                       group_name, authored_specular, claims);
+        }
+        if (x == run.x1) {
+          break;
+        }
       }
     }
   }
@@ -455,84 +721,167 @@ LabPbrCompositionResult composeLabPbrSpecular(
     conflict.encoded_values.assign(claim.values.begin(), claim.values.end());
     result.conflicts.push_back(std::move(conflict));
   }
+  try {
+    result.specular =
+        std::make_shared<const TextureImage>(std::move(authored_specular));
+  } catch (const std::bad_alloc &) {
+    result.errors.emplace_back(
+        "specular atlas publication exceeded the memory budget");
+  } catch (const std::length_error &) {
+    result.errors.emplace_back("specular atlas publication size is invalid");
+  }
   return result;
 }
 
 bool buildAuthoredResolvedMaterial(
-    const TextureImage &base, const ResolvedMaterialTable &source,
-    const TextureImage *authored_normal,
-    const TextureImage *authored_specular, ResolvedMaterialTable &out,
-    std::string *error) {
-  if (!base.valid() ||
+    SharedTextureImage base, const ResolvedMaterialTable &source,
+    SharedTextureImage authored_normal,
+    SharedTextureImage authored_specular, ResolvedMaterialTable &out,
+    std::string *error, std::uint64_t maximum_peak_bytes) {
+  const bool has_authored_normal = authored_normal != nullptr;
+  const bool has_authored_specular = authored_specular != nullptr;
+  if (base == nullptr || !base->valid() ||
       (authored_specular != nullptr &&
        (!authored_specular->valid() ||
-        authored_specular->width != base.width ||
-        authored_specular->height != base.height ||
+        authored_specular->width != base->width ||
+        authored_specular->height != base->height ||
         authored_specular->source_channels != 4))) {
     if (error != nullptr) {
       *error = "authored specular image does not match the base atlas";
     }
     return false;
   }
-  const TextureImage *normal = authored_normal;
+  SharedTextureImage normal = std::move(authored_normal);
   if (normal == nullptr && source.normal_map_active) {
-    normal = &source.normal_image;
+    normal = source.normalImageAsset();
   }
-  const TextureImage *specular = authored_specular;
+  SharedTextureImage specular = std::move(authored_specular);
   if (specular == nullptr && source.specular_map_active) {
-    specular = &source.specular_image;
+    specular = source.specularImageAsset();
   }
   if (normal != nullptr &&
-      (!normal->valid() || normal->width != base.width ||
-       normal->height != base.height || normal->source_channels < 3)) {
+      (!normal->valid() || normal->width != base->width ||
+       normal->height != base->height || normal->source_channels < 3)) {
     if (error != nullptr) {
       *error = "normal image does not match the base atlas or lacks RGB";
     }
     return false;
   }
 
-  ResolvedMaterialTable material = source;
-  material.width = base.width;
-  material.height = base.height;
-  if (authored_normal != nullptr || authored_specular != nullptr) {
-    material.format = LabPbrFormat::LabPbr13;
-  }
-  material.normal_map_active = normal != nullptr;
-  material.normal_image = normal == nullptr ? TextureImage{} : *normal;
-  material.specular_map_active = specular != nullptr;
-  material.specular_image =
-      specular == nullptr ? TextureImage{} : *specular;
-  const std::size_t texel_count =
-      static_cast<std::size_t>(base.width) *
-      static_cast<std::size_t>(base.height);
-  material.texels.resize(texel_count);
-  for (std::size_t texel = 0; texel < texel_count; ++texel) {
-    std::array<std::uint8_t, 4> base_rgba{};
-    std::array<std::uint8_t, 4> normal_rgba{};
-    std::array<std::uint8_t, 4> specular_rgba{};
-    std::copy_n(base.rgba.begin() +
-                    static_cast<std::ptrdiff_t>(texel * 4u),
-                4u, base_rgba.begin());
-    if (specular != nullptr) {
-      std::copy_n(specular->rgba.begin() +
-                      static_cast<std::ptrdiff_t>(texel * 4u),
-                  4u, specular_rgba.begin());
+  LabPbrMemoryEstimateRequest memory_request;
+  memory_request.width = static_cast<std::uint64_t>(base->width);
+  memory_request.height = static_cast<std::uint64_t>(base->height);
+  memory_request.resolved_texel_bytes_per_pixel =
+      kLabPbrResolvedTexelBytesPerPixel;
+  const SharedTextureImage assets[] = {
+      base, normal, specular, out.baseImageAsset(), out.normalImageAsset(),
+      out.specularImageAsset()};
+  const TextureImage *counted[std::size(assets)]{};
+  std::size_t counted_size = 0;
+  for (const auto &asset : assets) {
+    if (asset == nullptr ||
+        std::find(counted, counted + counted_size, asset.get()) !=
+            counted + counted_size) {
+      continue;
     }
-    if (normal != nullptr) {
-      std::copy_n(normal->rgba.begin() +
-                      static_cast<std::ptrdiff_t>(texel * 4u),
-                  4u, normal_rgba.begin());
+    counted[counted_size++] = asset.get();
+    if (asset->rgba.capacity() >
+        (std::numeric_limits<std::uint64_t>::max)() -
+            memory_request.resident_fixed_bytes) {
+      if (error != nullptr) {
+        *error = "LabPBR budget preflight failed: resident byte overflow";
+      }
+      return false;
     }
-    material.texels[texel] =
-        decodeLabPbrTexel(base_rgba,
-                          normal == nullptr ? nullptr : &normal_rgba,
-                          specular == nullptr ? nullptr : &specular_rgba, 4);
+    memory_request.resident_fixed_bytes +=
+        static_cast<std::uint64_t>(asset->rgba.capacity());
   }
-  out = std::move(material);
-  if (error != nullptr) {
-    error->clear();
+  LabPbrMemoryEstimate memory_estimate;
+  if (!preflightLabPbrMemory(memory_request, maximum_peak_bytes,
+                             memory_estimate, error)) {
+    return false;
   }
-  return true;
+
+  try {
+    ResolvedMaterialTable material = source;
+    material.width = base->width;
+    material.height = base->height;
+    if (has_authored_normal || has_authored_specular) {
+      material.format = LabPbrFormat::LabPbr13;
+    }
+    material.normal_map_active = normal != nullptr;
+    material.specular_map_active = specular != nullptr;
+    material.setImageAssets(std::move(base), std::move(normal),
+                            std::move(specular));
+    out = std::move(material);
+    if (error != nullptr) {
+      error->clear();
+    }
+    return true;
+  } catch (const std::bad_alloc &) {
+    if (error != nullptr) {
+      *error = "LabPBR budget stage failed while allocating compact material images";
+    }
+    return false;
+  } catch (const std::length_error &exception) {
+    if (error != nullptr) {
+      *error = std::string("LabPBR budget stage failed: ") + exception.what();
+    }
+    return false;
+  }
+}
+
+bool buildAuthoredResolvedMaterial(
+    const TextureImage &base, const ResolvedMaterialTable &source,
+    const TextureImage *authored_normal,
+    const TextureImage *authored_specular, ResolvedMaterialTable &out,
+    std::string *error, std::uint64_t maximum_peak_bytes) {
+  if (!base.valid()) {
+    if (error != nullptr) {
+      *error = "authored specular image does not match the base atlas";
+    }
+    return false;
+  }
+  LabPbrMemoryEstimateRequest memory_request;
+  memory_request.width = static_cast<std::uint64_t>(base.width);
+  memory_request.height = static_cast<std::uint64_t>(base.height);
+  memory_request.resident_rgba_image_count =
+      1u + (authored_normal != nullptr ? 1u : 0u) +
+      (authored_specular != nullptr ? 1u : 0u);
+  memory_request.candidate_rgba_image_count =
+      memory_request.resident_rgba_image_count;
+  memory_request.resolved_texel_bytes_per_pixel =
+      kLabPbrResolvedTexelBytesPerPixel;
+  LabPbrMemoryEstimate memory_estimate;
+  if (!preflightLabPbrMemory(memory_request, maximum_peak_bytes,
+                             memory_estimate, error)) {
+    return false;
+  }
+  try {
+    auto base_asset = std::make_shared<const TextureImage>(base);
+    auto normal_asset = authored_normal != nullptr
+                            ? std::make_shared<const TextureImage>(
+                                  *authored_normal)
+                            : SharedTextureImage{};
+    auto specular_asset = authored_specular != nullptr
+                              ? std::make_shared<const TextureImage>(
+                                    *authored_specular)
+                              : SharedTextureImage{};
+    return buildAuthoredResolvedMaterial(
+        std::move(base_asset), source, std::move(normal_asset),
+        std::move(specular_asset), out, error, maximum_peak_bytes);
+  } catch (const std::bad_alloc &) {
+    if (error != nullptr) {
+      *error =
+          "LabPBR budget stage failed while allocating compact material images";
+    }
+    return false;
+  } catch (const std::length_error &exception) {
+    if (error != nullptr) {
+      *error = std::string("LabPBR budget stage failed: ") + exception.what();
+    }
+    return false;
+  }
 }
 
 std::string sha256Hex(std::span<const std::uint8_t> bytes) {
@@ -550,60 +899,97 @@ std::string sha256Hex(std::span<const std::uint8_t> bytes) {
 bool importReadOnlyIrisNormal(const std::filesystem::path &path,
                               int expected_width, int expected_height,
                               ReadOnlyIrisNormalAsset &out,
-                              std::string *error) {
-  std::ifstream input(path, std::ios::binary);
-  if (!input) {
-    if (error != nullptr) {
-      *error = "failed to open Iris normal image";
+                              std::string *error,
+                              TextureDecodeLimits limits) {
+  try {
+    const auto add_retained = [&](std::size_t bytes) {
+      if (bytes > (std::numeric_limits<std::size_t>::max)() -
+                      limits.retained_resident_bytes) {
+        return false;
+      }
+      limits.retained_resident_bytes += bytes;
+      return true;
+    };
+    if ((out.original_file_bytes != nullptr &&
+         !add_retained(out.original_file_bytes->capacity())) ||
+        (out.decoded != nullptr &&
+         !add_retained(out.decoded->rgba.capacity()))) {
+      if (error != nullptr) {
+        *error =
+            "Iris Normal budget stage failed before snapshot: retained byte overflow";
+      }
+      return false;
     }
-    return false;
-  }
-  std::vector<std::uint8_t> bytes(
-      (std::istreambuf_iterator<char>(input)),
-      std::istreambuf_iterator<char>());
-  if (bytes.empty()) {
-    if (error != nullptr) {
-      *error = "Iris normal image is empty";
+    const std::size_t effective_peak =
+        (std::min)(limits.maximum_peak_bytes,
+                   kTextureDecodeMaximumPeakBytes);
+    if (limits.retained_resident_bytes > effective_peak) {
+      if (error != nullptr) {
+        *error =
+            "Iris Normal budget stage failed before snapshot: retained state exceeds the peak limit";
+      }
+      return false;
     }
-    return false;
-  }
-  TextureImage decoded;
-  std::string decode_error;
-  if (bytes.size() >
-          static_cast<std::size_t>((std::numeric_limits<int>::max)()) ||
-      !loadTextureImageFromMemory(bytes.data(), static_cast<int>(bytes.size()),
-                                  decoded, &decode_error)) {
-    if (error != nullptr) {
-      *error = decode_error.empty() ? "failed to decode Iris normal image"
-                                    : decode_error;
-    }
-    return false;
-  }
-  if (decoded.source_channels != 4) {
-    if (error != nullptr) {
-      *error = "Iris normal image must be RGBA";
-    }
-    return false;
-  }
-  if (decoded.width != expected_width ||
-      decoded.height != expected_height) {
-    if (error != nullptr) {
-      *error = "Iris normal dimensions do not match the base atlas";
-    }
-    return false;
-  }
 
-  ReadOnlyIrisNormalAsset imported;
-  imported.source_path = path;
-  imported.original_file_bytes = std::move(bytes);
-  imported.sha256 = sha256Hex(imported.original_file_bytes);
-  imported.decoded = std::move(decoded);
-  imported.decoded.path = path.string();
-  out = std::move(imported);
-  if (error != nullptr) {
-    error->clear();
+    FileByteSnapshot snapshot;
+    if (!snapshotFileBytes(
+            path, snapshot, error, "Iris Normal",
+            static_cast<std::uintmax_t>(
+                effective_peak - limits.retained_resident_bytes))) {
+      return false;
+    }
+
+    TextureImage decoded;
+    std::string decode_error;
+    if (!loadTextureImageFromMemory(
+            snapshot.bytes->data(), static_cast<int>(snapshot.bytes->size()),
+            decoded, &decode_error, limits)) {
+      if (error != nullptr) {
+        *error = "Iris Normal Decode stage failed: " +
+                 (decode_error.empty() ? std::string("invalid image")
+                                       : decode_error);
+      }
+      return false;
+    }
+    if (decoded.source_channels != 4) {
+      if (error != nullptr) {
+        *error = "Iris Normal Decode stage failed: image must be RGBA";
+      }
+      return false;
+    }
+    if (decoded.width != expected_width ||
+        decoded.height != expected_height) {
+      if (error != nullptr) {
+        *error = "Iris Normal Domain stage failed: dimensions do not match "
+                 "the base atlas";
+      }
+      return false;
+    }
+
+    ReadOnlyIrisNormalAsset imported;
+    imported.source_path = snapshot.path;
+    imported.original_file_bytes = snapshot.bytes;
+    imported.sha256 = sha256Hex(*imported.original_file_bytes);
+    decoded.path = pathUtf8String(snapshot.path);
+    imported.decoded =
+        std::make_shared<const TextureImage>(std::move(decoded));
+    out = std::move(imported);
+    if (error != nullptr) {
+      error->clear();
+    }
+    return true;
+  } catch (const std::bad_alloc &) {
+    if (error != nullptr) {
+      *error = "Iris Normal budget stage failed: std::bad_alloc";
+    }
+    return false;
+  } catch (const std::length_error &exception) {
+    if (error != nullptr) {
+      *error = std::string("Iris Normal budget stage failed: ") +
+               exception.what();
+    }
+    return false;
   }
-  return true;
 }
 
 bool encodePngRgba8(int width, int height,

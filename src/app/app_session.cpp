@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cwchar>
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -23,6 +24,7 @@
 #include <map>
 #include <optional>
 #include <sstream>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -41,7 +43,6 @@
 
 
 #include <windows.h>
-#include <commdlg.h>
 #include <shobjidl.h>
 
 #endif
@@ -104,26 +105,219 @@ void logBakeDiagnostic(const char *event, WorkerPhase phase, int current,
   xpbd::log::flush();
 }
 
-bool sameTextureResource(const gfx::TextureImage &lhs,
-                         const gfx::TextureImage &rhs) noexcept {
-  return lhs.width == rhs.width && lhs.height == rhs.height &&
-         lhs.rgba == rhs.rgba;
+bool sameTextureResource(const gfx::SharedTextureImage &lhs,
+                         const gfx::SharedTextureImage &rhs) noexcept {
+  if (lhs == rhs) {
+    return true;
+  }
+  return lhs != nullptr && rhs != nullptr && lhs->width == rhs->width &&
+         lhs->height == rhs->height && lhs->rgba == rhs->rgba;
 }
 
-bool hasTextureResourceState(const gfx::TextureImage &texture) noexcept {
-  return texture.width != 0 || texture.height != 0 || !texture.rgba.empty();
+bool sameTextureResource(const gfx::SharedTextureImage &lhs,
+                         const gfx::TextureImage &rhs) noexcept {
+  return lhs != nullptr && lhs->width == rhs.width &&
+         lhs->height == rhs.height && lhs->rgba == rhs.rgba;
+}
+
+bool hasTextureResourceState(
+    const gfx::SharedTextureImage &texture) noexcept {
+  return texture != nullptr &&
+         (texture->width != 0 || texture->height != 0 ||
+          !texture->rgba.empty());
+}
+
+void addLabPbrResidentBytes(std::uint64_t bytes,
+                            std::uint64_t &total) noexcept {
+  if (bytes > (std::numeric_limits<std::uint64_t>::max)() - total) {
+    total = (std::numeric_limits<std::uint64_t>::max)();
+  } else {
+    total += bytes;
+  }
+}
+
+struct LabPbrResidentCounter {
+  std::uint64_t total = 0;
+  std::array<const gfx::TextureImage *, 12> images{};
+  std::size_t image_count = 0;
+  std::array<const std::vector<std::uint8_t> *, 8> sources{};
+  std::size_t source_count = 0;
+
+  void addImage(const gfx::SharedTextureImage &image) noexcept {
+    if (image == nullptr ||
+        std::find(images.begin(), images.begin() + image_count, image.get()) !=
+            images.begin() + image_count) {
+      return;
+    }
+    if (image_count >= images.size()) {
+      total = (std::numeric_limits<std::uint64_t>::max)();
+      return;
+    }
+    images[image_count++] = image.get();
+    addLabPbrResidentBytes(
+        static_cast<std::uint64_t>(image->rgba.capacity()), total);
+  }
+
+  void addSource(const gfx::LabPbrSourceFile &source) noexcept {
+    if (source.original_bytes == nullptr ||
+        std::find(sources.begin(), sources.begin() + source_count,
+                  source.original_bytes.get()) !=
+            sources.begin() + source_count) {
+      return;
+    }
+    if (source_count >= sources.size()) {
+      total = (std::numeric_limits<std::uint64_t>::max)();
+      return;
+    }
+    sources[source_count++] = source.original_bytes.get();
+    addLabPbrResidentBytes(static_cast<std::uint64_t>(
+                              source.original_bytes->capacity()),
+                          total);
+  }
+
+  void excludeSource(const gfx::LabPbrSourceFile &source) noexcept {
+    if (source.original_bytes == nullptr ||
+        std::find(sources.begin(), sources.begin() + source_count,
+                  source.original_bytes.get()) !=
+            sources.begin() + source_count) {
+      return;
+    }
+    if (source_count >= sources.size()) {
+      total = (std::numeric_limits<std::uint64_t>::max)();
+      return;
+    }
+    sources[source_count++] = source.original_bytes.get();
+  }
+
+  [[nodiscard]] std::span<const gfx::TextureImage *const>
+  imageIdentities() const noexcept {
+    return {images.data(), image_count};
+  }
+
+  [[nodiscard]]
+  std::span<const std::vector<std::uint8_t> *const>
+  sourceIdentities() const noexcept {
+    return {sources.data(), source_count};
+  }
+};
+
+LabPbrResidentCounter sessionLabPbrResidentCounter(
+    const AppSession &session,
+    const gfx::ResolvedMaterialTable &source_material) noexcept {
+  LabPbrResidentCounter counter;
+  counter.addImage(session.model_texture);
+  counter.addImage(source_material.baseImageAsset());
+  counter.addImage(source_material.normalImageAsset());
+  counter.addImage(source_material.specularImageAsset());
+  counter.addImage(session.resolved_material.baseImageAsset());
+  counter.addImage(session.resolved_material.normalImageAsset());
+  counter.addImage(session.resolved_material.specularImageAsset());
+  counter.addImage(session.labpbr_composition.specular);
+  counter.addImage(session.labpbr_imported_normal.decoded);
+  if (session.labpbr_imported_normal.original_file_bytes != nullptr) {
+    gfx::LabPbrSourceFile iris_source;
+    iris_source.original_bytes =
+        session.labpbr_imported_normal.original_file_bytes;
+    counter.addSource(iris_source);
+  }
+  for (const auto &[group, runs] :
+       session.labpbr_uv_coverage.group_runs) {
+    addLabPbrResidentBytes(static_cast<std::uint64_t>(group.capacity()),
+                          counter.total);
+    std::uint64_t run_bytes = 0;
+    if (!gfx::detail::checkedLabPbrMultiply(
+            static_cast<std::uint64_t>(runs.capacity()),
+            static_cast<std::uint64_t>(sizeof(gfx::UvRun)), run_bytes)) {
+      counter.total = (std::numeric_limits<std::uint64_t>::max)();
+    } else {
+      addLabPbrResidentBytes(run_bytes, counter.total);
+    }
+  }
+  counter.addSource(session.labpbr_suite_source.base);
+  counter.addSource(session.labpbr_suite_source.normal);
+  counter.addSource(session.labpbr_suite_source.specular);
+  counter.addSource(session.labpbr_suite_source.properties);
+  return counter;
+}
+
+std::size_t narrowLabPbrBytes(std::uint64_t bytes) noexcept {
+  return static_cast<std::size_t>((std::min)(
+      bytes, static_cast<std::uint64_t>(
+                 (std::numeric_limits<std::size_t>::max)())));
+}
+
+gfx::TextureDecodeLimits sessionTextureDecodeLimits(
+    const AppSession &session,
+    const gfx::ResolvedMaterialTable &source_material,
+    const gfx::LabPbrSuiteImportCache &cache) noexcept {
+  const auto resident =
+      sessionLabPbrResidentCounter(session, source_material);
+  std::uint64_t retained = resident.total;
+  const auto cache_bytes = cache.residentBytes(
+      resident.imageIdentities(), resident.sourceIdentities());
+  addLabPbrResidentBytes(cache_bytes, retained);
+  gfx::TextureDecodeLimits limits;
+  limits.maximum_peak_bytes =
+      narrowLabPbrBytes(session.labpbr_peak_memory_budget_bytes);
+  limits.retained_resident_bytes = narrowLabPbrBytes(retained);
+  return limits;
+}
+
+gfx::LabPbrSuiteImportLimits sessionSuiteImportLimits(
+    const AppSession &session,
+    const gfx::ResolvedMaterialTable &source_material,
+    const gfx::LabPbrSuiteImportCache &cache) noexcept {
+  const auto resident =
+      sessionLabPbrResidentCounter(session, source_material);
+  return {
+      session.labpbr_peak_memory_budget_bytes,
+      resident.total,
+      cache.residentBytes(resident.imageIdentities(),
+                          resident.sourceIdentities()),
+      true,
+      !session.labpbr_group_overrides.empty(),
+      true,
+  };
+}
+
+std::uint64_t suiteSnapshotBytes(
+    const gfx::LabPbrSuiteSource &source) noexcept {
+  LabPbrResidentCounter counter;
+  counter.addSource(source.base);
+  counter.addSource(source.normal);
+  counter.addSource(source.specular);
+  counter.addSource(source.properties);
+  return counter.total;
+}
+
+gfx::LabPbrSuiteSource metadataOnlyLabPbrSource(
+    const gfx::LabPbrSuiteSource &source) {
+  auto metadata = source;
+  metadata.base.original_bytes.reset();
+  metadata.specular.original_bytes.reset();
+  metadata.normal.original_bytes.reset();
+  metadata.properties.original_bytes.reset();
+  return metadata;
 }
 
 bool buildSessionLabPbrMaterial(
     const loader::Geometry &geometry, const baker::BoneMapper &bone_mapper,
-    const gfx::TextureImage &base,
+    const gfx::SharedTextureImage &base,
     const gfx::ResolvedMaterialTable &source_material,
     const std::map<std::string, gfx::GroupLabPbrOverride> &overrides,
     const gfx::ReadOnlyIrisNormalAsset *imported_normal,
+    gfx::ResolvedUvDomain &domain,
     gfx::LabPbrUvCoverage &coverage,
     gfx::LabPbrCompositionResult &composition,
-    gfx::ResolvedMaterialTable &resolved, std::string *error) {
-  if (!base.valid()) {
+    gfx::ResolvedMaterialTable &resolved, std::string *error,
+    std::uint64_t maximum_peak_bytes,
+    LabPbrResidentCounter resident_counter = {},
+    const gfx::LabPbrSuiteSource *candidate_source = nullptr,
+    const gfx::LabPbrSuiteImportCache *cache = nullptr,
+    const gfx::ResolvedUvDomain *reusable_domain = nullptr,
+    const gfx::LabPbrUvCoverage *reusable_coverage = nullptr) {
+  if (base == nullptr || !base->valid()) {
+    domain = {};
     coverage = {};
     composition = {};
     resolved = source_material;
@@ -133,38 +327,126 @@ bool buildSessionLabPbrMaterial(
     return true;
   }
 
-  gfx::ViewportMeshBuilder builder;
-  builder.setGeometry(&geometry);
-  builder.setBoneMapper(&bone_mapper);
-  builder.setTexture(&base);
+  std::uint64_t pixels = 0;
+  std::uint64_t rgba_bytes = 0;
+  std::uint64_t coverage_bytes = 0;
+  const bool has_overrides = !overrides.empty();
+  if (!gfx::detail::checkedLabPbrMultiply(
+          static_cast<std::uint64_t>(base->width),
+          static_cast<std::uint64_t>(base->height), pixels) ||
+      !gfx::detail::checkedLabPbrMultiply(pixels, 4u, rgba_bytes)) {
+    if (error != nullptr) {
+      *error = "LabPBR budget preflight failed: atlas byte arithmetic overflow";
+    }
+    return false;
+  }
+  if (has_overrides &&
+      !gfx::estimateLabPbrUvRunCoveragePeakBytes(
+          static_cast<std::uint64_t>(base->width),
+          static_cast<std::uint64_t>(base->height), coverage_bytes, error)) {
+    if (error != nullptr && !error->empty()) {
+      *error = "LabPBR budget preflight failed: " + *error;
+    }
+    return false;
+  }
+  const bool has_imported_normal =
+      imported_normal != nullptr && imported_normal->valid();
+  const bool has_source_specular = source_material.specular_map_active;
+  const gfx::SharedTextureImage candidate_assets[] = {
+      base,
+      source_material.normal_map_active
+          ? source_material.normalImageAsset()
+          : gfx::SharedTextureImage{},
+      has_source_specular ? source_material.specularImageAsset()
+                          : gfx::SharedTextureImage{},
+      has_imported_normal ? imported_normal->decoded
+                          : gfx::SharedTextureImage{},
+  };
+  for (const auto &asset : candidate_assets) {
+    resident_counter.addImage(asset);
+  }
+  std::uint64_t encoded_snapshot_bytes = 0;
+  if (candidate_source != nullptr) {
+    encoded_snapshot_bytes = suiteSnapshotBytes(*candidate_source);
+    resident_counter.excludeSource(candidate_source->base);
+    resident_counter.excludeSource(candidate_source->normal);
+    resident_counter.excludeSource(candidate_source->specular);
+    resident_counter.excludeSource(candidate_source->properties);
+  }
+  const std::uint64_t cache_bytes =
+      cache != nullptr
+          ? cache->residentBytes(resident_counter.imageIdentities(),
+                                 resident_counter.sourceIdentities())
+          : 0u;
+  gfx::LabPbrMemoryEstimateRequest memory_request;
+  memory_request.width = static_cast<std::uint64_t>(base->width);
+  memory_request.height = static_cast<std::uint64_t>(base->height);
+  memory_request.candidate_rgba_image_count = has_overrides ? 1u : 0u;
+  memory_request.resolved_texel_bytes_per_pixel =
+      gfx::kLabPbrResolvedTexelBytesPerPixel;
+  memory_request.resident_fixed_bytes = resident_counter.total;
+  memory_request.encoded_snapshot_bytes = encoded_snapshot_bytes;
+  memory_request.coverage_peak_bytes = coverage_bytes;
+  memory_request.cache_bytes = cache_bytes;
+  gfx::LabPbrMemoryEstimate memory_estimate;
+  if (!gfx::preflightLabPbrMemory(memory_request, maximum_peak_bytes,
+                                  memory_estimate, error)) {
+    return false;
+  }
+
   gfx::StaticIndexedModelMesh mesh;
-  builder.buildStaticIndexedModel(mesh);
-  auto next_coverage =
-      gfx::rasterizeLabPbrUvCoverage(mesh, base.width, base.height);
-  const gfx::TextureImage *source_specular =
+  try {
+    gfx::ViewportMeshBuilder builder;
+    builder.setGeometry(&geometry);
+    builder.setBoneMapper(&bone_mapper);
+    builder.setTexture(base.get());
+    builder.buildStaticIndexedModel(mesh);
+  } catch (const std::exception &exception) {
+    if (error != nullptr) {
+      *error = exception.what();
+    }
+    return false;
+  }
+  gfx::LabPbrUvCoverage next_coverage;
+  if (has_overrides) {
+    const bool can_reuse_coverage =
+        reusable_domain != nullptr && reusable_coverage != nullptr &&
+        *reusable_domain == mesh.uv_domain && reusable_coverage->valid() &&
+        reusable_coverage->width == base->width &&
+        reusable_coverage->height == base->height;
+    if (can_reuse_coverage) {
+      next_coverage = *reusable_coverage;
+    } else if (!gfx::rasterizeLabPbrUvCoverage(
+                   mesh, base->width, base->height, next_coverage, error)) {
+      return false;
+    }
+  }
+  const auto source_specular =
       source_material.specular_map_active
-          ? &source_material.specular_image
-          : nullptr;
+          ? source_material.specularImageAsset()
+          : gfx::SharedTextureImage{};
   auto next_composition = gfx::composeLabPbrSpecular(
-      base.width, base.height, source_specular, next_coverage, overrides);
+      base->width, base->height, source_specular, next_coverage, overrides);
   if (!next_composition.errors.empty()) {
     if (error != nullptr) {
       *error = next_composition.errors.front();
     }
     return false;
   }
-  const gfx::TextureImage *normal =
+  const gfx::SharedTextureImage normal =
       imported_normal != nullptr && imported_normal->valid()
-          ? &imported_normal->decoded
-          : nullptr;
+          ? imported_normal->decoded
+          : gfx::SharedTextureImage{};
   gfx::ResolvedMaterialTable next_resolved;
-  const gfx::TextureImage *authored_specular =
-      overrides.empty() ? nullptr : &next_composition.specular;
+  const gfx::SharedTextureImage authored_specular =
+      overrides.empty() ? gfx::SharedTextureImage{}
+                        : next_composition.specular;
   if (!gfx::buildAuthoredResolvedMaterial(
           base, source_material, normal, authored_specular,
-          next_resolved, error)) {
+          next_resolved, error, maximum_peak_bytes)) {
     return false;
   }
+  domain = mesh.uv_domain;
   coverage = std::move(next_coverage);
   composition = std::move(next_composition);
   resolved = std::move(next_resolved);
@@ -2004,23 +2286,75 @@ void AppSession::setLoopMode(int mode) {
 void AppSession::loadModel(const std::filesystem::path &path) {
   try {
     auto loaded_geometry = loader::ModelLoader::load(path);
-    geometry = std::move(loaded_geometry);
-    model_path = path.string();
-    bone_mapper.replaceModelBones(geometry.bones);
-    for (auto it = transition_follow_weights.begin();
-         it != transition_follow_weights.end();) {
-      const bool exists =
-          std::any_of(geometry.bones.begin(), geometry.bones.end(),
-                      [&](const auto &bone) { return bone.name == it->first; });
+    auto loaded_bone_mapper = bone_mapper;
+    loaded_bone_mapper.replaceModelBones(loaded_geometry.bones);
+    auto loaded_transition_follow_weights = transition_follow_weights;
+    for (auto it = loaded_transition_follow_weights.begin();
+         it != loaded_transition_follow_weights.end();) {
+      const bool exists = std::any_of(
+          loaded_geometry.bones.begin(), loaded_geometry.bones.end(),
+          [&](const auto &bone) { return bone.name == it->first; });
       if (exists) {
         ++it;
       } else {
-        it = transition_follow_weights.erase(it);
+        it = loaded_transition_follow_weights.erase(it);
       }
     }
+
+    gfx::ResolvedUvDomain loaded_domain;
+    gfx::LabPbrUvCoverage loaded_coverage;
+    gfx::LabPbrCompositionResult loaded_composition;
+    gfx::ResolvedMaterialTable loaded_resolved;
+    std::string material_error;
+    const std::map<std::string, gfx::GroupLabPbrOverride> no_overrides;
+    if (!buildSessionLabPbrMaterial(
+            loaded_geometry, loaded_bone_mapper, model_texture,
+            labpbr_source_material_, no_overrides,
+            labpbr_imported_normal.valid() ? &labpbr_imported_normal : nullptr,
+            loaded_domain, loaded_coverage, loaded_composition,
+            loaded_resolved, &material_error,
+            labpbr_peak_memory_budget_bytes,
+            sessionLabPbrResidentCounter(*this, labpbr_source_material_),
+            nullptr, &labpbr_import_cache_)) {
+      last_error = material_error.empty()
+                       ? "Model UV/material preflight failed"
+                       : material_error;
+      status = "Model load failed";
+      return;
+    }
+    const bool material_changed =
+        !labpbr_group_overrides.empty() ||
+        !gfx::sameResolvedMaterialResource(resolved_material,
+                                           loaded_resolved);
+    const std::string loaded_model_path = path.string();
+    std::string loaded_status =
+        "Model: " + path.filename().string() + " (" +
+        std::to_string(loaded_geometry.bones.size()) + " bones)";
+    if (loaded_geometry.description.hasCompleteTextureSize()) {
+      loaded_status +=
+          " UV " +
+          std::to_string(loaded_geometry.description.texture_width) + "x" +
+          std::to_string(loaded_geometry.description.texture_height);
+    }
+    if (model_texture != nullptr && model_texture->valid()) {
+      loaded_status += " tex " + std::to_string(model_texture->width) + "x" +
+                       std::to_string(model_texture->height);
+      loaded_status += " domain=";
+      loaded_status += gfx::uvDomainKindName(loaded_domain.kind);
+    }
+
+    geometry = std::move(loaded_geometry);
+    model_path = loaded_model_path;
+    bone_mapper = std::move(loaded_bone_mapper);
+    transition_follow_weights =
+        std::move(loaded_transition_follow_weights);
     selected_bone_name.clear();
     hovered_bone_name.clear();
     labpbr_group_overrides.clear();
+    model_uv_domain = loaded_domain;
+    labpbr_uv_coverage = std::move(loaded_coverage);
+    labpbr_composition = std::move(loaded_composition);
+    resolved_material = std::move(loaded_resolved);
     labpbr_draft = {};
     labpbr_draft_dirty = false;
     hidden_bone_names.clear();
@@ -2035,17 +2369,11 @@ void AppSession::loadModel(const std::filesystem::path &path) {
     invalidatePhysicsArtifacts(
         InvalidationReason::Model,
         "Model loaded — select physics bones and play to bake");
-    status = "Model: " + path.filename().string() + " (" +
-             std::to_string(geometry.bones.size()) + " bones)";
-    if (geometry.description.has_texture_size) {
-      status += " UV " + std::to_string(geometry.description.texture_width) +
-                "x" + std::to_string(geometry.description.texture_height);
-    }
-    if (model_texture.valid()) {
-      status += " tex " + std::to_string(model_texture.width) + "x" +
-                std::to_string(model_texture.height);
-    }
+    status = std::move(loaded_status);
     advanceGeneration(model_generation_);
+    if (material_changed) {
+      advanceGeneration(material_generation_);
+    }
     advanceGeneration(viewport_appearance_generation_);
     advanceGeneration(viewport_visibility_generation_);
     scene_selection.source_identity = model_path;
@@ -2056,9 +2384,6 @@ void AppSession::loadModel(const std::filesystem::path &path) {
     }
     advanceGeneration(scene_selection.generation);
     resetPathTraceAccumulation();
-    if (model_texture.valid() && !refreshLabPbrAuthoring()) {
-      status += " [!] LabPBR coverage refresh failed";
-    }
   } catch (const std::exception &e) {
     last_error = e.what();
     status = "Model load failed";
@@ -2266,7 +2591,9 @@ bool AppSession::importLabPbrSuiteInternal(
   }
 
   auto imported = gfx::importLabPbrSuite(
-      base_path, confirm_missing_properties, &labpbr_import_cache_);
+      base_path, confirm_missing_properties, &labpbr_import_cache_,
+      sessionSuiteImportLimits(*this, labpbr_source_material_,
+                               labpbr_import_cache_));
   if (imported.status ==
       gfx::LabPbrSuiteImportStatus::NeedsLabPbr13Confirmation) {
     pending_labpbr_import_path_ = base_path;
@@ -2288,11 +2615,14 @@ bool AppSession::importLabPbrSuiteInternal(
   if (imported.suite.source.normal.present) {
     imported_normal.source_path = imported.suite.source.normal.path;
     imported_normal.original_file_bytes =
-        *imported.suite.source.normal.original_bytes;
+        imported.suite.source.normal.original_bytes;
     imported_normal.sha256 = imported.suite.source.normal.sha256;
-    imported_normal.decoded = imported.suite.material.normal_image;
+    imported_normal.decoded = imported.suite.material.normalImageAsset();
   }
 
+  auto source_metadata = metadataOnlyLabPbrSource(imported.suite.source);
+
+  gfx::ResolvedUvDomain loaded_domain;
   gfx::LabPbrUvCoverage loaded_coverage;
   gfx::LabPbrCompositionResult loaded_composition;
   gfx::ResolvedMaterialTable loaded_resolved;
@@ -2301,7 +2631,11 @@ bool AppSession::importLabPbrSuiteInternal(
           geometry, bone_mapper, imported.suite.base_image,
           imported.suite.material, labpbr_group_overrides,
           imported_normal.valid() ? &imported_normal : nullptr,
-          loaded_coverage, loaded_composition, loaded_resolved, &error)) {
+          loaded_domain, loaded_coverage, loaded_composition, loaded_resolved,
+          &error, labpbr_peak_memory_budget_bytes,
+          sessionLabPbrResidentCounter(*this, labpbr_source_material_),
+          &imported.suite.source, &labpbr_import_cache_, &model_uv_domain,
+          &labpbr_uv_coverage)) {
     last_error = error.empty() ? "LabPBR authoring resolve failed" : error;
     status = relink ? "LabPBR relink failed" : "LabPBR suite import failed";
     return false;
@@ -2315,15 +2649,18 @@ bool AppSession::importLabPbrSuiteInternal(
                                          loaded_resolved) ||
       labpbr_imported_normal.sha256 != imported_normal.sha256;
 
-  model_texture = std::move(imported.suite.base_image);
+  (void)labpbr_import_cache_.store(imported.suite);
+
+  model_texture = imported.suite.base_image;
+  model_uv_domain = loaded_domain;
   labpbr_source_material_ = std::move(imported.suite.material);
   resolved_material = std::move(loaded_resolved);
   labpbr_uv_coverage = std::move(loaded_coverage);
   labpbr_composition = std::move(loaded_composition);
   labpbr_imported_normal = std::move(imported_normal);
-  labpbr_suite_source = std::move(imported.suite.source);
+  labpbr_suite_source = std::move(source_metadata);
   labpbr_last_import_cache_hit = imported.suite.cache_hit;
-  texture_path = labpbr_suite_source.base.path.string();
+  texture_path = gfx::pathUtf8String(labpbr_suite_source.base.path);
   labpbr_import_confirmation_pending = false;
   pending_labpbr_import_path_.reset();
   pending_labpbr_import_is_relink_ = false;
@@ -2339,9 +2676,11 @@ bool AppSession::importLabPbrSuiteInternal(
   last_error.clear();
   status = relink ? "LabPBR suite relinked: " :
                     "LabPBR suite imported: ";
-  status += labpbr_suite_source.base.path.filename().string() + " (" +
-            std::to_string(model_texture.width) + "x" +
-            std::to_string(model_texture.height) + ")";
+  status += gfx::pathUtf8String(
+                labpbr_suite_source.base.path.filename()) +
+            " (" +
+            std::to_string(model_texture->width) + "x" +
+            std::to_string(model_texture->height) + ")";
   if (labpbr_last_import_cache_hit) {
     status += " [cache]";
   }
@@ -2430,7 +2769,7 @@ void AppSession::confirmLabPbrSuiteImport(bool proceed) {
 }
 
 bool AppSession::reloadLabPbrSuite() {
-  if (!labpbr_suite_source.valid()) {
+  if (!labpbr_suite_source.metadataValid()) {
     last_error = "No active LabPBR suite source to reload";
     status = last_error;
     return false;
@@ -2476,7 +2815,10 @@ bool AppSession::loadTexture(const std::filesystem::path &path) {
   }
   std::string err;
   gfx::TextureImage loaded_texture;
-  if (!gfx::loadTextureImage(path, loaded_texture, &err)) {
+  if (!gfx::loadTextureImage(path, loaded_texture, &err,
+                             sessionTextureDecodeLimits(
+                                 *this, labpbr_source_material_,
+                                 labpbr_import_cache_))) {
     last_error = err.empty() ? "Texture load failed" : err;
     status = "Texture load failed";
     return false;
@@ -2492,8 +2834,17 @@ bool AppSession::loadTexture(const std::filesystem::path &path) {
        labpbr_source_material_.specular_image.source_channels == 4);
   const bool keep_imported_normal =
       labpbr_imported_normal.valid() &&
-      labpbr_imported_normal.decoded.width == loaded_texture.width &&
-      labpbr_imported_normal.decoded.height == loaded_texture.height;
+      labpbr_imported_normal.decoded->width == loaded_texture.width &&
+      labpbr_imported_normal.decoded->height == loaded_texture.height;
+  gfx::SharedTextureImage loaded_texture_asset;
+  try {
+    loaded_texture_asset =
+        std::make_shared<const gfx::TextureImage>(std::move(loaded_texture));
+  } catch (const std::bad_alloc &) {
+    last_error = "Texture budget stage failed while publishing shared Base";
+    status = "Texture load failed";
+    return false;
+  }
   gfx::ResolvedMaterialTable base_source;
   base_source.assets.base = path;
   if (keep_imported_specular) {
@@ -2504,36 +2855,42 @@ bool AppSession::loadTexture(const std::filesystem::path &path) {
         labpbr_source_material_.assets.specular;
     base_source.assets.specular_exists = true;
     base_source.specular_map_active = true;
-    base_source.specular_image =
-        labpbr_source_material_.specular_image;
+    base_source.setImageAssets(
+        {}, {}, labpbr_source_material_.specularImageAsset());
   }
   gfx::ResolvedMaterialTable loaded_material;
   if (!gfx::buildAuthoredResolvedMaterial(
-          loaded_texture, base_source, nullptr, nullptr, loaded_material,
-          &err)) {
+          loaded_texture_asset, base_source, {}, {}, loaded_material,
+          &err, labpbr_peak_memory_budget_bytes)) {
     last_error = err.empty() ? "Base material resolve failed" : err;
     status = "Texture load failed";
     return false;
   }
+  gfx::ResolvedUvDomain loaded_domain;
   gfx::LabPbrUvCoverage loaded_coverage;
   gfx::LabPbrCompositionResult loaded_composition;
   gfx::ResolvedMaterialTable loaded_resolved;
   if (!buildSessionLabPbrMaterial(
-          geometry, bone_mapper, loaded_texture, loaded_material,
+          geometry, bone_mapper, loaded_texture_asset, loaded_material,
           labpbr_group_overrides,
           keep_imported_normal ? &labpbr_imported_normal : nullptr,
-          loaded_coverage, loaded_composition, loaded_resolved, &err)) {
+          loaded_domain, loaded_coverage, loaded_composition, loaded_resolved,
+          &err, labpbr_peak_memory_budget_bytes,
+          sessionLabPbrResidentCounter(*this, labpbr_source_material_),
+          nullptr, &labpbr_import_cache_, &model_uv_domain,
+          &labpbr_uv_coverage)) {
     last_error = err.empty() ? "LabPBR authoring resolve failed" : err;
     status = "Texture load failed";
     return false;
   }
   const bool texture_changed =
-      !sameTextureResource(model_texture, loaded_texture) ||
+      !sameTextureResource(model_texture, loaded_texture_asset) ||
       !gfx::sameResolvedMaterialResource(resolved_material, loaded_resolved) ||
       (labpbr_imported_normal.valid() && !keep_imported_normal) ||
       (labpbr_source_material_.specular_map_active &&
        !keep_imported_specular);
-  model_texture = std::move(loaded_texture);
+  model_texture = std::move(loaded_texture_asset);
+  model_uv_domain = loaded_domain;
   labpbr_source_material_ = std::move(loaded_material);
   resolved_material = std::move(loaded_resolved);
   labpbr_uv_coverage = std::move(loaded_coverage);
@@ -2541,7 +2898,7 @@ bool AppSession::loadTexture(const std::filesystem::path &path) {
   if (!keep_imported_normal) {
     labpbr_imported_normal.clear();
   }
-  texture_path = path.string();
+  texture_path = model_texture->path;
   labpbr_suite_source = {};
   labpbr_import_confirmation_pending = false;
   pending_labpbr_import_path_.reset();
@@ -2554,9 +2911,9 @@ bool AppSession::loadTexture(const std::filesystem::path &path) {
     advanceGeneration(material_generation_);
   }
   last_error.clear();
-  status = "Texture: " + path.filename().string() + " (" +
-           std::to_string(model_texture.width) + "x" +
-           std::to_string(model_texture.height) + ")";
+  status = "Texture: " + gfx::pathUtf8String(path.filename()) + " (" +
+           std::to_string(model_texture->width) + "x" +
+           std::to_string(model_texture->height) + ")";
   if (resolved_material.normal_map_active ||
       resolved_material.specular_map_active) {
     status += " LabPBR 1.3 [normal=" +
@@ -2572,9 +2929,9 @@ bool AppSession::loadTexture(const std::filesystem::path &path) {
   }
 
 
-  if (geometry.description.has_texture_size &&
-      (model_texture.width != geometry.description.texture_width ||
-       model_texture.height != geometry.description.texture_height)) {
+  if (geometry.description.hasCompleteTextureSize() &&
+      (model_texture->width != geometry.description.texture_width ||
+       model_texture->height != geometry.description.texture_height)) {
     status += "  [!] model UV " +
               std::to_string(geometry.description.texture_width) + "x" +
               std::to_string(geometry.description.texture_height) +
@@ -3974,7 +4331,8 @@ void AppSession::clearTexture() {
   }
   const bool texture_changed = hasTextureResourceState(model_texture) ||
                                resolved_material.valid();
-  model_texture.clear();
+  model_texture.reset();
+  model_uv_domain = {};
   resolved_material.clear();
   labpbr_source_material_.clear();
   labpbr_uv_coverage = {};
@@ -4002,6 +4360,7 @@ void AppSession::clearTexture() {
 }
 
 bool AppSession::refreshLabPbrAuthoring() {
+  gfx::ResolvedUvDomain domain;
   gfx::LabPbrUvCoverage coverage;
   gfx::LabPbrCompositionResult composition;
   gfx::ResolvedMaterialTable resolved;
@@ -4010,11 +4369,16 @@ bool AppSession::refreshLabPbrAuthoring() {
           geometry, bone_mapper, model_texture, labpbr_source_material_,
           labpbr_group_overrides,
           labpbr_imported_normal.valid() ? &labpbr_imported_normal : nullptr,
-          coverage, composition, resolved, &error)) {
+          domain, coverage, composition, resolved, &error,
+          labpbr_peak_memory_budget_bytes,
+          sessionLabPbrResidentCounter(*this, labpbr_source_material_),
+          nullptr, &labpbr_import_cache_, &model_uv_domain,
+          &labpbr_uv_coverage)) {
     last_error =
         error.empty() ? "LabPBR authoring refresh failed" : error;
     return false;
   }
+  model_uv_domain = domain;
   labpbr_uv_coverage = std::move(coverage);
   labpbr_composition = std::move(composition);
   resolved_material = std::move(resolved);
@@ -4035,15 +4399,16 @@ void AppSession::loadSelectedLabPbrDraft() {
     return;
   }
 
-  const auto *texels = labpbr_uv_coverage.find(selected_bone_name);
-  if (texels == nullptr || texels->empty()) {
+  const auto first_texel =
+      labpbr_uv_coverage.firstTexel(selected_bone_name);
+  if (!first_texel.has_value()) {
     return;
   }
   std::array<std::uint8_t, 4> source{0u, 10u, 0u, 0u};
   if (labpbr_source_material_.specular_map_active) {
     const auto &specular = labpbr_source_material_.specular_image;
     const std::size_t offset =
-        static_cast<std::size_t>(texels->front()) * 4u;
+        static_cast<std::size_t>(*first_texel) * 4u;
     if (offset + 4u <= specular.rgba.size()) {
       std::copy_n(specular.rgba.begin() +
                       static_cast<std::ptrdiff_t>(offset),
@@ -4103,6 +4468,7 @@ bool AppSession::applySelectedLabPbrDraft() {
     overrides.erase(selected_bone_name);
   }
 
+  gfx::ResolvedUvDomain domain;
   gfx::LabPbrUvCoverage coverage;
   gfx::LabPbrCompositionResult composition;
   gfx::ResolvedMaterialTable resolved;
@@ -4110,7 +4476,11 @@ bool AppSession::applySelectedLabPbrDraft() {
           geometry, bone_mapper, model_texture, labpbr_source_material_,
           overrides,
           labpbr_imported_normal.valid() ? &labpbr_imported_normal : nullptr,
-          coverage, composition, resolved, &error)) {
+          domain, coverage, composition, resolved, &error,
+          labpbr_peak_memory_budget_bytes,
+          sessionLabPbrResidentCounter(*this, labpbr_source_material_),
+          nullptr, &labpbr_import_cache_, &model_uv_domain,
+          &labpbr_uv_coverage)) {
     last_error = error;
     status = "LabPBR apply failed: " + error;
     return false;
@@ -4119,6 +4489,7 @@ bool AppSession::applySelectedLabPbrDraft() {
       overrides != labpbr_group_overrides ||
       !gfx::sameResolvedMaterialResource(resolved_material, resolved);
   labpbr_group_overrides = std::move(overrides);
+  model_uv_domain = domain;
   labpbr_uv_coverage = std::move(coverage);
   labpbr_composition = std::move(composition);
   resolved_material = std::move(resolved);
@@ -4153,6 +4524,7 @@ bool AppSession::restoreSelectedLabPbrFromTexture() {
   auto overrides = labpbr_group_overrides;
   const bool removed = overrides.erase(selected_bone_name) != 0u;
   std::string error;
+  gfx::ResolvedUvDomain domain;
   gfx::LabPbrUvCoverage coverage;
   gfx::LabPbrCompositionResult composition;
   gfx::ResolvedMaterialTable resolved;
@@ -4160,7 +4532,11 @@ bool AppSession::restoreSelectedLabPbrFromTexture() {
           geometry, bone_mapper, model_texture, labpbr_source_material_,
           overrides,
           labpbr_imported_normal.valid() ? &labpbr_imported_normal : nullptr,
-          coverage, composition, resolved, &error)) {
+          domain, coverage, composition, resolved, &error,
+          labpbr_peak_memory_budget_bytes,
+          sessionLabPbrResidentCounter(*this, labpbr_source_material_),
+          nullptr, &labpbr_import_cache_, &model_uv_domain,
+          &labpbr_uv_coverage)) {
     last_error = error;
     status = "LabPBR restore failed: " + error;
     return false;
@@ -4169,6 +4545,7 @@ bool AppSession::restoreSelectedLabPbrFromTexture() {
       removed ||
       !gfx::sameResolvedMaterialResource(resolved_material, resolved);
   labpbr_group_overrides = std::move(overrides);
+  model_uv_domain = domain;
   labpbr_uv_coverage = std::move(coverage);
   labpbr_composition = std::move(composition);
   resolved_material = std::move(resolved);
@@ -4182,7 +4559,7 @@ bool AppSession::restoreSelectedLabPbrFromTexture() {
 }
 
 bool AppSession::importLabPbrSpecular(const std::filesystem::path &path) {
-  if (!model_texture.valid()) {
+  if (model_texture == nullptr || !model_texture->valid()) {
     last_error = "Load a base texture before importing a LabPBR specular image";
     status = last_error;
     return false;
@@ -4196,7 +4573,10 @@ bool AppSession::importLabPbrSpecular(const std::filesystem::path &path) {
 
   gfx::TextureImage imported;
   std::string error;
-  if (!gfx::loadTextureImage(path, imported, &error)) {
+  if (!gfx::loadTextureImage(path, imported, &error,
+                             sessionTextureDecodeLimits(
+                                 *this, labpbr_source_material_,
+                                 labpbr_import_cache_))) {
     last_error = error.empty() ? "LabPBR specular image decode failed" : error;
     status = "LabPBR specular import failed: " + last_error;
     return false;
@@ -4206,25 +4586,37 @@ bool AppSession::importLabPbrSpecular(const std::filesystem::path &path) {
     status = "LabPBR specular import failed: " + last_error;
     return false;
   }
-  if (imported.width != model_texture.width ||
-      imported.height != model_texture.height) {
+  if (imported.width != model_texture->width ||
+      imported.height != model_texture->height) {
     last_error = "LabPBR specular image dimensions must match the base texture";
+    status = "LabPBR specular import failed: " + last_error;
+    return false;
+  }
+  gfx::SharedTextureImage imported_asset;
+  try {
+    imported_asset =
+        std::make_shared<const gfx::TextureImage>(std::move(imported));
+  } catch (const std::bad_alloc &) {
+    last_error =
+        "LabPBR budget stage failed while publishing shared Specular";
     status = "LabPBR specular import failed: " + last_error;
     return false;
   }
 
   auto source = labpbr_source_material_;
-  source.width = model_texture.width;
-  source.height = model_texture.height;
+  source.width = model_texture->width;
+  source.height = model_texture->height;
   source.format = gfx::LabPbrFormat::LabPbr13;
   source.declared_format = "lab-pbr/1.3";
   source.format_declared = true;
-  source.assets.base = model_texture.path;
+  source.assets.base = model_texture->path;
   source.assets.specular = path;
   source.assets.specular_exists = true;
   source.specular_map_active = true;
-  source.specular_image = imported;
+  source.setImageAssets(source.baseImageAsset(), source.normalImageAsset(),
+                        imported_asset);
 
+  gfx::ResolvedUvDomain domain;
   gfx::LabPbrUvCoverage coverage;
   gfx::LabPbrCompositionResult composition;
   gfx::ResolvedMaterialTable resolved;
@@ -4232,16 +4624,22 @@ bool AppSession::importLabPbrSpecular(const std::filesystem::path &path) {
           geometry, bone_mapper, model_texture, source,
           labpbr_group_overrides,
           labpbr_imported_normal.valid() ? &labpbr_imported_normal : nullptr,
-          coverage, composition, resolved, &error)) {
+          domain, coverage, composition, resolved, &error,
+          labpbr_peak_memory_budget_bytes,
+          sessionLabPbrResidentCounter(*this, labpbr_source_material_),
+          nullptr, &labpbr_import_cache_, &model_uv_domain,
+          &labpbr_uv_coverage)) {
     last_error = error.empty() ? "LabPBR specular resolve failed" : error;
     status = "LabPBR specular import failed: " + last_error;
     return false;
   }
 
   const bool changed =
-      !sameTextureResource(labpbr_source_material_.specular_image, imported) ||
+      !sameTextureResource(labpbr_source_material_.specularImageAsset(),
+                           imported_asset) ||
       !gfx::sameResolvedMaterialResource(resolved_material, resolved);
   labpbr_source_material_ = std::move(source);
+  model_uv_domain = domain;
   labpbr_uv_coverage = std::move(coverage);
   labpbr_composition = std::move(composition);
   resolved_material = std::move(resolved);
@@ -4254,7 +4652,8 @@ bool AppSession::importLabPbrSpecular(const std::filesystem::path &path) {
     advanceGeneration(material_generation_);
   }
   last_error.clear();
-  status = "Imported LabPBR specular image: " + path.filename().string();
+  status = "Imported LabPBR specular image: " +
+           gfx::pathUtf8String(path.filename());
   return true;
 }
 
@@ -4271,10 +4670,11 @@ void AppSession::removeLabPbrSpecular() {
 
   auto source = labpbr_source_material_;
   source.specular_map_active = false;
-  source.specular_image.clear();
+  source.setImageAssets(source.baseImageAsset(), source.normalImageAsset(), {});
   source.assets.specular.clear();
   source.assets.specular_exists = false;
   std::string error;
+  gfx::ResolvedUvDomain domain;
   gfx::LabPbrUvCoverage coverage;
   gfx::LabPbrCompositionResult composition;
   gfx::ResolvedMaterialTable resolved;
@@ -4282,13 +4682,18 @@ void AppSession::removeLabPbrSpecular() {
           geometry, bone_mapper, model_texture, source,
           labpbr_group_overrides,
           labpbr_imported_normal.valid() ? &labpbr_imported_normal : nullptr,
-          coverage, composition, resolved, &error)) {
+          domain, coverage, composition, resolved, &error,
+          labpbr_peak_memory_budget_bytes,
+          sessionLabPbrResidentCounter(*this, labpbr_source_material_),
+          nullptr, &labpbr_import_cache_, &model_uv_domain,
+          &labpbr_uv_coverage)) {
     last_error = error.empty() ? "LabPBR specular removal failed" : error;
     status = last_error;
     return;
   }
 
   labpbr_source_material_ = std::move(source);
+  model_uv_domain = domain;
   labpbr_uv_coverage = std::move(coverage);
   labpbr_composition = std::move(composition);
   resolved_material = std::move(resolved);
@@ -4299,7 +4704,7 @@ void AppSession::removeLabPbrSpecular() {
 }
 
 bool AppSession::importLabPbrNormal(const std::filesystem::path &path) {
-  if (!model_texture.valid()) {
+  if (model_texture == nullptr || !model_texture->valid()) {
     last_error = "Load a base texture before importing an Iris normal";
     status = last_error;
     return false;
@@ -4312,20 +4717,27 @@ bool AppSession::importLabPbrNormal(const std::filesystem::path &path) {
   }
   gfx::ReadOnlyIrisNormalAsset imported;
   std::string error;
-  if (!gfx::importReadOnlyIrisNormal(path, model_texture.width,
-                                     model_texture.height, imported,
-                                     &error)) {
+  if (!gfx::importReadOnlyIrisNormal(path, model_texture->width,
+                                     model_texture->height, imported,
+                                     &error,
+                                     sessionTextureDecodeLimits(
+                                         *this, labpbr_source_material_,
+                                         labpbr_import_cache_))) {
     last_error = error;
     status = "Iris normal import failed: " + error;
     return false;
   }
+  gfx::ResolvedUvDomain domain;
   gfx::LabPbrUvCoverage coverage;
   gfx::LabPbrCompositionResult composition;
   gfx::ResolvedMaterialTable resolved;
   if (!buildSessionLabPbrMaterial(
           geometry, bone_mapper, model_texture, labpbr_source_material_,
-          labpbr_group_overrides, &imported, coverage, composition, resolved,
-          &error)) {
+          labpbr_group_overrides, &imported, domain, coverage, composition,
+          resolved, &error, labpbr_peak_memory_budget_bytes,
+          sessionLabPbrResidentCounter(*this, labpbr_source_material_),
+          nullptr, &labpbr_import_cache_, &model_uv_domain,
+          &labpbr_uv_coverage)) {
     last_error = error;
     status = "Iris normal import failed: " + error;
     return false;
@@ -4334,6 +4746,7 @@ bool AppSession::importLabPbrNormal(const std::filesystem::path &path) {
       imported.sha256 != labpbr_imported_normal.sha256 ||
       !gfx::sameResolvedMaterialResource(resolved_material, resolved);
   labpbr_imported_normal = std::move(imported);
+  model_uv_domain = domain;
   labpbr_uv_coverage = std::move(coverage);
   labpbr_composition = std::move(composition);
   resolved_material = std::move(resolved);
@@ -4346,7 +4759,7 @@ bool AppSession::importLabPbrNormal(const std::filesystem::path &path) {
   }
   last_error.clear();
   status = "Imported LabPBR / Iris normal image: " +
-           path.filename().string();
+           gfx::pathUtf8String(path.filename());
   return true;
 }
 
@@ -4356,21 +4769,28 @@ void AppSession::removeLabPbrNormal() {
   }
   auto source_without_normal = labpbr_source_material_;
   source_without_normal.normal_map_active = false;
-  source_without_normal.normal_image.clear();
+  source_without_normal.setImageAssets(
+      source_without_normal.baseImageAsset(), {},
+      source_without_normal.specularImageAsset());
   std::string error;
+  gfx::ResolvedUvDomain domain;
   gfx::LabPbrUvCoverage coverage;
   gfx::LabPbrCompositionResult composition;
   gfx::ResolvedMaterialTable resolved;
   if (!buildSessionLabPbrMaterial(
           geometry, bone_mapper, model_texture, source_without_normal,
-          labpbr_group_overrides, nullptr, coverage, composition, resolved,
-          &error)) {
+          labpbr_group_overrides, nullptr, domain, coverage, composition,
+          resolved, &error, labpbr_peak_memory_budget_bytes,
+          sessionLabPbrResidentCounter(*this, labpbr_source_material_),
+          nullptr, &labpbr_import_cache_, &model_uv_domain,
+          &labpbr_uv_coverage)) {
     last_error = error;
     status = "Iris normal removal failed: " + error;
     return;
   }
   labpbr_imported_normal.clear();
   labpbr_source_material_ = std::move(source_without_normal);
+  model_uv_domain = domain;
   labpbr_uv_coverage = std::move(coverage);
   labpbr_composition = std::move(composition);
   resolved_material = std::move(resolved);
@@ -4381,7 +4801,7 @@ void AppSession::removeLabPbrNormal() {
 
 bool AppSession::requestLabPbrExport(
     const std::filesystem::path &path) {
-  if (!model_texture.valid()) {
+  if (model_texture == nullptr || !model_texture->valid()) {
     last_error = "Load a base texture before exporting LabPBR";
     status = last_error;
     return false;
@@ -4393,7 +4813,10 @@ bool AppSession::requestLabPbrExport(
   const auto exported = gfx::exportLabPbrBundle(
       path, labpbr_composition,
       labpbr_imported_normal.valid() ? &labpbr_imported_normal : nullptr,
-      false);
+      false,
+      labpbr_source_material_.specular_map_active
+          ? &labpbr_source_material_.specular_image
+          : nullptr);
   if (exported.success) {
     labpbr_export_confirmation_pending = false;
     labpbr_export_existing_paths.clear();
@@ -4431,7 +4854,10 @@ void AppSession::confirmLabPbrExport(bool proceed) {
   const auto exported = gfx::exportLabPbrBundle(
       *pending, labpbr_composition,
       labpbr_imported_normal.valid() ? &labpbr_imported_normal : nullptr,
-      true);
+      true,
+      labpbr_source_material_.specular_map_active
+          ? &labpbr_source_material_.specular_image
+          : nullptr);
   if (!exported.success) {
     last_error = exported.error;
     status = "LabPBR export failed: " + exported.error;
@@ -6593,138 +7019,177 @@ render::SkeletonDrawList AppSession::buildViewportDrawList(float view_w,
 }
 
 #if defined(_WIN32)
-std::optional<std::filesystem::path> openFileDialog(const wchar_t *title,
-                                                    const wchar_t *filter) {
+class ComApartmentScope {
+public:
+  ComApartmentScope() noexcept
+      : result_(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
+                                           COINIT_DISABLE_OLE1DDE)),
+        uninitialize_(result_ == S_OK || result_ == S_FALSE) {}
+
+  ~ComApartmentScope() {
+    if (uninitialize_) {
+      CoUninitialize();
+    }
+  }
+
+  [[nodiscard]] bool ready() const noexcept {
+    return SUCCEEDED(result_) || result_ == RPC_E_CHANGED_MODE;
+  }
+
+private:
+  HRESULT result_ = E_FAIL;
+  bool uninitialize_ = false;
+};
+
+class DialogFilterStorage {
+public:
+  explicit DialogFilterStorage(const wchar_t *packed_filter) {
+    if (packed_filter == nullptr) {
+      return;
+    }
+    const wchar_t *cursor = packed_filter;
+    while (*cursor != L'\0') {
+      names_.emplace_back(cursor);
+      cursor += names_.back().size() + 1u;
+      if (*cursor == L'\0') {
+        names_.pop_back();
+        break;
+      }
+      patterns_.emplace_back(cursor);
+      cursor += patterns_.back().size() + 1u;
+    }
+    specs_.reserve((std::min)(names_.size(), patterns_.size()));
+    for (std::size_t index = 0; index < names_.size() &&
+                                index < patterns_.size();
+         ++index) {
+      specs_.push_back(
+          COMDLG_FILTERSPEC{names_[index].c_str(), patterns_[index].c_str()});
+    }
+  }
+
+  [[nodiscard]] const COMDLG_FILTERSPEC *data() const noexcept {
+    return specs_.data();
+  }
+  [[nodiscard]] UINT size() const noexcept {
+    return static_cast<UINT>(specs_.size());
+  }
+
+private:
+  std::vector<std::wstring> names_;
+  std::vector<std::wstring> patterns_;
+  std::vector<COMDLG_FILTERSPEC> specs_;
+};
+
+enum class FileDialogKind { Open, Save };
+
+std::optional<std::filesystem::path> runFileSystemDialog(
+    FileDialogKind kind, const wchar_t *title, const wchar_t *filter,
+    const wchar_t *default_name, const wchar_t *default_extension,
+    FILEOPENDIALOGOPTIONS requested_options) {
   // Pause GPU / RT before the modal shell dialog so the picker is not
   // contending with in-flight command buffers (fixes hang after close).
   NativeDialogScope modal_scope;
-
-  wchar_t file[MAX_PATH] = {};
-  OPENFILENAMEW ofn{};
-  ofn.lStructSize = sizeof(ofn);
-  ofn.hwndOwner = static_cast<HWND>(nativeDialogHooks().owner_window);
-  ofn.lpstrFile = file;
-  ofn.nMaxFile = MAX_PATH;
-  ofn.lpstrFilter = filter;
-  ofn.nFilterIndex = 1;
-  ofn.lpstrTitle = title;
-  ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR |
-              OFN_EXPLORER | OFN_HIDEREADONLY;
-  if (GetOpenFileNameW(&ofn) == TRUE) {
-    return std::filesystem::path(file);
-  }
-  return std::nullopt;
-}
-
-std::optional<std::filesystem::path> openFolderDialog(
-    const wchar_t *title) {
-  NativeDialogScope modal_scope;
-
-  const HRESULT initialize_result =
-      CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
-                                  COINIT_DISABLE_OLE1DDE);
-  const bool uninitialize =
-      initialize_result == S_OK || initialize_result == S_FALSE;
-  if (FAILED(initialize_result) &&
-      initialize_result != RPC_E_CHANGED_MODE) {
+  ComApartmentScope apartment;
+  if (!apartment.ready()) {
     return std::nullopt;
   }
 
   IFileDialog *dialog = nullptr;
-  HRESULT result =
-      CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
-                       IID_PPV_ARGS(&dialog));
+  HRESULT result = E_FAIL;
+  if (kind == FileDialogKind::Open) {
+    IFileOpenDialog *open_dialog = nullptr;
+    result = CoCreateInstance(CLSID_FileOpenDialog, nullptr,
+                              CLSCTX_INPROC_SERVER,
+                              IID_PPV_ARGS(&open_dialog));
+    dialog = open_dialog;
+  } else {
+    IFileSaveDialog *save_dialog = nullptr;
+    result = CoCreateInstance(CLSID_FileSaveDialog, nullptr,
+                              CLSCTX_INPROC_SERVER,
+                              IID_PPV_ARGS(&save_dialog));
+    dialog = save_dialog;
+  }
+  if (FAILED(result) || dialog == nullptr) {
+    return std::nullopt;
+  }
+
+  FILEOPENDIALOGOPTIONS options{};
+  result = dialog->GetOptions(&options);
+  if (SUCCEEDED(result)) {
+    result = dialog->SetOptions(options | FOS_FORCEFILESYSTEM |
+                                FOS_NOCHANGEDIR | requested_options);
+  }
+  if (SUCCEEDED(result) && title != nullptr) {
+    result = dialog->SetTitle(title);
+  }
+  DialogFilterStorage filters(filter);
+  if (SUCCEEDED(result) && filters.size() != 0u) {
+    result = dialog->SetFileTypes(filters.size(), filters.data());
+    if (SUCCEEDED(result)) {
+      result = dialog->SetFileTypeIndex(1u);
+    }
+  }
+  if (SUCCEEDED(result) && default_name != nullptr) {
+    result = dialog->SetFileName(default_name);
+  }
+  if (SUCCEEDED(result) && default_extension != nullptr) {
+    result = dialog->SetDefaultExtension(default_extension);
+  }
+  if (SUCCEEDED(result)) {
+    result = dialog->Show(
+        static_cast<HWND>(nativeDialogHooks().owner_window));
+  }
+
   std::optional<std::filesystem::path> selected;
-  if (SUCCEEDED(result) && dialog != nullptr) {
-    FILEOPENDIALOGOPTIONS options{};
-    result = dialog->GetOptions(&options);
-    if (SUCCEEDED(result)) {
-      result = dialog->SetOptions(options | FOS_PICKFOLDERS |
-                                  FOS_FORCEFILESYSTEM |
-                                  FOS_PATHMUSTEXIST |
-                                  FOS_NOCHANGEDIR);
-    }
-    if (SUCCEEDED(result) && title != nullptr) {
-      result = dialog->SetTitle(title);
-    }
-    if (SUCCEEDED(result)) {
-      result = dialog->Show(
-          static_cast<HWND>(nativeDialogHooks().owner_window));
-    }
-    if (SUCCEEDED(result)) {
-      IShellItem *item = nullptr;
-      result = dialog->GetResult(&item);
-      if (SUCCEEDED(result) && item != nullptr) {
-        PWSTR path = nullptr;
-        result = item->GetDisplayName(SIGDN_FILESYSPATH, &path);
-        if (SUCCEEDED(result) && path != nullptr) {
-          selected = std::filesystem::path(path);
-        }
-        if (path != nullptr) {
-          CoTaskMemFree(path);
-        }
-        item->Release();
+  if (SUCCEEDED(result)) {
+    IShellItem *item = nullptr;
+    result = dialog->GetResult(&item);
+    if (SUCCEEDED(result) && item != nullptr) {
+      PWSTR selected_path = nullptr;
+      result = item->GetDisplayName(SIGDN_FILESYSPATH, &selected_path);
+      if (SUCCEEDED(result) && selected_path != nullptr) {
+        selected = std::filesystem::path(selected_path);
       }
+      if (selected_path != nullptr) {
+        CoTaskMemFree(selected_path);
+      }
+      item->Release();
     }
-    dialog->Release();
   }
-  if (uninitialize) {
-    CoUninitialize();
-  }
+  dialog->Release();
   return selected;
+}
+
+std::optional<std::filesystem::path> openFileDialog(const wchar_t *title,
+                                                    const wchar_t *filter) {
+  return runFileSystemDialog(
+      FileDialogKind::Open, title, filter, nullptr, nullptr,
+      FOS_PATHMUSTEXIST | FOS_FILEMUSTEXIST);
+}
+
+std::optional<std::filesystem::path> openFolderDialog(
+    const wchar_t *title) {
+  return runFileSystemDialog(FileDialogKind::Open, title, nullptr, nullptr,
+                             nullptr, FOS_PICKFOLDERS | FOS_PATHMUSTEXIST);
 }
 
 std::optional<std::filesystem::path>
 saveFileDialog(const wchar_t *title, const wchar_t *filter,
                const wchar_t *default_name) {
-  NativeDialogScope modal_scope;
-
-  wchar_t file[MAX_PATH] = {};
-  if (default_name != nullptr) {
-    wcsncpy_s(file, default_name, _TRUNCATE);
-  }
-  OPENFILENAMEW ofn{};
-  ofn.lStructSize = sizeof(ofn);
-  ofn.hwndOwner = static_cast<HWND>(nativeDialogHooks().owner_window);
-  ofn.lpstrFile = file;
-  ofn.nMaxFile = MAX_PATH;
-  ofn.lpstrFilter = filter;
-  ofn.nFilterIndex = 1;
-  ofn.lpstrTitle = title;
-  ofn.lpstrDefExt = L"json";
-  ofn.Flags = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR | OFN_EXPLORER |
-              OFN_HIDEREADONLY;
-  if (GetSaveFileNameW(&ofn) == TRUE) {
-    return ensureJsonExtension(std::filesystem::path(file));
-  }
-  return std::nullopt;
+  const auto selected = runFileSystemDialog(
+      FileDialogKind::Save, title, filter, default_name, L"json",
+      FOS_OVERWRITEPROMPT);
+  return selected ? std::optional<std::filesystem::path>(
+                        ensureJsonExtension(*selected))
+                  : std::nullopt;
 }
 
 std::optional<std::filesystem::path>
 savePngFileDialog(const wchar_t *title, const wchar_t *default_name) {
-  NativeDialogScope modal_scope;
-
-  wchar_t file[MAX_PATH] = {};
-  if (default_name != nullptr) {
-    wcsncpy_s(file, default_name, _TRUNCATE);
-  }
   static constexpr wchar_t kPngFilter[] =
       L"PNG Image (*.png)\0*.png\0All Files (*.*)\0*.*\0\0";
-  OPENFILENAMEW ofn{};
-  ofn.lStructSize = sizeof(ofn);
-  ofn.hwndOwner = static_cast<HWND>(nativeDialogHooks().owner_window);
-  ofn.lpstrFile = file;
-  ofn.nMaxFile = MAX_PATH;
-  ofn.lpstrFilter = kPngFilter;
-  ofn.nFilterIndex = 1;
-  ofn.lpstrTitle = title;
-  ofn.lpstrDefExt = L"png";
-  ofn.Flags =
-      OFN_NOCHANGEDIR | OFN_EXPLORER | OFN_HIDEREADONLY | OFN_PATHMUSTEXIST;
-  if (GetSaveFileNameW(&ofn) == TRUE) {
-    return std::filesystem::path(file);
-  }
-  return std::nullopt;
+  return runFileSystemDialog(FileDialogKind::Save, title, kPngFilter,
+                             default_name, L"png", FOS_PATHMUSTEXIST);
 }
 #else
 std::optional<std::filesystem::path> openFileDialog(const wchar_t *,

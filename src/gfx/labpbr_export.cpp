@@ -121,13 +121,24 @@ normalizeLabPbrSpecularPath(const std::filesystem::path &destination) {
 LabPbrExportResult exportLabPbrBundle(
     const std::filesystem::path &destination,
     const LabPbrCompositionResult &composition,
-    const ReadOnlyIrisNormalAsset *normal, bool allow_overwrite) {
+    const ReadOnlyIrisNormalAsset *normal, bool allow_overwrite,
+    const TextureImage *deferred_source_specular) {
   LabPbrExportResult result;
   try {
     if (!composition.exportable()) {
       throw std::runtime_error(
           "LabPBR composition has validation errors or UV conflicts");
     }
+    const bool materialization_deferred =
+        (composition.specular == nullptr ||
+         !composition.specular->valid()) &&
+        composition.specular_materialization_deferred;
+    const int specular_width = materialization_deferred
+                                   ? composition.deferred_width
+                                   : composition.specular->width;
+    const int specular_height = materialization_deferred
+                                    ? composition.deferred_height
+                                    : composition.specular->height;
     const auto normalized = normalizeLabPbrSpecularPath(destination);
     if (normalized.empty()) {
       throw std::runtime_error("LabPBR export destination is empty");
@@ -144,9 +155,9 @@ LabPbrExportResult exportLabPbrBundle(
 
     if (normal != nullptr) {
       if (!normal->valid() ||
-          normal->decoded.width != composition.specular.width ||
-          normal->decoded.height != composition.specular.height ||
-          sha256Hex(normal->original_file_bytes) != normal->sha256) {
+          normal->decoded->width != specular_width ||
+          normal->decoded->height != specular_height ||
+          sha256Hex(*normal->original_file_bytes) != normal->sha256) {
         throw std::runtime_error(
             "imported Iris normal bytes or checksum are invalid");
       }
@@ -167,6 +178,21 @@ LabPbrExportResult exportLabPbrBundle(
       return result;
     }
 
+    TextureImage materialized_specular;
+    const TextureImage *effective_specular = composition.specular.get();
+    if (materialization_deferred) {
+      std::string materialize_error;
+      if (!materializeLabPbrSpecular(
+              specular_width, specular_height, deferred_source_specular,
+              materialized_specular, &materialize_error)) {
+        throw std::runtime_error(
+            materialize_error.empty()
+                ? "failed to materialize deferred LabPBR specular"
+                : materialize_error);
+      }
+      effective_specular = &materialized_specular;
+    }
+
     const auto stage_directory =
         createTransactionDirectory(parent, "stage");
     std::filesystem::path backup_directory;
@@ -179,9 +205,9 @@ LabPbrExportResult exportLabPbrBundle(
           stage_directory / result.specular_path.filename();
       std::vector<std::uint8_t> encoded_specular;
       std::string png_error;
-      if (!encodePngRgba8(composition.specular.width,
-                          composition.specular.height,
-                          composition.specular.rgba, encoded_specular,
+      if (!encodePngRgba8(effective_specular->width,
+                          effective_specular->height,
+                          effective_specular->rgba, encoded_specular,
                           &png_error)) {
         throw std::runtime_error(
             png_error.empty() ? "failed to encode LabPBR specular PNG"
@@ -196,7 +222,7 @@ LabPbrExportResult exportLabPbrBundle(
       if (normal != nullptr) {
         const auto staged_normal =
             stage_directory / result.normal_path.filename();
-        writeBytes(staged_normal, normal->original_file_bytes);
+        writeBytes(staged_normal, *normal->original_file_bytes);
         stage_files.push_back(staged_normal);
         pending.push_back({result.normal_path, staged_normal,
                            backup_directory /
@@ -215,10 +241,10 @@ LabPbrExportResult exportLabPbrBundle(
       std::string validation_error;
       if (!loadTextureImage(staged_specular, verified_specular,
                             &validation_error) ||
-          verified_specular.width != composition.specular.width ||
-          verified_specular.height != composition.specular.height ||
+          verified_specular.width != effective_specular->width ||
+          verified_specular.height != effective_specular->height ||
           verified_specular.source_channels != 4 ||
-          verified_specular.rgba != composition.specular.rgba) {
+          verified_specular.rgba != effective_specular->rgba) {
         throw std::runtime_error(
             validation_error.empty()
                 ? "staged LabPBR specular PNG failed round-trip validation"
@@ -228,10 +254,12 @@ LabPbrExportResult exportLabPbrBundle(
         ReadOnlyIrisNormalAsset verified_normal;
         if (!importReadOnlyIrisNormal(
                 stage_directory / result.normal_path.filename(),
-                composition.specular.width, composition.specular.height,
+                effective_specular->width, effective_specular->height,
                 verified_normal, &validation_error) ||
-            verified_normal.original_file_bytes !=
-                normal->original_file_bytes ||
+            verified_normal.original_file_bytes == nullptr ||
+            normal->original_file_bytes == nullptr ||
+            *verified_normal.original_file_bytes !=
+                *normal->original_file_bytes ||
             verified_normal.sha256 != normal->sha256) {
           throw std::runtime_error(
               validation_error.empty()

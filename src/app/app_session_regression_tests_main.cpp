@@ -4,7 +4,9 @@
 #include "xpbd/gfx/labpbr_authoring.hpp"
 #include "xpbd/gfx/labpbr_material.hpp"
 #include "xpbd/gfx/still_image_export.hpp"
+#include "test_support/labpbr_synthetic_fixture.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -32,6 +34,14 @@ bool sameTexture(const xpbd::gfx::TextureImage &lhs,
                  const xpbd::gfx::TextureImage &rhs) {
   return lhs.width == rhs.width && lhs.height == rhs.height &&
          lhs.source_channels == rhs.source_channels && lhs.rgba == rhs.rgba;
+}
+
+bool sameTexture(const xpbd::gfx::SharedTextureImage &lhs,
+                 const xpbd::gfx::SharedTextureImage &rhs) {
+  if (lhs == rhs) {
+    return true;
+  }
+  return lhs != nullptr && rhs != nullptr && sameTexture(*lhs, *rhs);
 }
 
 bool sameSourceFile(const xpbd::gfx::LabPbrSourceFile &lhs,
@@ -73,7 +83,8 @@ bool sameImportedNormal(const xpbd::gfx::ReadOnlyIrisNormalAsset &lhs,
 }
 
 struct MaterialSessionSnapshot {
-  xpbd::gfx::TextureImage texture;
+  xpbd::gfx::SharedTextureImage texture;
+  xpbd::gfx::ResolvedUvDomain domain;
   xpbd::gfx::ResolvedMaterialTable material;
   xpbd::gfx::LabPbrUvCoverage coverage;
   std::map<std::string, xpbd::gfx::GroupLabPbrOverride> overrides;
@@ -90,6 +101,7 @@ struct MaterialSessionSnapshot {
 MaterialSessionSnapshot snapshot(const xpbd::app::AppSession &session) {
   return {
       session.model_texture,
+      session.model_uv_domain,
       session.resolved_material,
       session.labpbr_uv_coverage,
       session.labpbr_group_overrides,
@@ -107,15 +119,22 @@ MaterialSessionSnapshot snapshot(const xpbd::app::AppSession &session) {
 bool unchanged(const xpbd::app::AppSession &session,
                const MaterialSessionSnapshot &before) {
   return sameTexture(session.model_texture, before.texture) &&
+         session.model_uv_domain == before.domain &&
          sameResolvedMaterial(session.resolved_material, before.material) &&
          session.labpbr_uv_coverage.width == before.coverage.width &&
          session.labpbr_uv_coverage.height == before.coverage.height &&
-         session.labpbr_uv_coverage.group_texels ==
-             before.coverage.group_texels &&
+         session.labpbr_uv_coverage.group_runs ==
+             before.coverage.group_runs &&
          session.labpbr_group_overrides == before.overrides &&
          session.labpbr_draft == before.draft &&
          sameTexture(session.labpbr_composition.specular,
                      before.composition.specular) &&
+         session.labpbr_composition.specular_materialization_deferred ==
+             before.composition.specular_materialization_deferred &&
+         session.labpbr_composition.deferred_width ==
+             before.composition.deferred_width &&
+         session.labpbr_composition.deferred_height ==
+             before.composition.deferred_height &&
          session.labpbr_composition.conflicts.size() ==
              before.composition.conflicts.size() &&
          session.labpbr_composition.errors == before.composition.errors &&
@@ -621,14 +640,15 @@ void testPathTraceSettingsPersistenceAndClassification() {
 
 bool writeBytes(const std::filesystem::path &path,
                 const std::vector<std::uint8_t> &bytes) {
-  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  std::ofstream output(xpbd::gfx::pathForFilesystemIo(path),
+                       std::ios::binary | std::ios::trunc);
   output.write(reinterpret_cast<const char *>(bytes.data()),
                static_cast<std::streamsize>(bytes.size()));
   return output.good();
 }
 
 std::vector<std::uint8_t> readBytes(const std::filesystem::path &path) {
-  std::ifstream input(path, std::ios::binary);
+  std::ifstream input(xpbd::gfx::pathForFilesystemIo(path), std::ios::binary);
   return {std::istreambuf_iterator<char>(input),
           std::istreambuf_iterator<char>()};
 }
@@ -693,10 +713,35 @@ void testTransactionalLabPbrSuiteImport() {
   session.clearTexture();
   expect(session.requestLabPbrSuiteImport(base_path),
          "AppSession commits a complete strict LabPBR suite");
-  expect(session.labpbr_suite_source.valid() &&
+  expect(session.labpbr_suite_source.metadataValid() &&
+             !session.labpbr_suite_source.base.original_bytes &&
+             !session.labpbr_suite_source.specular.original_bytes &&
+             !session.labpbr_suite_source.normal.original_bytes &&
+             !session.labpbr_suite_source.properties.original_bytes &&
              session.resolved_material.valid() &&
-             session.labpbr_imported_normal.valid(),
-         "AppSession retains committed source/material/normal state");
+             session.labpbr_imported_normal.valid() &&
+             session.model_texture ==
+                 session.resolved_material.baseImageAsset() &&
+             session.labpbr_imported_normal.decoded ==
+                 session.resolved_material.normalImageAsset() &&
+             session.labpbr_composition.specular ==
+                 session.resolved_material.specularImageAsset(),
+         "AppSession retains metadata-only source and shared material assets");
+
+  const auto cached_base = session.model_texture;
+  const auto cached_normal =
+      session.resolved_material.normalImageAsset();
+  const auto cached_specular =
+      session.resolved_material.specularImageAsset();
+  const auto generation_before_cache_hit = session.materialGeneration();
+  expect(session.reloadLabPbrSuite() &&
+             session.labpbr_last_import_cache_hit &&
+             session.model_texture == cached_base &&
+             session.resolved_material.normalImageAsset() == cached_normal &&
+             session.resolved_material.specularImageAsset() ==
+                 cached_specular &&
+             session.materialGeneration() == generation_before_cache_hit,
+         "AppSession checksum reload hits the shared LRU without changing material generation");
 
   auto committed = snapshot(session);
   expect(readBytes(base_path) == base_png &&
@@ -717,7 +762,8 @@ void testTransactionalLabPbrSuiteImport() {
              session.resolved_material.normal_map_active &&
              session.materialGeneration() == generation_before_normal + 1u,
          "dedicated Iris normal import updates resolved GPU material state");
-  expect(session.labpbr_imported_normal.original_file_bytes == normal_png,
+  expect(session.labpbr_imported_normal.original_file_bytes != nullptr &&
+             *session.labpbr_imported_normal.original_file_bytes == normal_png,
          "dedicated Iris normal import retains exact source bytes");
 
   const std::vector<std::uint8_t> direct_specular_rgba{
@@ -746,6 +792,13 @@ void testTransactionalLabPbrSuiteImport() {
                  generation_before_base_reload,
          "same-size base import preserves independently selected PBR slots "
          "without discovering sibling images");
+  expect(!session.labpbr_uv_coverage.valid() &&
+             session.labpbr_uv_coverage.group_runs.empty() &&
+             session.labpbr_composition.exportable() &&
+             !session.labpbr_composition.specular_materialization_deferred &&
+             session.labpbr_composition.specular ==
+                 session.resolved_material.specularImageAsset(),
+         "no Override keeps Coverage nonresident and shares Source Specular");
   const auto direct_committed = snapshot(session);
   const fs::path mismatched_specular_path =
       directory / "mismatched_specular.png";
@@ -857,9 +910,8 @@ void testTransactionalLabPbrSuiteImport() {
              session.importLabPbrSpecular(rgb_pbr_path) &&
              session.resolved_material.specular_map_active &&
              session.resolved_material.specular_image.source_channels == 3 &&
-             !session.resolved_material.texels.empty() &&
-             session.resolved_material.texels.front().emission_strength ==
-                 0.0f,
+             session.resolved_material.sample(0.5f, 0.5f).emission_strength ==
+                  0.0f,
          "direct RGB PBR image imports as a no-emission LabPBR map");
   expect(session.loadTexture(rgb_base_path) &&
              session.resolved_material.specular_map_active &&
@@ -868,6 +920,416 @@ void testTransactionalLabPbrSuiteImport() {
   session.clearTexture();
   fs::remove_all(directory, filesystem_error);
   expect(!filesystem_error, "remove isolated AppSession fixture directory");
+}
+
+void testUnicodeLongPathTextureTransactions() {
+  namespace fs = std::filesystem;
+
+  const auto nonce =
+      std::chrono::steady_clock::now().time_since_epoch().count();
+  const fs::path root =
+      fs::temp_directory_path() / fs::path(L"xpbd_Unicode路径_事务") /
+      std::to_wstring(nonce);
+  fs::path directory = root;
+  while (directory.native().size() < 330u) {
+    directory /= fs::path(L"层级_长路径_甲乙丙丁_0123456789");
+  }
+
+  std::error_code filesystem_error;
+  fs::create_directories(xpbd::gfx::pathForFilesystemIo(directory),
+                         filesystem_error);
+  expect(!filesystem_error && directory.native().size() > 260u,
+         "create runtime Unicode path longer than the legacy Windows limit");
+  if (filesystem_error) {
+    return;
+  }
+
+  const std::vector<std::uint8_t> base_rgba{
+      240u, 120u, 60u, 255u, 20u, 70u, 150u, 80u};
+  const std::vector<std::uint8_t> specular_rgba{
+      0u, 10u, 32u, 0u, 255u, 230u, 64u, 254u};
+  const std::vector<std::uint8_t> normal_rgba{
+      128u, 128u, 255u, 255u, 140u, 120u, 210u, 24u};
+  const auto base_png = encodePng(2, 1, base_rgba);
+  const auto specular_png = encodePng(2, 1, specular_rgba);
+  const auto normal_png = encodePng(2, 1, normal_rgba);
+  const std::string properties_text = "format=lab-pbr/1.3\n";
+  const std::vector<std::uint8_t> properties_bytes(properties_text.begin(),
+                                                     properties_text.end());
+
+  const fs::path base_path = directory / fs::path(L"角色_基础贴图.png");
+  const fs::path specular_path =
+      directory / fs::path(L"角色_基础贴图_s.png");
+  const fs::path normal_path =
+      directory / fs::path(L"角色_基础贴图_n.png");
+  const fs::path properties_path = directory / "texture.properties";
+  expect(writeBytes(base_path, base_png) &&
+             writeBytes(specular_path, specular_png) &&
+             writeBytes(normal_path, normal_png) &&
+             writeBytes(properties_path, properties_bytes),
+         "write runtime Unicode Base/Normal/Specular/properties fixtures");
+
+  xpbd::gfx::TextureImage decoded_base;
+  std::string error;
+  expect(xpbd::gfx::loadTextureImage(base_path, decoded_base, &error) &&
+             decoded_base.rgba == base_rgba &&
+             decoded_base.path == xpbd::gfx::pathUtf8String(base_path),
+         "memory-only Base import accepts a Unicode long path");
+
+  xpbd::gfx::TextureImage preserved = decoded_base;
+  preserved.path = "preserved-candidate";
+  const auto preserved_before = preserved;
+  xpbd::gfx::TextureDecodeLimits tight_limits;
+  tight_limits.maximum_peak_bytes = 1u;
+  error.clear();
+  expect(!xpbd::gfx::loadTextureImage(base_path, preserved, &error,
+                                      tight_limits) &&
+             sameTexture(preserved, preserved_before) &&
+             preserved.path == preserved_before.path &&
+             error.find("budget stage") != std::string::npos,
+         "Base snapshot budget rejection preserves the output candidate");
+
+  xpbd::gfx::TextureImage resident_preserved = decoded_base;
+  resident_preserved.path = "resident-preserved-candidate";
+  const auto resident_before = resident_preserved;
+  xpbd::gfx::TextureDecodeLimits resident_limits;
+  // 77 encoded + 8 decoder + 8 candidate + 8 resident caller bytes = 101.
+  resident_limits.maximum_peak_bytes = 100u;
+  error.clear();
+  expect(!xpbd::gfx::loadTextureImage(base_path, resident_preserved, &error,
+                                      resident_limits) &&
+             sameTexture(resident_preserved, resident_before) &&
+             resident_preserved.path == resident_before.path &&
+             error.find("required_peak=101 bytes") != std::string::npos,
+         "Base path decode counts resident output and preserves it on budget failure");
+
+  const auto strict = xpbd::gfx::importLabPbrSuite(base_path, false);
+  expect(strict.imported() && strict.suite.base_image != nullptr &&
+             strict.suite.base_image->rgba == base_rgba &&
+             strict.suite.base_image ==
+                 strict.suite.material.baseImageAsset() &&
+             *strict.suite.source.base.original_bytes == base_png &&
+             *strict.suite.source.specular.original_bytes == specular_png &&
+             *strict.suite.source.normal.original_bytes == normal_png &&
+             *strict.suite.source.properties.original_bytes ==
+                 properties_bytes,
+         "strict Unicode suite import retains exact immutable snapshots");
+
+  xpbd::gfx::ReadOnlyIrisNormalAsset iris;
+  expect(xpbd::gfx::importReadOnlyIrisNormal(normal_path, 2, 1, iris,
+                                             &error) &&
+             iris.original_file_bytes != nullptr &&
+             *iris.original_file_bytes == normal_png &&
+             iris.decoded != nullptr && iris.decoded->rgba == normal_rgba &&
+             iris.decoded->path == xpbd::gfx::pathUtf8String(normal_path),
+         "read-only Iris import accepts Unicode long paths and exact bytes");
+
+  auto &session = xpbd::app::AppSession::instance();
+  session.labpbr_draft_dirty = false;
+  session.clearTexture();
+  expect(session.loadTexture(base_path) &&
+             session.texture_path == xpbd::gfx::pathUtf8String(base_path),
+         "AppSession commits a Base texture from a Unicode long path");
+  expect(session.requestLabPbrSuiteImport(base_path) &&
+             session.labpbr_suite_source.metadataValid() &&
+             !session.labpbr_suite_source.base.original_bytes &&
+             !session.labpbr_suite_source.specular.original_bytes &&
+             session.texture_path == xpbd::gfx::pathUtf8String(base_path),
+         "AppSession commits a strict suite from a Unicode long path");
+  expect(session.importLabPbrNormal(normal_path) &&
+             session.labpbr_imported_normal.original_file_bytes != nullptr &&
+             *session.labpbr_imported_normal.original_file_bytes == normal_png,
+         "AppSession commits a read-only Iris normal from a Unicode long path");
+  const auto committed = snapshot(session);
+
+  const auto saved_peak_budget = session.labpbr_peak_memory_budget_bytes;
+  session.labpbr_peak_memory_budget_bytes = 1u;
+  const bool budget_rejected = !session.loadTexture(base_path);
+  session.labpbr_peak_memory_budget_bytes = saved_peak_budget;
+  expect(budget_rejected && unchanged(session, committed) &&
+             session.last_error.find("budget") != std::string::npos,
+         "product LabPBR budget failure preserves Session Generation and material state");
+
+  const fs::path missing_base = directory / fs::path(L"不存在_基础.png");
+  expect(!session.loadTexture(missing_base) && unchanged(session, committed) &&
+             session.last_error.find("file-check stage") != std::string::npos,
+         "missing Unicode Base import preserves the complete material session");
+
+  const fs::path corrupt_base = directory / fs::path(L"损坏_基础.png");
+  const std::vector<std::uint8_t> corrupt_header{0u, 1u, 2u, 3u};
+  expect(writeBytes(corrupt_base, corrupt_header) &&
+             !session.loadTexture(corrupt_base) &&
+             unchanged(session, committed) &&
+             session.last_error.find("Header stage") != std::string::npos,
+         "corrupt Unicode Base header preserves the complete material session");
+
+  auto corrupt_decode_png = base_png;
+  const std::array<std::uint8_t, 4> idat{'I', 'D', 'A', 'T'};
+  const auto idat_position =
+      std::search(corrupt_decode_png.begin(), corrupt_decode_png.end(),
+                  idat.begin(), idat.end());
+  if (idat_position != corrupt_decode_png.end() &&
+      std::distance(idat_position, corrupt_decode_png.end()) > 4) {
+    *(idat_position + 4) = 0u;
+  }
+  const fs::path decode_failure = directory / fs::path(L"损坏_IDAT.png");
+  expect(idat_position != corrupt_decode_png.end() &&
+             writeBytes(decode_failure, corrupt_decode_png) &&
+             !session.loadTexture(decode_failure) &&
+             unchanged(session, committed) &&
+             session.last_error.find("Decode stage") != std::string::npos,
+         "post-Header Base decode failure preserves the complete session");
+
+  const fs::path missing_suite_directory = directory / fs::path(L"缺少边车");
+  fs::create_directories(
+      xpbd::gfx::pathForFilesystemIo(missing_suite_directory),
+      filesystem_error);
+  const fs::path missing_suite_base =
+      missing_suite_directory / fs::path(L"缺少组合.png");
+  expect(!filesystem_error && writeBytes(missing_suite_base, base_png) &&
+             !session.requestLabPbrSuiteImport(missing_suite_base) &&
+             unchanged(session, committed) &&
+             session.last_error.find("Specular Sidecar") != std::string::npos,
+         "missing Unicode Sidecar preserves the complete material session");
+
+  const fs::path corrupt_suite_directory = directory / fs::path(L"损坏边车");
+  fs::create_directories(
+      xpbd::gfx::pathForFilesystemIo(corrupt_suite_directory),
+      filesystem_error);
+  const fs::path corrupt_suite_base =
+      corrupt_suite_directory / fs::path(L"组合.png");
+  const fs::path corrupt_suite_specular =
+      corrupt_suite_directory / fs::path(L"组合_s.png");
+  expect(!filesystem_error && writeBytes(corrupt_suite_base, base_png) &&
+             writeBytes(corrupt_suite_specular, corrupt_header) &&
+             !session.requestLabPbrSuiteImport(corrupt_suite_base) &&
+             unchanged(session, committed) &&
+             session.last_error.find("Specular Sidecar") != std::string::npos &&
+             session.last_error.find("Header stage") != std::string::npos,
+         "corrupt Unicode Sidecar preserves the complete material session");
+
+  const fs::path missing_iris = directory / fs::path(L"不存在_法线.png");
+  expect(!session.importLabPbrNormal(missing_iris) &&
+             unchanged(session, committed) &&
+             session.last_error.find("file-check stage") != std::string::npos,
+         "missing Unicode Iris normal preserves the complete material session");
+  const fs::path corrupt_iris = directory / fs::path(L"损坏_法线.png");
+  expect(writeBytes(corrupt_iris, corrupt_header) &&
+             !session.importLabPbrNormal(corrupt_iris) &&
+             unchanged(session, committed) &&
+             session.last_error.find("Header stage") != std::string::npos,
+         "corrupt Unicode Iris normal preserves the complete material session");
+  const fs::path mismatched_iris = directory / fs::path(L"错尺寸_法线.png");
+  expect(writeBytes(mismatched_iris,
+                    encodePng(1, 1, {128u, 128u, 255u, 255u})) &&
+             !session.importLabPbrNormal(mismatched_iris) &&
+             unchanged(session, committed) &&
+             session.last_error.find("Domain stage") != std::string::npos,
+         "mismatched Unicode Iris Domain preserves the complete session");
+
+  const fs::path app_source_path =
+      fs::absolute(fs::path(__FILE__)).parent_path() / "app_session.cpp";
+  const fs::path texture_source_path =
+      fs::absolute(fs::path(__FILE__)).parent_path().parent_path() / "gfx" /
+      "texture_image.cpp";
+  const auto app_source_bytes = readBytes(app_source_path);
+  const auto texture_source_bytes = readBytes(texture_source_path);
+  const std::string app_source(app_source_bytes.begin(), app_source_bytes.end());
+  const std::string texture_source(texture_source_bytes.begin(),
+                                   texture_source_bytes.end());
+  expect(app_source.find("IFileOpenDialog") != std::string::npos &&
+             app_source.find("IFileSaveDialog") != std::string::npos &&
+             app_source.find("GetOpenFileName") == std::string::npos &&
+             app_source.find("GetSaveFileName") == std::string::npos &&
+             app_source.find("OPENFILENAME") == std::string::npos &&
+             app_source.find("MAX_PATH") == std::string::npos,
+         "file-dialog source contract has no fixed legacy path buffer");
+  expect(texture_source.find("stbi_info_from_memory") != std::string::npos &&
+             texture_source.find("stbi_load_from_memory") !=
+                 std::string::npos &&
+             texture_source.find("stbi_info(") == std::string::npos &&
+             texture_source.find("stbi_load(") == std::string::npos,
+         "texture source contract uses memory-only stb decode");
+
+  expect(readBytes(base_path) == base_png &&
+             readBytes(specular_path) == specular_png &&
+             readBytes(normal_path) == normal_png &&
+             readBytes(properties_path) == properties_bytes,
+         "Unicode success and failure paths never mutate source fixtures");
+  session.clearTexture();
+  filesystem_error.clear();
+  fs::remove_all(xpbd::gfx::pathForFilesystemIo(root), filesystem_error);
+  expect(!filesystem_error, "remove runtime Unicode long-path fixtures");
+}
+
+void testLargeUvModelMaterialTransactions() {
+  namespace fs = std::filesystem;
+  using xpbd::gfx::UvDomainKind;
+  using xpbd::test_support::SyntheticLabPbrSuitePaths;
+  using xpbd::test_support::SyntheticLargeUvFixture;
+
+  const auto nonce =
+      std::chrono::steady_clock::now().time_since_epoch().count();
+  const fs::path directory =
+      fs::temp_directory_path() / fs::path(L"xpbd会话_大UV_事务") /
+      std::to_string(nonce);
+  std::error_code filesystem_error;
+  fs::create_directories(directory, filesystem_error);
+  expect(!filesystem_error,
+         "create Unicode large-UV AppSession fixture directory");
+  if (filesystem_error) {
+    return;
+  }
+
+  SyntheticLargeUvFixture fixture;
+  std::string error;
+  expect(xpbd::test_support::buildSyntheticLargeUvFixture(fixture, &error),
+         "build AppSession large-UV runtime fixture");
+  SyntheticLabPbrSuitePaths suite_paths;
+  expect(xpbd::test_support::writeSyntheticLabPbrSuite(
+             fixture, directory, fs::path(L"角色材质_眼睛.png"),
+             suite_paths, &error),
+         "write Unicode Base Normal Specular suite for AppSession");
+
+  static constexpr std::string_view kLargeModel = R"json(
+{"format_version":"1.12.0","minecraft:geometry":[{"description":{"identifier":"geometry.session_large_uv","texture_width":16,"texture_height":16},"bones":[
+{"name":"body","pivot":[0,0,0],"cubes":[{"origin":[0,0,0],"size":[16,16,1],"uv":{"north":{"uv":[0,0],"uv_size":[16,16]}}}]},
+{"name":"eye_left","pivot":[0,0,0],"cubes":[{"origin":[0,0,0],"size":[16,16,1],"uv":{"north":{"uv":[192,0],"uv_size":[16,16]}}}]},
+{"name":"eye_right","pivot":[0,0,0],"cubes":[{"origin":[0,0,0],"size":[16,16,1],"uv":{"north":{"uv":[208,0],"uv_size":[16,16]}}}]}
+]}]})json";
+  static constexpr std::string_view kOutOfBoundsModel = R"json(
+{"format_version":"1.12.0","minecraft:geometry":[{"description":{"identifier":"geometry.session_out_of_bounds","texture_width":16,"texture_height":16},"bones":[
+{"name":"outside","pivot":[0,0,0],"cubes":[{"origin":[0,0,0],"size":[16,16,1],"uv":{"north":{"uv":[300,0],"uv_size":[16,16]}}}]}
+]}]})json";
+  const fs::path large_model_path = directory / fs::path(L"角色_大UV.geo.json");
+  const fs::path out_of_bounds_model_path =
+      directory / fs::path(L"角色_真正越界.geo.json");
+  expect(writeBytes(
+             large_model_path,
+             std::vector<std::uint8_t>(kLargeModel.begin(),
+                                       kLargeModel.end())) &&
+             writeBytes(
+                 out_of_bounds_model_path,
+                 std::vector<std::uint8_t>(kOutOfBoundsModel.begin(),
+                                           kOutOfBoundsModel.end())),
+         "write Unicode runtime model fixtures");
+
+  auto &session = xpbd::app::AppSession::instance();
+  session.labpbr_draft_dirty = false;
+  session.clearTexture();
+  session.loadModel(large_model_path);
+  expect(session.last_error.empty() &&
+             session.geometry.description.identifier ==
+                 "geometry.session_large_uv" &&
+             session.geometry.bones.size() == 3u,
+         "real AppSession model entry commits valid large-UV geometry");
+  expect(session.requestLabPbrSuiteImport(suite_paths.base) &&
+             session.model_uv_domain.kind == UvDomainKind::Recovered &&
+             session.model_uv_domain.width == 256.0 &&
+             session.resolved_material.normal_map_active &&
+             session.resolved_material.specular_map_active,
+         "real suite entry commits one Recovered Domain for all channels");
+  expect(!session.labpbr_uv_coverage.valid() &&
+             session.labpbr_uv_coverage.group_runs.empty() &&
+             !session.labpbr_composition.specular_materialization_deferred &&
+             session.labpbr_composition.specular ==
+                 session.resolved_material.specularImageAsset(),
+         "large-UV suite without Overrides shares Source Specular");
+  const auto source_specular = session.labpbr_composition.specular;
+  session.selected_bone_name = "eye_left";
+  session.loadSelectedLabPbrDraft();
+  session.labpbr_draft.roughness_enabled = true;
+  session.labpbr_draft.roughness = 0.25f;
+  session.markLabPbrDraftDirty();
+  expect(session.applySelectedLabPbrDraft(),
+         "real AppSession Override materializes large-UV authoring state");
+  const auto *left_coverage = session.labpbr_uv_coverage.find("eye_left");
+  const auto *right_coverage = session.labpbr_uv_coverage.find("eye_right");
+  expect(session.labpbr_uv_coverage.valid() &&
+             left_coverage != nullptr && !left_coverage->empty() &&
+             right_coverage != nullptr && !right_coverage->empty() &&
+             session.labpbr_composition.specular != nullptr &&
+             session.labpbr_composition.specular->valid() &&
+             session.labpbr_composition.specular != source_specular &&
+             session.labpbr_composition.specular ==
+                 session.resolved_material.specularImageAsset() &&
+             !session.labpbr_composition.specular_materialization_deferred,
+         "first Override materializes run Coverage for both large-UV eyes");
+  std::weak_ptr<const xpbd::gfx::TextureImage> authored_specular =
+      session.labpbr_composition.specular;
+  expect(session.restoreSelectedLabPbrFromTexture() &&
+             session.labpbr_composition.specular == source_specular &&
+             authored_specular.expired(),
+         "clearing the last Override releases the authored COW image");
+  session.labpbr_draft.roughness_enabled = true;
+  session.labpbr_draft.roughness = 0.25f;
+  session.markLabPbrDraftDirty();
+  expect(session.applySelectedLabPbrDraft(),
+         "large-UV Override can be reapplied after COW release");
+
+  std::vector<std::uint8_t> small_rgba(16u * 16u * 4u, 255u);
+  std::vector<std::uint8_t> small_png;
+  expect(xpbd::gfx::encodePngRgba8(16, 16, small_rgba, small_png, &error),
+         "encode runtime smaller-atlas rejection fixture");
+  const fs::path small_texture_path =
+      directory / fs::path(L"错误的小贴图_16x16.png");
+  expect(writeBytes(small_texture_path, small_png),
+         "write runtime smaller-atlas rejection fixture");
+  const auto material_before_small_texture = snapshot(session);
+  expect(!session.loadTexture(small_texture_path) &&
+             session.last_error.find("exceed") != std::string::npos &&
+             unchanged(session, material_before_small_texture),
+         "smaller atlas Domain failure preserves Session and GPU material");
+
+  const auto material_before_bad_model = snapshot(session);
+  const std::string model_path_before = session.model_path;
+  const std::string identifier_before =
+      session.geometry.description.identifier;
+  const std::vector<std::string> bone_names_before{
+      session.geometry.bones[0].name,
+      session.geometry.bones[1].name,
+      session.geometry.bones[2].name,
+  };
+  const double left_uv_before =
+      session.geometry.bones[1].cubes[0].uv_north.u;
+  const auto model_generation_before = session.modelGeneration();
+  const auto physics_generation_before = session.physicsGeneration();
+  const auto material_generation_before = session.materialGeneration();
+  const auto appearance_generation_before =
+      session.viewportAppearanceGeneration();
+  const auto visibility_generation_before =
+      session.viewportVisibilityGeneration();
+  const auto scene_generation_before = session.scene_selection.generation;
+  const auto pt_reset_before = session.path_trace_settings.reset_generation;
+  session.loadModel(out_of_bounds_model_path);
+  const bool same_bones =
+      session.geometry.bones.size() == bone_names_before.size() &&
+      session.geometry.bones[0].name == bone_names_before[0] &&
+      session.geometry.bones[1].name == bone_names_before[1] &&
+      session.geometry.bones[2].name == bone_names_before[2];
+  expect(session.last_error.find("exceed") != std::string::npos &&
+             session.model_path == model_path_before &&
+             session.geometry.description.identifier == identifier_before &&
+             same_bones &&
+             session.geometry.bones[1].cubes[0].uv_north.u == left_uv_before &&
+             unchanged(session, material_before_bad_model),
+         "out-of-domain model load preserves committed model and material");
+  expect(session.modelGeneration() == model_generation_before &&
+             session.physicsGeneration() == physics_generation_before &&
+             session.materialGeneration() == material_generation_before &&
+             session.viewportAppearanceGeneration() ==
+                 appearance_generation_before &&
+             session.viewportVisibilityGeneration() ==
+                 visibility_generation_before &&
+             session.scene_selection.generation == scene_generation_before &&
+             session.path_trace_settings.reset_generation == pt_reset_before,
+         "failed model preflight preserves every renderer/history generation");
+
+  session.labpbr_draft_dirty = false;
+  session.clearTexture();
+  fs::remove_all(directory, filesystem_error);
+  expect(!filesystem_error,
+         "remove Unicode large-UV AppSession fixture directory");
 }
 
 void testExternalLabPbrSuite(const std::filesystem::path &base_path) {
@@ -904,7 +1366,7 @@ void testExternalLabPbrSuite(const std::filesystem::path &base_path) {
          "external suite pauses for missing-properties confirmation");
   session.confirmLabPbrSuiteImport(true);
 
-  expect(session.labpbr_suite_source.valid() &&
+  expect(session.labpbr_suite_source.metadataValid() &&
              session.labpbr_suite_source.base.path == normalized_base,
          "external suite commits through the real AppSession path");
   expect(session.labpbr_suite_source
@@ -912,23 +1374,23 @@ void testExternalLabPbrSuite(const std::filesystem::path &base_path) {
              session.resolved_material.specular_map_active &&
              session.resolved_material.normal_map_active,
          "external suite activates confirmed LabPBR specular and normal maps");
-  expect(session.model_texture.width == 1024 &&
-             session.model_texture.height == 1024,
+  expect(session.model_texture != nullptr &&
+             session.model_texture->width == 1024 &&
+             session.model_texture->height == 1024,
          "external suite preserves expected 1024x1024 dimensions");
   expect(session.materialGeneration() > generation_before,
          "external suite advances material generation on first commit");
-  expect(session.labpbr_suite_source.base.original_bytes &&
-             *session.labpbr_suite_source.base.original_bytes == base_bytes &&
-             session.labpbr_suite_source.specular.original_bytes &&
-             *session.labpbr_suite_source.specular.original_bytes ==
-                 specular_bytes &&
-             session.labpbr_suite_source.normal.original_bytes &&
-             *session.labpbr_suite_source.normal.original_bytes == normal_bytes,
-         "external suite retains exact original source bytes");
+  expect(!session.labpbr_suite_source.base.original_bytes &&
+             !session.labpbr_suite_source.specular.original_bytes &&
+             !session.labpbr_suite_source.normal.original_bytes &&
+             session.labpbr_imported_normal.original_file_bytes != nullptr &&
+             *session.labpbr_imported_normal.original_file_bytes ==
+                 normal_bytes,
+         "external Session retains metadata and only the Iris encoded asset");
 
   auto committed = snapshot(session);
   expect(session.reloadLabPbrSuite() && session.labpbr_last_import_cache_hit,
-         "external suite reload reuses the checksum cache");
+         "external suite reload reuses the shared byte-bounded LRU cache");
   committed.last_import_cache_hit = true;
   expect(unchanged(session, committed),
          "cached external reload leaves committed material generation stable");
@@ -1298,6 +1760,8 @@ int main(int argc, char **argv) {
   testPathTraceSettingsPersistenceAndClassification();
   testStillRenderSnapshotAndOutput();
   testTransactionalLabPbrSuiteImport();
+  testUnicodeLongPathTextureTransactions();
+  testLargeUvModelMaterialTransactions();
   if (argc >= 2) {
     testExternalLabPbrSuite(std::filesystem::path(argv[1]));
   }

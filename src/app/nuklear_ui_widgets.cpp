@@ -830,7 +830,7 @@ void drawMenuBar(UiPanelContext &ui, float inner_width, bool &show_about) {
                    busy ? nk_rgb(94, 212, 218) : nk_rgb(150, 156, 172));
   nk_layout_row_push(ctx, w_clr);
   if (nk_button_label(ctx, tr("clear_tex")) &&
-      session.model_texture.valid()) {
+      session.model_texture != nullptr && session.model_texture->valid()) {
     session.clearTexture();
   }
   nk_layout_row_end(ctx);
