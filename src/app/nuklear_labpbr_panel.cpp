@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <map>
 #include <set>
 #include <string>
@@ -115,12 +116,15 @@ void drawLabPbrEditor(nk_context *ctx, const Geom &g, AppSession &session) {
         std::string(tr("labpbr_selected_group")) +
         session.selected_bone_name;
     muted(ctx, g, selected.c_str());
-    const auto *texels =
-        session.labpbr_uv_coverage.find(session.selected_bone_name);
+    const auto covered_texels =
+        session.labpbr_uv_coverage.texelCount(session.selected_bone_name);
+    const auto displayed_texels = static_cast<std::size_t>((std::min)(
+        covered_texels,
+        static_cast<std::uint64_t>(
+            (std::numeric_limits<std::size_t>::max)())));
     char coverage_line[160];
     std::snprintf(coverage_line, sizeof(coverage_line),
-                  tr("labpbr_coverage_texels"),
-                  texels == nullptr ? 0u : texels->size());
+                  tr("labpbr_coverage_texels"), displayed_texels);
     muted(ctx, g, coverage_line);
   }
 

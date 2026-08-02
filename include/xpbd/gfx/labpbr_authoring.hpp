@@ -7,8 +7,10 @@
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace xpbd::gfx {
@@ -42,14 +44,28 @@ struct GroupLabPbrOverride {
   bool operator==(const GroupLabPbrOverride &) const = default;
 };
 
+struct UvRun {
+  std::uint32_t y = 0;
+  std::uint32_t x0 = 0;
+  std::uint32_t x1 = 0;
+
+  bool operator==(const UvRun &) const = default;
+};
+
+static_assert(sizeof(UvRun) == kLabPbrUvRunBytes);
+
 struct LabPbrUvCoverage {
   int width = 0;
   int height = 0;
-  std::map<std::string, std::vector<std::uint32_t>> group_texels;
+  std::map<std::string, std::vector<UvRun>, std::less<>> group_runs;
 
   [[nodiscard]] bool valid() const noexcept;
-  [[nodiscard]] const std::vector<std::uint32_t> *
+  [[nodiscard]] const std::vector<UvRun> *
   find(std::string_view group_name) const;
+  [[nodiscard]] std::uint64_t texelCount(
+      std::string_view group_name) const noexcept;
+  [[nodiscard]] std::optional<std::uint32_t> firstTexel(
+      std::string_view group_name) const noexcept;
 };
 
 struct LabPbrUvConflict {
@@ -61,12 +77,19 @@ struct LabPbrUvConflict {
 
 struct LabPbrCompositionResult {
   TextureImage specular;
+  bool specular_materialization_deferred = false;
+  int deferred_width = 0;
+  int deferred_height = 0;
   std::vector<LabPbrUvConflict> conflicts;
   std::vector<std::string> errors;
   std::vector<std::string> warnings;
 
   [[nodiscard]] bool exportable() const noexcept {
-    return specular.valid() && conflicts.empty() && errors.empty();
+    const bool has_specular =
+        specular.valid() ||
+        (specular_materialization_deferred && deferred_width > 0 &&
+         deferred_height > 0);
+    return has_specular && conflicts.empty() && errors.empty();
   }
 };
 
@@ -107,6 +130,11 @@ bool rasterizeLabPbrUvCoverage(const StaticIndexedModelMesh &mesh, int width,
     int width, int height, const TextureImage *imported_specular,
     const LabPbrUvCoverage &coverage,
     const std::map<std::string, GroupLabPbrOverride> &overrides);
+
+bool materializeLabPbrSpecular(int width, int height,
+                               const TextureImage *imported_specular,
+                               TextureImage &out,
+                               std::string *error = nullptr);
 
 bool buildAuthoredResolvedMaterial(
     const TextureImage &base, const ResolvedMaterialTable &source,

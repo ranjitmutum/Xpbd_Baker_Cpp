@@ -64,6 +64,7 @@ struct LabPbrSuiteImportLimits {
   std::uint64_t retained_resident_bytes = 0;
   std::uint64_t cache_bytes = 0;
   bool copy_normal_to_iris_asset = false;
+  bool has_overrides = false;
 };
 
 class LabPbrSuiteImportCache {

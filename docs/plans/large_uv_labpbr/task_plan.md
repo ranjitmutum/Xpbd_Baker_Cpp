@@ -2,7 +2,7 @@
 
 ## Current phase
 
-S04 — remove persistent resolved-texel expansion and add final-model budget preflight (`COMPLETE`; next: S05).
+S05 — lazy Coverage/Composition and compact run encoding (`COMPLETE`; next: S06).
 
 ## Phases and dependencies
 
@@ -14,7 +14,7 @@ S04 — remove persistent resolved-texel expansion and add final-model budget pr
 | S03 | Unicode/long-path snapshot-and-memory image import | S02 | COMPLETE |
 | Gate A | Release app build and full CTest correctness gate | S00–S03 | COMPLETE |
 | S04 | Remove persistent resolved-texel expansion; final-model budget preflight | Gate A | COMPLETE |
-| S05 | Lazy Coverage/Composition and compact run encoding | S04 | PENDING |
+| S05 | Lazy Coverage/Composition and compact run encoding | S04 | COMPLETE |
 | S06 | Shared immutable texture and Iris byte ownership; copy-on-write composition | S05 | PENDING |
 | S07 | Shared-asset byte-bounded LRU import cache | S06 | PENDING |
 | Gate B | Release app build, full CTest, 2K and one 4K memory gate | S07 | PENDING |

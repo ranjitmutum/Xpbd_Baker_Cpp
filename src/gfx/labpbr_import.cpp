@@ -711,12 +711,17 @@ LabPbrSuiteImportResult importLabPbrSuite(
   if (!detail::checkedLabPbrMultiply(
           static_cast<std::uint64_t>(base_header.width),
           static_cast<std::uint64_t>(base_header.height), pixels) ||
-      !detail::checkedLabPbrMultiply(pixels, 4u, rgba_bytes) ||
-      !detail::checkedLabPbrMultiply(
-          pixels, static_cast<std::uint64_t>(sizeof(std::uint32_t)),
-          coverage_bytes)) {
+      !detail::checkedLabPbrMultiply(pixels, 4u, rgba_bytes)) {
     result.error =
         "LabPBR budget preflight failed: atlas byte arithmetic overflow";
+    return result;
+  }
+  if (limits.has_overrides &&
+      !estimateLabPbrUvRunCoveragePeakBytes(
+          static_cast<std::uint64_t>(base_header.width),
+          static_cast<std::uint64_t>(base_header.height), coverage_bytes,
+          &result.error)) {
+    result.error = "LabPBR budget preflight failed: " + result.error;
     return result;
   }
   LabPbrMemoryEstimateRequest memory_request;
@@ -726,7 +731,8 @@ LabPbrSuiteImportResult importLabPbrSuite(
   memory_request.resolved_texel_bytes_per_pixel =
       kLabPbrResolvedTexelBytesPerPixel;
   memory_request.resident_fixed_bytes = limits.retained_resident_bytes;
-  memory_request.candidate_fixed_bytes = rgba_bytes;
+  memory_request.candidate_fixed_bytes =
+      limits.has_overrides ? rgba_bytes : 0u;
   if (source.normal.present && limits.copy_normal_to_iris_asset &&
       !detail::checkedLabPbrAdd(
           memory_request.candidate_fixed_bytes,

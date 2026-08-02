@@ -24,6 +24,7 @@ normalizeLabPbrSpecularPath(const std::filesystem::path &destination);
 [[nodiscard]] LabPbrExportResult exportLabPbrBundle(
     const std::filesystem::path &destination,
     const LabPbrCompositionResult &composition,
-    const ReadOnlyIrisNormalAsset *normal, bool allow_overwrite);
+    const ReadOnlyIrisNormalAsset *normal, bool allow_overwrite,
+    const TextureImage *deferred_source_specular = nullptr);
 
 } // namespace xpbd::gfx

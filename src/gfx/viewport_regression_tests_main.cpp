@@ -38,6 +38,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -45,6 +46,13 @@
 namespace {
 
 int g_failures = 0;
+
+std::set<std::uint32_t> expandCoverageRuns(
+    const xpbd::gfx::LabPbrUvCoverage &coverage,
+    std::string_view group_name);
+bool coverageContains(const xpbd::gfx::LabPbrUvCoverage &coverage,
+                      std::string_view group_name,
+                      std::uint32_t texel);
 
 void expect(bool cond, const char *label) {
   if (!cond) {
@@ -1070,17 +1078,16 @@ void testResolvedUvDomainMaterialConsumers() {
          "Coverage accepts the mesh-owned Domain and imported atlas extent");
   const auto contains_fixture_texel = [&](std::string_view group,
                                           const std::array<int, 2> &pixel) {
-    const auto *texels = coverage.find(group);
     const auto index = static_cast<std::uint32_t>(
         pixel[1] * fixture.base.width + pixel[0]);
-    return texels != nullptr &&
-           std::binary_search(texels->begin(), texels->end(), index);
+    return coverageContains(coverage, group, index);
   };
   expect(contains_fixture_texel("eye_left", fixture.left_eye_texel) &&
              contains_fixture_texel("eye_right", fixture.right_eye_texel) &&
              !contains_fixture_texel("eye_left", fixture.repeat_trap_texel),
          "Coverage aligns both eye groups and excludes the Repeat trap");
-  LabPbrUvCoverage preserved_coverage{7, 9, {{"keep", {3u}}}};
+  LabPbrUvCoverage preserved_coverage{
+      7, 9, {{"keep", {{0u, 3u, 3u}}}}};
   const auto coverage_before_failure = preserved_coverage;
   expect(!xpbd::gfx::rasterizeLabPbrUvCoverage(
              mesh, fixture.base.width - 1, fixture.base.height,
@@ -1088,8 +1095,8 @@ void testResolvedUvDomainMaterialConsumers() {
              error.find("match") != std::string::npos &&
              preserved_coverage.width == coverage_before_failure.width &&
              preserved_coverage.height == coverage_before_failure.height &&
-             preserved_coverage.group_texels ==
-                 coverage_before_failure.group_texels,
+             preserved_coverage.group_runs ==
+                 coverage_before_failure.group_runs,
          "Coverage mismatch rejects without replacing the caller candidate");
 
   builder.setShowGround(false);
@@ -1930,6 +1937,32 @@ xpbd::gfx::StaticIndexedModelMesh makeOverlappingLabPbrMesh() {
   return mesh;
 }
 
+std::set<std::uint32_t> expandCoverageRuns(
+    const xpbd::gfx::LabPbrUvCoverage &coverage,
+    std::string_view group_name) {
+  std::set<std::uint32_t> texels;
+  const auto *runs = coverage.find(group_name);
+  if (runs == nullptr || coverage.width <= 0) {
+    return texels;
+  }
+  for (const xpbd::gfx::UvRun &run : *runs) {
+    for (std::uint32_t x = run.x0;; ++x) {
+      texels.insert(run.y * static_cast<std::uint32_t>(coverage.width) + x);
+      if (x == run.x1) {
+        break;
+      }
+    }
+  }
+  return texels;
+}
+
+bool coverageContains(const xpbd::gfx::LabPbrUvCoverage &coverage,
+                      std::string_view group_name,
+                      std::uint32_t texel) {
+  const auto expanded = expandCoverageRuns(coverage, group_name);
+  return expanded.contains(texel);
+}
+
 void testLabPbrAuthoringEncodingAndCoverage() {
   using xpbd::gfx::GroupLabPbrOverride;
   using xpbd::gfx::encodeLabPbrEmission;
@@ -1938,6 +1971,20 @@ void testLabPbrAuthoringEncodingAndCoverage() {
   using xpbd::gfx::encodeLabPbrSubsurface;
   using xpbd::gfx::validGroupLabPbrOverride;
   std::string validation_error;
+
+  const auto authoring_source =
+      readTestSource("src/gfx/labpbr_authoring.cpp");
+  expect(authoring_source.find("std::vector<std::uint8_t> marked") !=
+                 std::string::npos &&
+             authoring_source.find("std::vector<std::uint32_t> touched") !=
+                 std::string::npos &&
+             authoring_source.find("std::sort(touched.begin()") !=
+                 std::string::npos &&
+             authoring_source.find("std::set<std::uint32_t>") ==
+                 std::string::npos &&
+             authoring_source.find("std::unordered_set<std::uint32_t>") ==
+                 std::string::npos,
+         "production Coverage uses marked touched sort merge without texel Set nodes");
 
   expect(encodeLabPbrEmission(0.0f) == 0u,
          "LabPBR emission zero encodes to zero");
@@ -1976,7 +2023,7 @@ void testLabPbrAuthoringEncodingAndCoverage() {
          "subsurface override validates as a unit interval");
   const auto sss_composition = xpbd::gfx::composeLabPbrSpecular(
       1, 1, nullptr,
-      xpbd::gfx::LabPbrUvCoverage{1, 1, {{"sss", {0u}}}},
+      xpbd::gfx::LabPbrUvCoverage{1, 1, {{"sss", {{0u, 0u, 0u}}}}},
       {{"sss", subsurface}});
   expect(sss_composition.exportable() &&
              sss_composition.specular.rgba[2] == 160u,
@@ -2006,9 +2053,12 @@ void testLabPbrAuthoringEncodingAndCoverage() {
   expect(coverage.valid(), "LabPBR UV coverage dimensions are valid");
   const auto *group_a = coverage.find("group_a");
   const auto *group_b = coverage.find("group_b");
-  expect(group_a != nullptr && group_a->size() == 4u,
+  const std::set<std::uint32_t> reference_texels{0u, 1u, 2u, 3u};
+  expect(group_a != nullptr && coverage.texelCount("group_a") == 4u &&
+             expandCoverageRuns(coverage, "group_a") == reference_texels,
          "selected group rasterizes all covered atlas texels");
-  expect(group_b != nullptr && group_b->size() == 4u,
+  expect(group_b != nullptr && coverage.texelCount("group_b") == 4u &&
+             expandCoverageRuns(coverage, "group_b") == reference_texels,
          "mirrored group coverage deduplicates triangle texels");
   expect(coverage.find("untextured") == nullptr,
          "untextured faces do not enter LabPBR coverage");
@@ -2019,8 +2069,84 @@ void testLabPbrAuthoringEncodingAndCoverage() {
   empty_mesh.uv_domain.imported_height = 2;
   const auto empty_coverage =
       xpbd::gfx::rasterizeLabPbrUvCoverage(empty_mesh, 2, 2);
-  expect(empty_coverage.valid() && empty_coverage.group_texels.empty(),
+  expect(empty_coverage.valid() && empty_coverage.group_runs.empty(),
          "empty model produces valid empty LabPBR coverage");
+
+  auto stress_mesh = makeOverlappingLabPbrMesh();
+  stress_mesh.faces.resize(1u);
+  stress_mesh.uv_domain.width = 2048.0;
+  stress_mesh.uv_domain.height = 2048.0;
+  stress_mesh.uv_domain.imported_width = 2048;
+  stress_mesh.uv_domain.imported_height = 2048;
+  for (std::size_t i = 0; i < 4u; ++i) {
+    stress_mesh.vertices[i].raw_u =
+        static_cast<double>(stress_mesh.vertices[i].u) * 2048.0;
+    stress_mesh.vertices[i].raw_v =
+        static_cast<double>(stress_mesh.vertices[i].v) * 2048.0;
+  }
+  const auto stress_coverage =
+      xpbd::gfx::rasterizeLabPbrUvCoverage(stress_mesh, 2048, 2048);
+  const auto *stress_runs = stress_coverage.find("group_a");
+  bool exact_stress_runs = stress_runs != nullptr &&
+                           stress_runs->size() == 2048u;
+  if (exact_stress_runs) {
+    for (std::uint32_t y = 0; y < 2048u; ++y) {
+      const auto &run = (*stress_runs)[y];
+      exact_stress_runs &=
+          run.y == y && run.x0 == 0u && run.x1 == 2047u;
+    }
+  }
+  expect(stress_coverage.valid() && exact_stress_runs &&
+             stress_coverage.texelCount("group_a") == 2048u * 2048u,
+         "runtime 2K full-atlas Coverage compacts to one run per row");
+
+  std::uint64_t eight_k_coverage_peak = 0u;
+  xpbd::gfx::LabPbrMemoryEstimateRequest eight_k_request;
+  eight_k_request.width = 8192u;
+  eight_k_request.height = 8192u;
+  xpbd::gfx::LabPbrMemoryEstimate preserved_estimate{11u, 22u, 33u, 44u};
+  auto rejected_estimate = preserved_estimate;
+  expect(xpbd::gfx::estimateLabPbrUvRunCoveragePeakBytes(
+             8192u, 8192u, eight_k_coverage_peak, &validation_error) &&
+             eight_k_coverage_peak == 8192u * 8192u * 17u,
+         "8K run Coverage peak uses checked arithmetic without allocation");
+  eight_k_request.coverage_peak_bytes = eight_k_coverage_peak;
+  expect(!xpbd::gfx::preflightLabPbrMemory(
+             eight_k_request, xpbd::gfx::kLabPbrDefaultPeakBudgetBytes,
+             rejected_estimate, &validation_error) &&
+             rejected_estimate == preserved_estimate,
+         "8K run Coverage rejects before allocation and preserves estimate output");
+
+  const auto lazy_default = xpbd::gfx::composeLabPbrSpecular(
+      2, 2, nullptr, {}, {});
+  expect(lazy_default.exportable() &&
+             lazy_default.specular_materialization_deferred &&
+             lazy_default.deferred_width == 2 &&
+             lazy_default.deferred_height == 2 &&
+             lazy_default.specular.rgba.empty(),
+         "no Override keeps default Specular and Coverage nonresident");
+  xpbd::gfx::TextureImage materialized_default;
+  expect(xpbd::gfx::materializeLabPbrSpecular(
+             2, 2, nullptr, materialized_default, &validation_error) &&
+             materialized_default.valid() &&
+             materialized_default.rgba[0] == 0u &&
+             materialized_default.rgba[1] == 10u,
+         "default Specular materializes transactionally only on demand");
+  const auto preserved_materialized = materialized_default;
+  xpbd::gfx::TextureImage mismatched_source;
+  mismatched_source.width = 1;
+  mismatched_source.height = 1;
+  mismatched_source.source_channels = 4;
+  mismatched_source.rgba = {0u, 10u, 0u, 0u};
+  expect(!xpbd::gfx::materializeLabPbrSpecular(
+             2, 2, &mismatched_source, materialized_default,
+             &validation_error) &&
+             materialized_default.width == preserved_materialized.width &&
+             materialized_default.height == preserved_materialized.height &&
+             materialized_default.source_channels ==
+                 preserved_materialized.source_channels &&
+             materialized_default.rgba == preserved_materialized.rgba,
+         "Composition materialization failure preserves caller output");
   GroupLabPbrOverride missing_group;
   missing_group.group_name = "missing";
   missing_group.emission_enabled = true;
@@ -2092,6 +2218,19 @@ void testLabPbrCompositionAndConflicts() {
       1u, 2u, 3u, 4u,       5u, 6u, 7u, 8u,
       9u, 10u, 11u, 12u,    13u, 14u, 15u, 16u,
   };
+
+  const auto lazy_source = xpbd::gfx::composeLabPbrSpecular(
+      2, 2, &imported, {}, {});
+  xpbd::gfx::TextureImage materialized_source;
+  std::string materialize_error;
+  expect(lazy_source.exportable() &&
+             lazy_source.specular_materialization_deferred &&
+             lazy_source.specular.rgba.empty() &&
+             xpbd::gfx::materializeLabPbrSpecular(
+                 2, 2, &imported, materialized_source,
+                 &materialize_error) &&
+             materialized_source.rgba == imported.rgba,
+         "no Override shares Source Specular until explicit materialization");
 
   GroupLabPbrOverride group_a;
   group_a.group_name = "group_a";
@@ -2346,6 +2485,42 @@ void testLabPbrBundleExport() {
                  normal_png &&
              reimported_after_edit.suite.material.format_declared,
          "import-edit-export-reimport round-trip preserves authored RGBA, exact _n bytes, and properties");
+
+  xpbd::gfx::LabPbrCompositionResult deferred;
+  deferred.specular_materialization_deferred = true;
+  deferred.deferred_width = 2;
+  deferred.deferred_height = 1;
+  const auto deferred_prompt = xpbd::gfx::exportLabPbrBundle(
+      directory / "skin_s.png", deferred, nullptr, false,
+      &composition.specular);
+  expect(deferred_prompt.overwrite_required &&
+             deferred.specular.rgba.empty(),
+         "deferred overwrite prompt does not materialize Source Specular");
+
+  const auto deferred_source_export = xpbd::gfx::exportLabPbrBundle(
+      directory / "lazy_source.png", deferred, nullptr, true,
+      &composition.specular);
+  xpbd::gfx::TextureImage lazy_source_image;
+  expect(deferred_source_export.success &&
+             deferred.specular.rgba.empty() &&
+             xpbd::gfx::loadTextureImage(
+                 deferred_source_export.specular_path, lazy_source_image,
+                 &error) &&
+             lazy_source_image.rgba == composition.specular.rgba,
+         "actual deferred export materializes exact Source Specular locally");
+
+  const auto deferred_default_export = xpbd::gfx::exportLabPbrBundle(
+      directory / "lazy_default.png", deferred, nullptr, true, nullptr);
+  xpbd::gfx::TextureImage lazy_default_image;
+  expect(deferred_default_export.success &&
+             deferred.specular.rgba.empty() &&
+             xpbd::gfx::loadTextureImage(
+                 deferred_default_export.specular_path, lazy_default_image,
+                 &error) &&
+             lazy_default_image.rgba ==
+                 std::vector<std::uint8_t>{0u, 10u, 0u, 0u,
+                                           0u, 10u, 0u, 0u},
+         "missing Source Specular materializes the default map only for export");
 
   xpbd::gfx::LabPbrCompositionResult conflicting = composition;
   conflicting.conflicts.push_back({});

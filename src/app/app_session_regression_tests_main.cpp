@@ -115,12 +115,18 @@ bool unchanged(const xpbd::app::AppSession &session,
          sameResolvedMaterial(session.resolved_material, before.material) &&
          session.labpbr_uv_coverage.width == before.coverage.width &&
          session.labpbr_uv_coverage.height == before.coverage.height &&
-         session.labpbr_uv_coverage.group_texels ==
-             before.coverage.group_texels &&
+         session.labpbr_uv_coverage.group_runs ==
+             before.coverage.group_runs &&
          session.labpbr_group_overrides == before.overrides &&
          session.labpbr_draft == before.draft &&
          sameTexture(session.labpbr_composition.specular,
                      before.composition.specular) &&
+         session.labpbr_composition.specular_materialization_deferred ==
+             before.composition.specular_materialization_deferred &&
+         session.labpbr_composition.deferred_width ==
+             before.composition.deferred_width &&
+         session.labpbr_composition.deferred_height ==
+             before.composition.deferred_height &&
          session.labpbr_composition.conflicts.size() ==
              before.composition.conflicts.size() &&
          session.labpbr_composition.errors == before.composition.errors &&
@@ -752,6 +758,12 @@ void testTransactionalLabPbrSuiteImport() {
                  generation_before_base_reload,
          "same-size base import preserves independently selected PBR slots "
          "without discovering sibling images");
+  expect(!session.labpbr_uv_coverage.valid() &&
+             session.labpbr_uv_coverage.group_runs.empty() &&
+             session.labpbr_composition.exportable() &&
+             session.labpbr_composition.specular_materialization_deferred &&
+             session.labpbr_composition.specular.rgba.empty(),
+         "no Override keeps AppSession Coverage and duplicate Composition nonresident");
   const auto direct_committed = snapshot(session);
   const fs::path mismatched_specular_path =
       directory / "mismatched_specular.png";
@@ -1175,11 +1187,26 @@ void testLargeUvModelMaterialTransactions() {
              session.resolved_material.normal_map_active &&
              session.resolved_material.specular_map_active,
          "real suite entry commits one Recovered Domain for all channels");
+  expect(!session.labpbr_uv_coverage.valid() &&
+             session.labpbr_uv_coverage.group_runs.empty() &&
+             session.labpbr_composition.specular_materialization_deferred &&
+             session.labpbr_composition.specular.rgba.empty(),
+         "large-UV suite without Overrides keeps Coverage and Composition nonresident");
+  session.selected_bone_name = "eye_left";
+  session.loadSelectedLabPbrDraft();
+  session.labpbr_draft.roughness_enabled = true;
+  session.labpbr_draft.roughness = 0.25f;
+  session.markLabPbrDraftDirty();
+  expect(session.applySelectedLabPbrDraft(),
+         "real AppSession Override materializes large-UV authoring state");
   const auto *left_coverage = session.labpbr_uv_coverage.find("eye_left");
   const auto *right_coverage = session.labpbr_uv_coverage.find("eye_right");
-  expect(left_coverage != nullptr && !left_coverage->empty() &&
-             right_coverage != nullptr && !right_coverage->empty(),
-         "AppSession commits Coverage for both large-UV eye groups");
+  expect(session.labpbr_uv_coverage.valid() &&
+             left_coverage != nullptr && !left_coverage->empty() &&
+             right_coverage != nullptr && !right_coverage->empty() &&
+             session.labpbr_composition.specular.valid() &&
+             !session.labpbr_composition.specular_materialization_deferred,
+         "first Override materializes run Coverage for both large-UV eyes");
 
   std::vector<std::uint8_t> small_rgba(16u * 16u * 4u, 255u);
   std::vector<std::uint8_t> small_png;

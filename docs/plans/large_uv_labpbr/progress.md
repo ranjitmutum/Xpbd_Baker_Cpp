@@ -9,7 +9,8 @@
 | 2026-08-02 | S03 | BLOCKED | planning files only after exact S03 rollback | AppSession CTest 1/1 PASS after repair 2, but affected viewport CTest then failed 1 assertion (`corrupt _s is rejected`); repair budget exhausted | none | Restore six S03 production/test files to `80970b6`; stop before Gate A |
 | 2026-08-02 | S03 resumed | COMPLETE | texture snapshot/decode, strict Suite/Iris import, COM dialogs, AppSession/viewport regressions, planning files | Affected Release app + viewport + AppSession targets PASS; related CTest 2/2 PASS (1.45 s); source contracts and `git diff --check` PASS | `a9b955d` | Gate A: full Release build and full CTest |
 | 2026-08-02 | Gate A | COMPLETE | planning files only after S03 commit `a9b955d` | Full Release preset PASS; SPIR-V 27-shader verification PASS; full CTest 5/5 PASS (4.30 s); CPU/reference/source contracts PASS | no gate commit by plan | S04: remove resolved-texel expansion and add final-model budget preflight |
-| 2026-08-02 | S04 | COMPLETE | compact material images/on-demand decode; checked pre-decode/final-model budgets; Suite/Iris/cache accounting; AppSession/viewport regressions; planning files | Release app + viewport + AppSession targets PASS; related CTest 2/2 PASS (1.35 s); actual 2K + 8K arithmetic-only gates PASS; `git diff --check` and scope audit PASS | this isolated phase commit | S05: lazy Coverage/Composition and run encoding |
+| 2026-08-02 | S04 | COMPLETE | compact material images/on-demand decode; checked pre-decode/final-model budgets; Suite/Iris/cache accounting; AppSession/viewport regressions; planning files | Release app + viewport + AppSession targets PASS; related CTest 2/2 PASS (1.35 s); actual 2K + 8K arithmetic-only gates PASS; `git diff --check` and scope audit PASS | `d01a428` | S05: lazy Coverage/Composition and run encoding |
+| 2026-08-02 | S05 | COMPLETE | lazy Coverage/Composition; `UvRun`; marked/touched/sort/merge; deferred export; AppSession/UI accessors; regressions; planning files | Release app + viewport + AppSession targets PASS; related CTest 2/2 PASS (1.70 s); actual 2K + 8K arithmetic-only gates PASS; `git diff --check` and scope audit PASS; repair 1/2 | this isolated phase commit | S06: shared immutable images/Iris bytes and copy-on-write Composition |
 
 - Resumed implementation: restored the shared snapshot API declaration and removed the filename-based stb branch; subsequent patches are reapplying the previously compiled candidate without altering its scope.
 
@@ -142,6 +143,106 @@
 - S04 affected verification is GREEN: viewport/AppSession CTest passes 2/2 in 1.35 s, including actual 2K compact allocation, 8K arithmetic rejection, exhaustive small-texel equality, header-only Suite budget rejection, Iris copy rejection, Unicode paths, and Session rollback. `git diff --check` passes; no persistent material `.texels` access or task file >=1 MiB exists.
 
 - S04 COMPLETE scope audit: the task diff is limited to compact material/texture/import/authoring/AppSession code, the two related regression sources, and the three planning files. No Vulkan/backend/shader/physics/UI file changed, no large image was added, staged state is empty, and the protected user baseline is unchanged and excluded from the pending phase commit.
+
+- S04 post-commit verification: `HEAD=d01a428`; the phase commit contains exactly the 16 audited task paths, and the worktree returned to the protected pre-existing baseline only. S05 is now active and begins with a complete Coverage/Composition caller/test inventory.
+
+- S05 inventory: persistent Coverage is `map<string, vector<uint32_t>>` built with per-group `std::set`; Composition always allocates a full RGBA atlas even with no Override. Product consumers are authoring composition, draft first-texel lookup, one UI count, export, resident-byte accounting, and transaction snapshots; all can migrate to run accessors without layout or rendering changes.
+
+- S05 implementation route fixed: introduce inclusive `UvRun{y,x0,x1}` plus run count/first-texel accessors; rasterize group-by-group with one reusable `marked` byte array and `touched` indices, then sort/merge by row. No-Override product state clears Coverage pixels/runs and keeps only deferred-export metadata; export materializes Source Specular or the default map locally after overwrite approval.
+
+- S05 context recovery restarted: `task_plan.md` and `progress.md` were re-read completely; `findings.md` contains 261 lines and is being re-read in bounded windows. `git diff --stat` shows only the three planning files plus the protected tracked manifest; full Git state/diffs and the newest recorded test result remain to be verified before code edits.
+
+- S05 recovery findings read: exact lines 1-160 were re-read without truncation, confirming the S05 lazy run/deferred-export design, the protected baseline, and S05 repair count 0/2. Lines 161-end remain before Git/test verification.
+
+- S05 recovery findings complete: exact lines 161-261 were re-read without truncation. All three planning files are now recovered; Git status/log/diffs and the latest test log are the remaining resume checks.
+
+- S05 recovery Git checkpoint: branch is `xpbdRT`, `HEAD=d01a428`, ahead 5/behind 3; status contains only the three planning files plus the fully enumerated protected tracked/untracked baseline. Recent 15-commit history matches the five isolated task commits; staged/unstaged diff content and test log remain.
+
+- S05 recovery diff audit: the complete unstaged diff contains only S05 planning updates plus the protected tracked manifest; the staged diff is empty. No S05 production/test code has been edited yet, and the protected manifest remains separable and untouched.
+
+- S05 recovery COMPLETE: the newest recorded affected log is the green AppSession regression at 2026-08-02 13:48 CST, and the original S05-S07/Gate B requirements were rechecked. Resume state is `HEAD=d01a428`, S05 repair count 0/2, with no S05 code diff.
+
+- User-authorized S05 execution resumed: `task_plan.md` and `progress.md` were re-read completely after session catch-up; full findings/Git/test recovery is being repeated before production edits.
+
+- Renewed recovery findings read was truncated at the combined output cap despite two bounded halves; no state changed. Retrying in four smaller exact line windows before implementation.
+
+- Renewed recovery findings read: exact lines 1-140 are now recovered without truncation; lines 141-end remain before Git/test checks.
+
+- Renewed recovery findings COMPLETE: exact lines 141-end were re-read without truncation. Git status/log/diffs and latest test evidence remain before S05 implementation.
+
+- Renewed recovery Git checkpoint: `xpbdRT` remains at `d01a428` (ahead 5/behind 3); status contains only task planning files and the exact protected baseline. Recent 15 commits still match the isolated S00-S04 sequence.
+
+- Renewed recovery diff audit: complete unstaged diff is limited to planning updates plus the protected tracked manifest, and staged diff is empty. No production/test S05 change exists yet.
+
+- Renewed recovery COMPLETE: latest affected log remains AppSession PASS at 2026-08-02 13:48 CST. S05 symbol inventory reconfirms the bounded authoring/AppSession/export/test surface; implementation may now begin with repair count 0/2.
+
+- S05 authoring API/implementation read complete: migrate flat texels to row-aware inclusive runs, short-circuit no-Override composition before Coverage validation/allocation, and preserve the existing conflict claim semantics for actual Overrides.
+
+- S05 product helper audit complete: budget and construction are currently unconditional; make Coverage/Composition allocations conditional on Overrides while keeping the existing local-candidate commit order and source-specular resolved path.
+
+- S05 export audit complete: preserve path/overwrite checks before any deferred Source/default Specular materialization, then use one local effective image through Iris validation, encoding, staging, and round-trip verification.
+
+- S05 AppSession/export-call audit complete: wire current atlas/source into request and confirmation, use `firstTexel()` for draft initialization, and retain existing local transaction/generation behavior; no UI layout or pending-state expansion is required.
+
+- S05 regression audit complete: migrate exact 2x2 and large-UV assertions through test-only run expansion, add a runtime 2K run stress and no-Override residency/export checks, and extend the AppSession rollback oracle for runs/deferred metadata.
+
+- S05 memory audit complete: leave S04 estimator baselines intact, but make product/strict-import Coverage and Composition estimates conditional on Overrides and use a conservative marked/touched/run construction peak.
+
+- S05 strict-import audit complete: extend the existing source-compatible import limits with override presence and reuse one checked run-Coverage peak helper in strict predecode and AppSession product preflight.
+
+- S05 implementation part 1: added checked run-Coverage peak arithmetic, row-aware `UvRun` storage, canonical validity checks, covered-texel counting, first-texel lookup, and deferred Composition metadata/API declarations.
+
+- S05 implementation part 2: Coverage now builds with grouped faces plus one reusable `marked` array and `touched` vector, sorts and merges exact row runs, and publishes transactionally. Composition defers all pixels with no Overrides and materializes locally only for actual override composition.
+
+- S05 implementation part 3: strict-suite and AppSession preflights now reserve run-Coverage/full Composition only when Overrides exist; resident accounting uses run capacity. Product material construction clears no-Override Coverage and can reuse valid same-Domain/same-atlas Coverage for material-only changes.
+
+- S05 implementation part 4: all same-geometry material/import/override transactions now offer the committed Domain/Coverage for safe reuse; model replacement deliberately does not. Reuse is accepted only after the rebuilt mesh Domain and atlas dimensions match.
+
+- S05 post-wiring inventory: remaining production flat-texel references are only draft first-texel lookup and the panel's displayed count; all ten material-helper calls are accounted for, with model import as the sole intentional no-reuse caller.
+
+- S05 implementation part 5: draft initialization and the unchanged UI label now use run accessors. Export accepts deferred Source Specular, performs overwrite detection without allocating Composition pixels, then materializes one local Source/default image only for an actual write and retains transactional staging/verification.
+
+- S05 migration inventory: no production `group_texels` use remains; only four regression references/initializers require conversion. The panel needs only a standard `<limits>` include for its existing `%zu` display boundary.
+
+- S05 export/session snapshot wiring complete. Viewport test helpers are the next migration point; test-only set expansion will serve as the exact reference oracle while production remains free of texel Set/Unordered Set nodes.
+
+- S05 test insertion points confirmed: add run expansion/membership helpers beside the existing overlapping-mesh fixture and keep the 2K run stress inside the already registered authoring regression function, so no CMake/test target changes are needed.
+
+- S05 regression implementation part 1: converted exact-set, transactional, and large-UV assertions to test-only run expansion; added a runtime 2K full-atlas one-run-per-row stress plus lazy default materialization checks. A forward declaration is required because the large-UV test precedes the helper definition.
+
+- S05 export/product test audit: extend the existing transactional bundle test with deferred Source/default exports, and update the AppSession large-UV flow to assert no-Override nonresidency before applying a real Override that materializes run Coverage.
+
+- S05 regression implementation part 2: no-Override Source Specular is now asserted to remain nonresident and to reproduce exact source bytes when explicitly materialized. Deferred export cases will be appended after the existing resident overwrite transaction checks.
+
+- S05 regression implementation part 3: transactional export now covers allocation-free overwrite prompts plus actual deferred Source/default materialization. AppSession tests assert no-Override nonresidency and then apply a real large-UV eye Override to require resident run Coverage/composition.
+
+- S05 structural inventory is clean: all flat Coverage fields are gone, and texel Set usage exists only in the test reference expander. Adding an explicit source-contract gate before compilation.
+
+- S05 source-contract gate added for marked/touched/sort and forbidden texel Set nodes; empty textured-group input now returns without allocating scratch arrays. Call-site audit confirms only model replacement omits Coverage reuse context.
+
+- S05 pre-build format/scope checkpoint: `git diff --check` passes (line-ending warnings only); candidate is confined to LabPBR authoring/import/export/memory, AppSession data access, two regressions, one count-only panel line, and planning files. No forbidden subsystem path is modified.
+
+- S05 repair 1/2: first affected Release build stopped on one syntax error at `nuklear_labpbr_panel.cpp:127` (extra `)` in display-only saturation cast). Apply the exact delimiter fix and rebuild; no behavioral repair is involved.
+
+- S05 repair 1 applied: the count conversion is now a named local passed to the unchanged `%zu` label, eliminating the unmatched delimiter without changing UI behavior or layout.
+
+- S05 affected Release build is GREEN after repair 1/2: `xpbd_baker_app`, `xpbd_viewport_regression_tests`, and `xpbd_app_session_regression_tests` compile and link successfully; only pre-existing third-party warnings remain.
+
+- S05 related CTest is GREEN 2/2 in 1.52 s. The log confirms marked/touched/sort source contract, actual 2K one-run-per-row Coverage, no-Override nonresidency, deferred Source/default export, and first-Override product materialization.
+
+- S05 core diff review complete: run validity/iteration, conservative checked peak arithmetic, strict-import lazy budgeting, and post-overwrite export materialization preserve transactional outputs and channel semantics. No PBR math, sampler, Vulkan, or rendering-protocol code changed.
+
+- S05 AppSession/test diff review complete: model topology changes cannot reuse Coverage; same-geometry paths require rebuilt Domain/atlas equality; transaction snapshots include runs and deferred metadata. UI changes are limited to replacing vector size with exact run texel count.
+
+- S05 gate re-read identified two final assertions before closure: 8K run-Coverage arithmetic must reject without allocation, and direct Composition materialization failure must preserve its caller-owned output. Adding both without changing production semantics.
+
+- S05 final gate assertions added: exact 8K run peak arithmetic rejects under the 1 GiB ceiling without allocation and preserves estimate output; mismatched-source materialization preserves the prior TextureImage. `git diff --check` remains clean.
+
+- S05 final regression verification remains GREEN: rebuilt Release viewport target PASS; viewport/AppSession CTest 2/2 PASS in 1.70 s, including the added 8K arithmetic-only rejection and Composition output-preservation checks.
+
+- S05 COMPLETE scope audit: no forbidden Vulkan/backend/shader/physics/BRDF/protocol path changed; the sole UI edit substitutes the exact run count without layout changes. No large asset exists, `git diff --check` passes, protected user files remain excluded, and repair usage is 1/2.
+
+- S05 final pre-stage status contains exactly 14 task-owned code/test/planning paths plus the unchanged protected baseline; staged state is still empty and final `git diff --check` passes.
 
 ## Resume protocol
 

@@ -11,6 +11,8 @@ inline constexpr std::uint64_t kLabPbrDefaultPeakBudgetBytes =
     std::uint64_t{1024} * 1024u * 1024u;
 inline constexpr std::uint64_t
     kLabPbrResolvedTexelBytesPerPixel = 0u;
+inline constexpr std::uint64_t kLabPbrUvRunBytes =
+    3u * sizeof(std::uint32_t);
 
 struct LabPbrMemoryEstimate {
   std::uint64_t resident_bytes = 0;
@@ -61,6 +63,42 @@ namespace detail {
 }
 
 } // namespace detail
+
+// Coverage construction keeps one byte per atlas texel in `marked`, one
+// uint32 entry per touched texel, and at most one row-aware run per texel.
+// The estimate is intentionally conservative and is used before allocation.
+[[nodiscard]] inline bool estimateLabPbrUvRunCoveragePeakBytes(
+    std::uint64_t width, std::uint64_t height, std::uint64_t &out,
+    std::string *error = nullptr) {
+  const auto fail = [&](const char *message) {
+    if (error != nullptr) {
+      *error = message;
+    }
+    return false;
+  };
+  if (width == 0u || height == 0u) {
+    return fail("LabPBR Coverage dimensions must be positive");
+  }
+  std::uint64_t pixels = 0;
+  std::uint64_t touched_bytes = 0;
+  std::uint64_t run_bytes = 0;
+  std::uint64_t candidate = 0;
+  if (!detail::checkedLabPbrMultiply(width, height, pixels) ||
+      !detail::checkedLabPbrMultiply(
+          pixels, static_cast<std::uint64_t>(sizeof(std::uint32_t)),
+          touched_bytes) ||
+      !detail::checkedLabPbrMultiply(pixels, kLabPbrUvRunBytes,
+                                     run_bytes) ||
+      !detail::checkedLabPbrAdd(pixels, touched_bytes, candidate) ||
+      !detail::checkedLabPbrAdd(candidate, run_bytes, candidate)) {
+    return fail("LabPBR Coverage peak byte arithmetic overflow");
+  }
+  out = candidate;
+  if (error != nullptr) {
+    error->clear();
+  }
+  return true;
+}
 
 // resident_bytes excludes cache ownership so cache_bytes remains separately
 // auditable. peak_bytes includes direct residency, transient candidates,
