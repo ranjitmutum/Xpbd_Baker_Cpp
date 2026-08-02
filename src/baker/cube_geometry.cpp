@@ -11,6 +11,23 @@
 
 namespace xpbd::baker {
 
+namespace {
+
+double effectiveAxisOrigin(const loader::Cube& cube, int axis) {
+    if (cube.size[axis] == 0.0 && cube.inflate < 0.0) {
+        return cube.origin[axis];
+    }
+    return std::min(cube.origin[axis],
+                    cube.origin[axis] + cube.size[axis]) - cube.inflate;
+}
+
+double effectiveAxisSize(const loader::Cube& cube, int axis) {
+    return std::max(0.0,
+                    std::abs(cube.size[axis]) + cube.inflate * 2.0);
+}
+
+} // namespace
+
 std::array<double, 3> CubeGeometry::effectivePivot(const loader::Cube& cube) {
     requireCube(cube);
     if (cube.has_pivot) {
@@ -22,16 +39,14 @@ std::array<double, 3> CubeGeometry::effectivePivot(const loader::Cube& cube) {
 
 std::array<double, 3> CubeGeometry::effectiveOrigin(const loader::Cube& cube) {
     requireCube(cube);
-    return {std::min(cube.origin[0], cube.origin[0] + cube.size[0]) - cube.inflate,
-            std::min(cube.origin[1], cube.origin[1] + cube.size[1]) - cube.inflate,
-            std::min(cube.origin[2], cube.origin[2] + cube.size[2]) - cube.inflate};
+    return {effectiveAxisOrigin(cube, 0), effectiveAxisOrigin(cube, 1),
+            effectiveAxisOrigin(cube, 2)};
 }
 
 std::array<double, 3> CubeGeometry::effectiveSize(const loader::Cube& cube) {
     requireCube(cube);
-    return {std::abs(cube.size[0]) + cube.inflate * 2.0,
-            std::abs(cube.size[1]) + cube.inflate * 2.0,
-            std::abs(cube.size[2]) + cube.inflate * 2.0};
+    return {effectiveAxisSize(cube, 0), effectiveAxisSize(cube, 1),
+            effectiveAxisSize(cube, 2)};
 }
 
 std::array<double, 24> CubeGeometry::bindVertices(const loader::Cube& cube) {
@@ -150,7 +165,8 @@ void CubeGeometry::requireCube(const loader::Cube& cube) {
         throw std::invalid_argument("cube inflate must be finite");
     }
     for (int axis = 0; axis < 3; ++axis) {
-        if (std::abs(cube.size[axis]) + cube.inflate * 2.0 < 0) {
+        if (cube.size[axis] != 0.0 &&
+            std::abs(cube.size[axis]) + cube.inflate * 2.0 < 0) {
             throw std::invalid_argument("cube inflate shrinks an effective size below zero");
         }
     }
