@@ -62,15 +62,28 @@ bool skipCoincidentOppositeFace(const loader::Cube &cube,
   const double size_y = std::abs(cube.size[1]) + 2.0 * cube.inflate;
   const double size_z = std::abs(cube.size[2]) + 2.0 * cube.inflate;
   constexpr double kFlatEpsilon = 1.0e-6;
+  const bool only_west_authored =
+      cube.uv_mode == loader::CubeUVMode::PerFace && cube.uv_west.present &&
+      !cube.uv_east.present;
+  const bool only_down_authored =
+      cube.uv_mode == loader::CubeUVMode::PerFace && cube.uv_down.present &&
+      !cube.uv_up.present;
+  const bool only_north_authored =
+      cube.uv_mode == loader::CubeUVMode::PerFace && cube.uv_north.present &&
+      !cube.uv_south.present;
   // A zero-thickness Bedrock cube produces two coincident quads. Keep the
-  // positive-axis face; RT is explicitly two-sided, so the other side remains
-  // visible without a second coplanar primitive (which would z-fight).
+  // only authored Per-Face side, otherwise prefer the positive-axis face. RT
+  // is explicitly two-sided, so one quad remains visible from either side
+  // without a second coplanar primitive (which would z-fight).
   return (size_x <= kFlatEpsilon &&
-          face_i == static_cast<int>(StaticModelFaceDirection::West)) ||
+          face_i == static_cast<int>(StaticModelFaceDirection::West) &&
+          !only_west_authored) ||
          (size_y <= kFlatEpsilon &&
-          face_i == static_cast<int>(StaticModelFaceDirection::Down)) ||
+          face_i == static_cast<int>(StaticModelFaceDirection::Down) &&
+          !only_down_authored) ||
          (size_z <= kFlatEpsilon &&
-          face_i == static_cast<int>(StaticModelFaceDirection::North));
+          face_i == static_cast<int>(StaticModelFaceDirection::North) &&
+          !only_north_authored);
 }
 
 struct Rgba {
