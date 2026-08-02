@@ -8,6 +8,7 @@
 #include "xpbd/gfx/labpbr_export.hpp"
 #include "xpbd/gfx/labpbr_import.hpp"
 #include "xpbd/gfx/labpbr_material.hpp"
+#include "xpbd/gfx/labpbr_memory.hpp"
 #include "xpbd/gfx/path_trace_aov.hpp"
 #include "xpbd/gfx/preview_scene.hpp"
 #include "xpbd/gfx/rt_scene_records.hpp"
@@ -21,6 +22,7 @@
 #include "xpbd/loader/bedrock_animation_data.hpp"
 #include "xpbd/loader/bedrock_model_data.hpp"
 #include "xpbd/render/skeleton_viewport.hpp"
+#include "test_support/labpbr_synthetic_fixture.hpp"
 
 #include <array>
 #include <algorithm>
@@ -561,6 +563,130 @@ void testTextureFromMemory() {
              err.find("peak byte arithmetic overflow") != std::string::npos &&
              outputWasPreserved(),
          "texture peak-budget addition rejects size_t overflow");
+}
+
+void testSyntheticLargeUvFixtureAndMemoryBaseline() {
+  using xpbd::gfx::LabPbrMemoryEstimate;
+  using xpbd::gfx::LabPbrMemoryEstimateRequest;
+  using xpbd::gfx::ResolvedMaterialTexel;
+  using xpbd::gfx::estimateLabPbrMemory;
+  using xpbd::test_support::SyntheticLabPbrSuitePaths;
+  using xpbd::test_support::SyntheticLargeUvFixture;
+  using xpbd::test_support::buildSyntheticLargeUvFixture;
+  using xpbd::test_support::fixtureTexel;
+  using xpbd::test_support::writeSyntheticLabPbrSuite;
+
+  SyntheticLargeUvFixture fixture;
+  std::string error;
+  expect(buildSyntheticLargeUvFixture(fixture, &error) && error.empty(),
+         "runtime synthetic large-UV fixture builds");
+  expect(fixture.base.valid() && fixture.normal.valid() &&
+             fixture.specular.valid() &&
+             fixture.base.width == SyntheticLargeUvFixture::kAtlasWidth &&
+             fixture.base.height == SyntheticLargeUvFixture::kAtlasHeight,
+         "synthetic Base Normal and Specular atlases share 256x256 extent");
+  expect(fixture.large_uv_geometry.description.texture_width == 16 &&
+             fixture.large_uv_geometry.description.texture_height == 16 &&
+             fixture.large_uv_geometry.bones.size() == 3u &&
+             fixture.large_uv_geometry.bones[1].name == "eye_left" &&
+             fixture.large_uv_geometry.bones[2].name == "eye_right",
+         "synthetic eye model declares 16x16 and authors distinct large UVs");
+
+  const auto body = fixtureTexel(fixture.base, fixture.body_texel);
+  const auto left = fixtureTexel(fixture.base, fixture.left_eye_texel);
+  const auto right = fixtureTexel(fixture.base, fixture.right_eye_texel);
+  const auto repeat_trap =
+      fixtureTexel(fixture.base, fixture.repeat_trap_texel);
+  expect(body == std::array<std::uint8_t, 4>{220u, 40u, 20u, 255u} &&
+             left ==
+                 std::array<std::uint8_t, 4>{20u, 220u, 40u, 255u} &&
+             right ==
+                 std::array<std::uint8_t, 4>{20u, 40u, 220u, 255u} &&
+             repeat_trap[3] == 0u,
+         "synthetic body and eyes are distinct while Repeat trap is transparent");
+  expect(fixtureTexel(fixture.normal, fixture.left_eye_texel) !=
+                 fixtureTexel(fixture.normal, fixture.right_eye_texel) &&
+             fixtureTexel(fixture.specular, fixture.left_eye_texel) !=
+                 fixtureTexel(fixture.specular, fixture.right_eye_texel),
+         "synthetic eye Normal and Specular texels have distinct sentinels");
+  expect(fixture.high_resolution_geometry.bones.size() == 1u &&
+             fixture.out_of_bounds_geometry.bones.size() == 1u &&
+             fixture.uv_cases.size() >= 7u,
+         "fixture includes high-resolution protection, out-of-bounds, and special UV cases");
+
+  const auto nonce =
+      std::chrono::steady_clock::now().time_since_epoch().count();
+  const std::filesystem::path suite_directory =
+      std::filesystem::temp_directory_path() /
+      std::filesystem::path(L"xpbd测试_希尔达_材质") /
+      std::to_string(nonce);
+  SyntheticLabPbrSuitePaths paths;
+  expect(writeSyntheticLabPbrSuite(fixture, suite_directory,
+                                   std::filesystem::path(L"默认材质.png"),
+                                   paths, &error) &&
+             error.empty(),
+         "runtime fixture writes Unicode Base Normal Specular and properties");
+  std::error_code filesystem_error;
+  expect(std::filesystem::is_regular_file(paths.base, filesystem_error) &&
+             std::filesystem::file_size(paths.base, filesystem_error) > 0u &&
+             std::filesystem::is_regular_file(paths.normal,
+                                              filesystem_error) &&
+             std::filesystem::is_regular_file(paths.specular,
+                                              filesystem_error) &&
+             std::filesystem::is_regular_file(paths.properties,
+                                              filesystem_error),
+         "synthetic Unicode suite consists only of runtime-generated files");
+  std::filesystem::remove_all(
+      suite_directory.parent_path(), filesystem_error);
+  expect(!filesystem_error, "remove runtime synthetic Unicode suite");
+
+  for (const std::uint64_t side : {1'024u, 2'048u, 4'096u}) {
+    const std::uint64_t pixels = side * side;
+    const std::uint64_t rgba_bytes = pixels * 4u;
+    LabPbrMemoryEstimateRequest request;
+    request.width = side;
+    request.height = side;
+    request.resident_rgba_image_count = 3u;
+    request.candidate_rgba_image_count = 3u;
+    request.resolved_texel_bytes_per_pixel =
+        sizeof(ResolvedMaterialTexel);
+    request.encoded_snapshot_bytes = rgba_bytes * 3u;
+    request.decoder_peak_bytes = rgba_bytes;
+    request.coverage_peak_bytes = pixels * sizeof(std::uint32_t);
+    request.cache_bytes = rgba_bytes * 3u;
+    LabPbrMemoryEstimate estimate;
+    expect(estimateLabPbrMemory(request, estimate, &error) &&
+               estimate.resident_bytes ==
+                   rgba_bytes * 3u +
+                       pixels * sizeof(ResolvedMaterialTexel) &&
+               estimate.coverage_peak_bytes ==
+                   pixels * sizeof(std::uint32_t) &&
+               estimate.cache_bytes == rgba_bytes * 3u &&
+               estimate.peak_bytes ==
+                   estimate.resident_bytes + rgba_bytes * 10u +
+                       estimate.coverage_peak_bytes,
+           "checked LabPBR baseline estimate matches explicit components");
+    std::printf(
+        "memory-baseline: side=%llu resolved-texel-size=%llu resident=%llu "
+        "peak=%llu coverage-peak=%llu cache=%llu\n",
+        static_cast<unsigned long long>(side),
+        static_cast<unsigned long long>(sizeof(ResolvedMaterialTexel)),
+        static_cast<unsigned long long>(estimate.resident_bytes),
+        static_cast<unsigned long long>(estimate.peak_bytes),
+        static_cast<unsigned long long>(estimate.coverage_peak_bytes),
+        static_cast<unsigned long long>(estimate.cache_bytes));
+  }
+
+  const LabPbrMemoryEstimate preserved{11u, 22u, 33u, 44u};
+  LabPbrMemoryEstimate overflow_output = preserved;
+  LabPbrMemoryEstimateRequest overflow_request;
+  overflow_request.width =
+      (std::numeric_limits<std::uint64_t>::max)();
+  overflow_request.height = 2u;
+  expect(!estimateLabPbrMemory(overflow_request, overflow_output, &error) &&
+             error.find("overflow") != std::string::npos &&
+             overflow_output == preserved,
+         "LabPBR estimate rejects overflow without changing output");
 }
 
 void testCc0PreviewSceneAssets() {
@@ -3895,6 +4021,7 @@ int main() {
   testLogicalFramebufferViewportContract();
   testVulkanQueueFamilySelection();
   testTextureFromMemory();
+  testSyntheticLargeUvFixtureAndMemoryBaseline();
   testCc0PreviewSceneAssets();
   testEmptyTextureSample();
   testLabPbrDecode();

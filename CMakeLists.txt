@@ -401,6 +401,7 @@ if(XPBD_BUILD_TESTS)
     endif()
     add_executable(xpbd_viewport_regression_tests
         src/gfx/viewport_regression_tests_main.cpp
+        src/test_support/labpbr_synthetic_fixture.cpp
         src/gfx/viewport_mesh.cpp
         src/gfx/texture_image.cpp
         src/gfx/labpbr_material.cpp
@@ -638,6 +639,7 @@ if(XPBD_BUILD_APP)
     if(XPBD_BUILD_TESTS)
         add_executable(xpbd_app_session_regression_tests
             src/app/app_session_regression_tests_main.cpp
+            src/test_support/labpbr_synthetic_fixture.cpp
             src/app/app_session.cpp
             src/app/native_dialog.cpp
             src/app/log.cpp
