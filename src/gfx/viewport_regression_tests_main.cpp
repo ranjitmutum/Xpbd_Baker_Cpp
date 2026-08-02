@@ -3977,6 +3977,43 @@ void testCanonicalCubeAndRtSceneRecords() {
                "Bedrock Up UV starts at the opposite V corner");
   }
 
+  xpbd::loader::Geometry eye_plane_geometry;
+  eye_plane_geometry.description.has_texture_width = true;
+  eye_plane_geometry.description.has_texture_height = true;
+  eye_plane_geometry.description.texture_width = 256;
+  eye_plane_geometry.description.texture_height = 256;
+  xpbd::loader::Bone eye_plane_bone;
+  eye_plane_bone.name = "eye_plane";
+  xpbd::loader::Cube eye_plane_cube;
+  eye_plane_cube.size[0] = 1.25;
+  eye_plane_cube.size[1] = 0.7;
+  eye_plane_cube.size[2] = 0.0;
+  eye_plane_cube.uv_mode = xpbd::loader::CubeUVMode::PerFace;
+  eye_plane_cube.uv_north = {9.0, 128.0, 1.0, 1.0, true};
+  eye_plane_cube.uv_south = {128.0, 9.0, 1.0, 1.0, true};
+  eye_plane_bone.cubes.push_back(eye_plane_cube);
+  eye_plane_geometry.bones.push_back(eye_plane_bone);
+  xpbd::baker::BoneMapper eye_plane_mapper;
+  eye_plane_mapper.replaceModelBones(eye_plane_geometry.bones);
+  xpbd::gfx::ViewportMeshBuilder eye_plane_builder;
+  eye_plane_builder.setGeometry(&eye_plane_geometry);
+  eye_plane_builder.setBoneMapper(&eye_plane_mapper);
+  xpbd::gfx::StaticIndexedModelMesh eye_plane_mesh;
+  eye_plane_builder.buildStaticIndexedModel(eye_plane_mesh);
+  expect(eye_plane_mesh.faces.size() == 1u &&
+             eye_plane_mesh.faces.front().direction ==
+                 xpbd::gfx::StaticModelFaceDirection::North,
+         "zero-Z eye plane retains its authored North/front UV face");
+  if (!eye_plane_mesh.faces.empty()) {
+    const auto first_vertex = eye_plane_mesh.faces.front().first_vertex;
+    expectNear(eye_plane_mesh.vertices[first_vertex].u, 9.0f / 256.0f,
+               1.0e-6f,
+               "zero-Z eye plane retains the North/front U coordinate");
+    expectNear(eye_plane_mesh.vertices[first_vertex].v, 128.0f / 256.0f,
+               1.0e-6f,
+               "zero-Z eye plane retains the North/front V coordinate");
+  }
+
   xpbd::gfx::TextureImage base_atlas;
   base_atlas.width = 1;
   base_atlas.height = 1;
