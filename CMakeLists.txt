@@ -578,6 +578,7 @@ if(XPBD_BUILD_APP)
                 src/gfx/vulkan_backend.cpp
                 src/gfx/vulkan/vulkan_backend_skybox.cpp
                 src/gfx/vulkan/vulkan_backend_pipelines.cpp
+                src/gfx/vulkan/vulkan_backend_static_resources.cpp
                 src/gfx/streamline_vulkan_runtime.cpp
                 src/gfx/vulkan_rt_scene.cpp
                 src/gfx/vulkan_path_tracer.cpp

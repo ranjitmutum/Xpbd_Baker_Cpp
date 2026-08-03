@@ -3636,8 +3636,6 @@ void VulkanBackend::createTimestampQueryPools() {
   }
 
 #include "vulkan_backend_parts/vulkan_backend_environment.inc"
-#include "vulkan_backend_parts/vulkan_backend_static_resources_core.inc"
-#include "vulkan_backend_parts/vulkan_backend_static_resources_upload.inc"
 
 int VulkanBackend::drawUi(FrameSync &frame, const UiDrawData &ui,
                           bool overlay_only) {
