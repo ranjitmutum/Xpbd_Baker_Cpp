@@ -1168,25 +1168,58 @@ void testNegativeInflatePlaneCompatibility() {
   expectNearDouble(effective_origin[2], plane.origin[2], 0.0,
                    "negative inflate keeps a zero-thickness plane centered");
 
-  bool over_deflated_solid_rejected = false;
-  try {
-    (void)ModelLoader::loadFromString(R"({
-      "minecraft:geometry": [{
-        "bones": [{
-          "name": "root",
-          "cubes": [{
-            "origin": [0, 0, 0],
-            "size": [1, 1, 0.001],
-            "inflate": -0.001
-          }]
+  const auto over_deflated_geometry = ModelLoader::loadFromString(R"({
+    "minecraft:geometry": [{
+      "bones": [{
+        "name": "root",
+        "cubes": [{
+          "origin": [10, -4, 6],
+          "size": [3.4, 3.85, 1.8],
+          "inflate": -1
+        }, {
+          "origin": [-3, 5, 7],
+          "size": [2, 4, 6],
+          "inflate": -1000000
         }]
       }]
-    })");
+    }]
+  })");
+  const auto &partially_collapsed =
+      over_deflated_geometry.bones.front().cubes[0];
+  const auto partial_size = CubeGeometry::effectiveSize(partially_collapsed);
+  const auto partial_origin =
+      CubeGeometry::effectiveOrigin(partially_collapsed);
+  expectNearDouble(partially_collapsed.inflate, -1.0, 0.0,
+                   "loader preserves authored over-contracting inflate");
+  expectNearDouble(partial_size[0], 1.4, 1.0e-12,
+                   "over-contracting inflate preserves unaffected X extent");
+  expectNearDouble(partial_size[1], 1.85, 1.0e-12,
+                   "over-contracting inflate preserves unaffected Y extent");
+  expectNearDouble(partial_size[2], 0.0, 0.0,
+                   "over-contracting inflate collapses affected Z extent");
+  expectNearDouble(partial_origin[0], 11.0, 1.0e-12,
+                   "unaffected X origin retains authored contraction");
+  expectNearDouble(partial_origin[1], -3.0, 1.0e-12,
+                   "unaffected Y origin retains authored contraction");
+  expectNearDouble(partial_origin[2], 6.9, 1.0e-12,
+                   "over-contracted axis remains centered");
+
+  const auto &fully_collapsed =
+      over_deflated_geometry.bones.front().cubes[1];
+  const auto full_size = CubeGeometry::effectiveSize(fully_collapsed);
+  const auto full_origin = CubeGeometry::effectiveOrigin(fully_collapsed);
+  bool arbitrary_negative_bind_valid = true;
+  try {
+    (void)CubeGeometry::bindVertices(fully_collapsed);
   } catch (const std::exception &) {
-    over_deflated_solid_rejected = true;
+    arbitrary_negative_bind_valid = false;
   }
-  expect(over_deflated_solid_rejected,
-         "loader still rejects negative effective size on a nonzero axis");
+  expect(arbitrary_negative_bind_valid &&
+             full_size == std::array<double, 3>{0.0, 0.0, 0.0},
+         "loader and canonical geometry accept arbitrary finite negative "
+         "inflate");
+  expect(full_origin == std::array<double, 3>{-2.0, 7.0, 10.0},
+         "fully over-contracted cube collapses at its authored center");
 
   xpbd::loader::Cube positively_inflated_plane;
   positively_inflated_plane.size[2] = 0.0;

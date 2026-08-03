@@ -13,15 +13,25 @@ namespace xpbd::baker {
 
 namespace {
 
+bool contractsAxisToPlane(const loader::Cube& cube, int axis) {
+    // Preserve arbitrary finite negative inflate values. Once contraction
+    // reaches an axis midpoint, its only stable geometry is a centered plane.
+    return cube.inflate < 0.0 &&
+           -cube.inflate >= std::abs(cube.size[axis]) * 0.5;
+}
+
 double effectiveAxisOrigin(const loader::Cube& cube, int axis) {
-    if (cube.size[axis] == 0.0 && cube.inflate < 0.0) {
-        return cube.origin[axis];
+    if (contractsAxisToPlane(cube, axis)) {
+        return cube.origin[axis] + cube.size[axis] * 0.5;
     }
     return std::min(cube.origin[axis],
                     cube.origin[axis] + cube.size[axis]) - cube.inflate;
 }
 
 double effectiveAxisSize(const loader::Cube& cube, int axis) {
+    if (contractsAxisToPlane(cube, axis)) {
+        return 0.0;
+    }
     return std::max(0.0,
                     std::abs(cube.size[axis]) + cube.inflate * 2.0);
 }
@@ -163,12 +173,6 @@ void CubeGeometry::requireCube(const loader::Cube& cube) {
     requireFinite(cube.size, "cube size");
     if (!std::isfinite(cube.inflate)) {
         throw std::invalid_argument("cube inflate must be finite");
-    }
-    for (int axis = 0; axis < 3; ++axis) {
-        if (cube.size[axis] != 0.0 &&
-            std::abs(cube.size[axis]) + cube.inflate * 2.0 < 0) {
-            throw std::invalid_argument("cube inflate shrinks an effective size below zero");
-        }
     }
     if (cube.has_pivot) {
         requireFinite(cube.pivot, "cube pivot");
