@@ -576,6 +576,7 @@ if(XPBD_BUILD_APP)
         if(Vulkan_FOUND)
             target_sources(xpbd_baker_app PRIVATE
                 src/gfx/vulkan_backend.cpp
+                src/gfx/vulkan/vulkan_backend_internal.hpp
                 src/gfx/vulkan/vulkan_backend_skybox.cpp
                 src/gfx/vulkan/vulkan_backend_pipelines.cpp
                 src/gfx/vulkan/vulkan_backend_static_resources.cpp
