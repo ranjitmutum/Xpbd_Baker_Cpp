@@ -102,46 +102,9 @@ constexpr bool frameGenerationColorFormatSupported(
   }
 }
 
-float halfToFloat(std::uint16_t value) noexcept {
-  const bool negative = (value & 0x8000u) != 0u;
-  const std::uint32_t exponent = (value >> 10u) & 0x1fu;
-  const std::uint32_t mantissa = value & 0x03ffu;
-  double decoded = 0.0;
-  if (exponent == 0u) {
-    decoded = std::ldexp(static_cast<double>(mantissa), -24);
-  } else if (exponent == 0x1fu) {
-    decoded = mantissa == 0u
-                  ? std::numeric_limits<double>::infinity()
-                  : std::numeric_limits<double>::quiet_NaN();
-  } else {
-    decoded = std::ldexp(static_cast<double>(1024u + mantissa),
-                         static_cast<int>(exponent) - 25);
-  }
-  return static_cast<float>(negative ? -decoded : decoded);
-}
 
-std::array<float, 3> colorTemperatureRgb(float kelvin) noexcept {
-  const double temperature =
-      std::clamp(static_cast<double>(kelvin), 1000.0, 40000.0) / 100.0;
-  double red = 255.0;
-  double green = 255.0;
-  double blue = 255.0;
-  if (temperature <= 66.0) {
-    green = 99.4708025861 * std::log(temperature) - 161.1195681661;
-    blue = temperature <= 19.0
-               ? 0.0
-               : 138.5177312231 * std::log(temperature - 10.0) -
-                     305.0447927307;
-  } else {
-    red = 329.698727446 * std::pow(temperature - 60.0, -0.1332047592);
-    green = 288.1221695283 *
-            std::pow(temperature - 60.0, -0.0755148492);
-  }
-  const auto normalized = [](double channel) {
-    return static_cast<float>(std::clamp(channel, 0.0, 255.0) / 255.0);
-  };
-  return {normalized(red), normalized(green), normalized(blue)};
-}
+
+
 
 
 
@@ -245,27 +208,13 @@ VkDebugUtilsMessengerCreateInfoEXT validationMessengerCreateInfo() {
 
 
 
-static const uint32_t kSpvAtmosphereTransmittanceComp[] = {
-#include "spirv/atmosphere_transmittance.comp.spv.inc"
-};
-static const uint32_t kSpvAtmosphereDirectIrradianceComp[] = {
-#include "spirv/atmosphere_direct_irradiance.comp.spv.inc"
-};
-static const uint32_t kSpvAtmosphereSingleScatteringComp[] = {
-#include "spirv/atmosphere_single_scattering.comp.spv.inc"
-};
-static const uint32_t kSpvAtmosphereScatteringDensityComp[] = {
-#include "spirv/atmosphere_scattering_density.comp.spv.inc"
-};
-static const uint32_t kSpvAtmosphereIndirectIrradianceComp[] = {
-#include "spirv/atmosphere_indirect_irradiance.comp.spv.inc"
-};
-static const uint32_t kSpvAtmosphereMultipleScatteringComp[] = {
-#include "spirv/atmosphere_multiple_scattering.comp.spv.inc"
-};
-static const uint32_t kSpvAtmosphereEnvironmentCacheComp[] = {
-#include "spirv/atmosphere_environment_cache.comp.spv.inc"
-};
+
+
+
+
+
+
+
 
 
 
@@ -3635,7 +3584,6 @@ void VulkanBackend::createTimestampQueryPools() {
     }
   }
 
-#include "vulkan_backend_parts/vulkan_backend_environment.inc"
 
 int VulkanBackend::drawUi(FrameSync &frame, const UiDrawData &ui,
                           bool overlay_only) {
