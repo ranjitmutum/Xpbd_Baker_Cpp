@@ -2,7 +2,7 @@
 // 本文件仍在 vulkan_backend.cpp 的同一编译单元中展开。
 // 禁止独立编译、迁移资源所有权或在本任务中修改原逻辑。
 
-  bool uploadSkyboxCubemap(const PreviewSkybox &sky) {
+bool VulkanBackend::uploadSkyboxCubemap(const PreviewSkybox &sky) {
     if (!sky.valid() || !device_ || !cmd_pool_ || !graphics_queue_) {
       skybox_ready_ = false;
       return false;

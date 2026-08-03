@@ -2,7 +2,7 @@
 // 本文件仍在 vulkan_backend.cpp 的同一编译单元中展开。
 // 禁止独立编译、迁移资源所有权或在本任务中修改原逻辑。
 
-  [[nodiscard]] static DynamicSkyCpuResult buildDynamicSkyDistribution(
+  [[nodiscard]] VulkanBackend::DynamicSkyCpuResult VulkanBackend::buildDynamicSkyDistribution(
       const DynamicSkyCpuInput &input, VkDevice device, VkFence fence,
       Clock::time_point submitted_at) {
     DynamicSkyCpuResult result;
@@ -314,9 +314,7 @@
       result.error = "dynamic-sky CPU build failed with unknown exception";
     }
     return result;
-  }
-
-  bool pollDynamicSkyEnvironmentCache(bool wait_for_completion = false) {
+  }bool VulkanBackend::pollDynamicSkyEnvironmentCache(bool wait_for_completion) {
     DynamicSkyPending &pending = atmosphere_environment_pending_;
     if (!pending.active()) {
       return false;
@@ -477,9 +475,7 @@
             atmosphere_environment_cache_reallocations_));
     atmosphere_environment_pending_ = {};
     return true;
-  }
-
-  void discardDynamicSkyPending() {
+  }void VulkanBackend::discardDynamicSkyPending() {
     if (!atmosphere_environment_pending_.active()) {
       atmosphere_environment_pending_ = {};
       return;
@@ -495,9 +491,7 @@
     xpbd::log::error(
         "Dynamic sky pending resources quarantined for device teardown");
     atmosphere_environment_pending_ = {};
-  }
-
-  void clearDynamicSkyEnvironmentCache() {
+  }void VulkanBackend::clearDynamicSkyEnvironmentCache() {
     discardDynamicSkyPending();
     destroyImage(atmosphere_environment_cache_);
     destroyImage(atmosphere_cloud_history_);
@@ -514,18 +508,14 @@
     atmosphere_environment_last_update_ = {};
     atmosphere_environment_spare_retirement_fence_ = VK_NULL_HANDLE;
     atmosphere_environment_ready_ = false;
-  }
-
-  void clearProceduralAtmosphereImage() {
+  }void VulkanBackend::clearProceduralAtmosphereImage() {
     clearDynamicSkyEnvironmentCache();
     destroyImage(atmosphere_transmittance_);
     destroyImage(atmosphere_scattering_);
     destroyImage(atmosphere_irradiance_);
     atmosphere_resource_key_.clear();
     atmosphere_ready_ = false;
-  }
-
-  void destroyProceduralAtmosphereGpu() {
+  }void VulkanBackend::destroyProceduralAtmosphereGpu() {
     clearProceduralAtmosphereImage();
     if (atmosphere_environment_cache_pipeline_ != VK_NULL_HANDLE) {
       vkDestroyPipeline(device_, atmosphere_environment_cache_pipeline_,
@@ -580,9 +570,7 @@
     }
     atmosphere_failed_key_.clear();
     atmosphere_environment_failed_key_.clear();
-  }
-
-  bool ensureProceduralAtmospherePipeline() {
+  }bool VulkanBackend::ensureProceduralAtmospherePipeline() {
     if (atmosphere_transmittance_pipeline_ != VK_NULL_HANDLE &&
         atmosphere_direct_irradiance_pipeline_ != VK_NULL_HANDLE &&
         atmosphere_single_scattering_pipeline_ != VK_NULL_HANDLE &&
@@ -751,9 +739,7 @@
       return false;
     }
     return true;
-  }
-
-  bool createAtmosphereImage(std::uint32_t width, std::uint32_t height,
+  }bool VulkanBackend::createAtmosphereImage(std::uint32_t width, std::uint32_t height,
                              std::uint32_t depth, ImageResource &out) {
     if (!storage_image_extended_formats_enabled_) {
       xpbd::log::warn(
@@ -861,9 +847,7 @@
     out.height = height;
     out.depth = depth;
     return true;
-  }
-
-  bool buildProceduralAtmosphereLuts(
+  }bool VulkanBackend::buildProceduralAtmosphereLuts(
       const ResolvedWorldEnvironment &resolved,
       const std::string &resource_key) {
     if (resolved.sky_rendering != SkyRendering::ProceduralDayNight ||
@@ -1348,9 +1332,7 @@
         static_cast<unsigned long long>(scattering_validation.positive_rgb),
         static_cast<unsigned long long>(irradiance_validation.positive_rgb));
     return true;
-  }
-
-  std::string proceduralEnvironmentResourceKey(
+  }std::string VulkanBackend::proceduralEnvironmentResourceKey(
       const ResolvedWorldEnvironment &resolved) const {
     if (!atmosphere_ready_ || atmosphere_resource_key_.empty() ||
         resolved.sky_rendering != SkyRendering::ProceduralDayNight ||
@@ -1442,9 +1424,7 @@
     }
     appendPathTraceHistoryBytes(hash, cloud_key.data(), cloud_key.size());
     return std::to_string(hash);
-  }
-
-  bool buildDynamicSkyEnvironmentCache(
+  }bool VulkanBackend::buildDynamicSkyEnvironmentCache(
       const ResolvedWorldEnvironment &resolved,
       const std::string &environment_key) {
     const float render_ratio =
@@ -2015,9 +1995,7 @@
         static_cast<unsigned long long>(
             atmosphere_environment_cache_reallocations_));
     return true;
-  }
-
-  bool ensureProceduralAtmosphereResources(
+  }bool VulkanBackend::ensureProceduralAtmosphereResources(
       const ResolvedWorldEnvironment &resolved) {
     if (resolved.sky_rendering != SkyRendering::ProceduralDayNight ||
         resolved.atmosphere == nullptr) {
@@ -2103,26 +2081,20 @@
       return atmosphere_environment_ready_;
     }
     return atmosphere_environment_ready_;
-  }
-
-  void clearWorldEnvironmentResources() {
+  }void VulkanBackend::clearWorldEnvironmentResources() {
     destroyImage(world_environment_texture_);
     destroyBuffer(world_environment_distribution_);
     world_environment_distribution_bytes_ = 0;
     world_environment_resource_key_ = 0;
     world_environment_ready_ = false;
-  }
-
-  void destroyWorldEnvironmentGpu() {
+  }void VulkanBackend::destroyWorldEnvironmentGpu() {
     clearWorldEnvironmentResources();
     if (world_environment_sampler_ != VK_NULL_HANDLE) {
       vkDestroySampler(device_, world_environment_sampler_, nullptr);
       world_environment_sampler_ = VK_NULL_HANDLE;
     }
     world_environment_failed_key_ = 0;
-  }
-
-  std::uint64_t worldEnvironmentResourceKey(
+  }std::uint64_t VulkanBackend::worldEnvironmentResourceKey(
       const ResolvedWorldEnvironment &resolved) const {
     std::uint64_t key = 14695981039346656037ull;
     appendPathTraceHistoryValue(
@@ -2138,9 +2110,7 @@
                                   resolved.hdr->checksum.size());
     }
     return key;
-  }
-
-  bool ensureWorldEnvironmentSampler() {
+  }bool VulkanBackend::ensureWorldEnvironmentSampler() {
     if (world_environment_sampler_ != VK_NULL_HANDLE) {
       return true;
     }
@@ -2155,9 +2125,7 @@
     sampler_info.maxLod = 0.0f;
     return vkCreateSampler(device_, &sampler_info, nullptr,
                            &world_environment_sampler_) == VK_SUCCESS;
-  }
-
-  bool uploadWorldEnvironment(
+  }bool VulkanBackend::uploadWorldEnvironment(
       const ResolvedWorldEnvironment &resolved) {
     constexpr VkDeviceSize kMaximumGpuBytes =
         VkDeviceSize{512} * 1024u * 1024u;
@@ -2374,9 +2342,7 @@
         static_cast<unsigned long long>(table_bytes),
         static_cast<unsigned long long>(resolved.generation));
     return true;
-  }
-
-  bool ensureWorldEnvironmentResources(
+  }bool VulkanBackend::ensureWorldEnvironmentResources(
       const ResolvedWorldEnvironment &resolved) {
     if (resolved.sky_rendering != SkyRendering::UserHdri ||
         resolved.hdr == nullptr) {

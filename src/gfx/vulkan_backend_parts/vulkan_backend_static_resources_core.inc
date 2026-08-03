@@ -2,7 +2,7 @@
 // 本文件仍在 vulkan_backend.cpp 的同一编译单元中展开。
 // 禁止独立编译、迁移资源所有权或在本任务中修改原逻辑。
 
-  void destroyStaticModelResources() {
+  void VulkanBackend::destroyStaticModelResources() {
     destroyBuffer(static_model_vbo_);
     destroyBuffer(static_model_ibo_);
     destroyImage(static_texture_);
@@ -14,9 +14,7 @@
     static_vertex_bytes_ = 0;
     static_index_bytes_ = 0;
     static_model_ready_ = false;
-  }
-
-  bool createStaticTexture(std::uint32_t width, std::uint32_t height,
+  }bool VulkanBackend::createStaticTexture(std::uint32_t width, std::uint32_t height,
                            VkFormat format, ImageResource &out) {
     VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     image_info.imageType = VK_IMAGE_TYPE_2D;

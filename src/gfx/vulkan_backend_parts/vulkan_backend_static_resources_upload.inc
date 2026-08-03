@@ -2,7 +2,7 @@
 // 本文件仍在 vulkan_backend.cpp 的同一编译单元中展开。
 // 禁止独立编译、迁移资源所有权或在本任务中修改原逻辑。
 
-  void destroyStaticMaterialSamplers() {
+  void VulkanBackend::destroyStaticMaterialSamplers() {
     if (static_specular_sampler_ != VK_NULL_HANDLE) {
       vkDestroySampler(device_, static_specular_sampler_, nullptr);
       static_specular_sampler_ = VK_NULL_HANDLE;
@@ -15,9 +15,7 @@
       vkDestroySampler(device_, static_albedo_sampler_, nullptr);
       static_albedo_sampler_ = VK_NULL_HANDLE;
     }
-  }
-
-  void updateStaticTextureDescriptors() {
+  }void VulkanBackend::updateStaticTextureDescriptors() {
     std::array<VkDescriptorImageInfo, 3> image_infos{};
     const std::array<VkImageView, 3> views{
         static_texture_.view, static_normal_texture_.view,
@@ -62,9 +60,7 @@
                              static_cast<std::uint32_t>(rt_writes.size()),
                              rt_writes.data(), 0, nullptr);
     }
-  }
-
-  void updateStaticBoneDescriptor(FrameSync &frame) {
+  }void VulkanBackend::updateStaticBoneDescriptor(FrameSync &frame) {
     VkDescriptorBufferInfo buffer_info{};
     buffer_info.buffer = frame.bone_ssbo.buffer;
     buffer_info.offset = 0;
@@ -87,9 +83,7 @@
       }
       break;
     }
-  }
-
-  bool rebuildStaticModelResources(const StaticIndexedModelMesh &mesh,
+  }bool VulkanBackend::rebuildStaticModelResources(const StaticIndexedModelMesh &mesh,
                                    const TextureImage *texture,
                                    const ResolvedMaterialTable *material,
                                    std::uint64_t model_generation,

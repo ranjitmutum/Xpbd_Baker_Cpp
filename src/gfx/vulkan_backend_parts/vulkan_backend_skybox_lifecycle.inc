@@ -2,7 +2,7 @@
 // 本文件仍在 vulkan_backend.cpp 的同一编译单元中展开。
 // 禁止独立编译、迁移资源所有权或在本任务中修改原逻辑。
 
-  void destroySkyboxGpu() {
+void VulkanBackend::destroySkyboxGpu() {
     destroyImage(skybox_cubemap_);
     destroyBuffer(skybox_vbo_);
     if (skybox_pipeline_) {
