@@ -4,7 +4,15 @@
 #include "xpbd/baker/bone_mapper.hpp"
 #include "xpbd/baker/physics_baker.hpp"
 #include "xpbd/baker/transition_bake_request.hpp"
+#include "xpbd/gfx/labpbr_authoring.hpp"
+#include "xpbd/gfx/labpbr_import.hpp"
+#include "xpbd/gfx/labpbr_material.hpp"
+#include "xpbd/gfx/gpu_backend.hpp"
+#include "xpbd/gfx/preview_scene.hpp"
+#include "xpbd/gfx/ray_tracing.hpp"
 #include "xpbd/gfx/texture_image.hpp"
+#include "xpbd/gfx/uv_domain.hpp"
+#include "xpbd/gfx/world_environment.hpp"
 #include "xpbd/loader/animation_loader.hpp"
 #include "xpbd/loader/bedrock_animation_data.hpp"
 #include "xpbd/loader/bedrock_model_data.hpp"
@@ -13,7 +21,9 @@
 #include "xpbd/render/skeleton_viewport.hpp"
 #include "xpbd/render/viewport_camera.hpp"
 
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -449,6 +459,65 @@ struct BakeJobResult {
 struct BakeExecutionState;
 struct BakeWorkerMailbox;
 
+enum class SceneSelectionKind : std::uint8_t {
+  Empty = 0,
+  Preset = 1,
+  UserBuilt = 2,
+  Loaded = 3,
+};
+
+struct SceneSelectionState {
+  SceneSelectionKind kind = SceneSelectionKind::Empty;
+  gfx::PreviewSceneId preset = gfx::PreviewSceneId::None;
+  // Stable source identity for a loaded scene. Empty/Preset never delete it,
+  // so switching away from a loaded model remains reversible.
+  std::string source_identity;
+  std::uint64_t generation = 1;
+
+  [[nodiscard]] constexpr bool
+  rendersLoadedContent(bool has_loaded_scene_content) const noexcept {
+    return kind != SceneSelectionKind::Empty && has_loaded_scene_content;
+  }
+};
+
+struct StillRenderSettings {
+  std::string filename = "render";
+  std::uint32_t width = 1920;
+  std::uint32_t height = 1080;
+  std::uint32_t target_samples = 1024;
+  std::uint32_t samples_per_submit = 8;
+  gfx::StillImageFormat format = gfx::StillImageFormat::Png;
+  bool transparent_background = false;
+};
+
+struct StillRenderSnapshot {
+  SceneSelectionState scene_selection{};
+  gfx::PathTraceSettings path_trace_settings{};
+  gfx::WorldEnvironmentState world_environment{};
+  gfx::LabPbrDebugView material_debug_view =
+      gfx::LabPbrDebugView::Shaded;
+  gfx::RtDebugView rt_debug_view = gfx::RtDebugView::Off;
+  std::array<float, 16> view_matrix{};
+  std::array<float, 16> proj_matrix{};
+  std::uint64_t model_generation = 0;
+  std::uint64_t material_generation = 0;
+  double preview_time = 0.0;
+  float raster_scene_time_seconds = 0.0f;
+  gfx::PreviewSceneId preview_scene_id = gfx::PreviewSceneId::None;
+  bool show_preview_grid = false;
+  bool show_preview_axes = false;
+  bool dynamic_preview_scene = false;
+  PlaybackState previous_playback_state = PlaybackState::Paused;
+  bool camera_frozen = false;
+};
+
+struct StillRenderJob {
+  StillRenderSettings settings{};
+  gfx::StillRenderStatus status{};
+  std::optional<StillRenderSnapshot> snapshot;
+  bool cancel_requested = false;
+};
+
 
 // 桌面应用共享状态：连接 UI、后台烘焙任务、预览资源与用户配置。
 class AppSession {
@@ -597,18 +666,78 @@ public:
   float bone_context_anchor_x = 0.0f;
   float bone_context_anchor_y = 0.0f;
 
-  bool show_ground = true;
+  bool show_ground = false;
 
-
-
-
+  // Blockbench-style preview scene + grid (Vulkan raster path).
+  SceneSelectionState scene_selection{};
+  // Renderer compatibility mirror. Mutate through selectScene/selectPresetScene
+  // so SceneSelection and PT history remain coherent.
+  gfx::PreviewSceneId preview_scene_id = gfx::PreviewSceneId::None;
+  bool show_preview_grid = false;
+  bool show_preview_axes = false;
+  // Fully procedural time-animated sky for supported scenes.
+  bool dynamic_preview_scene = false;
 
   bool camera_follow_preview = false;
 
 
   bool use_mcbe_coords = true;
-  gfx::TextureImage model_texture;
+  gfx::SharedTextureImage model_texture;
+  gfx::ResolvedUvDomain model_uv_domain;
+  gfx::ResolvedMaterialTable resolved_material;
+  // Product import/authoring preflight ceiling. Public for deterministic
+  // regression injection; no UI setting or layout is introduced.
+  std::uint64_t labpbr_peak_memory_budget_bytes =
+      gfx::kLabPbrDefaultPeakBudgetBytes;
+  gfx::LabPbrDebugView labpbr_debug_view = gfx::LabPbrDebugView::Shaded;
+  gfx::RtDebugView rt_debug_view = gfx::RtDebugView::Off;
+  gfx::PathTraceSettings path_trace_settings{};
+  gfx::PathTracePostProcessCapabilities
+      path_trace_post_process_capabilities{};
+  std::string path_trace_post_process_status;
+  std::optional<gfx::PathTraceRenderSnapshot> path_trace_render_snapshot;
+  gfx::WorldEnvironmentState world_environment{};
+  StillRenderJob still_render_job{};
+  void setApplicationDirectory(std::filesystem::path directory);
+  [[nodiscard]] const std::filesystem::path &
+  applicationDirectory() const noexcept {
+    return application_directory_;
+  }
+  [[nodiscard]] std::filesystem::path stillRenderOutputDirectory() const;
+  [[nodiscard]] bool stillRenderActive() const noexcept;
+  bool queueStillRender();
+  bool freezeQueuedStillRenderCamera(const float *view_matrix,
+                                     const float *proj_matrix,
+                                     float raster_scene_time_seconds);
+  void requestStillRenderCancel() noexcept;
+  void synchronizeStillRenderState();
+  void resetPathTraceAccumulation() noexcept {
+    ++path_trace_settings.reset_generation;
+  }
+  [[nodiscard]] gfx::PathTraceChangeClass
+  applyPathTraceSettings(const gfx::PathTraceSettings &settings) noexcept;
+  void freezePathTraceRenderSnapshot() noexcept;
+  void clearPathTraceRenderSnapshot() noexcept {
+    path_trace_render_snapshot.reset();
+  }
+  bool savePathTraceSettings(const std::filesystem::path &path);
+  bool loadPathTraceSettings(const std::filesystem::path &path);
   std::string texture_path;
+  gfx::LabPbrUvCoverage labpbr_uv_coverage;
+  std::map<std::string, gfx::GroupLabPbrOverride> labpbr_group_overrides;
+  gfx::GroupLabPbrOverride labpbr_draft;
+  bool labpbr_draft_dirty = false;
+  gfx::LabPbrCompositionResult labpbr_composition;
+  gfx::ReadOnlyIrisNormalAsset labpbr_imported_normal;
+  gfx::LabPbrSuiteSource labpbr_suite_source;
+  bool labpbr_import_confirmation_pending = false;
+  bool labpbr_candidate_selection_pending = false;
+  bool labpbr_source_change_pending = false;
+  bool labpbr_last_import_cache_hit = false;
+  std::vector<std::filesystem::path> labpbr_import_candidates;
+  std::vector<std::filesystem::path> labpbr_source_changed_paths;
+  bool labpbr_export_confirmation_pending = false;
+  std::vector<std::filesystem::path> labpbr_export_existing_paths;
 
 
   [[nodiscard]] std::uint64_t modelGeneration() const noexcept {
@@ -624,11 +753,73 @@ public:
   }
 
   [[nodiscard]] std::uint64_t textureGeneration() const noexcept {
-    return texture_generation_;
+    return material_generation_;
   }
 
+  [[nodiscard]] std::uint64_t materialGeneration() const noexcept {
+    return material_generation_;
+  }
+
+  [[nodiscard]] std::uint64_t viewportAppearanceGeneration() const noexcept {
+    return viewport_appearance_generation_;
+  }
+
+  [[nodiscard]] std::uint64_t viewportVisibilityGeneration() const noexcept {
+    return viewport_visibility_generation_;
+  }
+
+  bool loadWorldHdr(const std::filesystem::path &path);
+  // Selects the single World/Sky rendering source. Scene/preset selection is
+  // intentionally independent and never calls this method.
+  bool setSkyRendering(gfx::SkyRendering mode);
+  // Recomputes the procedural Sun/Moon state from user-editable UTC,
+  // observer, and bounded artistic Sun angle controls transactionally.
+  bool setProceduralSkyControls(const gfx::UtcDateTime &utc,
+                                const gfx::ObserverLocation &observer,
+                                double sun_azimuth_offset_degrees,
+                                double sun_altitude_offset_degrees);
+  // Physical environment edits reset PT history but never rebuild scene AS.
+  void touchWorldEnvironment(bool clouds_changed = false) noexcept;
+  // Display-only background edits update GPU state without invalidating raw PT.
+  void touchWorldEnvironmentDisplay() noexcept;
+  void touchWorldEnvironmentCelestial() noexcept;
+  void touchWorldEnvironmentTargets() noexcept;
+  void resetWorldSkyPhysicalDefaults();
+  bool advanceWorldSkyTime(double elapsed_seconds);
+  bool saveWorldSkySettings(const std::filesystem::path &path);
+  bool loadWorldSkySettings(const std::filesystem::path &path);
+  [[nodiscard]] bool hasLoadedSceneContent() const noexcept {
+    return !model_path.empty() && !geometry.bones.empty();
+  }
+  [[nodiscard]] bool sceneRendersLoadedContent() const noexcept {
+    return scene_selection.rendersLoadedContent(hasLoadedSceneContent());
+  }
+  bool selectScene(SceneSelectionKind kind);
+  bool selectPresetScene(gfx::PreviewSceneId preset);
+  bool saveSceneSelectionSettings(const std::filesystem::path &path);
+  bool loadSceneSelectionSettings(const std::filesystem::path &path);
   bool loadTexture(const std::filesystem::path &path);
+  bool requestLabPbrSuiteImport(const std::filesystem::path &base_path);
+  bool requestLabPbrSuiteRelink(const std::filesystem::path &base_path);
+  bool requestLabPbrSuiteFolder(const std::filesystem::path &folder);
+  void selectLabPbrSuiteCandidate(std::size_t index);
+  void cancelLabPbrSuiteCandidateSelection();
+  void confirmLabPbrSuiteImport(bool proceed);
+  bool reloadLabPbrSuite();
+  void pollLabPbrSourceChanges();
   void clearTexture();
+  bool refreshLabPbrAuthoring();
+  void loadSelectedLabPbrDraft();
+  void markLabPbrDraftDirty();
+  bool applySelectedLabPbrDraft();
+  void revertSelectedLabPbrDraft();
+  bool restoreSelectedLabPbrFromTexture();
+  bool importLabPbrSpecular(const std::filesystem::path &path);
+  void removeLabPbrSpecular();
+  bool importLabPbrNormal(const std::filesystem::path &path);
+  void removeLabPbrNormal();
+  bool requestLabPbrExport(const std::filesystem::path &path);
+  void confirmLabPbrExport(bool proceed);
 
 
   bool show_debug_hud = false;
@@ -636,6 +827,9 @@ public:
 
   bool debug_instant_sample = false;
   float debug_fps = 0.0f;
+  float debug_original_fps = 0.0f;
+  float debug_dlss_fg_fps = 0.0f;
+  bool debug_dlss_frame_generation_active = false;
   float debug_frame_ms = 0.0f;
   float debug_ema_frame_ms = 16.0f;
   float debug_mesh_ms = 0.0f;
@@ -675,6 +869,11 @@ public:
   bool vsync_enabled = true;
   bool vsync_dirty = false;
 
+  // NVIDIA hardware ray tracing (Vulkan RT). Default off; UI disables the
+  // option when the active GPU is not NVIDIA or lacks RT support. Runtime
+  // always falls back to rasterization when unsupported.
+  bool enable_ray_tracing = false;
+
 
 
   [[nodiscard]] static double
@@ -703,6 +902,7 @@ public:
 
   void clearCollisionRoots();
   void selectBone(const std::string &name);
+  void setHoveredBone(std::string name);
   [[nodiscard]] bool isBoneVisible(const std::string &name) const {
     return !hidden_bone_names.contains(name);
   }
@@ -769,6 +969,9 @@ public:
 
 private:
   AppSession();
+  std::filesystem::path application_directory_;
+  std::uint64_t next_still_render_job_id_ = 1;
+  bool still_render_playback_restored_ = true;
   [[nodiscard]] BakeJobInput
   makeBakeJobInput(bool allow_input_molang_zero,
                    bool allow_selected_molang_zero) const;
@@ -784,8 +987,19 @@ private:
   bool molang_approved_once_ = false;
   std::uint64_t model_generation_ = 0;
   std::uint64_t animation_generation_ = 0;
-  std::uint64_t texture_generation_ = 0;
+  std::uint64_t material_generation_ = 0;
   std::uint64_t physics_generation_ = 0;
+  std::uint64_t viewport_appearance_generation_ = 0;
+  std::uint64_t viewport_visibility_generation_ = 0;
+  gfx::ResolvedMaterialTable labpbr_source_material_;
+  gfx::LabPbrSuiteImportCache labpbr_import_cache_;
+  std::optional<std::filesystem::path> pending_labpbr_import_path_;
+  bool pending_labpbr_import_is_relink_ = false;
+  std::chrono::steady_clock::time_point labpbr_next_source_poll_{};
+  bool importLabPbrSuiteInternal(const std::filesystem::path &base_path,
+                                 bool confirm_missing_properties,
+                                 bool relink);
+  std::optional<std::filesystem::path> pending_labpbr_export_path_;
   bool viewport_pick_cache_valid_ = false;
   std::uint64_t viewport_pick_cache_token_ = 0;
   render::BonePickIndex viewport_pick_cache_;
@@ -807,8 +1021,11 @@ private:
 
 std::optional<std::filesystem::path> openFileDialog(const wchar_t *title,
                                                     const wchar_t *filter);
+std::optional<std::filesystem::path> openFolderDialog(const wchar_t *title);
 std::optional<std::filesystem::path>
 saveFileDialog(const wchar_t *title, const wchar_t *filter,
                const wchar_t *default_name);
+std::optional<std::filesystem::path>
+savePngFileDialog(const wchar_t *title, const wchar_t *default_name);
 
 }

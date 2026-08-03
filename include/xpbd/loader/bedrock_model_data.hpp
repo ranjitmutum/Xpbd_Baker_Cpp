@@ -1,10 +1,12 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
 namespace xpbd::loader {
 
+inline constexpr std::uint32_t kBedrockTextureDimensionMaximum = 16'384u;
 
 struct FaceUV {
     double u = 0.0;
@@ -12,6 +14,8 @@ struct FaceUV {
     double size_u = 0.0;
     double size_v = 0.0;
     bool present = false;
+    int rotation_degrees = 0;
+    bool size_explicit = true;
 };
 
 enum class CubeUVMode {
@@ -55,7 +59,12 @@ struct GeometryDescription {
 
     int texture_width = 16;
     int texture_height = 16;
-    bool has_texture_size = false;
+    bool has_texture_width = false;
+    bool has_texture_height = false;
+
+    [[nodiscard]] bool hasCompleteTextureSize() const noexcept {
+        return has_texture_width && has_texture_height;
+    }
 };
 
 struct Geometry {

@@ -1,0 +1,822 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_scalar_block_layout : enable
+
+// Unified viewport ray-query renderer. Rigid model groups and dynamic/static
+// scene geometry keep policy-specific BLASes in one TLAS visibility domain.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT topLevelAS;
+layout(set = 0, binding = 1, rgba16f) uniform image2D outputImage;
+layout(set = 0, binding = 2, std430) readonly buffer NormalBuffer {
+  vec4 normals[];
+};
+layout(set = 0, binding = 3, std430) readonly buffer IndexBuffer {
+  uint indices[];
+};
+layout(set = 0, binding = 4, std430) readonly buffer UvBuffer {
+  vec2 uvs[];
+};
+layout(set = 0, binding = 5) uniform sampler2D uAlbedo;
+layout(set = 0, binding = 6, std430) readonly buffer ColorBuffer {
+  vec4 colors[];
+};
+layout(set = 0, binding = 7, std430) readonly buffer PrimitiveFlagBuffer {
+  uint primitiveFlags[];
+};
+layout(set = 0, binding = 8, r32f) uniform image2D outputDepth;
+layout(set = 0, binding = 9, std430) readonly buffer TangentBuffer {
+  vec4 tangents[];
+};
+layout(set = 0, binding = 10) uniform sampler2D uNormalTexture;
+layout(set = 0, binding = 11) uniform sampler2D uSpecularTexture;
+layout(set = 0, binding = 12, std430) readonly buffer InstanceMetadataBuffer {
+  uvec4 instanceMetadata[];
+};
+layout(set = 0, binding = 13, std430) readonly buffer PositionBuffer {
+  float positions[];
+};
+layout(set = 0, binding = 14, std430) readonly buffer PreviousPositionBuffer {
+  float previousPositions[];
+};
+struct InstanceMotionRecord {
+  mat4 currentTransform;
+  mat4 previousTransform;
+  uvec4 metadata;
+};
+layout(set = 0, binding = 15, std430) readonly buffer InstanceMotionBuffer {
+  InstanceMotionRecord instanceMotion[];
+};
+layout(set = 0, binding = 16, std430) readonly buffer MotionFrameBuffer {
+  mat4 previousViewProj;
+  uvec4 motionInfo;
+};
+layout(set = 0, binding = 17, rgba16f) uniform image2DArray outputAov;
+layout(set = 0, binding = 18, rgba32f) uniform image2D outputStatistics;
+layout(set = 0, binding = 19, rg32f) uniform image2D outputRrMotion;
+layout(set = 0, binding = 20, r32f)
+    uniform image2D outputRrSpecularHitDistance;
+layout(set = 0, binding = 21, rgba16f)
+    uniform image2D outputRrDiffuseAlbedo;
+layout(set = 0, binding = 22, rgba16f)
+    uniform image2D outputRrSpecularAlbedo;
+layout(set = 0, binding = 23, rgba16f)
+    uniform image2D outputRrNormalRoughness;
+
+const int kAovGeometry = 0;
+const int kAovShading = 1;
+const int kAovDiffuseAlbedo = 2;
+const int kAovSpecularAlbedo = 3;
+const int kAovDiffuseRadiance = 4;
+const int kAovSpecularRadiance = 5;
+const int kAovMotion = 6;
+const int kAovEmission = 7;
+const int kAovTransparency = 8;
+const int kAovSpecularHitDistance = 9;
+const uint kOutputRrMotion = 1u << 10u;
+const uint kOutputRrSpecularHitDistance = 1u << 11u;
+const uint kOutputRrDiffuseAlbedo = 1u << 12u;
+const uint kOutputRrSpecularAlbedo = 1u << 13u;
+const uint kOutputRrNormalRoughness = 1u << 14u;
+const uint kOutputStatistics = 1u << 15u;
+
+layout(push_constant) uniform PC {
+  mat4 invViewProj;  // OpenGL clip convention, used to construct primary rays
+  mat4 viewProj;     // Vulkan clip convention, used to emit raster depth
+  vec4 cameraPos;
+  vec4 lightDirAmb;
+  vec4 lightColorInt;
+  vec4 clearColor;
+  uvec4 sizeFrame;
+  vec4 cameraJitter;
+} pc;
+
+bool outputEnabled(uint bit) {
+  return (floatBitsToUint(pc.cameraJitter.w) & bit) != 0u;
+}
+
+bool aovOutputEnabled(int layer) {
+  return outputEnabled(1u << uint(layer));
+}
+
+const uint kMaterialTextured = 1u << 0u;
+const uint kMaterialCutout = 1u << 1u;
+const uint kMaterialBlend = 1u << 2u;
+const uint kMaterialEnvironment = 1u << 3u;
+const float kAlphaCutoff = 0.02;
+
+vec3 srgbToLinear(vec3 value) {
+  bvec3 cutoff = lessThanEqual(value, vec3(0.04045));
+  vec3 low = value / 12.92;
+  vec3 high = pow((value + 0.055) / 1.055, vec3(2.4));
+  return mix(high, low, cutoff);
+}
+
+bool finiteFloat(float value) {
+  return !isnan(value) && !isinf(value);
+}
+
+bool finite3(vec3 value) {
+  return !any(isnan(value)) && !any(isinf(value));
+}
+
+vec3 safeNormalizeNormal(vec3 value, vec3 fallbackValue) {
+  float lengthSquared = dot(value, value);
+  if (!finiteFloat(lengthSquared) || lengthSquared < 1.0e-8) {
+    return fallbackValue;
+  }
+  return value * inversesqrt(lengthSquared);
+}
+
+vec4 sampleAlbedoBaseLevel(vec2 uv) {
+  vec4 packed = textureLod(uAlbedo, uv, 0.0);
+  if (any(isnan(packed)) || any(isinf(packed))) {
+    return vec4(1.0);
+  }
+  packed = clamp(packed, vec4(0.0), vec4(1.0));
+  return vec4(srgbToLinear(packed.rgb), packed.a);
+}
+
+float sampleAlphaBaseLevel(vec2 uv) {
+  float alpha = textureLod(uAlbedo, uv, 0.0).a;
+  return finiteFloat(alpha) ? clamp(alpha, 0.0, 1.0) : 1.0;
+}
+
+vec3 sampleNormalBaseLevel(vec2 uv) {
+  vec3 packed = textureLod(uNormalTexture, uv, 0.0).rgb;
+  return finite3(packed) ? clamp(packed, vec3(0.0), vec3(1.0))
+                         : vec3(0.5, 0.5, 1.0);
+}
+
+vec4 sampleSpecularBaseLevel(vec2 uv) {
+  vec4 packed = textureLod(uSpecularTexture, uv, 0.0);
+  return any(isnan(packed)) || any(isinf(packed))
+             ? vec4(0.0, 10.0 / 255.0, 0.0, 1.0)
+             : clamp(packed, vec4(0.0), vec4(1.0));
+}
+
+vec3 decodeLabPbrNormal(vec3 packed) {
+  vec2 xy = vec2(packed.r * 2.0 - 1.0, 1.0 - packed.g * 2.0);
+  float xy2 = dot(xy, xy);
+  if (!finiteFloat(xy2)) {
+    return vec3(0.0, 0.0, 1.0);
+  }
+  if (xy2 > 1.0) {
+    xy *= inversesqrt(xy2);
+  }
+  return safeNormalizeNormal(
+      vec3(xy, sqrt(max(0.0, 1.0 - dot(xy, xy)))),
+      vec3(0.0, 0.0, 1.0));
+}
+
+float decodeLabPbrMicrofacetAlpha(float smoothness) {
+  float perceptualRoughness =
+      finiteFloat(smoothness) ? clamp(1.0 - smoothness, 0.0, 1.0) : 1.0;
+  return max(perceptualRoughness * perceptualRoughness, 0.02);
+}
+
+float decodeLabPbrEmission(float packed) {
+  return packed > (254.5 / 255.0) ? 0.0
+                                  : packed * (255.0 / 254.0);
+}
+
+vec3 decodeLabPbrF0(float packed, vec3 baseColor, out bool metal,
+                    out bool predefinedMetal) {
+  uint code = uint(round(packed * 255.0));
+  metal = code >= 230u;
+  predefinedMetal = code >= 230u && code <= 237u;
+  if (!metal) {
+    return vec3(packed);
+  }
+  vec3 n;
+  vec3 k;
+  if (code == 230u) {
+    n = vec3(2.9114, 2.9497, 2.5845);
+    k = vec3(3.0893, 2.9318, 2.7670);
+  } else if (code == 231u) {
+    n = vec3(0.18299, 0.42108, 1.3734);
+    k = vec3(3.4242, 2.3459, 1.7704);
+  } else if (code == 232u) {
+    n = vec3(1.3456, 0.96521, 0.61722);
+    k = vec3(7.4746, 6.3995, 5.3031);
+  } else if (code == 233u) {
+    n = vec3(3.1071, 3.1812, 2.3230);
+    k = vec3(3.3314, 3.3291, 3.1350);
+  } else if (code == 234u) {
+    n = vec3(0.27105, 0.67693, 1.3164);
+    k = vec3(3.6092, 2.6248, 2.2921);
+  } else if (code == 235u) {
+    n = vec3(1.91, 1.83, 1.44);
+    k = vec3(3.51, 3.40, 3.18);
+  } else if (code == 236u) {
+    n = vec3(2.3757, 2.0847, 1.8453);
+    k = vec3(4.2655, 3.7153, 3.1365);
+  } else if (code == 237u) {
+    n = vec3(0.15943, 0.14512, 0.13547);
+    k = vec3(3.9291, 3.19, 2.3808);
+  } else {
+    return baseColor;
+  }
+  vec3 numerator = (n - 1.0) * (n - 1.0) + k * k;
+  vec3 denominator = (n + 1.0) * (n + 1.0) + k * k;
+  return numerator / denominator;
+}
+
+vec3 labPbrDebugColor(uint view, vec3 baseColor, vec3 tangentNormal,
+                      float ao, float roughness, vec3 f0, vec3 emission,
+                      float opacity) {
+  if (view == 2u) {
+    return tangentNormal * 0.5 + 0.5;
+  }
+  if (view == 3u) {
+    return vec3(ao);
+  }
+  if (view == 4u) {
+    return vec3(roughness);
+  }
+  if (view == 5u) {
+    return f0;
+  }
+  if (view == 6u) {
+    return emission;
+  }
+  if (view == 7u) {
+    return vec3(opacity);
+  }
+  return baseColor;
+}
+
+vec3 skyColor(vec3 direction) {
+  float t = clamp(direction.y * 0.5 + 0.5, 0.0, 1.0);
+  vec3 zenith = pc.clearColor.xyz * 1.15;
+  vec3 horizon =
+      mix(pc.clearColor.xyz, vec3(0.55, 0.65, 0.85), 0.35);
+  return mix(horizon, zenith, t);
+}
+
+bool traceClosest(vec3 origin, vec3 direction, float tMin, float tMax,
+                  out float tHit, out uint primitive, out vec2 barycentrics,
+                  out uint instanceId) {
+  rayQueryEXT query;
+  rayQueryInitializeEXT(query, topLevelAS, gl_RayFlagsOpaqueEXT, 0xFFu,
+                        origin, tMin, direction, tMax);
+  while (rayQueryProceedEXT(query)) {
+  }
+  if (rayQueryGetIntersectionTypeEXT(query, true) ==
+      gl_RayQueryCommittedIntersectionNoneEXT) {
+    return false;
+  }
+  tHit = rayQueryGetIntersectionTEXT(query, true);
+  uint localPrimitive =
+      rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
+  uint instanceCustomIndex =
+      rayQueryGetIntersectionInstanceCustomIndexEXT(query, true);
+  instanceId = instanceCustomIndex;
+  primitive =
+      instanceMetadata[instanceCustomIndex].x + localPrimitive;
+  barycentrics = rayQueryGetIntersectionBarycentricsEXT(query, true);
+  return true;
+}
+
+vec3 packedPosition(uint vertex, bool previous) {
+  uint base = vertex * 3u;
+  return previous
+             ? vec3(previousPositions[base + 0u],
+                    previousPositions[base + 1u],
+                    previousPositions[base + 2u])
+             : vec3(positions[base + 0u], positions[base + 1u],
+                    positions[base + 2u]);
+}
+
+vec4 motionVector(vec2 currentUv, vec3 previousWorld, bool valid) {
+  if (!valid || motionInfo.x == 0u) {
+    return vec4(0.0, 0.0, 1.0, 0.0);
+  }
+  vec4 previousClip = previousViewProj * vec4(previousWorld, 1.0);
+  if (!(previousClip.w > 1.0e-6) ||
+      any(isnan(previousClip)) || any(isinf(previousClip))) {
+    return vec4(0.0, 0.0, 1.0, 0.0);
+  }
+  vec2 previousNdc = previousClip.xy / previousClip.w;
+  // previousViewProj is pre-converted by glMvpToVulkan(), so its NDC Y already
+  // maps directly to the top-left-origin storage-image UV convention.
+  vec2 previousUv = previousNdc * 0.5 + 0.5;
+  bool inside = all(greaterThanEqual(previousUv, vec2(0.0))) &&
+                all(lessThanEqual(previousUv, vec2(1.0)));
+  if (!inside) {
+    return vec4(0.0, 0.0, 1.0, 0.0);
+  }
+  // Pixel-space vector from the current sample to its previous-frame sample.
+  vec2 motionPixels =
+      (previousUv - currentUv) * vec2(pc.sizeFrame.xy);
+  return vec4(motionPixels, 0.0, 1.0);
+}
+
+vec4 surfaceMotion(uint primitive, uint instanceId, vec2 barycentrics,
+                   vec2 currentUv) {
+  uint i0 = indices[primitive * 3u + 0u];
+  uint i1 = indices[primitive * 3u + 1u];
+  uint i2 = indices[primitive * 3u + 2u];
+  float w = 1.0 - barycentrics.x - barycentrics.y;
+  bool sceneMotionValid =
+      motionInfo.y != 0u && instanceMotion[instanceId].metadata.x != 0u;
+  vec3 previousLocal =
+      packedPosition(i0, sceneMotionValid) * w +
+      packedPosition(i1, sceneMotionValid) * barycentrics.x +
+      packedPosition(i2, sceneMotionValid) * barycentrics.y;
+  vec3 previousWorld =
+      ((sceneMotionValid
+            ? instanceMotion[instanceId].previousTransform
+            : instanceMotion[instanceId].currentTransform) *
+       vec4(previousLocal, 1.0)).xyz;
+  return motionVector(currentUv, previousWorld, true);
+}
+
+void fetchSurface(uint primitive, vec2 barycentrics, out vec3 normal,
+                  out vec2 uv, out vec4 vertexColor, out vec4 tangent,
+                  out uint flags) {
+  uint i0 = indices[primitive * 3u + 0u];
+  uint i1 = indices[primitive * 3u + 1u];
+  uint i2 = indices[primitive * 3u + 2u];
+  float w = 1.0 - barycentrics.x - barycentrics.y;
+  normal = normals[i0].xyz * w + normals[i1].xyz * barycentrics.x +
+           normals[i2].xyz * barycentrics.y;
+  normal = safeNormalizeNormal(normal, vec3(0.0, 1.0, 0.0));
+  uv = uvs[i0] * w + uvs[i1] * barycentrics.x +
+       uvs[i2] * barycentrics.y;
+  vertexColor = colors[i0] * w + colors[i1] * barycentrics.x +
+                colors[i2] * barycentrics.y;
+  tangent = tangents[i0] * w + tangents[i1] * barycentrics.x +
+            tangents[i2] * barycentrics.y;
+  flags = primitiveFlags[primitive];
+}
+
+vec4 sampleBaseColor(vec2 uv, vec4 vertexColor, uint flags) {
+  if ((flags & kMaterialTextured) != 0u) {
+    vec4 sampledAlbedo = sampleAlbedoBaseLevel(uv);
+    return vec4(sampledAlbedo.rgb * vertexColor.rgb,
+                sampledAlbedo.a * vertexColor.a);
+  }
+  return vertexColor;
+}
+
+void resolveMaterial(vec2 uv, vec4 baseColor, uint flags,
+                     vec3 geometricNormal, vec4 tangentData,
+                     out vec3 materialNormal, out float ambientOcclusion,
+                     out float linearRoughness, out vec3 f0, out bool metal,
+                     out bool predefinedMetal, out vec3 emission,
+                     out vec3 tangentSpaceNormal) {
+  materialNormal = geometricNormal;
+  tangentSpaceNormal = vec3(0.0, 0.0, 1.0);
+  ambientOcclusion = 1.0;
+  linearRoughness = 1.0;
+  f0 = vec3(0.04);
+  metal = false;
+  predefinedMetal = false;
+  emission = vec3(0.0);
+  if ((flags & kMaterialTextured) == 0u) {
+    return;
+  }
+
+  uint materialFeatures = pc.sizeFrame.w >> 8u;
+  bool normalMapActive = (materialFeatures & 1u) != 0u;
+  bool specularMapActive = (materialFeatures & 2u) != 0u;
+  vec3 tangent =
+      tangentData.xyz -
+      geometricNormal * dot(geometricNormal, tangentData.xyz);
+  float tangentLength2 = dot(tangent, tangent);
+  if (!finiteFloat(tangentLength2) || tangentLength2 <= 1.0e-10) {
+    vec3 helper = abs(geometricNormal.z) < 0.999
+                      ? vec3(0.0, 0.0, 1.0)
+                      : vec3(0.0, 1.0, 0.0);
+    tangent = normalize(cross(helper, geometricNormal));
+  } else {
+    tangent *= inversesqrt(tangentLength2);
+  }
+  vec3 bitangent =
+      cross(geometricNormal, tangent) *
+      (tangentData.w < 0.0 ? -1.0 : 1.0);
+  vec3 normalSample =
+      normalMapActive ? sampleNormalBaseLevel(uv)
+                      : vec3(0.5, 0.5, 1.0);
+  tangentSpaceNormal =
+      normalMapActive ? decodeLabPbrNormal(normalSample)
+                      : vec3(0.0, 0.0, 1.0);
+  materialNormal =
+      safeNormalizeNormal(mat3(tangent, bitangent, geometricNormal) *
+                              tangentSpaceNormal,
+                          geometricNormal);
+  ambientOcclusion = clamp(normalSample.b, 0.0, 1.0);
+
+  if (specularMapActive) {
+    vec4 specularSample = sampleSpecularBaseLevel(uv);
+    linearRoughness = decodeLabPbrMicrofacetAlpha(specularSample.r);
+    f0 = decodeLabPbrF0(specularSample.g, baseColor.rgb, metal,
+                        predefinedMetal);
+    emission =
+        baseColor.rgb * decodeLabPbrEmission(specularSample.a);
+  }
+}
+
+float nextRayMin(float tHit) {
+  return tHit + max(0.002, abs(tHit) * 1.0e-5);
+}
+
+float traceShadowVisibility(vec3 origin, vec3 direction, float tMin,
+                            float tMax) {
+  const int kMaxShadowLayers = 16;
+  float visibility = 1.0;
+  for (int layer = 0; layer < kMaxShadowLayers; ++layer) {
+    float tHit = 0.0;
+    uint primitive = 0u;
+    vec2 barycentrics = vec2(0.0);
+    uint instanceId = 0u;
+    if (!traceClosest(origin, direction, tMin, tMax, tHit, primitive,
+                      barycentrics, instanceId)) {
+      break;
+    }
+
+    vec3 normal;
+    vec2 uv;
+    vec4 vertexColor;
+    vec4 tangent;
+    uint flags;
+    fetchSurface(primitive, barycentrics, normal, uv, vertexColor, tangent,
+                 flags);
+    float alpha = clamp(vertexColor.a, 0.0, 1.0);
+    if ((flags & kMaterialTextured) != 0u) {
+      alpha *= sampleAlphaBaseLevel(uv);
+    }
+    if (alpha < kAlphaCutoff) {
+      tMin = nextRayMin(tHit);
+      continue;
+    }
+
+    bool cutout = (flags & kMaterialCutout) != 0u;
+    bool blended = (flags & kMaterialBlend) != 0u ||
+                   (!cutout && alpha < 0.98);
+    if (!blended) {
+      return 0.0;
+    }
+    visibility *= 1.0 - alpha;
+    if (visibility <= 0.02) {
+      return 0.0;
+    }
+    tMin = nextRayMin(tHit);
+  }
+  return visibility;
+}
+
+vec3 shadeSurface(vec3 hit, vec3 rayDirection, vec3 normal, vec4 baseColor,
+                   uint flags, float ambientOcclusion, float linearRoughness,
+                   vec3 f0, bool metal, bool predefinedMetal, vec3 emission) {
+  // Match the forward shaders' two-sided lighting: retain the authored
+  // material normal for the directional/wrap term instead of face-forwarding
+  // it to the camera. View-dependent terms use abs(N.V) below.
+  vec3 lightDirection = normalize(pc.lightDirAmb.xyz);
+  float nd = max(dot(normal, lightDirection), 0.0);
+  float wrap =
+      max(nd, max(dot(-normal, lightDirection), 0.0) * 0.30);
+  float visibility = 1.0;
+  if (nd > 0.0) {
+    vec3 shadowOrigin =
+        hit + normal * 0.02 + lightDirection * 0.01;
+    visibility = traceShadowVisibility(shadowOrigin, lightDirection, 0.02,
+                                       500.0);
+  } else {
+    visibility = 0.1;
+  }
+  float shadow = mix(0.28, 1.0, visibility);
+  float ambient = pc.lightDirAmb.w;
+  float intensity = pc.lightColorInt.w;
+  vec3 lightColor = pc.lightColorInt.xyz;
+
+  bool textured = (flags & kMaterialTextured) != 0u;
+  bool environment = (flags & kMaterialEnvironment) != 0u;
+  vec3 lit;
+  if (textured) {
+    float shade =
+        ambient * ambientOcclusion + intensity * wrap * 0.55 * shadow;
+    vec3 halfVector =
+        normalize(lightDirection + normalize(-rayDirection));
+    float specularPower = mix(96.0, 4.0, linearRoughness);
+    float specular = pow(max(dot(normal, halfVector), 0.0),
+                         specularPower) *
+                     intensity * shadow;
+    vec3 diffuse = metal ? vec3(0.0)
+                         : baseColor.rgb * shade * lightColor;
+    vec3 reflectionTint =
+        predefinedMetal ? baseColor.rgb : vec3(1.0);
+    lit = diffuse + reflectionTint * f0 * specular * lightColor + emission;
+  } else {
+    float top = clamp(normal.y, 0.0, 1.0);
+    float side =
+        clamp(abs(normal.x) * 0.55 + abs(normal.z) * 0.45, 0.0, 1.0);
+    float bottom = clamp(-normal.y, 0.0, 1.0);
+    float faceMultiplier =
+        0.85 + 0.15 * top + 0.05 * side - 0.08 * bottom;
+    float shade = ambient + intensity * wrap * shadow;
+    lit = baseColor.rgb * faceMultiplier * shade * lightColor;
+
+    if (environment) {
+      vec3 halfVector =
+          normalize(lightDirection + normalize(-rayDirection));
+      float specular =
+          pow(max(dot(normal, halfVector), 0.0), 56.0) *
+          intensity * 0.24 * shadow;
+      lit += lightColor * specular;
+    }
+  }
+
+  bool blended = (flags & kMaterialBlend) != 0u ||
+                 baseColor.a < 0.98;
+  if (blended) {
+    float noV = clamp(abs(dot(normal, -rayDirection)), 0.0, 1.0);
+    float baseFresnel = max(max(f0.r, f0.g), f0.b);
+    float fresnel =
+        baseFresnel + (1.0 - baseFresnel) * pow(1.0 - noV, 5.0);
+    float reflectionStrength =
+        (environment ? 0.46 : 0.20) * fresnel *
+        (1.0 - baseColor.a * 0.35);
+    vec3 reflected = skyColor(reflect(rayDirection, normal));
+    lit = mix(lit, reflected, clamp(reflectionStrength, 0.0, 0.55));
+  }
+
+  return clamp(lit, 0.0, 1.0);
+}
+
+float deviceDepth(vec3 worldPosition) {
+  vec4 clip = pc.viewProj * vec4(worldPosition, 1.0);
+  if (abs(clip.w) <= 1.0e-8) {
+    return 1.0;
+  }
+  return clamp(clip.z / clip.w, 0.0, 1.0);
+}
+
+// NVIDIA DLSS-RR Programming Guide 4.2.1. The guide expects the
+// environment-integrated specular reflectance, not raw material F0.
+vec3 rrSpecularAlbedo(vec3 specularColor, float linearRoughness,
+                      float noV) {
+  noV = abs(noV);
+  float alpha = clamp(linearRoughness, 0.0, 1.0);
+  alpha *= alpha;
+  float noV2 = noV * noV;
+  float noV3 = noV2 * noV;
+  float alpha2 = alpha * alpha;
+  float alpha3 = alpha2 * alpha;
+
+  float biasNumerator =
+      (0.99044 - 1.28514 * noV) +
+      alpha * (1.29678 - 0.755907 * noV);
+  float biasDenominator =
+      (1.0 + 2.92338 * noV + 59.4188 * noV3) +
+      alpha * (20.3225 - 27.0302 * noV + 222.592 * noV3) +
+      alpha3 * (121.563 + 626.13 * noV + 316.627 * noV3);
+  float scaleNumerator =
+      (0.0365463 + 3.32707 * noV) +
+      alpha * (9.0632 - 9.04756 * noV);
+  float scaleDenominator =
+      (1.0 + 3.59685 * noV2 - 1.36772 * noV3) +
+      alpha * (9.04401 - 16.3174 * noV2 + 9.22949 * noV3) +
+      alpha3 * (5.56589 + 19.7886 * noV2 - 20.2123 * noV3);
+
+  float bias = biasNumerator / max(biasDenominator, 1.0e-6);
+  float scale = scaleNumerator / max(scaleDenominator, 1.0e-6);
+  bias *= clamp(specularColor.g * 50.0, 0.0, 1.0);
+  return specularColor * max(scale, 0.0) + vec3(max(bias, 0.0));
+}
+
+void main() {
+  uvec2 pixel = gl_GlobalInvocationID.xy;
+  uint width = pc.sizeFrame.x;
+  uint height = pc.sizeFrame.y;
+  if (pixel.x >= width || pixel.y >= height) {
+    return;
+  }
+
+  vec2 pixelOffset =
+      pc.cameraJitter.z > 0.5
+          // Streamline receives +jitter. With an unjittered inverse
+          // projection the equivalent jittered camera ray is sampled at
+          // pixelCenter-jitter, matching NVIDIA's clip-space convention.
+          ? vec2(0.5) - clamp(pc.cameraJitter.xy, vec2(-0.5), vec2(0.5))
+          : vec2(0.5);
+  vec2 sampleUv = (vec2(pixel) + pixelOffset) / vec2(width, height);
+  vec2 ndc = vec2(sampleUv.x * 2.0 - 1.0,
+                  1.0 - sampleUv.y * 2.0);
+  vec4 farWorldH = pc.invViewProj * vec4(ndc, 1.0, 1.0);
+  vec3 farWorld = farWorldH.xyz / max(farWorldH.w, 1.0e-6);
+  vec3 origin = pc.cameraPos.xyz;
+  vec3 direction = normalize(farWorld - origin);
+
+  const int kMaxPrimaryLayers = 24;
+  vec3 accumulated = vec3(0.0);
+  float remaining = 1.0;
+  float opaqueDepth = 1.0;
+  bool foundSurface = false;
+  bool foundOpaqueSurface = false;
+  float tMin = 0.001;
+  vec4 geometryAov = vec4(0.0, 0.0, 1.0, 0.0);
+  vec4 shadingAov = vec4(0.0, 0.0, 1.0, 1.0);
+  vec4 diffuseAlbedoAov = vec4(0.0);
+  vec4 specularAlbedoAov = vec4(0.0);
+  vec4 diffuseRadianceAov = vec4(0.0);
+  vec4 specularRadianceAov = vec4(0.0);
+  vec4 emissionAov = vec4(0.0);
+  vec4 transparencyAov = vec4(0.0);
+  vec4 motionAov = vec4(0.0, 0.0, 1.0, 0.0);
+  float specularHitDistanceAov = 0.0;
+  float linearDepth = 0.0;
+  float pathLength = 0.0;
+
+  for (int layer = 0; layer < kMaxPrimaryLayers; ++layer) {
+    float tHit = 0.0;
+    uint primitive = 0u;
+    vec2 barycentrics = vec2(0.0);
+    uint instanceId = 0u;
+    if (!traceClosest(origin, direction, tMin, 1.0e4, tHit, primitive,
+                      barycentrics, instanceId)) {
+      break;
+    }
+    pathLength += 1.0;
+
+    vec3 normal;
+    vec2 uv;
+    vec4 vertexColor;
+    vec4 tangent;
+    uint flags;
+    fetchSurface(primitive, barycentrics, normal, uv, vertexColor, tangent,
+                 flags);
+    vec4 baseColor = sampleBaseColor(uv, vertexColor, flags);
+    float alpha = clamp(baseColor.a, 0.0, 1.0);
+    if (alpha < kAlphaCutoff) {
+      tMin = nextRayMin(tHit);
+      continue;
+    }
+
+    bool cutout = (flags & kMaterialCutout) != 0u;
+    bool blended = (flags & kMaterialBlend) != 0u ||
+                   (!cutout && alpha < 0.98);
+    float opacity = blended ? alpha : 1.0;
+    vec3 hit = origin + direction * tHit;
+    float ambientOcclusion;
+    float linearRoughness;
+    vec3 f0;
+    bool metal;
+    bool predefinedMetal;
+    vec3 emission;
+    vec3 tangentSpaceNormal;
+    vec3 materialNormal;
+    resolveMaterial(uv, baseColor, flags, normal, tangent, materialNormal,
+                    ambientOcclusion, linearRoughness, f0, metal,
+                    predefinedMetal, emission, tangentSpaceNormal);
+    vec3 lit;
+    uint materialDebugView = pc.sizeFrame.w & 0xffu;
+    if ((flags & kMaterialTextured) != 0u && materialDebugView != 0u) {
+      lit = labPbrDebugColor(materialDebugView, baseColor.rgb,
+                             tangentSpaceNormal, ambientOcclusion,
+                             linearRoughness, f0, emission, baseColor.a);
+    } else {
+      lit = shadeSurface(hit, direction, materialNormal, baseColor, flags,
+                         ambientOcclusion, linearRoughness, f0, metal,
+                         predefinedMetal, emission);
+    }
+    accumulated += remaining * opacity * lit;
+    foundSurface = true;
+
+    if (blended && opacity < 0.995) {
+      transparencyAov.rgb += remaining * opacity * lit;
+      transparencyAov.a += remaining * opacity;
+    } else if (!foundOpaqueSurface) {
+      foundOpaqueSurface = true;
+      opaqueDepth = deviceDepth(hit);
+      linearDepth = tHit;
+      float normalizedHit = tHit / (1.0 + max(tHit, 0.0));
+      geometryAov = vec4(normal, linearDepth);
+      shadingAov = vec4(materialNormal, linearRoughness);
+      diffuseAlbedoAov =
+          vec4(metal ? vec3(0.0) : baseColor.rgb, 1.0);
+      if ((pc.sizeFrame.w & 0x80000000u) != 0u) {
+        vec3 reflectedDirection =
+            normalize(reflect(direction, materialNormal));
+        float reflectedHit = 0.0;
+        uint reflectedPrimitive = 0u;
+        vec2 reflectedBarycentrics = vec2(0.0);
+        uint reflectedInstance = 0u;
+        vec3 reflectedOrigin =
+            hit + materialNormal *
+                      (dot(reflectedDirection, materialNormal) >= 0.0
+                           ? 0.001
+                           : -0.001);
+        if (traceClosest(
+                reflectedOrigin, reflectedDirection, 0.001, 10000.0,
+                reflectedHit, reflectedPrimitive, reflectedBarycentrics,
+                reflectedInstance)) {
+          vec3 reflectedHitPosition =
+              reflectedOrigin + reflectedDirection * reflectedHit;
+          specularHitDistanceAov =
+              length(reflectedHitPosition - hit);
+        }
+      }
+      vec3 reflectionTint =
+          predefinedMetal ? baseColor.rgb : vec3(1.0);
+      specularAlbedoAov =
+          vec4(reflectionTint *
+                   rrSpecularAlbedo(
+                       clamp(f0, vec3(0.0), vec3(0.99)),
+                       linearRoughness,
+                       dot(materialNormal, -direction)),
+               specularHitDistanceAov);
+      vec3 reflectedSignal = max(lit - emission, vec3(0.0));
+      diffuseRadianceAov =
+          vec4(metal ? vec3(0.0) : reflectedSignal, normalizedHit);
+      specularRadianceAov =
+          vec4(metal ? reflectedSignal : vec3(0.0), normalizedHit);
+      emissionAov = vec4(emission, 1.0);
+      motionAov =
+          surfaceMotion(primitive, instanceId, barycentrics, sampleUv);
+    }
+
+    if (!blended || opacity >= 0.995) {
+      remaining = 0.0;
+      break;
+    }
+
+    remaining *= 1.0 - opacity;
+    if (remaining <= 0.01) {
+      break;
+    }
+    tMin = nextRayMin(tHit);
+  }
+
+  float outputAlpha = foundSurface ? clamp(1.0 - remaining, 0.0, 1.0)
+                                   : 0.0;
+  vec3 straightColor =
+      outputAlpha > 1.0e-6
+          ? accumulated / outputAlpha
+          : vec3(0.0);
+  imageStore(outputImage, ivec2(pixel),
+             vec4(clamp(straightColor, 0.0, 1.0), outputAlpha));
+  imageStore(outputDepth, ivec2(pixel), vec4(opaqueDepth));
+  if (!foundOpaqueSurface) {
+    vec3 previousSkyPoint = origin + direction * 10000.0;
+    motionAov = motionVector(sampleUv, previousSkyPoint, true);
+  }
+  if (aovOutputEnabled(kAovGeometry)) {
+    imageStore(outputAov, ivec3(pixel, kAovGeometry), geometryAov);
+  }
+  if (aovOutputEnabled(kAovShading)) {
+    imageStore(outputAov, ivec3(pixel, kAovShading), shadingAov);
+  }
+  if (aovOutputEnabled(kAovDiffuseAlbedo)) {
+    imageStore(outputAov, ivec3(pixel, kAovDiffuseAlbedo),
+               diffuseAlbedoAov);
+  }
+  if (aovOutputEnabled(kAovSpecularAlbedo)) {
+    imageStore(outputAov, ivec3(pixel, kAovSpecularAlbedo),
+               specularAlbedoAov);
+  }
+  if (aovOutputEnabled(kAovDiffuseRadiance)) {
+    imageStore(outputAov, ivec3(pixel, kAovDiffuseRadiance),
+               diffuseRadianceAov);
+  }
+  if (aovOutputEnabled(kAovSpecularRadiance)) {
+    imageStore(outputAov, ivec3(pixel, kAovSpecularRadiance),
+               specularRadianceAov);
+  }
+  if (aovOutputEnabled(kAovMotion)) {
+    imageStore(outputAov, ivec3(pixel, kAovMotion), motionAov);
+  }
+  if (aovOutputEnabled(kAovEmission)) {
+    imageStore(outputAov, ivec3(pixel, kAovEmission), emissionAov);
+  }
+  if (aovOutputEnabled(kAovTransparency)) {
+    imageStore(outputAov, ivec3(pixel, kAovTransparency),
+               clamp(transparencyAov, vec4(0.0), vec4(65504.0)));
+  }
+  if (aovOutputEnabled(kAovSpecularHitDistance)) {
+    imageStore(outputAov, ivec3(pixel, kAovSpecularHitDistance),
+               vec4(specularHitDistanceAov));
+  }
+  if (outputEnabled(kOutputRrMotion)) {
+    imageStore(outputRrMotion, ivec2(pixel), motionAov);
+  }
+  if (outputEnabled(kOutputRrSpecularHitDistance)) {
+    imageStore(outputRrSpecularHitDistance, ivec2(pixel),
+               vec4(specularHitDistanceAov));
+  }
+  if (outputEnabled(kOutputRrDiffuseAlbedo)) {
+    imageStore(outputRrDiffuseAlbedo, ivec2(pixel), diffuseAlbedoAov);
+  }
+  if (outputEnabled(kOutputRrSpecularAlbedo)) {
+    imageStore(outputRrSpecularAlbedo, ivec2(pixel), specularAlbedoAov);
+  }
+  if (outputEnabled(kOutputRrNormalRoughness)) {
+    imageStore(outputRrNormalRoughness, ivec2(pixel), shadingAov);
+  }
+  if (outputEnabled(kOutputStatistics)) {
+    imageStore(outputStatistics, ivec2(pixel),
+               vec4(0.0, pathLength, 1.0, linearDepth));
+  }
+}

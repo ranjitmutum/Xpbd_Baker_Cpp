@@ -27,8 +27,29 @@ if (-not (Test-Path -LiteralPath $ShaderDirectory -PathType Container)) {
 $shaderNames = @(
     "mesh.vert",
     "mesh.frag",
+    "mesh_rt.vert",
+    "mesh_rt.frag",
     "static_mesh.vert",
     "static_mesh.frag",
+    "static_mesh_rt.vert",
+    "static_mesh_rt.frag",
+    "path_trace.comp",
+    "rt_debug.rgen",
+    "rt_debug.rmiss",
+    "rt_shadow.rmiss",
+    "rt_debug.rchit",
+    "rt_debug.rahit",
+    "pt_composite.vert",
+    "pt_composite.frag",
+    "skybox.vert",
+    "skybox.frag",
+    "atmosphere_transmittance.comp",
+    "atmosphere_direct_irradiance.comp",
+    "atmosphere_single_scattering.comp",
+    "atmosphere_scattering_density.comp",
+    "atmosphere_indirect_irradiance.comp",
+    "atmosphere_multiple_scattering.comp",
+    "atmosphere_environment_cache.comp",
     "ui.vert",
     "ui.frag"
 )
@@ -80,10 +101,18 @@ try {
         # Windows PowerShell turns native stderr into a terminating ErrorRecord when the
         # script-wide preference is Stop. glslang writes the source path to stderr even on
         # success, so capture it under Continue and decide from the process exit code.
+        # Ray-query / path-trace shaders need SPIR-V 1.4 / Vulkan 1.2 environment.
+        $targetEnv = if ($shaderName -match "_rt\.(vert|frag)$" -or
+                         $shaderName -match "path_trace\.comp$" -or
+                         $shaderName -match "\.(rgen|rmiss|rchit|rahit)$") {
+            "vulkan1.2"
+        } else {
+            "vulkan1.0"
+        }
         $savedErrorActionPreference = $ErrorActionPreference
         try {
             $ErrorActionPreference = "Continue"
-            $validatorOutput = & $Validator -V --target-env vulkan1.0 -o $binaryPath $sourcePath 2>&1
+            $validatorOutput = & $Validator -V --target-env $targetEnv "-I$repoRoot" -o $binaryPath $sourcePath 2>&1
             $validatorExitCode = $LASTEXITCODE
         } finally {
             $ErrorActionPreference = $savedErrorActionPreference

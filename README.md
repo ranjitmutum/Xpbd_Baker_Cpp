@@ -20,30 +20,68 @@ English: [README.en.md](README.en.md)
 - MSVC 2022 或同等 C++23 工具链
 - [vcpkg](https://vcpkg.io/)，并设置 `VCPKG_ROOT`
 
-# 库 + 测试 + CLI
-.\cpp\build.bat
+从源码构建 DLSS SR/RR/FG 与 Reflex 时，需要自行取得官方 NVIDIA
+Streamline 2.12.0 SDK，并在配置 CMake 时传入
+`-DXPBD_STREAMLINE_SDK_ROOT=<SDK目录>`。SDK 头文件、DLL 与许可证不会提交到
+本仓库；可运行包只携带经签名校验的生产 DLL 和对应许可证。
 
-# 桌面程序
-.\cpp\run_app.bat
-.\cpp\run_app.bat -gl
-.\cpp\run_app.bat -vk
-.\cpp\run_app.bat -d3d
+## 快速开始
+
+```powershell
+cmake --preset vscode-windows-app
+cmake --build --preset vscode-windows-app-release
+
+# Vulkan（支持光栅与 RT）
+.\out\build\vscode-windows-app\Release\xpbd_baker_app.exe -vk
+
+# OpenGL 3.3 光栅回退
+.\out\build\vscode-windows-app\Release\xpbd_baker_app.exe -gl
 ```
 
 无界面烘焙示例：
 
 ```powershell
-.\cpp\run_cli.bat bake --model model.geo.json --anim idle.animation.json --out idle.baked.json --bones mid,tip
+cmake --build out\build\vscode-windows-app --config Release --target xpbd_cli
+.\out\build\vscode-windows-app\Release\xpbd_cli.exe bake --model model.geo.json --anim idle.animation.json --out idle.baked.json --bones mid,tip
 ```
 
 ## 图形后端
 
-| 启动参数 / 环境变量       | 后端                    |
-|---------------------------|-------------------------|
-| `-gl` / `XPBD_GFX=opengl` | OpenGL 3.3              |
-| `-vk` / `XPBD_GFX=vulkan` | Vulkan（FIFO 垂直同步） |
-| `-d3d` / `XPBD_GFX=dx11`  | Direct3D 11             |
-| `auto`                    | Vulkan → DX11 → OpenGL  |
+应用只保留 **Vulkan** 与 **OpenGL 3.3**。Vulkan 提供光栅与硬件 RT；
+OpenGL 是光栅回退。DX11 与 Metal 后端已移除。
+
+| 启动参数 / 环境变量         | 说明                              |
+|-----------------------------|-----------------------------------|
+| `-vk` / `XPBD_GFX=vulkan`   | 强制 Vulkan                       |
+| `-gl` / `XPBD_GFX=opengl`   | 强制 OpenGL 3.3                   |
+| `auto`（默认）              | 先尝试 Vulkan，失败后回退 OpenGL  |
+| `XPBD_VULKAN_VALIDATION=1`  | 请求 Khronos Validation；不可用时记录并安全降级 |
+| `XPBD_VULKAN_DIAGNOSTICS=1` | 输出 Vulkan 层、扩展与等待诊断    |
+| `XPBD_ANIMATION=<path>`      | 启动时加载动画（无人值守验证用） |
+| `XPBD_AUTOPLAY=1`            | 模型和动画加载成功后自动播放     |
+| `XPBD_SHOW_BONES=0`          | 关闭骨骼覆盖层（无人值守 RT 验证用） |
+| `XPBD_RT_DEBUG=<mode>`       | RT Pipeline 调试视图：`instance`/`primitive`/`cube`/`face`/`material`/`normal` |
+| `XPBD_PT_SPP=<1..64>`        | 每个 frame slot 每帧追加的路径追踪样本数 |
+| `XPBD_PT_MAX_SAMPLES=<n>`    | 每个独立历史的最大样本数；`0` 表示不限 |
+| `XPBD_PT_BOUNCES=<1..64>`    | 最大路径反弹总数 |
+| `XPBD_PT_DIFFUSE_BOUNCES=<0..16>` | 最大漫反射反弹数 |
+| `XPBD_PT_GLOSSY_BOUNCES=<0..16>` | 最大光泽/GGX 反弹数 |
+| `XPBD_PT_TRANSMISSION_BOUNCES=<0..32>` | 最大透射/折射反弹数 |
+| `XPBD_PT_TRANSPARENT_BOUNCES=<0..64>` | 最大透明反弹数（Phase 7 完整使用） |
+| `XPBD_PT_RR=<0|1>`           | 是否启用 Russian roulette |
+| `XPBD_PT_RR_START=<1..Bounces>` | 开始 Russian roulette 的反弹数 |
+| `XPBD_PT_SEED=<uint32>`      | 固定的确定性采样 seed |
+| `XPBD_PT_ENVIRONMENT=<0..16>` | 临时解析 clear-sky 强度；默认 `0`（Sky Rendering Off） |
+| `XPBD_PT_CAPTURE=<png>`      | 无人值守诊断：达到非零有限 `XPBD_PT_MAX_SAMPLES` 后写出一张 PT PNG；不是静帧渲染工作流 |
+
+在支持的 NVIDIA 显卡上，可在「选项」中启用「高级预览光照（NVIDIA）」。
+模型、地面、水面与预览场景共用同一个支持 alpha 的 BVH；不透明、裁切与半透明
+材质分别采用正确的可见性和阴影规则。
+
+DLSS 帧生成默认关闭，只在用户手动开启后加载。Vulkan 帧生成会关闭应用自身的
+VSync，并且只在交换链可使用 `VK_PRESENT_MODE_IMMEDIATE_KHR` 时启用。G-SYNC/
+VRR 仍由 NVIDIA 驱动和显示器控制；F11 无边框模式需要在 NVIDIA 控制面板中为
+“窗口和全屏模式”启用 G-SYNC。程序本身不会替用户修改驱动设置。
 
 为避免第三方覆盖层插入 Vulkan 调用链导致驱动不稳定，程序默认只在自身进程内禁用
 GamePP 与 RTSS 的 Vulkan 隐式层；这不会修改系统设置或卸载相关软件。确需启用这些
@@ -62,10 +100,8 @@ GamePP 与 RTSS 的 Vulkan 隐式层；这不会修改系统设置或卸载相�
 
 启动时按系统显示语言自动选择：
 
-- English（默认）
-- 简体中文
-- 繁體中文（香港）
-- 繁體中文（台灣）
+- English
+- 简体中文（默认）
 
 可在右侧「选项 / Options」里手动切换。
 

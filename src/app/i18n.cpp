@@ -52,10 +52,6 @@ const char* fileForLang(Lang lang) {
     switch (lang) {
         case Lang::ZhCn:
             return "zh-CN.json";
-        case Lang::ZhHk:
-            return "zh-HK.json";
-        case Lang::ZhTw:
-            return "zh-TW.json";
         case Lang::En:
         default:
             return "en.json";
@@ -157,10 +153,6 @@ const char* langName(Lang lang) {
     switch (lang) {
         case Lang::ZhCn:
             return tr("lang_zh_cn");
-        case Lang::ZhHk:
-            return tr("lang_zh_hk");
-        case Lang::ZhTw:
-            return tr("lang_zh_tw");
         case Lang::En:
         default:
             return tr("lang_en");

@@ -7,14 +7,28 @@ if "%VCPKG_ROOT%"=="" (
 )
 
 set "SCRIPT_DIR=%~dp0"
-set "BUILD_DIR=%SCRIPT_DIR%build"
+set "BUILD_DIR=%SCRIPT_DIR%out\build\vscode-windows-app"
 
 echo === XPBD Baker C++ verify ===
-call "%SCRIPT_DIR%build.bat"
-if not "%ERRORLEVEL%"=="0" exit /b 1
+cmake --preset vscode-windows-app
+if errorlevel 1 (
+  echo ERROR: cmake configure failed.
+  exit /b 1
+)
+
+cmake --build --preset vscode-windows-app-release --parallel 8
+if errorlevel 1 (
+  echo ERROR: desktop app build failed.
+  exit /b 1
+)
+
+cmake --build "%BUILD_DIR%" --config Release --target xpbd_cli --parallel 8
+if errorlevel 1 (
+  echo ERROR: CLI build failed.
+  exit /b 1
+)
 
 set "CLI=%BUILD_DIR%\Release\xpbd_cli.exe"
-if not exist "%CLI%" set "CLI=%BUILD_DIR%\xpbd_cli.exe"
 if not exist "%CLI%" (
   echo ERROR: xpbd_cli not found
   exit /b 1

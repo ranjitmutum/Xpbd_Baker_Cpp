@@ -22,35 +22,73 @@ texts ship in the **`notices/`** folder next to the built app (see below).
 - MSVC 2022+ or another supported C++23 toolchain
 - [vcpkg](https://vcpkg.io/) with `VCPKG_ROOT` set
 
+Source builds with DLSS SR/RR/FG and Reflex require the official NVIDIA
+Streamline 2.12.0 SDK. Configure CMake with
+`-DXPBD_STREAMLINE_SDK_ROOT=<sdk-root>`. SDK headers, DLLs, and licenses are
+not committed to this repository; runnable packages contain only the
+signature-verified production DLLs and their licenses.
+
 ## Quick start
 
-# Library + tests + CLI
-.\cpp\build.bat
+```powershell
+cmake --preset vscode-windows-app
+cmake --build --preset vscode-windows-app-release
 
-# Same + fixture bake smoke
-.\cpp\verify.bat
+# Vulkan raster + RT
+.\out\build\vscode-windows-app\Release\xpbd_baker_app.exe -vk
 
-# Desktop app
-.\cpp\run_app.bat
-.\cpp\run_app.bat -gl
-.\cpp\run_app.bat -vk
-.\cpp\run_app.bat -d3d
+# OpenGL 3.3 raster fallback
+.\out\build\vscode-windows-app\Release\xpbd_baker_app.exe -gl
 ```
 
 Headless bake:
 
 ```powershell
-.\cpp\run_cli.bat bake --model model.geo.json --anim idle.animation.json --out idle.baked.json --bones mid,tip
+cmake --build out\build\vscode-windows-app --config Release --target xpbd_cli
+.\out\build\vscode-windows-app\Release\xpbd_cli.exe bake --model model.geo.json --anim idle.animation.json --out idle.baked.json --bones mid,tip
 ```
 
-## Graphics backends
+## Graphics backend
 
-| Flag / env                | Backend                |
-|---------------------------|------------------------|
-| `-gl` / `XPBD_GFX=opengl` | OpenGL 3.3             |
-| `-vk` / `XPBD_GFX=vulkan` | Vulkan (FIFO vsync)    |
-| `-d3d` / `XPBD_GFX=dx11`  | Direct3D 11            |
-| `auto`                    | Vulkan → DX11 → OpenGL |
+The app retains only **Vulkan** and **OpenGL 3.3**. Vulkan provides raster and
+hardware RT rendering; OpenGL is the raster fallback. DX11 and Metal have been
+removed.
+
+| Flag / env                  | Notes                              |
+|-----------------------------|------------------------------------|
+| `-vk` / `XPBD_GFX=vulkan`   | Force Vulkan                       |
+| `-gl` / `XPBD_GFX=opengl`   | Force OpenGL 3.3                   |
+| `auto` (default)            | Try Vulkan, then fall back to GL   |
+| `XPBD_VULKAN_VALIDATION=1`  | Request Khronos Validation; log and fall back safely if unavailable |
+| `XPBD_VULKAN_DIAGNOSTICS=1` | Log Vulkan layers, extensions, and waits |
+| `XPBD_ANIMATION=<path>`      | Load an animation at startup for unattended validation |
+| `XPBD_AUTOPLAY=1`            | Autoplay after model and animation load successfully |
+| `XPBD_SHOW_BONES=0`          | Hide bone overlays for unattended RT validation |
+| `XPBD_RT_DEBUG=<mode>`       | RT Pipeline view: `instance`/`primitive`/`cube`/`face`/`material`/`normal` |
+| `XPBD_PT_SPP=<1..64>`        | Path samples appended per frame slot per frame |
+| `XPBD_PT_MAX_SAMPLES=<n>`    | Maximum samples per independent history; `0` is unlimited |
+| `XPBD_PT_BOUNCES=<1..64>`    | Maximum total path-bounce count |
+| `XPBD_PT_DIFFUSE_BOUNCES=<0..16>` | Maximum diffuse bounces |
+| `XPBD_PT_GLOSSY_BOUNCES=<0..16>` | Maximum glossy/GGX bounces |
+| `XPBD_PT_TRANSMISSION_BOUNCES=<0..32>` | Maximum transmission/refraction bounces |
+| `XPBD_PT_TRANSPARENT_BOUNCES=<0..64>` | Maximum transparent bounces (fully consumed in Phase 7) |
+| `XPBD_PT_RR=<0|1>`           | Enable Russian roulette |
+| `XPBD_PT_RR_START=<1..Bounces>` | Bounce where Russian roulette starts |
+| `XPBD_PT_SEED=<uint32>`      | Fixed deterministic sampling seed |
+| `XPBD_PT_ENVIRONMENT=<0..16>` | Temporary analytic clear-sky strength; default `0` (Sky Rendering Off) |
+| `XPBD_PT_CAPTURE=<png>`      | Unattended diagnostic: write one PT PNG after reaching a finite nonzero `XPBD_PT_MAX_SAMPLES`; not the still-render workflow |
+
+On supported NVIDIA hardware, enable **Advanced preview lighting (NVIDIA)** in
+Options to use the unified RT primary path. Model, ground, water, and preview
+environment triangles share one alpha-aware BVH; opaque, cutout, and blended
+materials retain distinct visibility and shadow behavior.
+
+DLSS Frame Generation defaults to Off and its plugin is loaded only after a
+manual request. Vulkan FG turns the application's own VSync off and activates
+only when the swapchain can use `VK_PRESENT_MODE_IMMEDIATE_KHR`. G-SYNC/VRR
+remains controlled by the NVIDIA driver and display; for F11 borderless mode,
+enable G-SYNC for windowed and full-screen mode in NVIDIA Control Panel. The
+application does not modify driver settings.
 
 To avoid driver instability from third-party overlays inserted into the Vulkan
 call chain, the app disables the GamePP and RTSS implicit Vulkan layers for its
@@ -71,10 +109,8 @@ Camera:
 
 On startup the UI picks a language from the OS display language:
 
-- English (default fallback)
-- Simplified Chinese
-- Traditional Chinese (Hong Kong)
-- Traditional Chinese (Taiwan)
+- English
+- Simplified Chinese (default)
 
 You can override it under Options.
 

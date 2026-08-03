@@ -1,0 +1,13 @@
+Poly Haven preview-scene HDRIs
+================================
+
+The offline preview-scene panoramas under assets/preview_scenes are sourced
+from Poly Haven and released under Creative Commons Zero (CC0).
+
+License and redistribution statement:
+https://polyhaven.com/license
+
+Exact asset pages, download URLs, authors, byte counts, MD5 hashes, and SHA-256
+hashes are recorded in assets/preview_scenes/SOURCES.md.
+
+No live Poly Haven API or network access is used by the application at runtime.

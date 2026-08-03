@@ -32,8 +32,8 @@ constexpr int kCubeFaces[6][4] = {
     {1, 5, 7, 3},
     {0, 1, 5, 4},
     {2, 6, 7, 3},
-    {0, 4, 5, 1},
-    {2, 3, 7, 6},
+    {0, 1, 3, 2},
+    {4, 6, 7, 5},
 };
 
 struct Rgba {
@@ -689,34 +689,8 @@ SkeletonDrawList SkeletonViewport::projectPoses(
     list.bounds_max = {max_x, max_y, max_z};
   }
 
-  for (const auto &bone : geometry_->bones) {
-    if (!show_bones_) {
-      break;
-    }
-    auto sit = screen.find(bone.name);
-    if (sit == screen.end()) {
-      continue;
-    }
-    if (bone.has_parent && !bone.parent.empty()) {
-      auto pit = screen.find(bone.parent);
-      if (pit != screen.end()) {
-        ProjectedSegment seg;
-        seg.x0 = pit->second[0];
-        seg.y0 = pit->second[1];
-        seg.x1 = sit->second[0];
-        seg.y1 = sit->second[1];
-        seg.depth = 0.5f * (pit->second[2] + sit->second[2]);
-        seg.depth0 = pit->second[2];
-        seg.depth1 = sit->second[2];
-        seg.role = roleFor(bone.name, baked_style);
-        seg.name = bone.name;
-
-        seg.thickness = (seg.role == JointRole::Default) ? 1.4f : 2.2f;
-        list.segments.push_back(seg);
-      }
-    }
-  }
-
+  // Bone pivot-to-parent connection segments are deliberately omitted from
+  // every preview path. Joint markers and explicit selection outlines remain.
   for (const auto &bone : geometry_->bones) {
     if (!show_bones_) {
       break;
@@ -760,32 +734,58 @@ std::string pickBoneCandidates(const SkeletonDrawList &list, float x, float y,
                                float tolerance,
                                const std::uint32_t *face_indices,
                                std::size_t face_count) {
-  std::string best_name;
-  float best_depth = (std::numeric_limits<float>::max)();
-  float best_distance_squared = (std::numeric_limits<float>::max)();
-  const auto consider = [&](const std::string &name, float depth,
-                            float distance_squared) {
+  struct PickCandidate {
+    std::string name;
+    float depth = (std::numeric_limits<float>::max)();
+    float distance_squared = (std::numeric_limits<float>::max)();
+  };
+  PickCandidate exact;
+  PickCandidate fallback;
+  const auto considerExact = [&](const std::string &name, float depth,
+                                 float distance_squared) {
     if (name.empty() || !std::isfinite(depth)) {
       return;
     }
     constexpr float kDepthEpsilon = 1e-4f;
-    if (depth < best_depth - kDepthEpsilon ||
-        (std::abs(depth - best_depth) <= kDepthEpsilon &&
-         distance_squared < best_distance_squared)) {
-      best_name = name;
-      best_depth = depth;
-      best_distance_squared = distance_squared;
+    if (depth < exact.depth - kDepthEpsilon ||
+        (std::abs(depth - exact.depth) <= kDepthEpsilon &&
+         distance_squared < exact.distance_squared)) {
+      exact.name = name;
+      exact.depth = depth;
+      exact.distance_squared = distance_squared;
+    }
+  };
+  const auto considerFallback = [&](const std::string &name, float depth,
+                                    float distance_squared) {
+    if (name.empty() || !std::isfinite(depth)) {
+      return;
+    }
+    // Outside visible geometry, follow the cursor first and use depth only to
+    // break near-equal hits. This avoids a nearer neighbouring cube stealing
+    // a click merely because it lies somewhere inside the old 6 px halo.
+    constexpr float kDistanceEpsilon = 0.25f;
+    if (distance_squared < fallback.distance_squared - kDistanceEpsilon ||
+        (std::abs(distance_squared - fallback.distance_squared) <=
+             kDistanceEpsilon &&
+         depth < fallback.depth)) {
+      fallback.name = name;
+      fallback.depth = depth;
+      fallback.distance_squared = distance_squared;
     }
   };
 
   const float clamped_tolerance = std::max(0.0f, tolerance);
+  const float face_tolerance = std::min(clamped_tolerance, 3.0f);
   const float face_tolerance_squared =
-      clamped_tolerance * clamped_tolerance;
+      face_tolerance * face_tolerance;
   const auto testFace = [&](const ProjectedFace &face) {
     if (!face.is_ground && !face.bone_name.empty()) {
       const float distance_squared = pointQuadDistanceSquared(x, y, face.xy);
-      if (distance_squared <= face_tolerance_squared) {
-        consider(face.bone_name, faceDepthAt(face, x, y), distance_squared);
+      const float depth = faceDepthAt(face, x, y);
+      if (distance_squared <= 1.0e-4f) {
+        considerExact(face.bone_name, depth, distance_squared);
+      } else if (distance_squared <= face_tolerance_squared) {
+        considerFallback(face.bone_name, depth, distance_squared);
       }
     }
   };
@@ -803,12 +803,15 @@ std::string pickBoneCandidates(const SkeletonDrawList &list, float x, float y,
   }
 
   for (const auto &segment : list.segments) {
-    const float radius = clamped_tolerance + segment.thickness * 0.5f;
+    const float visual_radius = segment.thickness * 0.5f;
+    const float radius = std::min(clamped_tolerance, 4.0f) + visual_radius;
     const SegmentHit hit = pointSegmentHit(x, y, segment.x0, segment.y0,
                                            segment.x1, segment.y1);
-    if (hit.distance_squared <= radius * radius) {
-      consider(segment.name, segmentDepthAt(segment, hit.t),
-               hit.distance_squared);
+    const float depth = segmentDepthAt(segment, hit.t);
+    if (hit.distance_squared <= visual_radius * visual_radius) {
+      considerExact(segment.name, depth, hit.distance_squared);
+    } else if (hit.distance_squared <= radius * radius) {
+      considerFallback(segment.name, depth, hit.distance_squared);
     }
   }
 
@@ -816,12 +819,15 @@ std::string pickBoneCandidates(const SkeletonDrawList &list, float x, float y,
     const float dx = x - joint.x;
     const float dy = y - joint.y;
     const float distance_squared = dx * dx + dy * dy;
-    const float radius = std::max(joint.radius, clamped_tolerance);
-    if (distance_squared <= radius * radius) {
-      consider(joint.name, joint.depth, distance_squared);
+    const float fallback_radius =
+        joint.radius + std::min(clamped_tolerance, 4.0f);
+    if (distance_squared <= joint.radius * joint.radius) {
+      considerExact(joint.name, joint.depth, distance_squared);
+    } else if (distance_squared <= fallback_radius * fallback_radius) {
+      considerFallback(joint.name, joint.depth, distance_squared);
     }
   }
-  return best_name;
+  return exact.name.empty() ? fallback.name : exact.name;
 }
 
 } // namespace

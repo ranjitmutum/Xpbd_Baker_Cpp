@@ -6135,6 +6135,12 @@ template<typename T> struct nk_alignof{struct Big {T x; char c;}; enum {
 #define NK_UINT_MIN 0
 #define NK_UINT_MAX 4294967295u
 
+/* Property editors share the window text-edit storage, but they are not part
+ * of the per-frame edit.seq widget namespace. Reserve a distinct identity so
+ * the first regular edit (whose identity is zero) cannot inherit property
+ * keyboard focus on the following frame. */
+#define NK_PROPERTY_EDIT_IDENTITY ((nk_hash)NK_UINT_MAX)
+
 /* Make sure correct type size:
  * This will fire with a negative subscript error if the type sizes
  * are set incorrectly by the compiler, and compile out if not */
@@ -20689,6 +20695,10 @@ nk_panel_end(struct nk_context *ctx)
     /* property garbage collector */
     if (window->property.active && window->property.old != window->property.seq &&
         window->property.active == window->property.prev) {
+        if (window->edit.name == NK_PROPERTY_EDIT_IDENTITY) {
+            window->edit.active = nk_false;
+            window->edit.name = 0;
+        }
         nk_zero(&window->property, sizeof(window->property));
     } else {
         window->property.old = window->property.seq;
@@ -20696,7 +20706,9 @@ nk_panel_end(struct nk_context *ctx)
         window->property.seq = 0;
     }
     /* edit garbage collector */
-    if (window->edit.active && window->edit.old != window->edit.seq &&
+    if (window->edit.active &&
+       window->edit.name != NK_PROPERTY_EDIT_IDENTITY &&
+       window->edit.old != window->edit.seq &&
        window->edit.active == window->edit.prev) {
         nk_zero(&window->edit, sizeof(window->edit));
     } else {
@@ -29356,6 +29368,7 @@ nk_property(struct nk_context *ctx, const char *name, struct nk_property_variant
         win->property.select_start = *select_begin;
         win->property.select_end = *select_end;
         win->edit.active = nk_true;
+        win->edit.name = NK_PROPERTY_EDIT_IDENTITY;
         if (*state == NK_PROPERTY_DRAG) {
             ctx->input.mouse.grab = nk_true;
             ctx->input.mouse.grabbed = nk_true;
@@ -29371,7 +29384,10 @@ nk_property(struct nk_context *ctx, const char *name, struct nk_property_variant
         win->property.select_start = 0;
         win->property.select_end = 0;
         win->property.active = 0;
-        win->edit.active = nk_false;
+        if (win->edit.name == NK_PROPERTY_EDIT_IDENTITY) {
+            win->edit.active = nk_false;
+            win->edit.name = 0;
+        }
     }
 }
 NK_API nk_bool

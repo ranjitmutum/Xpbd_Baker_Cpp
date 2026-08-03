@@ -23,12 +23,23 @@ struct StaticModelIndexRange {
   std::uint32_t index_count = 0;
 };
 
+struct StaticModelPrimitiveMaterial {
+  StaticModelMaterialClass material = StaticModelMaterialClass::Opaque;
+  bool textured = false;
+  std::uint32_t source_face_index = 0;
+  std::uint32_t source_triangle_index = 0;
+  std::uint32_t bone_index = 0;
+  std::uint32_t cube_index = 0;
+  StaticModelFaceDirection face_direction =
+      StaticModelFaceDirection::West;
+};
 
 
 
 
 struct StaticModelDrawPlan {
   std::vector<std::uint32_t> indices;
+  std::vector<StaticModelPrimitiveMaterial> primitive_materials;
 
   std::vector<std::uint8_t> textured_vertices;
   StaticModelIndexRange opaque;
@@ -70,68 +81,31 @@ namespace detail {
   return first <= size && count <= size - first;
 }
 
-[[nodiscard]] inline int wrappedTexel(float coordinate, int extent) noexcept {
-  const float wrapped = coordinate - std::floor(coordinate);
-  return (std::clamp)(static_cast<int>(
-                          std::floor(wrapped * static_cast<float>(extent))),
-                      0, extent - 1);
-}
-
 struct TexelSpan {
   int begin = 0;
   int end = 0;
 };
 
-struct TexelSpans {
-  std::array<TexelSpan, 2> spans{};
-  std::size_t count = 0;
-};
-
-
-
-
-
-
-[[nodiscard]] inline TexelSpans coveredTexelSpans(float lo, float hi,
-                                                  int extent) noexcept {
+[[nodiscard]] inline TexelSpan coveredTexelSpan(double lo, double hi,
+                                                int extent) noexcept {
   if (lo > hi) {
     std::swap(lo, hi);
   }
-  TexelSpans result;
-  if (hi - lo <= 1.0e-7f) {
-    const int texel = wrappedTexel(lo, extent);
-    result.spans[0] = {texel, texel + 1};
-    result.count = 1;
-    return result;
+  lo = std::clamp(lo, 0.0, 1.0);
+  hi = std::clamp(hi, 0.0, 1.0);
+  if (hi - lo <= 1.0e-12) {
+    const int texel = std::clamp(
+        static_cast<int>(std::floor(lo * static_cast<double>(extent))), 0,
+        extent - 1);
+    return {texel, texel + 1};
   }
-  if (hi - lo >= 1.0f) {
-    result.spans[0] = {0, extent};
-    result.count = 1;
-    return result;
-  }
-
-  double cursor = lo;
-  const double interval_end = hi;
-  while (cursor < interval_end && result.count < result.spans.size()) {
-    const double period = std::floor(cursor);
-    const double segment_end = (std::min)(interval_end, period + 1.0);
-    const double local_begin = cursor - period;
-    const double local_end = segment_end - period;
-    const int first =
-        (std::clamp)(static_cast<int>(std::floor(local_begin * extent)), 0,
-                     extent - 1);
-    const int end =
-        (std::clamp)(static_cast<int>(std::ceil(local_end * extent)), first + 1,
-                     extent);
-    result.spans[result.count++] = {first, end};
-    cursor = segment_end;
-    if (cursor < interval_end && cursor == std::floor(cursor)) {
-
-      cursor =
-          std::nextafter(cursor, (std::numeric_limits<double>::infinity)());
-    }
-  }
-  return result;
+  const int first = std::clamp(
+      static_cast<int>(std::floor(lo * static_cast<double>(extent))), 0,
+      extent - 1);
+  const int end = std::clamp(
+      static_cast<int>(std::ceil(hi * static_cast<double>(extent))),
+      first + 1, extent);
+  return {first, end};
 }
 
 [[nodiscard]] inline bool validFace(const StaticIndexedModelMesh &mesh,
@@ -153,7 +127,8 @@ struct TexelSpans {
         !std::isfinite(vertex.py) || !std::isfinite(vertex.pz) ||
         !std::isfinite(vertex.nx) || !std::isfinite(vertex.ny) ||
         !std::isfinite(vertex.nz) || !std::isfinite(vertex.u) ||
-        !std::isfinite(vertex.v)) {
+        !std::isfinite(vertex.v) || !std::isfinite(vertex.raw_u) ||
+        !std::isfinite(vertex.raw_v)) {
       return false;
     }
   }
@@ -185,43 +160,41 @@ staticModelFaceMaterial(const StaticIndexedModelMesh &mesh,
     return StaticModelMaterialClass::Opaque;
   }
 
-  float min_u = mesh.vertices[face.first_vertex].u;
-  float max_u = min_u;
-  float min_v = mesh.vertices[face.first_vertex].v;
-  float max_v = min_v;
+  double min_u = mesh.vertices[face.first_vertex].u;
+  double max_u = min_u;
+  double min_v = mesh.vertices[face.first_vertex].v;
+  double max_v = min_v;
   const std::size_t vertex_end =
       static_cast<std::size_t>(face.first_vertex) + face.vertex_count;
   for (std::size_t vertex_i = face.first_vertex + 1u; vertex_i < vertex_end;
        ++vertex_i) {
-    min_u = (std::min)(min_u, mesh.vertices[vertex_i].u);
-    max_u = (std::max)(max_u, mesh.vertices[vertex_i].u);
-    min_v = (std::min)(min_v, mesh.vertices[vertex_i].v);
-    max_v = (std::max)(max_v, mesh.vertices[vertex_i].v);
+    min_u = (std::min)(
+        min_u, static_cast<double>(mesh.vertices[vertex_i].u));
+    max_u = (std::max)(
+        max_u, static_cast<double>(mesh.vertices[vertex_i].u));
+    min_v = (std::min)(
+        min_v, static_cast<double>(mesh.vertices[vertex_i].v));
+    max_v = (std::max)(
+        max_v, static_cast<double>(mesh.vertices[vertex_i].v));
   }
 
   bool has_cutout = false;
-  const detail::TexelSpans x_spans =
-      detail::coveredTexelSpans(min_u, max_u, texture->width);
-  const detail::TexelSpans y_spans =
-      detail::coveredTexelSpans(min_v, max_v, texture->height);
-  for (std::size_t y_span = 0; y_span < y_spans.count; ++y_span) {
-    for (int y = y_spans.spans[y_span].begin; y < y_spans.spans[y_span].end;
-         ++y) {
-      for (std::size_t x_span = 0; x_span < x_spans.count; ++x_span) {
-        for (int x = x_spans.spans[x_span].begin; x < x_spans.spans[x_span].end;
-             ++x) {
-          const std::size_t alpha_offset =
-              (static_cast<std::size_t>(y) * texture->width +
-               static_cast<std::size_t>(x)) *
-                  4u +
-              3u;
-          const float alpha = texture->rgba[alpha_offset] / 255.0f;
-          if (alpha >= 0.02f && alpha < 0.98f) {
-            return StaticModelMaterialClass::Blend;
-          }
-          has_cutout = has_cutout || alpha < 0.02f;
-        }
+  const detail::TexelSpan x_span =
+      detail::coveredTexelSpan(min_u, max_u, texture->width);
+  const detail::TexelSpan y_span =
+      detail::coveredTexelSpan(min_v, max_v, texture->height);
+  for (int y = y_span.begin; y < y_span.end; ++y) {
+    for (int x = x_span.begin; x < x_span.end; ++x) {
+      const std::size_t alpha_offset =
+          (static_cast<std::size_t>(y) * texture->width +
+           static_cast<std::size_t>(x)) *
+              4u +
+          3u;
+      const float alpha = texture->rgba[alpha_offset] / 255.0f;
+      if (alpha >= 0.02f && alpha < 0.98f) {
+        return StaticModelMaterialClass::Blend;
       }
+      has_cutout = has_cutout || alpha < 0.02f;
     }
   }
   return has_cutout ? StaticModelMaterialClass::Cutout
@@ -237,11 +210,19 @@ makeStaticModelDrawPlan(const StaticIndexedModelMesh &mesh,
   std::vector<std::uint32_t> opaque;
   std::vector<std::uint32_t> cutout;
   std::vector<std::uint32_t> blend;
+  std::vector<StaticModelPrimitiveMaterial> opaque_materials;
+  std::vector<StaticModelPrimitiveMaterial> cutout_materials;
+  std::vector<StaticModelPrimitiveMaterial> blend_materials;
   opaque.reserve(mesh.indices.size());
   cutout.reserve(mesh.indices.size());
   blend.reserve(mesh.indices.size());
+  opaque_materials.reserve(mesh.indices.size() / 3u);
+  cutout_materials.reserve(mesh.indices.size() / 3u);
+  blend_materials.reserve(mesh.indices.size() / 3u);
 
-  for (const auto &face : mesh.faces) {
+  for (std::size_t face_index = 0; face_index < mesh.faces.size();
+       ++face_index) {
+    const auto &face = mesh.faces[face_index];
     if (!detail::validFace(mesh, face)) {
       ++plan.skipped_face_count;
       continue;
@@ -256,31 +237,53 @@ makeStaticModelDrawPlan(const StaticIndexedModelMesh &mesh,
                 plan.textured_vertices.begin() + vertex_end, 1u);
     }
 
+    const StaticModelMaterialClass material =
+        staticModelFaceMaterial(mesh, face, texture);
     std::vector<std::uint32_t> *destination = &opaque;
-    switch (staticModelFaceMaterial(mesh, face, texture)) {
+    std::vector<StaticModelPrimitiveMaterial> *material_destination =
+        &opaque_materials;
+    switch (material) {
     case StaticModelMaterialClass::Opaque:
       break;
     case StaticModelMaterialClass::Cutout:
       destination = &cutout;
+      material_destination = &cutout_materials;
       break;
     case StaticModelMaterialClass::Blend:
       destination = &blend;
+      material_destination = &blend_materials;
       break;
     }
     const auto begin = mesh.indices.begin() + face.first_index;
     destination->insert(destination->end(), begin, begin + face.index_count);
+    for (std::uint32_t triangle = 0; triangle < face.index_count / 3u;
+         ++triangle) {
+      StaticModelPrimitiveMaterial primitive;
+      primitive.material = material;
+      primitive.textured = textured;
+      primitive.source_face_index =
+          static_cast<std::uint32_t>(face_index);
+      primitive.source_triangle_index = triangle;
+      primitive.bone_index = face.bone_index;
+      primitive.cube_index = face.cube_index;
+      primitive.face_direction = face.direction;
+      material_destination->push_back(primitive);
+    }
   }
 
   plan.indices.reserve(opaque.size() + cutout.size() + blend.size());
   auto append = [&](const std::vector<std::uint32_t> &source,
+                    const std::vector<StaticModelPrimitiveMaterial> &materials,
                     StaticModelIndexRange &range) {
     range.first_index = static_cast<std::uint32_t>(plan.indices.size());
     range.index_count = static_cast<std::uint32_t>(source.size());
     plan.indices.insert(plan.indices.end(), source.begin(), source.end());
+    plan.primitive_materials.insert(plan.primitive_materials.end(),
+                                    materials.begin(), materials.end());
   };
-  append(opaque, plan.opaque);
-  append(cutout, plan.cutout);
-  append(blend, plan.blend);
+  append(opaque, opaque_materials, plan.opaque);
+  append(cutout, cutout_materials, plan.cutout);
+  append(blend, blend_materials, plan.blend);
   return plan;
 }
 

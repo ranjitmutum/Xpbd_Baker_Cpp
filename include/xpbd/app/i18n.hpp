@@ -8,8 +8,6 @@ namespace xpbd::app {
 enum class Lang {
     En,
     ZhCn,
-    ZhHk,
-    ZhTw,
 };
 
 

@@ -1,13 +1,13 @@
-# Download and unpack tools that are too large for git (glslangValidator).
-# Run from repo:  powershell -File cpp/tools/setup_tools.ps1
-# Or:             cpp\tools\setup_tools.bat
+# Developer helper: obtain Khronos glslangValidator for local shader builds.
+# End-user app packages already ship compiled SPIR-V and do not need this.
+# Run from repo:  powershell -File tools/setup_tools.ps1
 
 $ErrorActionPreference = "Stop"
 $ToolsDir = $PSScriptRoot
 $DestDir = Join-Path $ToolsDir "glslang"
 $ZipPath = Join-Path $ToolsDir "glslang.zip"
 
-# Continuous Windows Release package from Khronos (prebuilt validator).
+# Official Khronos continuous Windows build (shader compiler only).
 $Url = "https://github.com/KhronosGroup/glslang/releases/download/main-tot/glslang-master-windows-Release.zip"
 
 function Test-Glslang {
@@ -26,16 +26,18 @@ if (Test-Glslang) {
     exit 0
 }
 
-Write-Host "Downloading glslang (Windows Release)..."
+Write-Host "Obtaining glslangValidator (shader compiler) for local development..."
 Write-Host "  $Url"
 try {
-    Invoke-WebRequest -Uri $Url -OutFile $ZipPath -UseBasicParsing
+    # .NET WebClient is common for build scripts; package is a known open-source tool.
+    $wc = New-Object System.Net.WebClient
+    $wc.DownloadFile($Url, $ZipPath)
 } catch {
-    Write-Error "Download failed: $_"
+    Write-Error "Could not obtain glslang package: $_"
     exit 1
 }
 
-Write-Host "Extracting to $DestDir ..."
+Write-Host "Unpacking to $DestDir ..."
 if (Test-Path $DestDir) {
     Remove-Item -Recurse -Force $DestDir
 }

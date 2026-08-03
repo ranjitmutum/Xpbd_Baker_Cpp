@@ -4,6 +4,7 @@
 #include "xpbd/baker/bone_mapper.hpp"
 #include "xpbd/core/simd_dispatch.hpp"
 #include "xpbd/gfx/texture_image.hpp"
+#include "xpbd/gfx/uv_domain.hpp"
 #include "xpbd/loader/bedrock_animation_data.hpp"
 #include "xpbd/loader/bedrock_model_data.hpp"
 #include "xpbd/render/skeleton_viewport.hpp"
@@ -46,6 +47,9 @@ struct StaticModelVertex {
   float px = 0, py = 0, pz = 0;
   float nx = 0, ny = 1, nz = 0;
   float u = 0, v = 0;
+  double raw_u = 0, raw_v = 0;
+  float tx = 1, ty = 0, tz = 0;
+  float tangent_handedness = 1;
   std::uint32_t bone_index = 0;
 };
 
@@ -72,6 +76,7 @@ struct StaticIndexedModelMesh {
   std::vector<StaticModelFace> faces;
   std::vector<std::string> bone_names;
   std::uint32_t cube_count = 0;
+  ResolvedUvDomain uv_domain;
 
   void clear() {
     vertices.clear();
@@ -79,6 +84,7 @@ struct StaticIndexedModelMesh {
     faces.clear();
     bone_names.clear();
     cube_count = 0;
+    uv_domain = {};
   }
 };
 
