@@ -300,20 +300,7 @@ static const uint32_t kSpvStaticMeshRtFrag[] = {
 };
 
 // Unit cube (triangle list, 36 verts) for skybox sampling.
-static const float kSkyboxCubePositions[] = {
-    // -Z
-    -1, -1, -1, 1, -1, -1, 1, 1, -1, -1, -1, -1, 1, 1, -1, -1, 1, -1,
-    // +Z
-    -1, -1, 1, -1, 1, 1, 1, 1, 1, -1, -1, 1, 1, 1, 1, 1, -1, 1,
-    // -X
-    -1, -1, -1, -1, 1, -1, -1, 1, 1, -1, -1, -1, -1, 1, 1, -1, -1, 1,
-    // +X
-    1, -1, -1, 1, -1, 1, 1, 1, 1, 1, -1, -1, 1, 1, 1, 1, 1, -1,
-    // -Y
-    -1, -1, -1, -1, -1, 1, 1, -1, 1, -1, -1, -1, 1, -1, 1, 1, -1, -1,
-    // +Y
-    -1, 1, -1, 1, 1, -1, 1, 1, 1, -1, 1, -1, 1, 1, 1, -1, 1, 1,
-};
+
 
 // Unit cube (triangle list, 36 verts) for skybox sampling.
 
@@ -3676,11 +3663,9 @@ void VulkanBackend::createTimestampQueryPools() {
     }
   }
 
-#include "vulkan_backend_parts/vulkan_backend_skybox_lifecycle.inc"
 #include "vulkan_backend_parts/vulkan_backend_environment.inc"
 #include "vulkan_backend_parts/vulkan_backend_static_resources_core.inc"
 #include "vulkan_backend_parts/vulkan_backend_static_resources_upload.inc"
-#include "vulkan_backend_parts/vulkan_backend_skybox_upload.inc"
 #include "vulkan_backend_parts/vulkan_backend_pipelines.inc"
 
 int VulkanBackend::drawUi(FrameSync &frame, const UiDrawData &ui,
