@@ -415,6 +415,10 @@ struct SwapchainSupport {
   std::vector<VkPresentModeKHR> modes;
 };
 
+}
+
+namespace detail {
+
 class VulkanBackend final : public IGpuBackend {
 public:
   bool init(SDL_Window *window) override {
@@ -4202,7 +4206,7 @@ int VulkanBackend::drawUi(FrameSync &frame, const UiDrawData &ui,
 }
 
 std::unique_ptr<IGpuBackend> createVulkanBackend() {
-  return std::make_unique<VulkanBackend>();
+  return std::make_unique<detail::VulkanBackend>();
 }
 
 }
