@@ -33,6 +33,77 @@ enum class FrameGenerationTransitionResult {
   FatalDeviceLost,
 };
 
+inline constexpr std::uint32_t kFrameGenerationDisableMaxAttempts = 3u;
+
+// SDK-independent progress for one Options-Off transaction.  `attempts`
+// counts only calls that can confirm slDLSSGSetOptions(eOff).  A retry is
+// legal only after the caller records a completed GPU/Present drain for the
+// preceding attempt.  Keeping this policy pure makes busy-retry and unsafe
+// destruction regressions testable without loading Streamline.
+struct FrameGenerationDisableProgress {
+  std::uint32_t attempts = 0u;
+  std::uint32_t completed_drains = 0u;
+  bool confirmed_off = false;
+  bool failure_latched = false;
+  bool recovery_required = false;
+  bool exhausted = false;
+};
+
+[[nodiscard]] constexpr bool frameGenerationDisableAttemptAllowed(
+    const FrameGenerationDisableProgress &progress) noexcept {
+  return !progress.confirmed_off && !progress.exhausted &&
+         progress.attempts < kFrameGenerationDisableMaxAttempts &&
+         (progress.attempts == 0u ||
+          progress.completed_drains >= progress.attempts);
+}
+
+[[nodiscard]] constexpr bool frameGenerationRecordDisableAttempt(
+    FrameGenerationDisableProgress &progress,
+    bool sdk_confirmed_off) noexcept {
+  if (!frameGenerationDisableAttemptAllowed(progress)) {
+    return false;
+  }
+  ++progress.attempts;
+  if (sdk_confirmed_off) {
+    progress.confirmed_off = true;
+    progress.recovery_required = false;
+    progress.exhausted = false;
+  } else {
+    progress.failure_latched = true;
+    progress.recovery_required = true;
+    progress.exhausted =
+        progress.attempts >= kFrameGenerationDisableMaxAttempts;
+  }
+  return true;
+}
+
+[[nodiscard]] constexpr bool frameGenerationRecordDisableDrain(
+    FrameGenerationDisableProgress &progress) noexcept {
+  if (progress.completed_drains >= progress.attempts) {
+    return false;
+  }
+  ++progress.completed_drains;
+  return true;
+}
+
+// Clearing SDK resource tags happens only after Options-Off succeeds.  A tag
+// clear failure is not another eOff attempt; it is an immediate destruction
+// blocker that remains diagnosable until a fresh user-acknowledged transaction.
+constexpr void frameGenerationRecordDisableCleanupFailure(
+    FrameGenerationDisableProgress &progress) noexcept {
+  progress.failure_latched = true;
+  progress.recovery_required = true;
+  progress.exhausted = true;
+}
+
+[[nodiscard]] constexpr bool frameGenerationDisableMayDestroy(
+    const FrameGenerationDisableProgress &progress, bool options_on,
+    bool options_key_valid, bool valid_inputs_tagged) noexcept {
+  return progress.confirmed_off && !progress.exhausted &&
+         progress.completed_drains >= progress.attempts && !options_on &&
+         !options_key_valid && !valid_inputs_tagged;
+}
+
 // Streamline names subrect coordinates `top` and `left`, in that order.
 // Keep this SDK-independent representation testable so callers cannot
 // accidentally aggregate-initialize an sl::Extent as {x, y, width, height}.
@@ -136,11 +207,19 @@ makeFrameGenerationTagExtent(std::uint32_t viewport_x,
         (!valid_inputs_tagged || options_on);
     return already_native || disabling_proxy;
   }
+  if (state == FrameGenerationRuntimeState::FaultedRecoveringNative) {
+    const bool preserved_proxy =
+        plugin_loaded &&
+        ownership == SwapchainOwnership::StreamlineFrameGenerationProxy;
+    const bool native_fault =
+        ownership == SwapchainOwnership::Native && !options_on &&
+        !valid_inputs_tagged;
+    return preserved_proxy || native_fault;
+  }
   if (state == FrameGenerationRuntimeState::DisablingDrain ||
       state ==
           FrameGenerationRuntimeState::DisablingDestroyProxySwapchain ||
-      state == FrameGenerationRuntimeState::DisablingUnloadPlugin ||
-      state == FrameGenerationRuntimeState::FaultedRecoveringNative) {
+      state == FrameGenerationRuntimeState::DisablingUnloadPlugin) {
     return !options_on && !valid_inputs_tagged;
   }
   return state == FrameGenerationRuntimeState::ShuttingDown;

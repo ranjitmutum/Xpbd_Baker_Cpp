@@ -38,6 +38,84 @@ double wrapRadians(double value) noexcept {
   return value < 0.0 ? value + kTwoPi : value;
 }
 
+std::uint64_t mixResolvedGeneration(std::uint64_t hash,
+                                    std::uint64_t value) noexcept {
+  constexpr std::uint64_t kPrime = 1099511628211ull;
+  for (std::uint32_t byte = 0; byte < 8u; ++byte) {
+    hash ^= (value >> (byte * 8u)) & 0xffu;
+    hash *= kPrime;
+  }
+  return hash;
+}
+
+std::array<float, 3> colorTemperatureRgb(float kelvin) noexcept {
+  const double finite_kelvin =
+      std::isfinite(kelvin) ? static_cast<double>(kelvin) : 5778.0;
+  const double temperature =
+      std::clamp(finite_kelvin, 1000.0, 40000.0) / 100.0;
+  double red = 255.0;
+  double green = 255.0;
+  double blue = 255.0;
+  if (temperature <= 66.0) {
+    green = 99.4708025861 * std::log(temperature) - 161.1195681661;
+    blue = temperature <= 19.0
+               ? 0.0
+               : 138.5177312231 * std::log(temperature - 10.0) -
+                     305.0447927307;
+  } else {
+    red = 329.698727446 * std::pow(temperature - 60.0, -0.1332047592);
+    green = 288.1221695283 *
+            std::pow(temperature - 60.0, -0.0755148492);
+  }
+  const auto normalized = [](double channel) {
+    return static_cast<float>(std::clamp(channel, 0.0, 255.0) / 255.0);
+  };
+  return {normalized(red), normalized(green), normalized(blue)};
+}
+
+float smoothUnit(float value) noexcept {
+  const float clamped = std::clamp(value, 0.0f, 1.0f);
+  return clamped * clamped * (3.0f - 2.0f * clamped);
+}
+
+float rgbLuminance(const std::array<float, 3> &value) noexcept {
+  return 0.2126f * value[0] + 0.7152f * value[1] + 0.0722f * value[2];
+}
+
+std::array<float, 3> normalizedDirection(
+    const std::array<float, 3> &direction) noexcept {
+  const double length_squared =
+      static_cast<double>(direction[0]) * direction[0] +
+      static_cast<double>(direction[1]) * direction[1] +
+      static_cast<double>(direction[2]) * direction[2];
+  if (!(length_squared > 1.0e-20) || !std::isfinite(length_squared)) {
+    return {0.0f, 1.0f, 0.0f};
+  }
+  const float inverse_length =
+      static_cast<float>(1.0 / std::sqrt(length_squared));
+  return {direction[0] * inverse_length, direction[1] * inverse_length,
+          direction[2] * inverse_length};
+}
+
+std::array<float, 3> analyticFallbackRadiance(
+    const std::array<float, 3> &direction, float strength) noexcept {
+  if (!std::isfinite(strength) || !(strength > 0.0f)) {
+    return {0.0f, 0.0f, 0.0f};
+  }
+  const std::array<float, 3> unit = normalizedDirection(direction);
+  const float elevation = std::clamp(unit[1] * 0.5f + 0.5f, 0.0f, 1.0f);
+  const float blend = std::pow(elevation, 0.65f);
+  constexpr std::array<float, 3> kHorizon{0.42f, 0.55f, 0.72f};
+  constexpr std::array<float, 3> kZenith{0.08f, 0.20f, 0.48f};
+  std::array<float, 3> radiance{};
+  for (std::size_t channel = 0; channel < radiance.size(); ++channel) {
+    radiance[channel] =
+        strength * (kHorizon[channel] +
+                    (kZenith[channel] - kHorizon[channel]) * blend);
+  }
+  return radiance;
+}
+
 bool validObserver(const ObserverLocation &observer) noexcept {
   return std::isfinite(observer.latitude_degrees) &&
          std::isfinite(observer.longitude_degrees) &&
@@ -1059,6 +1137,402 @@ resolveWorldEnvironment(const WorldEnvironmentState &state) {
     }
   }
   return resolved;
+}
+
+ResolvedSunLight
+resolveSunLight(const ResolvedWorldEnvironment &resolved) noexcept {
+  ResolvedSunLight sun;
+  std::uint64_t generation = 14695981039346656037ull;
+  generation = mixResolvedGeneration(
+      generation, static_cast<std::uint64_t>(resolved.sky_rendering));
+  generation = mixResolvedGeneration(generation, resolved.generation);
+  generation = mixResolvedGeneration(generation,
+                                     resolved.lighting_generation);
+  generation = mixResolvedGeneration(generation,
+                                     resolved.celestial_generation);
+  generation = mixResolvedGeneration(generation, resolved.cloud_generation);
+  generation = mixResolvedGeneration(
+      generation,
+      static_cast<std::uint64_t>(
+          std::bit_cast<std::uint32_t>(resolved.global_lighting_strength)));
+  generation = mixResolvedGeneration(
+      generation,
+      static_cast<std::uint64_t>(
+          std::bit_cast<std::uint32_t>(resolved.rotation_radians)));
+  generation = mixResolvedGeneration(
+      generation, static_cast<std::uint64_t>(resolved.sun_moon_lighting));
+  sun.generation = generation;
+  sun.cloud_generation = resolved.cloud_generation;
+  if (resolved.sky_rendering != SkyRendering::ProceduralDayNight ||
+      resolved.celestial == nullptr || !resolved.celestial->valid ||
+      resolved.sun == nullptr) {
+    return sun;
+  }
+
+  const SunControls &controls = *resolved.sun;
+  const double cosine = std::cos(static_cast<double>(resolved.rotation_radians));
+  const double sine = std::sin(static_cast<double>(resolved.rotation_radians));
+  const auto &local = resolved.celestial->sun.direction;
+  sun.direction = normalizedDirection({
+      static_cast<float>(local[0] * cosine + local[2] * sine),
+      static_cast<float>(local[1]),
+      static_cast<float>(-local[0] * sine + local[2] * cosine)});
+  sun.color = colorTemperatureRgb(controls.color_temperature_kelvin);
+  const double angular_diameter_degrees =
+      std::isfinite(controls.angular_diameter_degrees)
+          ? std::clamp(static_cast<double>(controls.angular_diameter_degrees),
+                       0.05, 5.0)
+          : 0.533;
+  sun.angular_radius = static_cast<float>(
+      angular_diameter_degrees * 0.5 * (kPi / 180.0));
+  sun.solid_angle = static_cast<float>(
+      kTwoPi * (1.0 - std::cos(static_cast<double>(sun.angular_radius))));
+  sun.strength = std::isfinite(controls.strength)
+                     ? std::clamp(controls.strength, 0.0f, 32.0f)
+                     : 0.0f;
+  sun.enabled = controls.enabled;
+  sun.disk_visible = controls.enabled && controls.disk_visible;
+  sun.casts_shadow = controls.cast_shadows;
+  sun.lighting_enabled =
+      controls.enabled && resolved.sun_moon_lighting &&
+      resolved.global_lighting_strength > 0.0f && sun.strength > 0.0f;
+
+  const float horizon_visibility =
+      smoothUnit((sun.direction[1] + 0.05f) / 0.07f);
+  const float radiance_scale =
+      sun.lighting_enabled
+          ? 700.0f * sun.strength * resolved.global_lighting_strength *
+                horizon_visibility
+          : 0.0f;
+  for (std::size_t channel = 0; channel < sun.radiance.size(); ++channel) {
+    sun.radiance[channel] = sun.color[channel] * radiance_scale;
+  }
+  sun.power_estimate =
+      std::max(rgbLuminance(sun.radiance) * sun.solid_angle, 0.0f);
+  const auto mix_float = [&](float value) {
+    generation = mixResolvedGeneration(
+        generation, static_cast<std::uint64_t>(
+                        std::bit_cast<std::uint32_t>(value)));
+  };
+  for (const float value : sun.direction) {
+    mix_float(value);
+  }
+  for (const float value : sun.color) {
+    mix_float(value);
+  }
+  mix_float(sun.angular_radius);
+  mix_float(sun.strength);
+  mix_float(sun.power_estimate);
+  generation = mixResolvedGeneration(
+      generation, static_cast<std::uint64_t>(sun.enabled));
+  generation = mixResolvedGeneration(
+      generation, static_cast<std::uint64_t>(sun.disk_visible));
+  generation = mixResolvedGeneration(
+      generation, static_cast<std::uint64_t>(sun.casts_shadow));
+  generation = mixResolvedGeneration(
+      generation, static_cast<std::uint64_t>(sun.lighting_enabled));
+  sun.generation = generation;
+  return sun;
+}
+
+float estimateEnvironmentPower(const FloatEnvironmentImage &image,
+                               float lighting_strength) noexcept {
+  if (!image.valid() || !std::isfinite(lighting_strength) ||
+      !(lighting_strength > 0.0f)) {
+    return 0.0f;
+  }
+  double integrated_luminance = 0.0;
+  for (std::uint32_t y = 0; y < image.height; ++y) {
+    const double theta0 =
+        kPi * static_cast<double>(y) / static_cast<double>(image.height);
+    const double theta1 = kPi * static_cast<double>(y + 1u) /
+                          static_cast<double>(image.height);
+    const double texel_solid_angle =
+        (kTwoPi / static_cast<double>(image.width)) *
+        (std::cos(theta0) - std::cos(theta1));
+    for (std::uint32_t x = 0; x < image.width; ++x) {
+      const std::size_t base =
+          (static_cast<std::size_t>(y) * image.width + x) * 4u;
+      const double red = std::max(static_cast<double>(image.rgba[base]), 0.0);
+      const double green =
+          std::max(static_cast<double>(image.rgba[base + 1u]), 0.0);
+      const double blue =
+          std::max(static_cast<double>(image.rgba[base + 2u]), 0.0);
+      const double luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+      if (std::isfinite(luminance)) {
+        integrated_luminance += luminance * texel_solid_angle;
+      }
+    }
+  }
+  const double power = integrated_luminance * lighting_strength;
+  return std::isfinite(power)
+             ? static_cast<float>(std::clamp(
+                   power, 0.0,
+                   static_cast<double>((std::numeric_limits<float>::max)())))
+             : 0.0f;
+}
+
+ResolvedEnvironmentView resolveEnvironmentView(
+    const ResolvedWorldEnvironment &resolved,
+    const std::array<float, 3> &constant_fallback,
+    float analytic_fallback_strength) noexcept {
+  ResolvedEnvironmentView view;
+  std::uint64_t generation = 14695981039346656037ull;
+  generation = mixResolvedGeneration(
+      generation, static_cast<std::uint64_t>(resolved.sky_rendering));
+  generation = mixResolvedGeneration(generation, resolved.generation);
+  generation = mixResolvedGeneration(generation,
+                                     resolved.lighting_generation);
+  generation = mixResolvedGeneration(generation,
+                                     resolved.celestial_generation);
+  generation = mixResolvedGeneration(generation, resolved.cloud_generation);
+  generation = mixResolvedGeneration(generation, resolved.target_generation);
+  view.generation = generation;
+  view.rotation_radians = resolved.rotation_radians;
+  view.background_multiplier = resolved.background_multiplier;
+  view.background_visible = resolved.background_visible;
+  const auto finalize_generation =
+      [&](ResolvedEnvironmentView &candidate,
+          std::uint64_t source_generation = 0u) {
+        std::uint64_t candidate_generation = candidate.generation;
+        candidate_generation = mixResolvedGeneration(
+            candidate_generation,
+            static_cast<std::uint64_t>(candidate.kind));
+        const auto mix_float = [&](float value) {
+          candidate_generation = mixResolvedGeneration(
+              candidate_generation,
+              static_cast<std::uint64_t>(
+                  std::bit_cast<std::uint32_t>(value)));
+        };
+        for (const float value : candidate.constant_radiance) {
+          mix_float(value);
+        }
+        mix_float(candidate.analytic_strength);
+        mix_float(candidate.lighting_strength);
+        mix_float(candidate.background_multiplier);
+        mix_float(candidate.rotation_radians);
+        mix_float(candidate.power_estimate);
+        candidate_generation = mixResolvedGeneration(
+            candidate_generation,
+            static_cast<std::uint64_t>(candidate.lighting_enabled));
+        candidate_generation = mixResolvedGeneration(
+            candidate_generation,
+            static_cast<std::uint64_t>(candidate.background_visible));
+        candidate_generation = mixResolvedGeneration(
+            candidate_generation,
+            static_cast<std::uint64_t>(candidate.sampling_ready));
+        candidate_generation =
+            mixResolvedGeneration(candidate_generation, source_generation);
+        candidate.generation = candidate_generation;
+      };
+
+  if (resolved.sky_rendering == SkyRendering::UserHdri &&
+      resolved.hdr != nullptr && resolved.hdr->valid()) {
+    view.kind = ResolvedEnvironmentKind::UserHdri;
+    view.radiance = &resolved.hdr->radiance;
+    view.distribution = &resolved.hdr->distribution;
+    view.lighting_strength = resolved.environment_strength;
+    view.lighting_enabled = resolved.environment_lighting &&
+                            resolved.environment_strength > 0.0f;
+    view.sampling_ready = view.lighting_enabled;
+    view.power_estimate = estimateEnvironmentPower(
+        resolved.hdr->radiance, resolved.environment_strength);
+    finalize_generation(view, resolved.hdr->generation);
+    return view;
+  }
+
+  if (resolved.sky_rendering == SkyRendering::ProceduralDayNight) {
+    view.kind = ResolvedEnvironmentKind::ProceduralDayNight;
+    view.lighting_strength = resolved.environment_strength;
+    view.lighting_enabled = resolved.environment_lighting &&
+                            resolved.environment_strength > 0.0f;
+    view.gpu_cache_required = true;
+    finalize_generation(view);
+    return view;
+  }
+
+  const float analytic_strength =
+      std::isfinite(analytic_fallback_strength)
+          ? std::max(analytic_fallback_strength, 0.0f)
+          : 0.0f;
+  if (analytic_strength > 0.0f) {
+    view.kind = ResolvedEnvironmentKind::AnalyticFallback;
+    view.analytic_strength = analytic_strength;
+    view.lighting_strength = analytic_strength;
+    view.lighting_enabled = true;
+    view.background_visible = true;
+    view.sampling_ready = true;
+    const std::array<float, 3> up =
+        analyticFallbackRadiance({0.0f, 1.0f, 0.0f}, analytic_strength);
+    const std::array<float, 3> horizon =
+        analyticFallbackRadiance({1.0f, 0.0f, 0.0f}, analytic_strength);
+    const std::array<float, 3> down =
+        analyticFallbackRadiance({0.0f, -1.0f, 0.0f}, analytic_strength);
+    const std::array<float, 3> mean{
+        (up[0] + horizon[0] + down[0]) / 3.0f,
+        (up[1] + horizon[1] + down[1]) / 3.0f,
+        (up[2] + horizon[2] + down[2]) / 3.0f};
+    view.power_estimate =
+        std::max(rgbLuminance(mean) * static_cast<float>(4.0 * kPi), 0.0f);
+    finalize_generation(view);
+    return view;
+  }
+
+  view.kind = ResolvedEnvironmentKind::Constant;
+  bool finite_positive = false;
+  for (std::size_t channel = 0; channel < view.constant_radiance.size();
+       ++channel) {
+    const float value = constant_fallback[channel];
+    view.constant_radiance[channel] =
+        std::isfinite(value) ? std::max(value, 0.0f) : 0.0f;
+    finite_positive = finite_positive || view.constant_radiance[channel] > 0.0f;
+  }
+  view.lighting_strength = finite_positive ? 1.0f : 0.0f;
+  view.lighting_enabled = finite_positive;
+  view.sampling_ready = finite_positive;
+  view.power_estimate =
+      finite_positive
+          ? rgbLuminance(view.constant_radiance) * static_cast<float>(4.0 * kPi)
+          : 0.0f;
+  finalize_generation(view);
+  return view;
+}
+
+ResolvedEnvironmentView attachEnvironmentSamplingData(
+    ResolvedEnvironmentView view, const FloatEnvironmentImage &radiance,
+    const EnvironmentDistribution &distribution,
+    std::uint64_t cache_generation) noexcept {
+  if (!radiance.valid() || !distribution.valid() ||
+      radiance.width != distribution.width() ||
+      radiance.height != distribution.height()) {
+    return view;
+  }
+  view.radiance = &radiance;
+  view.distribution = &distribution;
+  view.sampling_ready = view.lighting_enabled;
+  view.gpu_cache_required = false;
+  view.power_estimate =
+      estimateEnvironmentPower(radiance, view.lighting_strength);
+  view.generation = mixResolvedGeneration(view.generation, cache_generation);
+  return view;
+}
+
+std::array<float, 3> evaluateEnvironment(
+    const ResolvedEnvironmentView &environment,
+    const std::array<float, 3> &direction) noexcept {
+  if (!environment.lighting_enabled) {
+    return {0.0f, 0.0f, 0.0f};
+  }
+  if (environment.sampling_ready && environment.radiance != nullptr &&
+      environment.distribution != nullptr && environment.radiance->valid() &&
+      environment.distribution->valid()) {
+    const std::array<float, 3> unit = normalizedDirection(direction);
+    double phi = std::atan2(static_cast<double>(unit[0]),
+                            static_cast<double>(unit[2])) -
+                 static_cast<double>(environment.rotation_radians);
+    phi = wrapRadians(phi);
+    const double v = std::acos(std::clamp(static_cast<double>(unit[1]),
+                                         -1.0, 1.0)) /
+                     kPi;
+    const std::uint32_t x = std::min(
+        static_cast<std::uint32_t>(
+            phi / kTwoPi * static_cast<double>(environment.radiance->width)),
+        environment.radiance->width - 1u);
+    const std::uint32_t y = std::min(
+        static_cast<std::uint32_t>(
+            v * static_cast<double>(environment.radiance->height)),
+        environment.radiance->height - 1u);
+    const std::size_t base =
+        (static_cast<std::size_t>(y) * environment.radiance->width + x) * 4u;
+    std::array<float, 3> result{};
+    for (std::size_t channel = 0; channel < result.size(); ++channel) {
+      const float value = environment.radiance->rgba[base + channel];
+      result[channel] =
+          std::isfinite(value)
+              ? std::max(value, 0.0f) * environment.lighting_strength
+              : 0.0f;
+    }
+    return result;
+  }
+  if (environment.kind == ResolvedEnvironmentKind::Constant) {
+    return environment.constant_radiance;
+  }
+  if (environment.kind == ResolvedEnvironmentKind::AnalyticFallback) {
+    return analyticFallbackRadiance(direction, environment.analytic_strength);
+  }
+  return {0.0f, 0.0f, 0.0f};
+}
+
+float environmentPdf(const ResolvedEnvironmentView &environment,
+                     const std::array<float, 3> &direction) noexcept {
+  if (!environment.lighting_enabled) {
+    return 0.0f;
+  }
+  if (environment.sampling_ready && environment.distribution != nullptr &&
+      environment.distribution->valid()) {
+    const std::array<float, 3> unit = normalizedDirection(direction);
+    const std::array<double, 3> double_direction{
+        unit[0], unit[1], unit[2]};
+    const double pdf = environment.distribution->solidAnglePdf(
+        double_direction, environment.rotation_radians);
+    return std::isfinite(pdf) && pdf > 0.0 ? static_cast<float>(pdf) : 0.0f;
+  }
+  return (environment.kind == ResolvedEnvironmentKind::Constant ||
+          environment.kind == ResolvedEnvironmentKind::AnalyticFallback) &&
+                 environment.sampling_ready
+             ? static_cast<float>(1.0 / (4.0 * kPi))
+             : 0.0f;
+}
+
+EnvironmentSample sampleEnvironment(
+    const ResolvedEnvironmentView &environment, float column_sample,
+    float coin_sample, float jitter_u, float jitter_v) noexcept {
+  EnvironmentSample sample;
+  if (!environment.lighting_enabled || !environment.sampling_ready) {
+    return sample;
+  }
+  if (environment.distribution != nullptr &&
+      environment.distribution->valid()) {
+    const EnvironmentDirectionSample direction = environment.distribution->sample(
+        column_sample, coin_sample, jitter_u, jitter_v,
+        environment.rotation_radians);
+    if (!direction.valid) {
+      return sample;
+    }
+    sample.direction = {static_cast<float>(direction.direction[0]),
+                        static_cast<float>(direction.direction[1]),
+                        static_cast<float>(direction.direction[2])};
+  } else if (environment.kind == ResolvedEnvironmentKind::Constant ||
+             environment.kind ==
+                 ResolvedEnvironmentKind::AnalyticFallback) {
+    const float u = std::isfinite(column_sample)
+                        ? std::clamp(column_sample, 0.0f,
+                                     std::nextafter(1.0f, 0.0f))
+                        : 0.0f;
+    const float v = std::isfinite(coin_sample)
+                        ? std::clamp(coin_sample, 0.0f,
+                                     std::nextafter(1.0f, 0.0f))
+                        : 0.0f;
+    const float y = 1.0f - 2.0f * u;
+    const float radius = std::sqrt(std::max(1.0f - y * y, 0.0f));
+    const float angle = static_cast<float>(kTwoPi) * v;
+    sample.direction = {radius * std::cos(angle), y,
+                        radius * std::sin(angle)};
+  } else {
+    return sample;
+  }
+  sample.radiance = evaluateEnvironment(environment, sample.direction);
+  sample.pdf = environmentPdf(environment, sample.direction);
+  sample.valid = sample.pdf > 0.0f &&
+                 std::isfinite(sample.radiance[0]) &&
+                 std::isfinite(sample.radiance[1]) &&
+                 std::isfinite(sample.radiance[2]);
+  return sample;
+}
+
+std::uint64_t environmentGeneration(
+    const ResolvedEnvironmentView &environment) noexcept {
+  return environment.generation;
 }
 
 bool EmissivePatchDistribution::build(

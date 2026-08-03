@@ -1,4 +1,12 @@
     bool fg_inputs_recorded = false;
+    auto propagate_fg_input_clear_failure = [&]() {
+      const FrameGenerationDiagnostic diagnostic =
+          streamline_vulkan_runtime_.frameGenerationDiagnostic();
+      fg_force_native_recovery_ = true;
+      fg_recovery_reason_ = diagnostic.status;
+      swapchain_recreate_target_ = SwapchainOwnership::Native;
+      recreate_swapchain_ = true;
+    };
     if (fg_frame_candidate) {
       auto image_barrier =
           [&](VkImage image, VkImageLayout old_layout,
@@ -164,24 +172,34 @@
           streamline_vulkan_runtime_.recordFrameGenerationInputs(
               fg_frame);
       if (!fg_inputs_recorded) {
-        streamline_vulkan_runtime_.clearFrameGenerationInputs(
-            fs.cmd, fg_frame.frame_index, fg_frame.output_width,
-            fg_frame.output_height, fg_frame.viewport_x,
-            fg_frame.viewport_y, fg_frame.viewport_width,
-            fg_frame.viewport_height);
+        const bool inputs_cleared =
+            streamline_vulkan_runtime_.clearFrameGenerationInputs(
+                fs.cmd, fg_frame.frame_index, fg_frame.output_width,
+                fg_frame.output_height, fg_frame.viewport_x,
+                fg_frame.viewport_y, fg_frame.viewport_width,
+                fg_frame.viewport_height);
+        if (!inputs_cleared ||
+            streamline_vulkan_runtime_.frameGenerationRecoveryRequired()) {
+          propagate_fg_input_clear_failure();
+        }
       }
     } else if (streamline_vulkan_runtime_.swapchainOwnership() ==
                SwapchainOwnership::StreamlineFrameGenerationProxy) {
       // NVIDIA's checklist requires explicit null tags whenever loading,
       // raster fallback, or a collapsed preview makes depth/motion invalid.
-      streamline_vulkan_runtime_.clearFrameGenerationInputs(
-          fs.cmd, static_cast<std::uint32_t>(
-                      frame.diagnostics.render_frame),
-          swap_extent_.width, swap_extent_.height,
-          static_cast<std::uint32_t>(safe_viewport.x),
-          static_cast<std::uint32_t>(safe_viewport.y),
-          static_cast<std::uint32_t>(safe_viewport.w),
-          static_cast<std::uint32_t>(safe_viewport.h));
+      const bool inputs_cleared =
+          streamline_vulkan_runtime_.clearFrameGenerationInputs(
+              fs.cmd, static_cast<std::uint32_t>(
+                          frame.diagnostics.render_frame),
+              swap_extent_.width, swap_extent_.height,
+              static_cast<std::uint32_t>(safe_viewport.x),
+              static_cast<std::uint32_t>(safe_viewport.y),
+              static_cast<std::uint32_t>(safe_viewport.w),
+              static_cast<std::uint32_t>(safe_viewport.h));
+      if (!inputs_cleared ||
+          streamline_vulkan_runtime_.frameGenerationRecoveryRequired()) {
+        propagate_fg_input_clear_failure();
+      }
     }
     stats_.draw_calls = draws;
     if (diagnostics_enabled_ && diagnostic_trace_frame_) {

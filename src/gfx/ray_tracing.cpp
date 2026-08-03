@@ -1,7 +1,9 @@
 #include "xpbd/gfx/ray_tracing.hpp"
+#include "xpbd/gfx/world_environment.hpp"
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cctype>
 #include <cmath>
 #include <limits>
@@ -121,9 +123,9 @@ normalizeBsdfMaterial(RtBsdfMaterial material) noexcept {
                     ? std::clamp(component, 0.0f, 0.99f)
                     : 0.04f;
   }
-  material.roughness =
-      std::isfinite(material.roughness)
-          ? std::clamp(material.roughness, 0.02f, 1.0f)
+  material.ggx_alpha =
+      std::isfinite(material.ggx_alpha)
+          ? std::clamp(material.ggx_alpha, 0.0f, 1.0f)
           : 0.25f;
   material.transmission =
       !material.metal && std::isfinite(material.transmission)
@@ -137,6 +139,273 @@ normalizeBsdfMaterial(RtBsdfMaterial material) noexcept {
 }
 
 } // namespace
+
+RtLightRegistry buildRtLightRegistry(
+    const ResolvedEnvironmentView &environment,
+    bool environment_sampling_available, const ResolvedSunLight &sun,
+    std::uint64_t emissive_generation, float emissive_power_estimate,
+    bool emissive_enabled) noexcept {
+  RtLightRegistry registry;
+  registry.families[0].stable_id = kRtEnvironmentLightId;
+  registry.families[0].type = RtLightType::Environment;
+  registry.families[0].generation = environmentGeneration(environment);
+  registry.families[0].power_estimate =
+      std::isfinite(environment.power_estimate)
+          ? std::max(environment.power_estimate, 0.0f)
+          : 0.0f;
+  registry.families[0].enabled =
+      environment.lighting_enabled && environment_sampling_available;
+  registry.families[0].casts_shadow = true;
+
+  registry.families[1].stable_id = kRtSunDiskLightId;
+  registry.families[1].type = RtLightType::SunDisk;
+  registry.families[1].generation = sun.generation;
+  registry.families[1].power_estimate =
+      std::isfinite(sun.power_estimate) ? std::max(sun.power_estimate, 0.0f)
+                                        : 0.0f;
+  registry.families[1].enabled =
+      sun.lighting_enabled && registry.families[1].power_estimate > 0.0f;
+  registry.families[1].casts_shadow = sun.casts_shadow;
+
+  registry.families[2].stable_id = kRtEmissiveFamilyLightId;
+  registry.families[2].type = RtLightType::EmissiveTriangle;
+  registry.families[2].generation = emissive_generation;
+  registry.families[2].power_estimate =
+      std::isfinite(emissive_power_estimate)
+          ? std::max(emissive_power_estimate, 0.0f)
+          : 0.0f;
+  registry.families[2].enabled =
+      emissive_enabled && registry.families[2].power_estimate > 0.0f;
+  registry.families[2].casts_shadow = true;
+  // Existing material emission is evaluated from both triangle sides. The
+  // per-emitter GPU flag makes this explicit and leaves one-sided ABI room.
+  registry.families[2].two_sided = true;
+
+  constexpr float kMinimumEnabledWeight = 1.0e-6f;
+  double total_weight = 0.0;
+  for (RtLightRecord &record : registry.families) {
+    if (!record.enabled) {
+      continue;
+    }
+    record.sampling_weight =
+        std::max(record.power_estimate, kMinimumEnabledWeight);
+    total_weight += record.sampling_weight;
+    ++registry.enabled_family_count;
+  }
+  registry.total_sampling_weight = std::isfinite(total_weight)
+                                       ? static_cast<float>(std::min(
+                                             total_weight,
+                                             static_cast<double>(
+                                                 (std::numeric_limits<float>::max)())))
+                                       : 0.0f;
+  if (total_weight > 0.0 && std::isfinite(total_weight)) {
+    for (RtLightRecord &record : registry.families) {
+      record.selection_probability =
+          record.enabled
+              ? static_cast<float>(
+                    static_cast<double>(record.sampling_weight) / total_weight)
+              : 0.0f;
+    }
+  }
+
+  auto mix_generation = [](std::uint64_t hash, std::uint64_t value) {
+    constexpr std::uint64_t kPrime = 1099511628211ull;
+    for (std::uint32_t byte = 0; byte < 8u; ++byte) {
+      hash ^= (value >> (byte * 8u)) & 0xffu;
+      hash *= kPrime;
+    }
+    return hash;
+  };
+  registry.generation = 14695981039346656037ull;
+  for (const RtLightRecord &record : registry.families) {
+    registry.generation =
+        mix_generation(registry.generation, record.stable_id.value);
+    registry.generation =
+        mix_generation(registry.generation, record.generation);
+    registry.generation = mix_generation(
+        registry.generation,
+        static_cast<std::uint64_t>(
+            std::bit_cast<std::uint32_t>(record.power_estimate)));
+    registry.generation = mix_generation(
+        registry.generation,
+        static_cast<std::uint64_t>(
+            std::bit_cast<std::uint32_t>(record.selection_probability)));
+    registry.generation = mix_generation(
+        registry.generation, static_cast<std::uint64_t>(record.enabled));
+    registry.generation = mix_generation(
+        registry.generation, static_cast<std::uint64_t>(record.casts_shadow));
+    registry.generation = mix_generation(
+        registry.generation, static_cast<std::uint64_t>(record.two_sided));
+  }
+  return registry;
+}
+
+const RtLightRecord *findRtLight(const RtLightRegistry &registry,
+                                RtLightType type) noexcept {
+  for (const RtLightRecord &record : registry.families) {
+    if (record.type == type) {
+      return &record;
+    }
+  }
+  return nullptr;
+}
+
+RtLightSelection sampleRtLight(const RtLightRegistry &registry,
+                               float family_sample) noexcept {
+  RtLightSelection selection;
+  if (!(registry.total_sampling_weight > 0.0f)) {
+    return selection;
+  }
+  const float sample =
+      std::isfinite(family_sample)
+          ? std::clamp(family_sample, 0.0f, std::nextafter(1.0f, 0.0f))
+          : 0.0f;
+  float cumulative = 0.0f;
+  const RtLightRecord *last_enabled = nullptr;
+  for (const RtLightRecord &record : registry.families) {
+    if (!record.enabled || !(record.selection_probability > 0.0f)) {
+      continue;
+    }
+    last_enabled = &record;
+    cumulative += record.selection_probability;
+    if (sample < cumulative) {
+      selection.stable_id = record.stable_id;
+      selection.type = record.type;
+      selection.selection_probability = record.selection_probability;
+      selection.valid = true;
+      return selection;
+    }
+  }
+  if (last_enabled != nullptr) {
+    selection.stable_id = last_enabled->stable_id;
+    selection.type = last_enabled->type;
+    selection.selection_probability = last_enabled->selection_probability;
+    selection.valid = true;
+  }
+  return selection;
+}
+
+float lightPdf(const RtLightRegistry &registry, RtLightType type) noexcept {
+  const RtLightRecord *record = findRtLight(registry, type);
+  return record != nullptr && record->enabled
+             ? record->selection_probability
+             : 0.0f;
+}
+
+float powerEstimate(const RtLightRecord &light) noexcept {
+  return std::isfinite(light.power_estimate)
+             ? std::max(light.power_estimate, 0.0f)
+             : 0.0f;
+}
+
+bool isDeltaLight(const RtLightRecord &light) noexcept { return light.delta; }
+
+bool castsShadow(const RtLightRecord &light) noexcept {
+  return light.casts_shadow;
+}
+
+bool isTwoSided(const RtLightRecord &light) noexcept {
+  return light.two_sided;
+}
+
+RtStableLightId makeRtEmissiveTriangleStableId(
+    const std::array<std::uint32_t, 4> &source_identity,
+    std::uint32_t source_instance) noexcept {
+  std::uint64_t hash = 14695981039346656037ull;
+  constexpr std::uint64_t kPrime = 1099511628211ull;
+  const auto mix_word = [&](std::uint32_t word) {
+    for (std::uint32_t byte = 0; byte < 4u; ++byte) {
+      hash ^= (word >> (byte * 8u)) & 0xffu;
+      hash *= kPrime;
+    }
+  };
+  mix_word(0x454d4954u);
+  mix_word(source_instance);
+  for (const std::uint32_t word : source_identity) {
+    mix_word(word);
+  }
+  if (hash == 0u || hash == kRtEnvironmentLightId.value ||
+      hash == kRtSunDiskLightId.value ||
+      hash == kRtEmissiveFamilyLightId.value) {
+    hash ^= 0x9e3779b97f4a7c15ull;
+  }
+  return {hash};
+}
+
+std::array<float, 3> evaluateRtSunDisk(
+    const ResolvedSunLight &sun,
+    const std::array<float, 3> &direction) noexcept {
+  if (!sun.lighting_enabled || !(sun.angular_radius > 0.0f) ||
+      !(sun.solid_angle > 0.0f)) {
+    return {0.0f, 0.0f, 0.0f};
+  }
+  const Vec3 axis = normalize3(sun.direction, {0.0f, 1.0f, 0.0f});
+  const Vec3 sample_direction =
+      normalize3(direction, {0.0f, 1.0f, 0.0f});
+  const float cosine = dot3(axis, sample_direction);
+  const float edge_cosine = std::cos(sun.angular_radius);
+  if (cosine < edge_cosine) {
+    return {0.0f, 0.0f, 0.0f};
+  }
+  const float angular_distance =
+      std::acos(std::clamp(cosine, -1.0f, 1.0f));
+  const float radial = angular_distance / sun.angular_radius;
+  const float transition = std::clamp((radial - 0.94f) / 0.06f, 0.0f, 1.0f);
+  const float disk = 1.0f - transition * transition * (3.0f - 2.0f * transition);
+  return {sun.radiance[0] * disk, sun.radiance[1] * disk,
+          sun.radiance[2] * disk};
+}
+
+float rtSunDiskPdf(const ResolvedSunLight &sun,
+                   const std::array<float, 3> &direction) noexcept {
+  if (!sun.lighting_enabled || !(sun.solid_angle > 0.0f)) {
+    return 0.0f;
+  }
+  const Vec3 axis = normalize3(sun.direction, {0.0f, 1.0f, 0.0f});
+  const Vec3 sample_direction =
+      normalize3(direction, {0.0f, 1.0f, 0.0f});
+  return dot3(axis, sample_direction) >= std::cos(sun.angular_radius)
+             ? 1.0f / sun.solid_angle
+             : 0.0f;
+}
+
+RtSunDiskSample sampleRtSunDisk(const ResolvedSunLight &sun, float sample_u,
+                                float sample_v) noexcept {
+  RtSunDiskSample sample;
+  if (!sun.lighting_enabled || !(sun.solid_angle > 0.0f)) {
+    return sample;
+  }
+  const float u = std::isfinite(sample_u)
+                      ? std::clamp(sample_u, 0.0f,
+                                   std::nextafter(1.0f, 0.0f))
+                      : 0.0f;
+  const float v = std::isfinite(sample_v)
+                      ? std::clamp(sample_v, 0.0f,
+                                   std::nextafter(1.0f, 0.0f))
+                      : 0.0f;
+  const Vec3 axis = normalize3(sun.direction, {0.0f, 1.0f, 0.0f});
+  const Vec3 helper = std::abs(axis[1]) < 0.999f
+                          ? Vec3{0.0f, 1.0f, 0.0f}
+                          : Vec3{1.0f, 0.0f, 0.0f};
+  const Vec3 tangent = normalize3(cross3(helper, axis),
+                                  {1.0f, 0.0f, 0.0f});
+  const Vec3 bitangent = normalize3(cross3(axis, tangent),
+                                    {0.0f, 0.0f, 1.0f});
+  const float cosine_theta =
+      1.0f - u * (1.0f - std::cos(sun.angular_radius));
+  const float sine_theta =
+      std::sqrt(std::max(1.0f - cosine_theta * cosine_theta, 0.0f));
+  const float phi = 6.28318530717958647692f * v;
+  sample.direction = normalize3(
+      add3(multiply3(axis, cosine_theta),
+           add3(multiply3(tangent, sine_theta * std::cos(phi)),
+                multiply3(bitangent, sine_theta * std::sin(phi)))),
+      axis);
+  sample.radiance = evaluateRtSunDisk(sun, sample.direction);
+  sample.pdf = rtSunDiskPdf(sun, sample.direction);
+  sample.valid = sample.pdf > 0.0f && max3(sample.radiance) > 0.0f;
+  return sample;
+}
 
 PathTraceSettings
 normalizePathTraceSettings(PathTraceSettings settings) noexcept {
@@ -570,6 +839,201 @@ float pathTraceRandom01(
          (1.0f / 16'777'216.0f);
 }
 
+PathTraceRngState makePathTraceRngState(
+    std::uint32_t pixel_x, std::uint32_t pixel_y,
+    std::uint32_t sample_index, std::uint32_t bounce,
+    PathTraceRngDomain domain, std::uint32_t stream,
+    std::uint32_t seed) noexcept {
+  std::uint32_t domain_key =
+      hashPathTraceWord(static_cast<std::uint32_t>(domain));
+  domain_key =
+      hashPathTraceWord(domain_key ^ (bounce + 0x68bc21ebu));
+  domain_key =
+      hashPathTraceWord(domain_key ^ (stream + 0x02e5be93u));
+  return {pathTraceRandomBits(pixel_x, pixel_y, sample_index, domain_key,
+                              seed),
+          0u};
+}
+
+std::uint32_t
+pathTraceNextRandomBits(PathTraceRngState &rng) noexcept {
+  rng.state = hashPathTraceWord(
+      rng.state ^ (rng.dimension + 0x9e3779b9u));
+  ++rng.dimension;
+  return rng.state;
+}
+
+float pathTraceNextRandom01(PathTraceRngState &rng) noexcept {
+  return static_cast<float>(pathTraceNextRandomBits(rng) >> 8u) *
+         (1.0f / 16'777'216.0f);
+}
+
+std::array<float, 3> pathTraceTriangleGeometricNormal(
+    const std::array<float, 3> &position0,
+    const std::array<float, 3> &position1,
+    const std::array<float, 3> &position2,
+    const std::array<float, 3> &fallback) noexcept {
+  const Vec3 edge1{position1[0] - position0[0],
+                   position1[1] - position0[1],
+                   position1[2] - position0[2]};
+  const Vec3 edge2{position2[0] - position0[0],
+                   position2[1] - position0[1],
+                   position2[2] - position0[2]};
+  return normalize3(cross3(edge1, edge2),
+                    normalize3(fallback, {0.0f, 1.0f, 0.0f}));
+}
+
+std::array<float, 3> offsetPathTraceRayOrigin(
+    const std::array<float, 3> &position,
+    const std::array<float, 3> &geometric_normal,
+    const std::array<float, 3> &outgoing_direction) noexcept {
+  if (!finite3(position) || !finite3(geometric_normal) ||
+      !finite3(outgoing_direction)) {
+    return position;
+  }
+  Vec3 oriented =
+      normalize3(geometric_normal, {0.0f, 1.0f, 0.0f});
+  if (dot3(oriented, outgoing_direction) < 0.0f) {
+    oriented = multiply3(oriented, -1.0f);
+  }
+
+  constexpr float kNearOrigin = 1.0f / 32.0f;
+  constexpr float kNearScale = 1.0f / 65'536.0f;
+  constexpr float kUlpScale = 256.0f;
+  Vec3 candidate = position;
+  for (std::size_t component = 0u; component < candidate.size();
+       ++component) {
+    if (std::abs(position[component]) < kNearOrigin) {
+      candidate[component] =
+          position[component] + kNearScale * oriented[component];
+      continue;
+    }
+    const std::int32_t ulps =
+        static_cast<std::int32_t>(kUlpScale * oriented[component]);
+    const std::uint32_t bits =
+        std::bit_cast<std::uint32_t>(position[component]);
+    const std::int64_t adjusted =
+        static_cast<std::int64_t>(bits) +
+        (position[component] < 0.0f ? -static_cast<std::int64_t>(ulps)
+                                    : static_cast<std::int64_t>(ulps));
+    if (adjusted >= 0 &&
+        adjusted <=
+            static_cast<std::int64_t>(
+                (std::numeric_limits<std::uint32_t>::max)())) {
+      candidate[component] =
+          std::bit_cast<float>(static_cast<std::uint32_t>(adjusted));
+    }
+  }
+  const Vec3 movement{candidate[0] - position[0],
+                      candidate[1] - position[1],
+                      candidate[2] - position[2]};
+  if (finite3(candidate) && dot3(movement, oriented) > 0.0f) {
+    return candidate;
+  }
+
+  const float scene_scale =
+      std::max(1.0f, std::max(std::abs(position[0]),
+                             std::max(std::abs(position[1]),
+                                      std::abs(position[2]))));
+  const float fallback_distance =
+      std::max(kNearScale,
+               scene_scale * std::numeric_limits<float>::epsilon() * 4.0f);
+  const Vec3 fallback_candidate =
+      add3(position, multiply3(oriented, fallback_distance));
+  return finite3(fallback_candidate) ? fallback_candidate : position;
+}
+
+PathTraceRayCone initializePathTraceRayCone(
+    std::uint32_t render_width, std::uint32_t render_height,
+    float vertical_fov_radians) noexcept {
+  if (render_width == 0u || render_height == 0u ||
+      !std::isfinite(vertical_fov_radians) ||
+      !(vertical_fov_radians > 0.0f) ||
+      !(vertical_fov_radians < 3.14159265358979323846f)) {
+    return {};
+  }
+  const float projected_pixel_height =
+      2.0f * std::tan(vertical_fov_radians * 0.5f) /
+      static_cast<float>(render_height);
+  const float aspect = static_cast<float>(render_width) /
+                       static_cast<float>(render_height);
+  const float horizontal_fov =
+      2.0f * std::atan(std::tan(vertical_fov_radians * 0.5f) * aspect);
+  const float projected_pixel_width =
+      2.0f * std::tan(horizontal_fov * 0.5f) /
+      static_cast<float>(render_width);
+  const float spread =
+      std::atan(std::max(projected_pixel_width, projected_pixel_height));
+  return {0.0f, std::isfinite(spread) ? spread : 0.0f};
+}
+
+float pathTraceRayConeWidthAtDistance(
+    const PathTraceRayCone &cone, float distance) noexcept {
+  if (!std::isfinite(cone.width) ||
+      !std::isfinite(cone.spread_angle) || !std::isfinite(distance)) {
+    return 0.0f;
+  }
+  return std::max(0.0f, cone.width) +
+         std::abs(distance) * std::max(0.0f, cone.spread_angle);
+}
+
+PathTraceRayCone propagatePathTraceRayCone(
+    const PathTraceRayCone &cone, float distance, PathTraceLobe lobe,
+    float ggx_alpha, float eta_ratio) noexcept {
+  PathTraceRayCone propagated;
+  propagated.width = pathTraceRayConeWidthAtDistance(cone, distance);
+  propagated.spread_angle =
+      std::isfinite(cone.spread_angle)
+          ? std::max(0.0f, cone.spread_angle)
+          : 0.0f;
+  const float alpha =
+      std::isfinite(ggx_alpha) ? std::clamp(ggx_alpha, 0.0f, 1.0f) : 1.0f;
+  float lobe_spread = 0.0f;
+  switch (lobe) {
+  case PathTraceLobe::Diffuse:
+    lobe_spread = 0.5f;
+    break;
+  case PathTraceLobe::Glossy:
+    lobe_spread = 0.5f * std::sqrt(alpha);
+    break;
+  case PathTraceLobe::Transmission:
+    lobe_spread =
+        0.25f * std::sqrt(alpha) +
+        0.05f * std::abs((std::isfinite(eta_ratio) ? eta_ratio : 1.0f) -
+                         1.0f);
+    break;
+  case PathTraceLobe::Transparent:
+    break;
+  }
+  propagated.spread_angle =
+      std::min(1.57079632679489661923f,
+               std::max(propagated.spread_angle, lobe_spread));
+  return propagated;
+}
+
+float pathTraceRayConeTextureLod(
+    const PathTraceRayCone &cone, float distance,
+    float triangle_world_double_area, float triangle_uv_double_area,
+    std::uint32_t texture_width, std::uint32_t texture_height) noexcept {
+  if (texture_width == 0u || texture_height == 0u ||
+      !std::isfinite(triangle_world_double_area) ||
+      !std::isfinite(triangle_uv_double_area) ||
+      !(triangle_world_double_area > 1.0e-20f) ||
+      !(triangle_uv_double_area > 0.0f)) {
+    return 0.0f;
+  }
+  const float uv_per_world =
+      std::sqrt(triangle_uv_double_area / triangle_world_double_area);
+  const float footprint =
+      pathTraceRayConeWidthAtDistance(cone, distance) * uv_per_world;
+  const float texels =
+      footprint * static_cast<float>(std::max(texture_width, texture_height));
+  if (!std::isfinite(texels) || !(texels > 1.0f)) {
+    return 0.0f;
+  }
+  return std::max(0.0f, std::log2(texels));
+}
+
 std::array<float, 2>
 pathTraceTemporalJitter(std::uint32_t frame_index,
                         std::uint32_t render_width,
@@ -754,6 +1218,49 @@ PathTraceRussianRouletteStep evaluatePathTraceRussianRoulette(
   return result;
 }
 
+RtSurfaceOptics normalizeRtSurfaceOptics(RtSurfaceOptics optics) noexcept {
+  optics.transmission =
+      std::isfinite(optics.transmission)
+          ? std::clamp(optics.transmission, 0.0f, 1.0f)
+          : 0.0f;
+  optics.ior = std::isfinite(optics.ior)
+                   ? std::clamp(optics.ior, 1.0001f, 99.0f)
+                   : 1.5f;
+  for (float &component : optics.attenuation_color) {
+    component = std::isfinite(component)
+                    ? std::clamp(component, 1.0e-6f, 1.0f)
+                    : 1.0f;
+  }
+  optics.attenuation_distance =
+      std::isfinite(optics.attenuation_distance) &&
+              optics.attenuation_distance > 0.0f
+          ? optics.attenuation_distance
+          : 0.0f;
+  return optics;
+}
+
+std::array<float, 3> rtBeerLambertTransmittance(
+    const RtSurfaceOptics &input, float traveled_distance) noexcept {
+  const RtSurfaceOptics optics = normalizeRtSurfaceOptics(input);
+  std::array<float, 3> result{1.0f, 1.0f, 1.0f};
+  if (optics.thin_walled || !(optics.attenuation_distance > 0.0f) ||
+      !std::isfinite(traveled_distance) || !(traveled_distance > 0.0f)) {
+    return result;
+  }
+  const double normalized_distance =
+      static_cast<double>(traveled_distance) /
+      static_cast<double>(optics.attenuation_distance);
+  for (std::size_t channel = 0u; channel < result.size(); ++channel) {
+    const double value = std::pow(
+        static_cast<double>(optics.attenuation_color[channel]),
+        normalized_distance);
+    result[channel] = std::isfinite(value)
+                          ? static_cast<float>(std::clamp(value, 0.0, 1.0))
+                          : 0.0f;
+  }
+  return result;
+}
+
 float rtDielectricF0FromIor(float ior) noexcept {
   if (!std::isfinite(ior)) {
     return 0.04f;
@@ -821,8 +1328,16 @@ rtFresnelSchlick(const std::array<float, 3> &f0,
   return result;
 }
 
-float rtGgxDistribution(float normal_dot_half, float roughness) noexcept {
-  if (!std::isfinite(normal_dot_half) || !std::isfinite(roughness)) {
+float rtRrRoughnessFromGgxAlpha(float ggx_alpha) noexcept {
+  if (!std::isfinite(ggx_alpha)) {
+    return 1.0f;
+  }
+  return std::sqrt(std::clamp(ggx_alpha, 0.0f, 1.0f));
+}
+
+float rtGgxDistribution(float normal_dot_half, float ggx_alpha) noexcept {
+  if (!std::isfinite(normal_dot_half) || !std::isfinite(ggx_alpha) ||
+      ggx_alpha <= kDeltaMirrorAlpha) {
     return 0.0f;
   }
   const double n_dot_h =
@@ -830,8 +1345,9 @@ float rtGgxDistribution(float normal_dot_half, float roughness) noexcept {
   if (!(n_dot_h > 0.0)) {
     return 0.0f;
   }
-  const double alpha =
-      std::clamp(static_cast<double>(roughness), 0.02, 1.0);
+  const double alpha = std::clamp(static_cast<double>(ggx_alpha),
+                                  static_cast<double>(kMinFiniteGgxAlpha),
+                                  1.0);
   const double alpha_squared = alpha * alpha;
   const double denominator =
       n_dot_h * n_dot_h * (alpha_squared - 1.0) + 1.0;
@@ -841,9 +1357,9 @@ float rtGgxDistribution(float normal_dot_half, float roughness) noexcept {
   return std::isfinite(value) ? static_cast<float>(value) : 0.0f;
 }
 
-float rtSmithGgxG1(float normal_dot_direction, float roughness) noexcept {
+float rtSmithGgxG1(float normal_dot_direction, float ggx_alpha) noexcept {
   if (!std::isfinite(normal_dot_direction) ||
-      !std::isfinite(roughness)) {
+      !std::isfinite(ggx_alpha) || ggx_alpha <= kDeltaMirrorAlpha) {
     return 0.0f;
   }
   const double cosine =
@@ -851,8 +1367,9 @@ float rtSmithGgxG1(float normal_dot_direction, float roughness) noexcept {
   if (!(cosine > 0.0)) {
     return 0.0f;
   }
-  const double alpha =
-      std::clamp(static_cast<double>(roughness), 0.02, 1.0);
+  const double alpha = std::clamp(static_cast<double>(ggx_alpha),
+                                  static_cast<double>(kMinFiniteGgxAlpha),
+                                  1.0);
   const double root =
       std::sqrt(alpha * alpha +
                 (1.0 - alpha * alpha) * cosine * cosine);
@@ -860,34 +1377,207 @@ float rtSmithGgxG1(float normal_dot_direction, float roughness) noexcept {
   return std::isfinite(value) ? static_cast<float>(value) : 0.0f;
 }
 
+float rtGgxVisibleNormalPdf(
+    const Vec3 &shading_normal, const Vec3 &view_direction,
+    const Vec3 &half_vector, float ggx_alpha) noexcept {
+  if (!std::isfinite(ggx_alpha) || ggx_alpha <= kDeltaMirrorAlpha) {
+    return 0.0f;
+  }
+  const Vec3 normal =
+      normalize3(shading_normal, {0.0f, 1.0f, 0.0f});
+  const Vec3 view = normalize3(view_direction, {});
+  const Vec3 half = normalize3(half_vector, {});
+  const float normal_dot_view = dot3(normal, view);
+  const float normal_dot_half = dot3(normal, half);
+  const float view_dot_half = dot3(view, half);
+  if (!finite3(view) || !finite3(half) || !(normal_dot_view > 0.0f) ||
+      !(normal_dot_half > 0.0f) || !(view_dot_half > 0.0f)) {
+    return 0.0f;
+  }
+  const double pdf =
+      static_cast<double>(rtGgxDistribution(normal_dot_half, ggx_alpha)) *
+      static_cast<double>(rtSmithGgxG1(normal_dot_view, ggx_alpha)) *
+      static_cast<double>(view_dot_half) /
+      static_cast<double>(normal_dot_view);
+  return std::isfinite(pdf) && pdf > 0.0
+             ? static_cast<float>(pdf)
+             : 0.0f;
+}
+
+RtGgxVisibleNormalSample sampleRtGgxVndf(
+    const Vec3 &shading_normal, const Vec3 &view_direction,
+    float ggx_alpha, float sample_u, float sample_v) noexcept {
+  RtGgxVisibleNormalSample result;
+  if (!std::isfinite(ggx_alpha) ||
+      ggx_alpha <= kDeltaMirrorAlpha || !std::isfinite(sample_u) ||
+      !std::isfinite(sample_v)) {
+    return result;
+  }
+  const Vec3 normal =
+      normalize3(shading_normal, {0.0f, 1.0f, 0.0f});
+  const Vec3 view = normalize3(view_direction, {});
+  if (!finite3(view) || !(dot3(normal, view) > 0.0f)) {
+    return result;
+  }
+  const Vec3 up = std::abs(normal[2]) < 0.999f
+                      ? Vec3{0.0f, 0.0f, 1.0f}
+                      : Vec3{0.0f, 1.0f, 0.0f};
+  const Vec3 tangent =
+      normalize3(cross3(up, normal), {1.0f, 0.0f, 0.0f});
+  const Vec3 bitangent = cross3(normal, tangent);
+  const Vec3 local_view{dot3(view, tangent), dot3(view, bitangent),
+                        dot3(view, normal)};
+  const float alpha =
+      std::clamp(ggx_alpha, kMinFiniteGgxAlpha, 1.0f);
+  const Vec3 stretched_view = normalize3(
+      {alpha * local_view[0], alpha * local_view[1], local_view[2]},
+      {0.0f, 0.0f, 1.0f});
+  const float lensq = stretched_view[0] * stretched_view[0] +
+                      stretched_view[1] * stretched_view[1];
+  const Vec3 basis_x =
+      lensq > 1.0e-20f
+          ? Vec3{-stretched_view[1] / std::sqrt(lensq),
+                 stretched_view[0] / std::sqrt(lensq), 0.0f}
+          : Vec3{1.0f, 0.0f, 0.0f};
+  const Vec3 basis_y = cross3(stretched_view, basis_x);
+  const float u = std::clamp(sample_u, 0.0f,
+                             1.0f - 1.0f / 16'777'216.0f);
+  const float v = std::clamp(sample_v, 0.0f,
+                             1.0f - 1.0f / 16'777'216.0f);
+  const float radius = std::sqrt(u);
+  const float phi = 6.28318530717958647692f * v;
+  const float disk_x = radius * std::cos(phi);
+  float disk_y = radius * std::sin(phi);
+  const float blend = 0.5f * (1.0f + stretched_view[2]);
+  disk_y = (1.0f - blend) *
+               std::sqrt(std::max(0.0f, 1.0f - disk_x * disk_x)) +
+           blend * disk_y;
+  const float disk_z = std::sqrt(
+      std::max(0.0f, 1.0f - disk_x * disk_x - disk_y * disk_y));
+  const Vec3 stretched_normal =
+      add3(add3(multiply3(basis_x, disk_x),
+                multiply3(basis_y, disk_y)),
+           multiply3(stretched_view, disk_z));
+  const Vec3 local_half = normalize3(
+      {alpha * stretched_normal[0], alpha * stretched_normal[1],
+       std::max(stretched_normal[2], 0.0f)},
+      {0.0f, 0.0f, 1.0f});
+  result.half_vector = normalize3(
+      add3(add3(multiply3(tangent, local_half[0]),
+                multiply3(bitangent, local_half[1])),
+           multiply3(normal, local_half[2])),
+      normal);
+  result.pdf = rtGgxVisibleNormalPdf(
+      normal, view, result.half_vector, ggx_alpha);
+  result.valid = result.pdf > 0.0f && finite3(result.half_vector);
+  if (!result.valid) {
+    result = {};
+  }
+  return result;
+}
+
 RtBsdfLobeProbabilities
 rtBsdfLobeProbabilities(const RtBsdfMaterial &input) noexcept {
   const RtBsdfMaterial material = normalizeBsdfMaterial(input);
-  const float f0_importance = std::clamp(max3(material.f0), 0.0f, 0.99f);
-  float diffuse_importance =
+  const float normal_fresnel =
+      material.metal
+          ? std::clamp(max3(material.f0), 0.0f, 0.99f)
+          : rtFresnelDielectric(1.0f, 1.0f, material.ior);
+  const float diffuse_importance =
       material.metal
           ? 0.0f
           : (1.0f - material.transmission) *
-                (1.0f - f0_importance) *
+                (1.0f - normal_fresnel) *
                 std::max(luminance3(material.base_color), 0.05f);
-  float glossy_importance = std::max(f0_importance, 0.02f);
-  float transmission_importance =
+  const float interface_importance =
       material.metal
-          ? 0.0f
-          : material.transmission * (1.0f - f0_importance) *
-                std::max(luminance3(material.base_color), 0.05f);
-  const float total =
-      diffuse_importance + glossy_importance + transmission_importance;
+          ? std::max(normal_fresnel, 0.02f)
+          : normal_fresnel +
+                material.transmission * (1.0f - normal_fresnel);
+  const float total = diffuse_importance + interface_importance;
   if (!std::isfinite(total) || !(total > 1.0e-8f)) {
     return {0.0f, 1.0f, 0.0f};
   }
-  return {diffuse_importance / total, glossy_importance / total,
-          transmission_importance / total};
+  const float diffuse_probability = diffuse_importance / total;
+  const float interface_probability = interface_importance / total;
+  const float reflection_weight = material.metal ? 1.0f : normal_fresnel;
+  const float transmission_weight =
+      material.metal
+          ? 0.0f
+          : material.transmission * (1.0f - normal_fresnel);
+  const float interface_total = reflection_weight + transmission_weight;
+  const float reflection_probability =
+      interface_total > 0.0f
+          ? interface_probability * reflection_weight / interface_total
+          : interface_probability;
+  return {diffuse_probability, reflection_probability,
+          std::max(0.0f,
+                   interface_probability - reflection_probability)};
 }
+
+namespace {
+
+[[nodiscard]] float thinWalledCombinedFresnel(float fresnel) noexcept {
+  const float clamped = std::clamp(fresnel, 0.0f, 1.0f);
+  return std::clamp(2.0f * clamped / (1.0f + clamped), 0.0f, 1.0f);
+}
+
+[[nodiscard]] float evaluateRtMicrofacetTransmission(
+    const RtBsdfMaterial &material, const Vec3 &normal, const Vec3 &view,
+    const Vec3 &light, const Vec3 &half, bool front_face) noexcept {
+  const float normal_dot_view = dot3(normal, view);
+  const float normal_dot_light = dot3(normal, light);
+  const float view_dot_half = dot3(view, half);
+  const float light_dot_half = dot3(light, half);
+  if (!(normal_dot_view > 0.0f) || !(normal_dot_light < 0.0f) ||
+      !(view_dot_half > 0.0f) || !(light_dot_half < 0.0f) ||
+      material.metal || material.thin_walled ||
+      !(material.transmission > 0.0f) ||
+      material.ggx_alpha <= kDeltaMirrorAlpha) {
+    return 0.0f;
+  }
+  const float eta_incident = front_face ? 1.0f : material.ior;
+  const float eta_transmitted = front_face ? material.ior : 1.0f;
+  const float eta_path = eta_transmitted / eta_incident;
+  const float denominator =
+      light_dot_half + view_dot_half / eta_path;
+  const double denominator_squared =
+      static_cast<double>(denominator) * denominator;
+  if (!(denominator_squared > 1.0e-16)) {
+    return 0.0f;
+  }
+  const float distribution =
+      rtGgxDistribution(dot3(normal, half), material.ggx_alpha);
+  const float geometry =
+      rtSmithGgxG1(normal_dot_view, material.ggx_alpha) *
+      rtSmithGgxG1(-normal_dot_light, material.ggx_alpha);
+  const float fresnel = rtFresnelDielectric(
+      view_dot_half, eta_incident, eta_transmitted);
+  const double geometric_denominator =
+      denominator_squared * static_cast<double>(normal_dot_view) *
+      static_cast<double>(normal_dot_light);
+  if (geometric_denominator == 0.0) {
+    return 0.0f;
+  }
+  const double eta_scale =
+      1.0 / (static_cast<double>(eta_path) * eta_path);
+  const double value =
+      static_cast<double>(material.transmission) * (1.0 - fresnel) *
+      distribution * geometry *
+      std::abs(static_cast<double>(light_dot_half) * view_dot_half /
+               geometric_denominator) *
+      eta_scale;
+  return std::isfinite(value) && value >= 0.0
+             ? static_cast<float>(value)
+             : 0.0f;
+}
+
+} // namespace
 
 RtBsdfEval evaluateRtBsdf(
     const RtBsdfMaterial &input, const Vec3 &shading_normal,
-    const Vec3 &view_direction, const Vec3 &light_direction) noexcept {
+    const Vec3 &view_direction, const Vec3 &light_direction,
+    bool front_face) noexcept {
   RtBsdfEval result;
   const RtBsdfMaterial material = normalizeBsdfMaterial(input);
   const Vec3 normal =
@@ -897,46 +1587,127 @@ RtBsdfEval evaluateRtBsdf(
   const float n_dot_v = dot3(normal, view);
   const float n_dot_l = dot3(normal, light);
   if (!finite3(view) || !finite3(light) || !(n_dot_v > 0.0f) ||
-      !(n_dot_l > 0.0f)) {
+      n_dot_l == 0.0f) {
     return result;
   }
-  const Vec3 half_vector = normalize3(add3(view, light), {});
-  const float n_dot_h = std::max(dot3(normal, half_vector), 0.0f);
-  const float v_dot_h = std::max(dot3(view, half_vector), 0.0f);
-  if (!(n_dot_h > 0.0f) || !(v_dot_h > 0.0f)) {
-    return result;
-  }
-
-  constexpr float kInversePi = 0.31830988618379067154f;
-  const Vec3 fresnel = rtFresnelSchlick(material.f0, v_dot_h);
-  const float distribution =
-      rtGgxDistribution(n_dot_h, material.roughness);
-  const float geometry =
-      rtSmithGgxG1(n_dot_v, material.roughness) *
-      rtSmithGgxG1(n_dot_l, material.roughness);
-  const float specular_scale =
-      distribution * geometry /
-      std::max(4.0f * n_dot_v * n_dot_l, 1.0e-8f);
-  const float diffuse_scale =
-      material.metal
-          ? 0.0f
-          : (1.0f - material.transmission) *
-                (1.0f - max3(fresnel)) * kInversePi;
-  for (std::size_t i = 0; i < result.value.size(); ++i) {
-    result.value[i] =
-        material.base_color[i] * diffuse_scale +
-        fresnel[i] * specular_scale;
-  }
-
+  const bool delta_mirror = material.ggx_alpha <= kDeltaMirrorAlpha;
+  // The minimal Thin-Walled model merges both interfaces into one stable
+  // straight-through/reflection atom. Keep that atom out of the continuous
+  // GGX density even when the source material carries finite roughness.
+  const bool delta_interface =
+      delta_mirror ||
+      (!material.metal && material.thin_walled &&
+       material.transmission > 0.0f);
   const RtBsdfLobeProbabilities probabilities =
       rtBsdfLobeProbabilities(material);
-  const float diffuse_pdf = n_dot_l * kInversePi;
-  const float glossy_pdf =
-      distribution * n_dot_h / std::max(4.0f * v_dot_h, 1.0e-8f);
-  result.pdf = probabilities.diffuse * diffuse_pdf +
-               probabilities.glossy * glossy_pdf;
+  const float interface_probability =
+      probabilities.glossy + probabilities.transmission;
+  constexpr float kInversePi = 0.31830988618379067154f;
+  const float eta_incident = front_face ? 1.0f : material.ior;
+  const float eta_transmitted = front_face ? material.ior : 1.0f;
+
+  if (n_dot_l > 0.0f) {
+    const Vec3 half_vector = normalize3(add3(view, light), {});
+    const float n_dot_h = dot3(normal, half_vector);
+    const float v_dot_h = dot3(view, half_vector);
+    if (!(n_dot_h > 0.0f) || !(v_dot_h > 0.0f)) {
+      return result;
+    }
+    Vec3 fresnel{};
+    float scalar_fresnel = 0.0f;
+    if (material.metal) {
+      fresnel = rtFresnelSchlick(material.f0, v_dot_h);
+      scalar_fresnel = max3(fresnel);
+    } else {
+      scalar_fresnel = rtFresnelDielectric(
+          v_dot_h, eta_incident, eta_transmitted);
+      fresnel.fill(scalar_fresnel);
+    }
+    const float distribution =
+        delta_interface
+            ? 0.0f
+            : rtGgxDistribution(n_dot_h, material.ggx_alpha);
+    const float geometry =
+        delta_interface
+            ? 0.0f
+            : rtSmithGgxG1(n_dot_v, material.ggx_alpha) *
+                  rtSmithGgxG1(n_dot_l, material.ggx_alpha);
+    const float specular_scale =
+        distribution * geometry /
+        std::max(4.0f * n_dot_v * n_dot_l, 1.0e-8f);
+    const float diffuse_scale =
+        material.metal
+            ? 0.0f
+            : (1.0f - material.transmission) *
+                  (1.0f - scalar_fresnel) * kInversePi;
+    for (std::size_t channel = 0u; channel < result.value.size(); ++channel) {
+      result.value[channel] =
+          material.base_color[channel] * diffuse_scale +
+          fresnel[channel] * specular_scale;
+    }
+    const float diffuse_pdf = n_dot_l * kInversePi;
+    float reflection_pdf = 0.0f;
+    if (!delta_interface && interface_probability > 0.0f) {
+      const float reflection_weight =
+          material.metal ? 1.0f : scalar_fresnel;
+      const float transmission_weight =
+          material.metal
+              ? 0.0f
+              : material.transmission * (1.0f - scalar_fresnel);
+      const float interface_total =
+          reflection_weight + transmission_weight;
+      const float conditional_reflection =
+          interface_total > 0.0f
+              ? reflection_weight / interface_total
+              : 1.0f;
+      reflection_pdf = interface_probability * conditional_reflection *
+                       rtGgxVisibleNormalPdf(
+                           normal, view, half_vector, material.ggx_alpha) /
+                       std::max(4.0f * std::abs(v_dot_h), 1.0e-8f);
+    }
+    result.pdf = probabilities.diffuse * diffuse_pdf + reflection_pdf;
+  } else {
+    if (material.metal || material.thin_walled ||
+        !(material.transmission > 0.0f) || delta_mirror ||
+        !(interface_probability > 0.0f)) {
+      return result;
+    }
+    const float eta_path = eta_transmitted / eta_incident;
+    Vec3 half_vector = normalize3(
+        add3(multiply3(light, eta_path), view), {});
+    if (dot3(half_vector, normal) < 0.0f) {
+      half_vector = multiply3(half_vector, -1.0f);
+    }
+    const float n_dot_h = dot3(normal, half_vector);
+    const float v_dot_h = dot3(view, half_vector);
+    const float l_dot_h = dot3(light, half_vector);
+    if (!(n_dot_h > 0.0f) || !(v_dot_h > 0.0f) ||
+        !(l_dot_h < 0.0f)) {
+      return result;
+    }
+    const float fresnel = rtFresnelDielectric(
+        v_dot_h, eta_incident, eta_transmitted);
+    const float transmission_weight =
+        material.transmission * (1.0f - fresnel);
+    const float interface_total = fresnel + transmission_weight;
+    if (!(interface_total > 0.0f)) {
+      return result;
+    }
+    const float transmission_value = evaluateRtMicrofacetTransmission(
+        material, normal, view, light, half_vector, front_face);
+    result.value.fill(transmission_value);
+    const float denominator = l_dot_h + v_dot_h / eta_path;
+    const float dwm_dwi =
+        std::abs(l_dot_h) /
+        std::max(denominator * denominator, 1.0e-8f);
+    result.pdf =
+        interface_probability * transmission_weight / interface_total *
+        rtGgxVisibleNormalPdf(normal, view, half_vector,
+                              material.ggx_alpha) *
+        dwm_dwi;
+  }
   result.valid = finite3(result.value) && std::isfinite(result.pdf) &&
-                 result.pdf > 0.0f;
+                  result.pdf > 0.0f;
   if (!result.valid) {
     result = {};
   }
@@ -971,112 +1742,186 @@ RtBsdfSample sampleRtBsdf(
                  1.0f - 1.0f / 16'777'216.0f);
   const RtBsdfLobeProbabilities probabilities =
       rtBsdfLobeProbabilities(material);
-
+  const float interface_probability =
+      probabilities.glossy + probabilities.transmission;
   const float eta_incident = front_face ? 1.0f : material.ior;
   const float eta_transmitted = front_face ? material.ior : 1.0f;
   const float eta = eta_incident / eta_transmitted;
-  const float cos_i = std::clamp(n_dot_v, 0.0f, 1.0f);
-  const float sin_t_squared =
-      eta * eta * std::max(0.0f, 1.0f - cos_i * cos_i);
-  const bool total_internal_reflection =
-      probabilities.transmission > 0.0f && sin_t_squared >= 1.0f;
-  if (total_internal_reflection && lobe_u >= probabilities.diffuse) {
-    // Under TIR the glossy and transmission choices describe one physical
-    // delta reflection event. Collapse their probability mass and use F=1:
-    // neither the transmission tint nor a (1-F) term belongs on this path.
-    const float reflection_probability =
-        probabilities.glossy + probabilities.transmission;
-    if (!(reflection_probability > 0.0f)) {
-      return result;
-    }
-    result.direction =
-        normalize3(add3(multiply3(normal, 2.0f * cos_i),
-                        multiply3(view, -1.0f)),
-                   {});
-    result.weight.fill(1.0f / reflection_probability);
-    result.pdf = reflection_probability;
-    result.lobe = PathTraceLobe::Glossy;
-    result.delta = true;
-    result.total_internal_reflection = true;
-    result.valid = finite3(result.direction) && finite3(result.weight) &&
-                   std::isfinite(result.pdf);
-    if (!result.valid) {
-      result = {};
-    }
-    return result;
-  }
-
   if (lobe_u < probabilities.diffuse) {
     const PathTraceHemisphereSample sampled =
         samplePathTraceCosineHemisphere(normal, sample_u, sample_v);
     result.direction = sampled.direction;
     result.lobe = PathTraceLobe::Diffuse;
-  } else if (lobe_u <
-             probabilities.diffuse + probabilities.glossy) {
-    const float alpha = material.roughness;
-    const float alpha_squared = alpha * alpha;
-    const float phi = 6.28318530717958647692f * sample_v;
-    const float cos_theta = std::sqrt(
-        std::max(0.0f, (1.0f - sample_u) /
-                           (1.0f +
-                            (alpha_squared - 1.0f) * sample_u)));
-    const float sin_theta =
-        std::sqrt(std::max(0.0f, 1.0f - cos_theta * cos_theta));
-    const Vec3 up = std::abs(normal[2]) < 0.999f
-                        ? Vec3{0.0f, 0.0f, 1.0f}
-                        : Vec3{0.0f, 1.0f, 0.0f};
-    const Vec3 tangent =
-        normalize3(cross3(up, normal), {1.0f, 0.0f, 0.0f});
-    const Vec3 bitangent = cross3(normal, tangent);
-    const Vec3 half_vector = normalize3(
-        add3(add3(multiply3(tangent, sin_theta * std::cos(phi)),
-                  multiply3(bitangent, sin_theta * std::sin(phi))),
-             multiply3(normal, cos_theta)),
-        normal);
-    const float v_dot_h = dot3(view, half_vector);
-    if (!(v_dot_h > 0.0f)) {
+  } else {
+    if (!(interface_probability > 0.0f)) {
       return result;
     }
-    result.direction =
-        normalize3(add3(multiply3(half_vector, 2.0f * v_dot_h),
-                        multiply3(view, -1.0f)),
-                   {});
-    result.lobe = PathTraceLobe::Glossy;
-  } else {
-    result.lobe = PathTraceLobe::Transmission;
-    result.delta = true;
-    result.pdf = probabilities.transmission;
-    const float cos_t =
-        std::sqrt(std::max(0.0f, 1.0f - sin_t_squared));
-    result.direction = normalize3(
-        add3(multiply3(view, -eta),
-             multiply3(normal, eta * cos_i - cos_t)),
-        {});
-    const float fresnel = rtFresnelDielectric(
-        cos_i, eta_incident, eta_transmitted);
-    const float inverse_probability =
-        1.0f / std::max(probabilities.transmission, 1.0e-8f);
-    for (std::size_t i = 0; i < result.weight.size(); ++i) {
-      result.weight[i] =
-          material.base_color[i] * material.transmission *
-          (1.0f - fresnel) * inverse_probability;
+    const float interface_u = std::clamp(
+        (lobe_u - probabilities.diffuse) / interface_probability,
+        0.0f, 1.0f - 1.0f / 16'777'216.0f);
+    const bool thin_sheet =
+        material.thin_walled && material.transmission > 0.0f;
+    if (thin_sheet) {
+      const float single_fresnel = rtFresnelDielectric(
+          n_dot_v, eta_incident, eta_transmitted);
+      const float fresnel = thinWalledCombinedFresnel(single_fresnel);
+      const float reflection_weight = fresnel;
+      const float transmission_weight =
+          material.transmission * (1.0f - fresnel);
+      const float interface_total =
+          reflection_weight + transmission_weight;
+      if (!(interface_total > 0.0f)) {
+        return result;
+      }
+      const float conditional_reflection =
+          reflection_weight / interface_total;
+      const bool reflect_event = interface_u < conditional_reflection;
+      const float selection_probability =
+          interface_probability *
+          (reflect_event ? conditional_reflection
+                         : 1.0f - conditional_reflection);
+      if (!(selection_probability > 0.0f)) {
+        return result;
+      }
+      result.direction = reflect_event
+                             ? normalize3(
+                                   add3(multiply3(normal, 2.0f * n_dot_v),
+                                        multiply3(view, -1.0f)),
+                                   {})
+                             : multiply3(view, -1.0f);
+      result.weight.fill(
+          (reflect_event ? reflection_weight : transmission_weight) /
+          selection_probability);
+      result.pdf = selection_probability;
+      result.lobe = reflect_event ? PathTraceLobe::Glossy
+                                  : PathTraceLobe::Transmission;
+      result.delta = true;
+      result.valid = finite3(result.direction) && finite3(result.weight) &&
+                     std::isfinite(result.pdf);
+      if (!result.valid) {
+        result = {};
+      }
+      return result;
     }
-    result.valid = probabilities.transmission > 0.0f &&
-                   finite3(result.direction) && finite3(result.weight);
-    if (!result.valid) {
-      result = {};
+
+    Vec3 half_vector = normal;
+    if (material.ggx_alpha > kDeltaMirrorAlpha) {
+      const RtGgxVisibleNormalSample sampled_half = sampleRtGgxVndf(
+          normal, view, material.ggx_alpha, sample_u, sample_v);
+      if (!sampled_half.valid) {
+        return result;
+      }
+      half_vector = sampled_half.half_vector;
     }
-    return result;
+    const float view_dot_half = dot3(view, half_vector);
+    if (!(view_dot_half > 0.0f)) {
+      return result;
+    }
+    const float sin_t_squared =
+        eta * eta * std::max(0.0f, 1.0f - view_dot_half * view_dot_half);
+    const bool can_refract = sin_t_squared < 1.0f;
+    float scalar_fresnel = 1.0f;
+    Vec3 fresnel{};
+    if (material.metal) {
+      fresnel = rtFresnelSchlick(material.f0, view_dot_half);
+      scalar_fresnel = max3(fresnel);
+    } else if (can_refract) {
+      scalar_fresnel = rtFresnelDielectric(
+          view_dot_half, eta_incident, eta_transmitted);
+      fresnel.fill(scalar_fresnel);
+    } else {
+      fresnel.fill(1.0f);
+    }
+    const float reflection_weight = material.metal ? 1.0f : scalar_fresnel;
+    const float transmission_weight =
+        material.metal || !can_refract
+            ? 0.0f
+            : material.transmission * (1.0f - scalar_fresnel);
+    const float interface_total = reflection_weight + transmission_weight;
+    if (!(interface_total > 0.0f)) {
+      return result;
+    }
+    const float conditional_reflection =
+        reflection_weight / interface_total;
+    const bool reflect_event = interface_u < conditional_reflection;
+    if (material.ggx_alpha <= kDeltaMirrorAlpha) {
+      const float selection_probability =
+          interface_probability *
+          (reflect_event ? conditional_reflection
+                         : 1.0f - conditional_reflection);
+      if (!(selection_probability > 0.0f)) {
+        return result;
+      }
+      result.delta = true;
+      result.pdf = selection_probability;
+      if (reflect_event) {
+        result.direction = normalize3(
+            add3(multiply3(half_vector, 2.0f * view_dot_half),
+                 multiply3(view, -1.0f)),
+            {});
+        for (std::size_t channel = 0u; channel < result.weight.size();
+             ++channel) {
+          result.weight[channel] =
+              fresnel[channel] / selection_probability;
+        }
+        result.lobe = PathTraceLobe::Glossy;
+        result.total_internal_reflection =
+            !can_refract && material.transmission > 0.0f;
+      } else {
+        const float cosine_transmitted =
+            std::sqrt(std::max(0.0f, 1.0f - sin_t_squared));
+        result.direction = normalize3(
+            add3(multiply3(view, -eta),
+                 multiply3(half_vector,
+                           eta * view_dot_half - cosine_transmitted)),
+            {});
+        const float eta_scale = eta * eta;
+        result.weight.fill(transmission_weight * eta_scale /
+                           selection_probability);
+        result.lobe = PathTraceLobe::Transmission;
+      }
+      result.valid = finite3(result.direction) && finite3(result.weight) &&
+                     std::isfinite(result.pdf);
+      if (!result.valid) {
+        result = {};
+      }
+      return result;
+    }
+
+    if (reflect_event) {
+      result.direction = normalize3(
+          add3(multiply3(half_vector, 2.0f * view_dot_half),
+               multiply3(view, -1.0f)),
+          {});
+      if (!(dot3(normal, result.direction) > 0.0f)) {
+        return {};
+      }
+      result.lobe = PathTraceLobe::Glossy;
+      result.total_internal_reflection =
+          !can_refract && material.transmission > 0.0f;
+    } else {
+      const float cosine_transmitted =
+          std::sqrt(std::max(0.0f, 1.0f - sin_t_squared));
+      result.direction = normalize3(
+          add3(multiply3(view, -eta),
+               multiply3(half_vector,
+                         eta * view_dot_half - cosine_transmitted)),
+          {});
+      if (!(dot3(normal, result.direction) < 0.0f)) {
+        return {};
+      }
+      result.lobe = PathTraceLobe::Transmission;
+    }
   }
 
   const RtBsdfEval evaluated =
-      evaluateRtBsdf(material, normal, view, result.direction);
+      evaluateRtBsdf(material, normal, view, result.direction, front_face);
   if (!evaluated.valid) {
     return {};
   }
   result.value = evaluated.value;
   result.pdf = evaluated.pdf;
-  const float cosine = std::max(dot3(normal, result.direction), 0.0f);
+  const float cosine = std::abs(dot3(normal, result.direction));
   for (std::size_t i = 0; i < result.weight.size(); ++i) {
     result.weight[i] =
         evaluated.value[i] * cosine / evaluated.pdf;
@@ -1296,6 +2141,7 @@ bool rtDispatchBuffersInBounds(
   std::uint64_t color_required = 0;
   std::uint64_t flag_required = 0;
   std::uint64_t primitive_metadata_required = 0;
+  std::uint64_t primitive_optics_required = 0;
   std::uint64_t instance_metadata_required = 0;
   return checkedMultiply(bounds.vertex_count, 16u, normal_required) &&
          checkedMultiply(bounds.vertex_count, 16u, tangent_required) &&
@@ -1304,8 +2150,10 @@ bool rtDispatchBuffersInBounds(
          checkedMultiply(bounds.vertex_count, 8u, uv_required) &&
          checkedMultiply(bounds.vertex_count, 16u, color_required) &&
          checkedMultiply(bounds.primitive_count, 4u, flag_required) &&
-         checkedMultiply(bounds.primitive_count, 16u,
-                         primitive_metadata_required) &&
+          checkedMultiply(bounds.primitive_count, 16u,
+                          primitive_metadata_required) &&
+          checkedMultiply(bounds.primitive_count, 32u,
+                          primitive_optics_required) &&
          checkedMultiply(bounds.instance_count, 16u,
                          instance_metadata_required) &&
          bounds.normal_bytes >= normal_required &&
@@ -1313,9 +2161,10 @@ bool rtDispatchBuffersInBounds(
          bounds.index_bytes >= index_required &&
          bounds.uv_bytes >= uv_required &&
          bounds.color_bytes >= color_required &&
-         bounds.primitive_flag_bytes >= flag_required &&
-         bounds.primitive_metadata_bytes >= primitive_metadata_required &&
-         bounds.instance_metadata_bytes >= instance_metadata_required;
+          bounds.primitive_flag_bytes >= flag_required &&
+          bounds.primitive_metadata_bytes >= primitive_metadata_required &&
+          bounds.primitive_optics_bytes >= primitive_optics_required &&
+          bounds.instance_metadata_bytes >= instance_metadata_required;
 }
 
 std::optional<RtRayTriangleHit>

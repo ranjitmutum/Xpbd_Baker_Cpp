@@ -5,6 +5,7 @@
 #include "xpbd/log.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -83,6 +84,21 @@ struct alignas(16) RtInstanceMotionGpu {
 };
 static_assert(sizeof(RtInstanceMotionGpu) == 144u);
 
+[[nodiscard]] RtSurfaceOpticsGpu
+packRtSurfaceOptics(const RtSurfaceOptics &input) noexcept {
+  const RtSurfaceOptics optics = normalizeRtSurfaceOptics(input);
+  RtSurfaceOpticsGpu packed;
+  packed.parameters[0] = optics.transmission;
+  packed.parameters[1] = optics.ior;
+  packed.parameters[2] = optics.attenuation_distance;
+  const std::uint32_t thin_walled = optics.thin_walled ? 1u : 0u;
+  std::memcpy(&packed.parameters[3], &thin_walled, sizeof(thin_walled));
+  packed.attenuation_color = {optics.attenuation_color[0],
+                              optics.attenuation_color[1],
+                              optics.attenuation_color[2], 0.0f};
+  return packed;
+}
+
 } // namespace
 
 bool VulkanRtScene::init(VkPhysicalDevice phys, VkDevice device,
@@ -124,6 +140,7 @@ void VulkanRtScene::shutdown() {
     destroyBuffer(host_tangents_);
     destroyBuffer(host_primitive_flags_);
     destroyBuffer(host_primitive_metadata_);
+    destroyBuffer(host_primitive_optics_);
     destroyBuffer(host_instance_metadata_);
     destroyBuffer(host_instance_motion_);
     destroyBuffer(host_emissive_triangles_);
@@ -141,6 +158,8 @@ void VulkanRtScene::shutdown() {
   scratch_tangents_ = {};
   scratch_indices_ = {};
   scratch_primitive_flags_ = {};
+  scratch_primitive_metadata_ = {};
+  scratch_primitive_optics_ = {};
   last_vertex_count_ = 0;
   last_index_count_ = 0;
   visible_instance_mask_count_ = 0;
@@ -176,6 +195,7 @@ void VulkanRtScene::shutdown() {
   emissive_records_cache_ = {};
   emissive_weights_cache_ = {};
   cached_emissive_count_ = 0;
+  cached_emissive_power_estimate_ = 0.0f;
   cached_hidden_source_emitter_triangle_count_ = 0;
   cached_hidden_positive_weight_triangle_count_ = 0;
   cached_positive_emission_source_ = false;
@@ -354,6 +374,7 @@ void VulkanRtScene::setRestGeometry(RtRestGeometry geometry) {
   emissive_records_cache_.clear();
   emissive_weights_cache_.clear();
   cached_emissive_count_ = 0;
+  cached_emissive_power_estimate_ = 0.0f;
   cached_hidden_source_emitter_triangle_count_ = 0;
   cached_hidden_positive_weight_triangle_count_ = 0;
   cached_positive_emission_source_ = false;
@@ -407,7 +428,7 @@ RtSceneStats VulkanRtScene::stats() const noexcept {
       host_indices_.capacity +
       host_normals_.capacity + host_uvs_.capacity + host_colors_.capacity +
       host_tangents_.capacity + host_primitive_flags_.capacity +
-      host_primitive_metadata_.capacity +
+      host_primitive_metadata_.capacity + host_primitive_optics_.capacity +
       host_instance_metadata_.capacity + host_instance_motion_.capacity +
       host_emissive_triangles_.capacity + instance_buffer_.capacity);
   result.allocated_bytes =
@@ -1044,6 +1065,7 @@ bool VulkanRtScene::updateGeometry(
   auto &world_indices = scratch_indices_;
   auto &primitive_flags = scratch_primitive_flags_;
   auto &primitive_metadata = scratch_primitive_metadata_;
+  auto &primitive_optics = scratch_primitive_optics_;
   world.resize(static_cast<std::size_t>(total_verts) * 3u);
   world_normals.assign(static_cast<std::size_t>(total_verts) * 4u, 0.0f);
   world_uvs.assign(static_cast<std::size_t>(total_verts) * 2u, 0.0f);
@@ -1055,6 +1077,8 @@ bool VulkanRtScene::updateGeometry(
   primitive_flags.reserve(total_indices / 3u);
   primitive_metadata.clear();
   primitive_metadata.reserve(total_indices / 3u);
+  primitive_optics.clear();
+  primitive_optics.reserve(total_indices / 3u);
 
   const bool have_rest_normals =
       rest_.normals.size() == static_cast<std::size_t>(model_verts) * 3u;
@@ -1270,6 +1294,14 @@ bool VulkanRtScene::updateGeometry(
            static_cast<std::uint32_t>(primitive)});
     }
   }
+  if (rest_.primitive_optics.size() == model_primitive_count) {
+    for (const RtSurfaceOptics &optics : rest_.primitive_optics) {
+      primitive_optics.push_back(packRtSurfaceOptics(optics));
+    }
+  } else {
+    primitive_optics.insert(primitive_optics.end(), model_primitive_count,
+                            packRtSurfaceOptics({}));
+  }
 
   // Face normals when rest has none.
   if (!have_rest_normals) {
@@ -1416,6 +1448,7 @@ bool VulkanRtScene::updateGeometry(
         primitive_metadata.push_back(
             {UINT32_MAX, UINT32_MAX, 0u,
              static_cast<std::uint32_t>(primitive_metadata.size())});
+        primitive_optics.push_back(packRtSurfaceOptics(view.surface_optics));
       }
     }
     desired_states.push_back(std::move(state));
@@ -1425,6 +1458,7 @@ bool VulkanRtScene::updateGeometry(
       world_indices.size() != total_indices ||
       primitive_flags.size() != total_indices / 3u ||
       primitive_metadata.size() != total_indices / 3u ||
+      primitive_optics.size() != total_indices / 3u ||
       desired_states.empty()) {
     return fail("assembled geometry buffers do not match their declared counts");
   }
@@ -1465,6 +1499,7 @@ bool VulkanRtScene::updateGeometry(
   auto &emissive_records = emissive_records_cache_;
   auto &emissive_weights = emissive_weights_cache_;
   std::uint32_t emissive_count = cached_emissive_count_;
+  double emissive_power_estimate = cached_emissive_power_estimate_;
   std::uint32_t hidden_source_emitter_count =
       cached_hidden_source_emitter_triangle_count_;
   std::uint32_t hidden_positive_weight_count =
@@ -1503,6 +1538,7 @@ bool VulkanRtScene::updateGeometry(
     const bool have_primitive_emission =
         rest_.primitive_emission.size() == model_primitive_count;
     emissive_count = 0u;
+    emissive_power_estimate = 0.0;
     hidden_source_emitter_count = 0u;
     hidden_positive_weight_count = 0u;
     bool positive_emission_source = false;
@@ -1572,10 +1608,28 @@ bool VulkanRtScene::updateGeometry(
           emission[0], emission[1], emission[2],
           static_cast<float>(std::max(luminance, 0.0))};
       record.metadata[2] = static_cast<std::uint32_t>(primitive);
+      const std::array<std::uint32_t, 4> source_identity =
+          primitive < rest_.primitive_metadata.size()
+              ? rest_.primitive_metadata[primitive]
+              : std::array<std::uint32_t, 4>{
+                    0xffffffffu, 0xffffffffu, 0xffffffffu,
+                    static_cast<std::uint32_t>(primitive)};
+      const std::uint32_t source_instance = rest_.bone_indices[i0];
+      const RtStableLightId stable_id =
+          makeRtEmissiveTriangleStableId(source_identity, source_instance);
+      record.stable_light_id = {
+          static_cast<std::uint32_t>(stable_id.value & 0xffffffffu),
+          static_cast<std::uint32_t>(stable_id.value >> 32u),
+          kRtEmissiveTriangleTwoSided, source_identity[3]};
       double final_weight = 0.0;
       if (std::isfinite(area) && std::isfinite(luminance) &&
           area > 1.0e-12 && luminance > 0.0) {
         final_weight = area * luminance;
+        // Existing emitters are explicitly two-sided. Radiant power is
+        // pi*area*luminance per side; the alias distribution itself remains
+        // proportional to area*luminance because the common factor cancels.
+        emissive_power_estimate +=
+            final_weight * (2.0 * 3.14159265358979323846);
         emissive_weights[primitive] = final_weight;
         record.metadata[1] = 1u;
         ++emissive_count;
@@ -1605,6 +1659,12 @@ bool VulkanRtScene::updateGeometry(
       emissive_count = 0u;
     }
     cached_emissive_count_ = emissive_count;
+    cached_emissive_power_estimate_ =
+        std::isfinite(emissive_power_estimate)
+            ? static_cast<float>(std::clamp(
+                  emissive_power_estimate, 0.0,
+                  static_cast<double>((std::numeric_limits<float>::max)())))
+            : 0.0f;
     cached_hidden_source_emitter_triangle_count_ =
         hidden_source_emitter_count;
     cached_hidden_positive_weight_triangle_count_ =
@@ -1688,6 +1748,9 @@ bool VulkanRtScene::updateGeometry(
       static_cast<VkDeviceSize>(
           primitive_metadata.size() *
           sizeof(std::array<std::uint32_t, 4>));
+  const VkDeviceSize primitive_optics_bytes =
+      static_cast<VkDeviceSize>(primitive_optics.size() *
+                                sizeof(RtSurfaceOpticsGpu));
   const VkDeviceSize emissive_triangle_bytes =
       sizeof(std::array<std::uint32_t, 4>) +
       static_cast<VkDeviceSize>(emissive_records.size()) *
@@ -1792,6 +1855,16 @@ bool VulkanRtScene::updateGeometry(
     }
     any_buffer_reallocated = true;
   }
+  if (host_primitive_optics_.capacity < primitive_optics_bytes ||
+      !host_primitive_optics_.buffer) {
+    if (!createBuffer(primitive_optics_bytes, kNormalUsage,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                      host_primitive_optics_, true)) {
+      return fail("host primitive-optics buffer allocation failed");
+    }
+    any_buffer_reallocated = true;
+  }
   if (host_emissive_triangles_.capacity < emissive_triangle_bytes ||
       !host_emissive_triangles_.buffer) {
     if (!createBuffer(emissive_triangle_bytes, kNormalUsage,
@@ -1864,15 +1937,22 @@ bool VulkanRtScene::updateGeometry(
       bufferDeviceAddress(host_primitive_flags_.buffer);
   host_primitive_metadata_.address =
       bufferDeviceAddress(host_primitive_metadata_.buffer);
+  host_primitive_optics_.address =
+      bufferDeviceAddress(host_primitive_optics_.buffer);
   if (upload_topology || materials_generation_changed) {
     copy_upload(host_primitive_flags_.mapped, primitive_flags.data(),
                 primitive_flag_bytes);
     copy_upload(host_primitive_metadata_.mapped, primitive_metadata.data(),
                 primitive_metadata_bytes);
   }
+  if (upload_materials) {
+    copy_upload(host_primitive_optics_.mapped, primitive_optics.data(),
+                primitive_optics_bytes);
+  }
   const std::array<std::uint32_t, 4> emissive_header{
       static_cast<std::uint32_t>(emissive_records.size()),
-      emissive_count, 1u, 0u};
+      emissive_count, 2u,
+      std::bit_cast<std::uint32_t>(cached_emissive_power_estimate_)};
   if (upload_emission) {
     copy_upload(host_emissive_triangles_.mapped, emissive_header.data(),
                 sizeof(emissive_header));

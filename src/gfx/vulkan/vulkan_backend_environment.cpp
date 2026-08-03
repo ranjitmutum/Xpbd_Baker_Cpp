@@ -36,29 +36,6 @@ float halfToFloat(std::uint16_t value) noexcept {
   return static_cast<float>(negative ? -decoded : decoded);
 }
 
-std::array<float, 3> colorTemperatureRgb(float kelvin) noexcept {
-  const double temperature =
-      std::clamp(static_cast<double>(kelvin), 1000.0, 40000.0) / 100.0;
-  double red = 255.0;
-  double green = 255.0;
-  double blue = 255.0;
-  if (temperature <= 66.0) {
-    green = 99.4708025861 * std::log(temperature) - 161.1195681661;
-    blue = temperature <= 19.0
-               ? 0.0
-               : 138.5177312231 * std::log(temperature - 10.0) -
-                     305.0447927307;
-  } else {
-    red = 329.698727446 * std::pow(temperature - 60.0, -0.1332047592);
-    green = 288.1221695283 *
-            std::pow(temperature - 60.0, -0.0755148492);
-  }
-  const auto normalized = [](double channel) {
-    return static_cast<float>(std::clamp(channel, 0.0, 255.0) / 255.0);
-  };
-  return {normalized(red), normalized(green), normalized(blue)};
-}
-
 static const uint32_t kSpvAtmosphereTransmittanceComp[] = {
 #include "spirv/atmosphere_transmittance.comp.spv.inc"
 };
@@ -179,65 +156,17 @@ static const uint32_t kSpvAtmosphereEnvironmentCacheComp[] = {
         return result;
       }
 
-      const double sun_angular_radius =
-          std::clamp(static_cast<double>(
-                         input.sun.angular_diameter_degrees),
-                     0.05, 5.0) *
-          0.5 * (kPi / 180.0);
-      const double sun_cos_radius = std::cos(sun_angular_radius);
-      const double cos_rotation = std::cos(input.rotation_radians);
-      const double sin_rotation = std::sin(input.rotation_radians);
-      const std::array<double, 3> sun_cache_direction = {
-          input.celestial.sun.direction[0] * cos_rotation -
-              input.celestial.sun.direction[2] * sin_rotation,
-          input.celestial.sun.direction[1],
-          input.celestial.sun.direction[2] * cos_rotation +
-              input.celestial.sun.direction[0] * sin_rotation};
-      const std::array<float, 3> sun_color =
-          colorTemperatureRgb(input.sun.color_temperature_kelvin);
-      const float sun_importance_strength =
-          input.sun_moon_lighting && input.sun.enabled
-              ? std::clamp(input.sun.strength, 0.0f, 32.0f)
-              : 0.0f;
-      const std::array<float, 3> analytic_sun_radiance = {
-          700.0f * sun_color[0] * sun_importance_strength,
-          700.0f * sun_color[1] * sun_importance_strength,
-          700.0f * sun_color[2] * sun_importance_strength};
       for (std::uint64_t pixel = 0; pixel < pixel_count; ++pixel) {
-        const std::uint32_t x =
-            static_cast<std::uint32_t>(pixel % input.width);
-        const std::uint32_t y =
-            static_cast<std::uint32_t>(pixel / input.width);
-        const double theta =
-            kPi * (static_cast<double>(y) + 0.5) / input.height;
-        const double phi =
-            kTwoPi * (static_cast<double>(x) + 0.5) / input.width;
-        const double sin_theta = std::sin(theta);
-        const std::array<double, 3> direction = {
-            sin_theta * std::sin(phi), std::cos(theta),
-            sin_theta * std::cos(phi)};
-        const double cosine = direction[0] * sun_cache_direction[0] +
-                              direction[1] * sun_cache_direction[1] +
-                              direction[2] * sun_cache_direction[2];
-        double sun_coverage = 0.0;
-        if (cosine >= sun_cos_radius) {
-          const double angular_distance =
-              std::acos(std::clamp(cosine, -1.0, 1.0));
-          const double radial = angular_distance / sun_angular_radius;
-          const double edge =
-              std::clamp((radial - 0.94) / 0.06, 0.0, 1.0);
-          sun_coverage = 1.0 - edge * edge * (3.0 - 2.0 * edge);
-        }
         const float moon_luminance = radiance.rgba[pixel * 4u + 3u];
         const float lighting_moon_luminance =
             input.sun_moon_lighting && input.moon.enabled
                 ? moon_luminance
                 : 0.0f;
         for (std::uint32_t channel = 0; channel < 3u; ++channel) {
-          radiance.rgba[pixel * 4u + channel] +=
-              lighting_moon_luminance +
-              static_cast<float>(sun_coverage) *
-                  analytic_sun_radiance[channel];
+          // SunDisk is a separate Light Registry family. Keeping it out of
+          // this alias data prevents Environment and Sun from counting it
+          // twice while preserving the disk in background evaluation.
+          radiance.rgba[pixel * 4u + channel] += lighting_moon_luminance;
         }
         radiance.rgba[pixel * 4u + 3u] = 1.0f;
       }
@@ -252,6 +181,8 @@ static const uint32_t kSpvAtmosphereEnvironmentCacheComp[] = {
         result.error = "dynamic-sky importance distribution build failed";
         return result;
       }
+      result.environment_power_estimate = estimateEnvironmentPower(
+          radiance, input.environment_strength);
       result.distribution_build_ms =
           std::chrono::duration<double, std::milli>(Clock::now() -
                                                     distribution_begin)
@@ -319,25 +250,23 @@ static const uint32_t kSpvAtmosphereEnvironmentCacheComp[] = {
       constexpr std::uint32_t kMoonCastsShadows = 1u << 9u;
       constexpr std::uint32_t kMoonSurfaceDetail = 1u << 10u;
       constexpr std::uint32_t kMoonManualPhase = 1u << 11u;
+      const double sun_angular_radius = input.sun.angular_radius;
+      const std::array<float, 3> &sun_color = input.sun.color;
       WorldEnvironmentGpuHeader header;
       header.flags =
           kValidEnvironment |
           (input.background_visible ? kBackgroundVisible : 0u) |
           (input.environment_lighting ? kLightingEnabled : 0u) |
           (input.moon.enabled ? kProceduralFiniteMoon : 0u) |
-          (input.sun.enabled && input.sun.disk_visible
-               ? kSunBackgroundVisible
-               : 0u) |
+          (input.sun.disk_visible ? kSunBackgroundVisible : 0u) |
           (input.moon.enabled && input.moon.disk_visible
                ? kMoonBackgroundVisible
                : 0u) |
-          (input.sun_moon_lighting && input.sun.enabled
-               ? kSunLightingEnabled
-               : 0u) |
+          (input.sun.lighting_enabled ? kSunLightingEnabled : 0u) |
           (input.sun_moon_lighting && input.moon.enabled
                ? kMoonLightingEnabled
                : 0u) |
-          (input.sun.cast_shadows ? kSunCastsShadows : 0u) |
+          (input.sun.casts_shadow ? kSunCastsShadows : 0u) |
           (input.moon.cast_shadows ? kMoonCastsShadows : 0u) |
           (input.moon.surface_detail > 0.0f ? kMoonSurfaceDetail : 0u) |
           (input.moon.phase_mode == MoonPhaseMode::Manual
@@ -371,6 +300,8 @@ static const uint32_t kSpvAtmosphereEnvironmentCacheComp[] = {
       header.sun_color_strength = {
           sun_color[0], sun_color[1], sun_color[2],
           std::clamp(input.sun.strength, 0.0f, 32.0f)};
+      header.light_power = {result.environment_power_estimate,
+                            input.sun.power_estimate, 0.0f, 0.0f};
       std::memcpy(input.distribution_mapped, &header, sizeof(header));
       auto *gpu_alias = reinterpret_cast<WorldEnvironmentGpuAlias *>(
           static_cast<std::byte *>(input.distribution_mapped) +
@@ -520,6 +451,8 @@ bool VulkanBackend::pollDynamicSkyEnvironmentCache(bool wait_for_completion) {
     atmosphere_environment_readback_ = pending.readback;
     pending.readback = {};
     atmosphere_environment_distribution_bytes_ = pending.distribution_bytes;
+    atmosphere_environment_power_estimate_ =
+        cpu_result.environment_power_estimate;
     atmosphere_environment_key_ = pending.environment_key;
     atmosphere_cloud_history_compatibility_key_ =
         pending.cloud_compatibility_key;
@@ -592,6 +525,7 @@ void VulkanBackend::clearDynamicSkyEnvironmentCache() {
     destroyBuffer(atmosphere_environment_distribution_);
     destroyBuffer(atmosphere_environment_distribution_spare_);
     atmosphere_environment_distribution_bytes_ = 0;
+    atmosphere_environment_power_estimate_ = 0.0f;
     atmosphere_environment_key_.clear();
     atmosphere_cloud_history_compatibility_key_.clear();
     atmosphere_cloud_history_weather_offset_ = {};
@@ -2031,7 +1965,7 @@ bool VulkanBackend::buildDynamicSkyEnvironmentCache(
     cpu_input.width = kCacheWidth;
     cpu_input.height = kCacheHeight;
     cpu_input.celestial = *resolved.celestial;
-    cpu_input.sun = sun_controls;
+    cpu_input.sun = resolveSunLight(resolved);
     cpu_input.moon = moon_controls;
     cpu_input.background_visible = resolved.background_visible;
     cpu_input.environment_lighting = resolved.environment_lighting;
@@ -2192,6 +2126,7 @@ void VulkanBackend::clearWorldEnvironmentResources() {
     destroyImage(world_environment_texture_);
     destroyBuffer(world_environment_distribution_);
     world_environment_distribution_bytes_ = 0;
+    world_environment_power_estimate_ = 0.0f;
     world_environment_resource_key_ = 0;
     world_environment_ready_ = false;
   }
@@ -2233,7 +2168,7 @@ bool VulkanBackend::ensureWorldEnvironmentSampler() {
     sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     sampler_info.minLod = 0.0f;
-    sampler_info.maxLod = 0.0f;
+    sampler_info.maxLod = VK_LOD_CLAMP_NONE;
     return vkCreateSampler(device_, &sampler_info, nullptr,
                            &world_environment_sampler_) == VK_SUCCESS;
   }
@@ -2268,17 +2203,6 @@ bool VulkanBackend::uploadWorldEnvironment(
     const VkDeviceSize table_bytes =
         sizeof(WorldEnvironmentGpuHeader) +
         entry_count * sizeof(WorldEnvironmentGpuAlias);
-    if (image_bytes > kMaximumGpuBytes ||
-        table_bytes > kMaximumGpuBytes ||
-        image_bytes > kMaximumGpuBytes - table_bytes) {
-      xpbd::log::warnf(
-          "World HDRI GPU upload rejected: image=%llu table=%llu "
-          "combined limit=%llu",
-          static_cast<unsigned long long>(image_bytes),
-          static_cast<unsigned long long>(table_bytes),
-          static_cast<unsigned long long>(kMaximumGpuBytes));
-      return false;
-    }
 
     VkFormatProperties format_properties{};
     vkGetPhysicalDeviceFormatProperties(
@@ -2287,6 +2211,44 @@ bool VulkanBackend::uploadWorldEnvironment(
          VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) == 0u) {
       xpbd::log::warn(
           "World HDRI GPU upload rejected: RGBA32F sampling unsupported");
+      return false;
+    }
+    constexpr VkFormatFeatureFlags kMipBlitFeatures =
+        VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+        VK_FORMAT_FEATURE_BLIT_DST_BIT |
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+    const bool mip_blit_supported =
+        (format_properties.optimalTilingFeatures & kMipBlitFeatures) ==
+        kMipBlitFeatures;
+    std::uint32_t environment_mip_levels = 1u;
+    std::uint64_t mip_texel_count = entry_count64;
+    if (mip_blit_supported) {
+      std::uint32_t mip_width = radiance.width;
+      std::uint32_t mip_height = radiance.height;
+      while (mip_width > 1u || mip_height > 1u) {
+        mip_width = std::max(mip_width >> 1u, 1u);
+        mip_height = std::max(mip_height >> 1u, 1u);
+        mip_texel_count +=
+            static_cast<std::uint64_t>(mip_width) * mip_height;
+        ++environment_mip_levels;
+      }
+    } else {
+      xpbd::log::warn(
+          "World HDRI RGBA32F linear blit unsupported; ray-cone LOD "
+          "conservatively clamps to the base level");
+    }
+    const VkDeviceSize gpu_image_bytes =
+        static_cast<VkDeviceSize>(mip_texel_count) *
+        VkDeviceSize{4u * sizeof(float)};
+    if (gpu_image_bytes > kMaximumGpuBytes ||
+        table_bytes > kMaximumGpuBytes ||
+        gpu_image_bytes > kMaximumGpuBytes - table_bytes) {
+      xpbd::log::warnf(
+          "World HDRI GPU upload rejected: image=%llu table=%llu "
+          "combined limit=%llu",
+          static_cast<unsigned long long>(gpu_image_bytes),
+          static_cast<unsigned long long>(table_bytes),
+          static_cast<unsigned long long>(kMaximumGpuBytes));
       return false;
     }
     if (!ensureWorldEnvironmentSampler()) {
@@ -2317,7 +2279,7 @@ bool VulkanBackend::uploadWorldEnvironment(
                       new_distribution) ||
         !createStaticTexture(radiance.width, radiance.height,
                              VK_FORMAT_R32G32B32A32_SFLOAT,
-                             new_texture)) {
+                             new_texture, environment_mip_levels)) {
       cleanup();
       return false;
     }
@@ -2337,6 +2299,9 @@ bool VulkanBackend::uploadWorldEnvironment(
     header.lighting_strength = resolved.environment_strength;
     header.background_multiplier = resolved.background_multiplier;
     header.rotation_radians = resolved.rotation_radians;
+    header.light_power = {
+        estimateEnvironmentPower(radiance, resolved.environment_strength),
+        0.0f, 0.0f, 0.0f};
     std::memcpy(new_distribution.mapped, &header, sizeof(header));
     auto *gpu_alias = reinterpret_cast<WorldEnvironmentGpuAlias *>(
         static_cast<std::byte *>(new_distribution.mapped) +
@@ -2376,7 +2341,8 @@ bool VulkanBackend::uploadWorldEnvironment(
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = new_texture.image;
-    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    barrier.subresourceRange = {
+        VK_IMAGE_ASPECT_COLOR_BIT, 0, environment_mip_levels, 0, 1};
     barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
@@ -2386,6 +2352,53 @@ bool VulkanBackend::uploadWorldEnvironment(
     region.imageExtent = {radiance.width, radiance.height, 1};
     vkCmdCopyBufferToImage(command, staging.buffer, new_texture.image,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    std::uint32_t source_width = radiance.width;
+    std::uint32_t source_height = radiance.height;
+    for (std::uint32_t level = 1u; level < environment_mip_levels;
+         ++level) {
+      barrier.subresourceRange = {
+          VK_IMAGE_ASPECT_COLOR_BIT, level - 1u, 1u, 0u, 1u};
+      barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+      barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+      barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+      vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                           nullptr, 1, &barrier);
+
+      const std::uint32_t destination_width =
+          std::max(source_width >> 1u, 1u);
+      const std::uint32_t destination_height =
+          std::max(source_height >> 1u, 1u);
+      VkImageBlit blit{};
+      blit.srcSubresource = {
+          VK_IMAGE_ASPECT_COLOR_BIT, level - 1u, 0u, 1u};
+      blit.srcOffsets[1] = {
+          static_cast<std::int32_t>(source_width),
+          static_cast<std::int32_t>(source_height), 1};
+      blit.dstSubresource = {
+          VK_IMAGE_ASPECT_COLOR_BIT, level, 0u, 1u};
+      blit.dstOffsets[1] = {
+          static_cast<std::int32_t>(destination_width),
+          static_cast<std::int32_t>(destination_height), 1};
+      vkCmdBlitImage(
+          command, new_texture.image,
+          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, new_texture.image,
+          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1u, &blit,
+          VK_FILTER_LINEAR);
+
+      barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+      barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+      barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+      vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, 0,
+                           0, nullptr, 0, nullptr, 1, &barrier);
+      source_width = destination_width;
+      source_height = destination_height;
+    }
+    barrier.subresourceRange = {
+        VK_IMAGE_ASPECT_COLOR_BIT, environment_mip_levels - 1u, 1u, 0u, 1u};
     barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -2443,15 +2456,17 @@ bool VulkanBackend::uploadWorldEnvironment(
     world_environment_distribution_ = new_distribution;
     new_distribution = {};
     world_environment_distribution_bytes_ = table_bytes;
+    world_environment_power_estimate_ = header.light_power[0];
     world_environment_resource_key_ =
         worldEnvironmentResourceKey(resolved);
     world_environment_failed_key_ = 0;
     world_environment_ready_ = true;
     xpbd::log::infof(
-        "World HDRI GPU ready: %ux%u image=%llu table=%llu "
+        "World HDRI GPU ready: %ux%u mips=%u image=%llu table=%llu "
         "generation=%llu",
         radiance.width, radiance.height,
-        static_cast<unsigned long long>(image_bytes),
+        environment_mip_levels,
+        static_cast<unsigned long long>(gpu_image_bytes),
         static_cast<unsigned long long>(table_bytes),
         static_cast<unsigned long long>(resolved.generation));
     return true;

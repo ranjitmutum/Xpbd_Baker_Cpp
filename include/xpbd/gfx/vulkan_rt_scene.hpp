@@ -25,6 +25,7 @@ inline constexpr std::uint32_t kRtPrimitiveTextured = 1u << 0u;
 inline constexpr std::uint32_t kRtPrimitiveCutout = 1u << 1u;
 inline constexpr std::uint32_t kRtPrimitiveBlend = 1u << 2u;
 inline constexpr std::uint32_t kRtPrimitiveEnvironment = 1u << 3u;
+inline constexpr std::uint32_t kRtEmissiveTriangleTwoSided = 1u << 0u;
 
 using RtRestGeometryRange = RtPackedGeometryRange;
 
@@ -39,6 +40,7 @@ struct RtRestGeometry {
   std::vector<std::uint32_t> primitive_flags; // one flag word per triangle
   // uvec4 per triangle: cube, face, material, original source primitive.
   std::vector<std::array<std::uint32_t, 4>> primitive_metadata;
+  std::vector<RtSurfaceOptics> primitive_optics;
   // Average premultiplied emitted radiance per packed triangle. This is used
   // to build the world-space GPU mesh-light alias table after rigid instance
   // transforms/tints have been applied.
@@ -55,8 +57,18 @@ struct alignas(16) RtEmissiveTriangleGpu {
   std::array<float, 4> p2_area{};
   std::array<float, 4> emission_luminance{};
   std::array<std::uint32_t, 4> metadata{};
+  // xy: stable 64-bit light ID, z: sidedness flags, w: source primitive.
+  std::array<std::uint32_t, 4> stable_light_id{};
 };
-static_assert(sizeof(RtEmissiveTriangleGpu) == 80u);
+static_assert(sizeof(RtEmissiveTriangleGpu) == 96u);
+
+// std430 representation of the minimal optics seam. parameters stores
+// transmission, IOR, attenuation distance, and a uint-bit Thin-Walled flag.
+struct alignas(16) RtSurfaceOpticsGpu {
+  std::array<float, 4> parameters{0.0f, 1.5f, 0.0f, 0.0f};
+  std::array<float, 4> attenuation_color{1.0f, 1.0f, 1.0f, 0.0f};
+};
+static_assert(sizeof(RtSurfaceOpticsGpu) == 32u);
 
 // Non-indexed world-space triangle list appended as a distinct BLAS.
 // `alpha_blended` identifies the source raster range; per-vertex alpha remains
@@ -73,6 +85,7 @@ struct RtColoredGeometryView {
   std::uint64_t topology_generation = 0;
   std::uint64_t material_generation = 0;
   std::uint64_t emission_generation = 0;
+  RtSurfaceOptics surface_optics{};
 };
 
 struct RtSceneStats {
@@ -181,6 +194,9 @@ public:
   [[nodiscard]] VkBuffer primitiveMetadataBuffer() const noexcept {
     return host_primitive_metadata_.buffer;
   }
+  [[nodiscard]] VkBuffer primitiveOpticsBuffer() const noexcept {
+    return host_primitive_optics_.buffer;
+  }
   [[nodiscard]] VkBuffer instanceMetadataBuffer() const noexcept {
     return host_instance_metadata_.buffer;
   }
@@ -217,6 +233,9 @@ public:
   [[nodiscard]] VkDeviceSize primitiveMetadataBufferBytes() const noexcept {
     return host_primitive_metadata_.capacity;
   }
+  [[nodiscard]] VkDeviceSize primitiveOpticsBufferBytes() const noexcept {
+    return host_primitive_optics_.capacity;
+  }
   [[nodiscard]] VkDeviceSize instanceMetadataBufferBytes() const noexcept {
     return host_instance_metadata_.capacity;
   }
@@ -244,6 +263,9 @@ public:
   void markMotionStable() noexcept { motion_history_valid_ = false; }
   [[nodiscard]] std::uint32_t emissiveTriangleCount() const noexcept {
     return emissive_triangle_count_;
+  }
+  [[nodiscard]] float emissivePowerEstimate() const noexcept {
+    return cached_emissive_power_estimate_;
   }
   [[nodiscard]] std::uint32_t pathTraceVertexCount() const noexcept {
     return last_vertex_count_;
@@ -373,6 +395,7 @@ private:
   Buffer host_tangents_{}; // vec4 per vertex (world tangent + handedness)
   Buffer host_primitive_flags_{}; // uint per triangle
   Buffer host_primitive_metadata_{}; // uvec4 per triangle
+  Buffer host_primitive_optics_{}; // two vec4 per triangle
   Buffer host_instance_metadata_{}; // uvec4 per instance
   // mat4 current + mat4 previous + uvec4 metadata per instance.
   Buffer host_instance_motion_{};
@@ -394,9 +417,11 @@ private:
   std::vector<std::uint32_t> scratch_indices_;
   std::vector<std::uint32_t> scratch_primitive_flags_;
   std::vector<std::array<std::uint32_t, 4>> scratch_primitive_metadata_;
+  std::vector<RtSurfaceOpticsGpu> scratch_primitive_optics_;
   std::vector<RtEmissiveTriangleGpu> emissive_records_cache_;
   std::vector<double> emissive_weights_cache_;
   std::uint32_t cached_emissive_count_ = 0;
+  float cached_emissive_power_estimate_ = 0.0f;
   std::uint32_t cached_hidden_source_emitter_triangle_count_ = 0;
   std::uint32_t cached_hidden_positive_weight_triangle_count_ = 0;
   bool cached_positive_emission_source_ = false;

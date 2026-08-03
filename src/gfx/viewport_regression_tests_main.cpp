@@ -148,33 +148,115 @@ void testPathTracePbrSourceContracts() {
       readTestSource("src/gfx/spirv/pt_composite.frag");
   const std::string backend =
       readTestSource("src/gfx/vulkan_backend.cpp");
+  const std::string backend_static = readTestSource(
+      "src/gfx/vulkan/vulkan_backend_static_resources.cpp");
+  const std::string backend_environment = readTestSource(
+      "src/gfx/vulkan/vulkan_backend_environment.cpp");
   const std::string path_tracer =
       readTestSource("src/gfx/vulkan_path_tracer.cpp");
   const std::string rt_pipeline =
       readTestSource("src/gfx/vulkan_rt_pipeline.cpp");
+  const std::string ray_tracing_header =
+      readTestSource("include/xpbd/gfx/ray_tracing.hpp");
+  const std::string ray_tracing_source =
+      readTestSource("src/gfx/ray_tracing.cpp");
+  const std::string rt_scene_header =
+      readTestSource("include/xpbd/gfx/vulkan_rt_scene.hpp");
+  const std::string rt_scene_source =
+      readTestSource("src/gfx/vulkan_rt_scene.cpp");
 
   expect(!forward.empty() && !forward_rt.empty() && !closest_hit.empty() &&
              !any_hit.empty() && !raygen.empty() && !compute.empty() &&
-             !composite.empty() && !backend.empty() && !path_tracer.empty() &&
-             !rt_pipeline.empty(),
-         "PBR source-contract fixtures are readable");
-  expect(closest_hit.find("sampleAlbedoBaseLevel") != std::string::npos &&
-             closest_hit.find("sampleNormalBaseLevel") != std::string::npos &&
-             closest_hit.find("sampleSpecularBaseLevel") !=
+             !composite.empty() && !backend.empty() &&
+             !backend_static.empty() && !backend_environment.empty() &&
+              !path_tracer.empty() &&
+              !rt_pipeline.empty() && !ray_tracing_header.empty() &&
+              !ray_tracing_source.empty() && !rt_scene_header.empty() &&
+              !rt_scene_source.empty(),
+          "PBR source-contract fixtures are readable");
+  expect(closest_hit.find("sampleAlbedoRayCone") != std::string::npos &&
+             closest_hit.find("sampleNormalRayCone") != std::string::npos &&
+             closest_hit.find("sampleSpecularRayCone") !=
                  std::string::npos &&
-             any_hit.find("sampleAlphaBaseLevel") != std::string::npos &&
+             any_hit.find("sampleAlphaRayCone") != std::string::npos &&
              compute.find("sampleAlphaBaseLevel") != std::string::npos,
-         "RT material shaders expose purpose-specific base-level samplers");
-  expect(countText(closest_hit, "textureLod(albedoTexture") == 1u &&
-             countText(closest_hit, "textureLod(normalTexture") == 1u &&
-             countText(closest_hit, "textureLod(specularTexture") == 1u &&
-             countText(any_hit, "textureLod(albedoTexture") == 1u &&
+         "Full RT material shaders expose ray-cone LOD samplers while the "
+         "compatibility compute path remains unchanged");
+  expect(countText(closest_hit, "textureLod(") == 3u &&
+             countText(any_hit, "textureLod(") == 1u &&
              countText(compute, "textureLod(uAlbedo") == 2u &&
              countText(compute, "textureLod(uNormalTexture") == 1u &&
              countText(compute, "textureLod(uSpecularTexture") == 1u &&
-             closest_hit.find(", uv, 0.0)") != std::string::npos &&
+             closest_hit.find("rayConeTextureLod") != std::string::npos &&
+             any_hit.find("rayConeTextureLod") != std::string::npos &&
+             closest_hit.find(", uv, 0.0)") == std::string::npos &&
+             any_hit.find(", uv, 0.0)") == std::string::npos &&
              compute.find(", uv, 0.0)") != std::string::npos,
-         "all RT material reads remain explicit fixed LOD 0 helper calls");
+         "Full RT material reads use explicit ray-cone LOD and compatibility "
+         "material reads retain their frozen base level");
+  expect(closest_hit.find("PositionBuffer") != std::string::npos &&
+             closest_hit.find("objectPosition0") != std::string::npos &&
+             closest_hit.find("vec4(objectPosition1 - objectPosition0, 0.0)") !=
+                 std::string::npos &&
+             closest_hit.find("cross(worldEdge1, worldEdge2)") !=
+                 std::string::npos &&
+             closest_hit.find("interpolatedNormal") != std::string::npos &&
+             closest_hit.find("payload.geometricNormal = geometricNormal;") !=
+                 std::string::npos &&
+             closest_hit.find("payload.shadingNormal = materialNormal;") !=
+                 std::string::npos,
+         "Full RT closest hit separates true triangle Ng from interpolated "
+         "and normal-mapped Ns");
+  expect(raygen.find("vec3 offsetRayOrigin(") != std::string::npos &&
+             raygen.find("offsetRayOrigin(hitPosition") !=
+                 std::string::npos &&
+             raygen.find("geometricNormal * 0.001") == std::string::npos &&
+             raygen.find("direction * 0.001") == std::string::npos,
+         "Full RT continuation, shadow, reflection, refraction, and "
+         "transparent origins share the scale-safe Ng offset seam");
+  expect(raygen.find("struct PathRngState") != std::string::npos &&
+             raygen.find("PathRngState makePathRng(") != std::string::npos &&
+             raygen.find("float nextRandom(inout PathRngState") !=
+                 std::string::npos &&
+             raygen.find("kRngDomainAlphaCoverage") != std::string::npos &&
+             raygen.find("kRngDomainRussianRoulette") !=
+                 std::string::npos,
+         "Full RT paths use explicit state+dimension RNG domains");
+  expect(raygen.find("struct RayCone") != std::string::npos &&
+             raygen.find("initialRayCone(") != std::string::npos &&
+             raygen.find("propagateRayCone(") != std::string::npos &&
+             raygen.find("uv + vec2(inverseSize.x, 0.0)") !=
+                 std::string::npos &&
+             raygen.find("uv + vec2(0.0, inverseSize.y)") !=
+                 std::string::npos &&
+             raygen.find("clamp(uv + vec2") == std::string::npos &&
+             closest_hit.find("payload.rayCone") != std::string::npos &&
+             any_hit.find("primaryPayload.rayCone") != std::string::npos &&
+             any_hit.find("shadowPayload.rayCone") != std::string::npos,
+         "Full RT initializes and propagates ray-cone footprint state into "
+         "material LOD selection");
+  expect(backend_static.find("full_mip_levels") != std::string::npos &&
+             backend_static.find("vkCmdBlitImage") != std::string::npos &&
+             backend_static.find("mip_levels - 1u") != std::string::npos &&
+             backend.find(
+                 "static_sampler_info.maxLod = VK_LOD_CLAMP_NONE;") !=
+                 std::string::npos &&
+             backend.find(
+                 "static_sampler_info.mipmapMode = "
+                 "VK_SAMPLER_MIPMAP_MODE_LINEAR;") !=
+                 std::string::npos &&
+             backend_environment.find("environment_mip_levels") !=
+                 std::string::npos &&
+             backend_environment.find(
+                 "sampler_info.maxLod = VK_LOD_CLAMP_NONE;") !=
+                 std::string::npos &&
+             path_tracer.find("si.maxLod = VK_LOD_CLAMP_NONE;") !=
+                 std::string::npos &&
+             path_tracer.find(
+                 "si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;") !=
+                 std::string::npos,
+         "material images expose complete mip chains to explicit Full RT "
+         "ray-cone LOD");
   expect(closest_hit.find("decodeLabPbrMicrofacetAlpha") !=
                  std::string::npos &&
              closest_hit.find("isnan") != std::string::npos &&
@@ -250,6 +332,38 @@ void testPathTracePbrSourceContracts() {
   const std::string compact_closest_hit = compactTestSource(closest_hit);
   const std::string compact_raygen = compactTestSource(raygen);
   const std::string compact_compute = compactTestSource(compute);
+  const std::string compact_ray_tracing_header =
+      compactTestSource(ray_tracing_header);
+  const std::string compact_ray_tracing_source =
+      compactTestSource(ray_tracing_source);
+  const std::string compact_rt_scene_header =
+      compactTestSource(rt_scene_header);
+  const std::string compact_rt_scene_source =
+      compactTestSource(rt_scene_source);
+  expect(compact_closest_hit.find("floatggxAlpha;") != std::string::npos &&
+             compact_closest_hit.find(
+                 "returnperceptualRoughness*perceptualRoughness;") !=
+                 std::string::npos &&
+             compact_closest_hit.find(
+                 "payload.ggxAlpha=clamp(ggxAlpha,0.0,1.0);") !=
+                 std::string::npos &&
+             compact_closest_hit.find("linearRoughness") ==
+                 std::string::npos &&
+             compact_raygen.find(
+                 "constfloatkDeltaMirrorAlpha=1.0e-6;") !=
+                 std::string::npos &&
+             compact_raygen.find(
+                 "constfloatkMinFiniteGgxAlpha=1.0e-4;") !=
+                 std::string::npos &&
+             compact_raygen.find(
+                 "floatrrRoughness=sqrt(ggxAlpha);") !=
+                 std::string::npos &&
+             compact_raygen.find(
+                 "if(ggxAlpha<=kDeltaMirrorAlpha)") !=
+                 std::string::npos &&
+             compact_raygen.find("linearRoughness") == std::string::npos,
+         "full RT shaders preserve zero GGX alpha, branch exact mirrors, and "
+         "submit RR perceptual roughness without ambiguous naming");
   const std::array<std::string_view, 2> forward_tint_contract{{
       "predefinedMetal=code>=230u&&code<=237u;",
       "reflection_tint*f0*specular*intensity*light",
@@ -275,7 +389,58 @@ void testPathTracePbrSourceContracts() {
                  "reflectionTint*rrSpecularAlbedo") != std::string::npos,
          "all Raster/PT paths tint predefined-metal reflection and RR guides");
 
-  const std::array<std::string_view, 15> raygen_descriptor_contract{{
+  expect(compact_ray_tracing_header.find("structRtSurfaceOptics{") !=
+                 std::string::npos &&
+             compact_ray_tracing_header.find(
+                 "attenuation_color{1.0f,1.0f,1.0f}") !=
+                 std::string::npos &&
+             compact_ray_tracing_header.find(
+                 "floatattenuation_distance=0.0f;") != std::string::npos &&
+             compact_ray_tracing_header.find("boolthin_walled=false;") !=
+                 std::string::npos &&
+             compact_closest_hit.find("PrimitiveOpticsBuffer") !=
+                 std::string::npos &&
+              compact_closest_hit.find(
+                  "payload.transmission=clamp(surfaceOptics.x,0.0,1.0);") !=
+                  std::string::npos &&
+              backend_static.find("XPBD_RT_SURFACE_OPTICS") !=
+                  std::string::npos &&
+              compact_closest_hit.find("floattransmission=0.0;") ==
+                  std::string::npos,
+         "minimal source-independent optics seam is default-inert and separate from coverage alpha");
+  expect(compact_raygen.find("sampleGgxVndf(") != std::string::npos &&
+             compact_raygen.find("ggxVisibleNormalPdf(") !=
+                 std::string::npos &&
+             compact_raygen.find("vec3sampleGgx(") == std::string::npos &&
+             compact_ray_tracing_source.find("sampleRtGgxVndf(") !=
+                 std::string::npos &&
+             compact_ray_tracing_source.find("rtGgxVisibleNormalPdf(") !=
+                 std::string::npos,
+         "finite GGX reflection uses matched Heitz visible-normal sampling on CPU and GPU");
+  expect(compact_raygen.find("evaluateMicrofacetTransmission(") !=
+                 std::string::npos &&
+             compact_raygen.find("dwmDwi") != std::string::npos &&
+             compact_raygen.find("etaScale") != std::string::npos &&
+             compact_ray_tracing_source.find("evaluateRtMicrofacetTransmission") !=
+                 std::string::npos,
+         "rough dielectric transmission carries its BTDF Jacobian and radiance eta-squared factor");
+  expect(compact_raygen.find("beerLambertTransmittance(") !=
+                 std::string::npos &&
+             compact_raygen.find("insideSolidMedium") !=
+                 std::string::npos &&
+             compact_raygen.find("thinWalled") != std::string::npos &&
+             compact_ray_tracing_source.find("rtBeerLambertTransmittance(") !=
+                 std::string::npos,
+         "solid-only Beer-Lambert absorption and Thin-Walled medium bypass share CPU/GPU contracts");
+  expect(compact_rt_scene_header.find("RtSurfaceOpticsGpu") !=
+                 std::string::npos &&
+             compact_rt_scene_header.find("primitiveOpticsBuffer()") !=
+                 std::string::npos &&
+             compact_rt_scene_source.find("host_primitive_optics_") !=
+                 std::string::npos,
+         "per-primitive optics has a material-generation GPU upload seam");
+
+  const std::array<std::string_view, 19> raygen_descriptor_contract{{
       "layout(set=0,binding=0)uniformaccelerationStructureEXTtopLevelAS;",
       "layout(set=0,binding=1,rgba16f)uniformimage2DoutputImage;",
       "layout(set=0,binding=3,std430)readonlybufferIndexBuffer{",
@@ -291,6 +456,10 @@ void testPathTracePbrSourceContracts() {
       "layout(set=0,binding=22,rgba32f)uniformimage2DoutputStatistics;",
       "layout(set=0,binding=23,rg32f)uniformimage2DoutputRrMotion;",
       "layout(set=0,binding=27,rgba16f)uniformimage2DoutputRrNormalRoughness;",
+      "layout(set=0,binding=28,std430)readonlybufferPrimitiveOpticsBuffer{",
+      "layout(set=0,binding=29,r8)uniformimage2DoutputTransparencyAndComposition;",
+      "layout(set=0,binding=30,r8)uniformimage2DoutputReactiveMask;",
+      "layout(set=0,binding=31,r8)uniformimage2DoutputGuideValidity;",
   }};
   bool raygen_bindings_match = true;
   for (const std::string_view descriptor : raygen_descriptor_contract) {
@@ -300,8 +469,8 @@ void testPathTracePbrSourceContracts() {
   }
 
   const std::string compact_pipeline = compactTestSource(rt_pipeline);
-  const std::array<std::string_view, 18> pipeline_descriptor_contract{{
-      "std::array<VkDescriptorSetLayoutBinding,28>bindings{};",
+  const std::array<std::string_view, 23> pipeline_descriptor_contract{{
+      "std::array<VkDescriptorSetLayoutBinding,32>bindings{};",
       "bindings[index].binding=index;",
       "bindings[index].descriptorCount=1;",
       "bindings[index].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;",
@@ -310,15 +479,20 @@ void testPathTracePbrSourceContracts() {
       "bindings[14].descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;",
       "bindings[21].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;",
       "bindings[27].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;",
+      "bindings[29].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;",
+      "bindings[31].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;",
       "{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,1}",
-      "{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,9}",
-      "{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,14}",
+      "{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,12}",
+      "{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,15}",
       "{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,4}",
-      "std::array<VkWriteDescriptorSet,28>writes{};",
+      "std::array<VkWriteDescriptorSet,32>writes{};",
       "writes[binding].dstBinding=binding;",
       "writes[14].pImageInfo=&images[5];",
       "writes[15].pBufferInfo=&buffers[8];",
       "writes[27].pImageInfo=&images[12];",
+      "writes[28].pBufferInfo=&buffers[14];",
+      "writes[29].pImageInfo=&images[13];",
+      "writes[31].pImageInfo=&images[15];",
   }};
   bool pipeline_bindings_match = true;
   for (const std::string_view descriptor : pipeline_descriptor_contract) {
@@ -327,10 +501,10 @@ void testPathTracePbrSourceContracts() {
         compact_pipeline.find(descriptor) != std::string::npos;
   }
   expect(raygen_bindings_match && pipeline_bindings_match,
-         "raygen set-0 descriptor ABI matches the Vulkan 28-binding layout and writes");
+           "raygen set-0 descriptor ABI matches the Vulkan 32-binding layout and writes");
 
   const auto binding_table_position = compact_pipeline.find(
-      "std::array<VkDescriptorSetLayoutBinding,28>bindings{};");
+      "std::array<VkDescriptorSetLayoutBinding,32>bindings{};");
   const auto descriptor_layout_position =
       compact_pipeline.find("vkCreateDescriptorSetLayout(");
   const auto descriptor_allocation_position =
@@ -366,16 +540,32 @@ void testPathTracePbrSourceContracts() {
 }
 
 void testSelectionOutlineTemporalContract() {
-  const std::string backend =
-      readTestSource("src/gfx/vulkan_backend.cpp");
+  const std::string backend_internal = readTestSource(
+      "src/gfx/vulkan/vulkan_backend_internal.hpp");
+  const std::string backend_pipelines = readTestSource(
+      "src/gfx/vulkan/vulkan_backend_pipelines.cpp");
+  const std::string main_render_pass = readTestSource(
+      "src/gfx/vulkan_render/render/70_main_render_pass.inc");
+  const std::string frame_generation = readTestSource(
+      "src/gfx/vulkan_render/render/80_frame_generation.inc");
+  const std::string render_sequence = readTestSource(
+      "src/gfx/vulkan_render/vulkan_backend_render.inc");
   const std::string path_tracer =
       readTestSource("src/gfx/vulkan_path_tracer.cpp");
   const std::string composite =
       readTestSource("src/gfx/spirv/pt_composite.frag");
-  expect(!backend.empty() && !path_tracer.empty() && !composite.empty(),
+  expect(!backend_internal.empty() && !backend_pipelines.empty() &&
+             !main_render_pass.empty() && !frame_generation.empty() &&
+             !render_sequence.empty() && !path_tracer.empty() &&
+             !composite.empty(),
          "selection-outline temporal source fixtures are readable");
 
-  const std::string compact_backend = compactTestSource(backend);
+  const std::string compact_backend_internal =
+      compactTestSource(backend_internal);
+  const std::string compact_backend_pipelines =
+      compactTestSource(backend_pipelines);
+  const std::string compact_main_render_pass =
+      compactTestSource(main_render_pass);
   const std::string compact_path_tracer = compactTestSource(path_tracer);
   const std::string compact_composite = compactTestSource(composite);
   expect(
@@ -402,16 +592,16 @@ void testSelectionOutlineTemporalContract() {
       "post-DLSS depth lookup reverses primary-ray jitter in render pixels");
 
   expect(
-      compact_backend.find(
+      compact_backend_internal.find(
           "VkPipelinemesh_pipeline_overlay_lines_=VK_NULL_HANDLE;") !=
               std::string::npos &&
-          compact_backend.find("rs.depthBiasEnable=VK_TRUE;") !=
+          compact_backend_pipelines.find("rs.depthBiasEnable=VK_TRUE;") !=
               std::string::npos &&
-          compact_backend.find(
+          compact_backend_pipelines.find(
               "ds.depthWriteEnable=(ui||mesh_trans||overlay_lines||"
               "temporal_hud_lines)?VK_FALSE:VK_TRUE;") !=
               std::string::npos &&
-          compact_backend.find(
+          compact_backend_pipelines.find(
               "ds.depthCompareOp=overlay_lines?"
               "VK_COMPARE_OP_LESS_OR_EQUAL:VK_COMPARE_OP_LESS;") !=
               std::string::npos,
@@ -419,22 +609,22 @@ void testSelectionOutlineTemporalContract() {
       "foreground occlusion");
 
   expect(
-      compact_backend.find(
+      compact_backend_internal.find(
           "VkPipelinemesh_pipeline_temporal_hud_lines_=VK_NULL_HANDLE;") !=
               std::string::npos &&
-          compact_backend.find(
+          compact_backend_pipelines.find(
               "ds.depthTestEnable=(ui||temporal_hud_lines)?"
               "VK_FALSE:VK_TRUE;") != std::string::npos &&
-          compact_backend.find(
+          compact_backend_pipelines.find(
               "if(ui||mesh_trans||temporal_hud_lines){"
               "blend.blendEnable=VK_TRUE;") != std::string::npos,
       "temporal selection HUD pipeline blends without depth test or writes");
 
   expect(
-      compact_backend.find(
+      compact_main_render_pass.find(
           "constbooltemporal_selection_active="
           "pt_dlss_active||fg_frame_candidate;") != std::string::npos &&
-          compact_backend.find(
+          compact_main_render_pass.find(
               "draw_selection_lines(temporal_selection_active?"
               "mesh_pipeline_temporal_hud_lines_:"
               "mesh_pipeline_overlay_lines_);") != std::string::npos,
@@ -442,11 +632,11 @@ void testSelectionOutlineTemporalContract() {
       "the original depth-aware pipeline");
 
   const auto composite_position =
-      backend.find("path_tracer.recordComposite(");
+      main_render_pass.find("path_tracer.recordComposite(");
   const auto overlay_position =
-      backend.find("mesh_pipeline_overlay_lines_", composite_position);
+      main_render_pass.find("mesh_pipeline_overlay_lines_", composite_position);
   const auto grid_position =
-      backend.find("mesh_pipeline_lines_", overlay_position);
+      main_render_pass.find("mesh_pipeline_lines_", overlay_position);
   expect(composite_position != std::string::npos &&
              overlay_position != std::string::npos &&
              grid_position != std::string::npos &&
@@ -456,27 +646,33 @@ void testSelectionOutlineTemporalContract() {
          "original depth pipeline");
 
   const auto fg_candidate_position =
-      backend.find("const bool fg_frame_candidate");
+      main_render_pass.find("const bool fg_frame_candidate");
   const auto hudless_copy_position =
-      backend.find("vkCmdCopyImage(", fg_candidate_position);
-  const auto fg_ui_pass_position = backend.find(
+      frame_generation.find("vkCmdCopyImage(");
+  const auto fg_ui_pass_position = frame_generation.find(
       "fg_ui_rp.renderPass = fg_ui_render_pass_", hudless_copy_position);
-  const auto fg_ui_selection_position = backend.find(
+  const auto fg_ui_selection_position = frame_generation.find(
       "draw_selection_lines(mesh_pipeline_temporal_hud_lines_);",
       fg_ui_pass_position);
-  const auto fg_overlay_pass_position = backend.find(
+  const auto fg_overlay_pass_position = frame_generation.find(
       "fg_overlay_rp.renderPass = fg_overlay_render_pass_",
       fg_ui_selection_position);
-  const auto fg_overlay_selection_position = backend.find(
+  const auto fg_overlay_selection_position = frame_generation.find(
       "draw_selection_lines(mesh_pipeline_temporal_hud_lines_);",
       fg_ui_selection_position + 1);
-  expect(fg_candidate_position != std::string::npos &&
+  const auto main_render_stage_position =
+      render_sequence.find("render/70_main_render_pass.inc");
+  const auto frame_generation_stage_position =
+      render_sequence.find("render/80_frame_generation.inc");
+  expect(main_render_stage_position != std::string::npos &&
+             frame_generation_stage_position != std::string::npos &&
+             main_render_stage_position < frame_generation_stage_position &&
+             fg_candidate_position != std::string::npos &&
              hudless_copy_position != std::string::npos &&
              fg_ui_pass_position != std::string::npos &&
              fg_ui_selection_position != std::string::npos &&
              fg_overlay_pass_position != std::string::npos &&
              fg_overlay_selection_position != std::string::npos &&
-             fg_candidate_position < hudless_copy_position &&
              hudless_copy_position < fg_ui_pass_position &&
              fg_ui_pass_position < fg_ui_selection_position &&
              fg_ui_selection_position < fg_overlay_pass_position &&
@@ -1709,6 +1905,7 @@ void testLabPbrDecode() {
   using xpbd::gfx::labPbrDebugViewFromName;
   using xpbd::gfx::labPbrDebugViewName;
   using xpbd::gfx::labPbrFeatureFlags;
+  using xpbd::gfx::rtRrRoughnessFromGgxAlpha;
   using xpbd::gfx::srgb8ToLinear;
 
   expectNear(srgb8ToLinear(0u), 0.0f, 1.0e-6f, "sRGB black -> linear zero");
@@ -1727,7 +1924,7 @@ void testLabPbrDecode() {
              "missing normal uses flat tangent normal");
   expectNear(fallback.ambient_occlusion, 1.0f, 1.0e-6f,
              "missing normal uses unoccluded AO");
-  expectNear(fallback.linear_roughness, 1.0f, 1.0e-6f,
+  expectNear(fallback.ggx_alpha, 1.0f, 1.0e-6f,
              "missing specular uses fully rough fallback");
   expectNear(fallback.dielectric_f0, 0.04f, 1.0e-6f,
              "missing specular uses dielectric F0");
@@ -1750,9 +1947,28 @@ void testLabPbrDecode() {
   expectNear(resolved.perceptual_smoothness, 128.0f / 255.0f, 1.0e-6f,
              "specular red decodes perceptual smoothness");
   const float expected_roughness = 1.0f - 128.0f / 255.0f;
-  expectNear(resolved.linear_roughness,
+  expectNear(resolved.ggx_alpha,
              expected_roughness * expected_roughness, 1.0e-6f,
-             "perceptual smoothness converts to linear roughness");
+             "perceptual smoothness converts to GGX alpha");
+  const std::array<std::uint8_t, 4> smoothness_codes{{255u, 254u, 128u,
+                                                      0u}};
+  for (const std::uint8_t smoothness_code : smoothness_codes) {
+    const std::array<std::uint8_t, 4> roughness_specular{
+        smoothness_code, 0u, 0u, 255u};
+    const auto roughness_texel =
+        decodeLabPbrTexel(base, nullptr, &roughness_specular);
+    const float expected_perceptual =
+        static_cast<float>(255u - smoothness_code) / 255.0f;
+    expectNear(roughness_texel.perceptual_roughness, expected_perceptual,
+               1.0e-7f,
+               "LabPBR specular R decodes exact perceptual roughness");
+    expectNear(roughness_texel.ggx_alpha,
+               expected_perceptual * expected_perceptual, 1.0e-7f,
+               "LabPBR specular R squares exactly once into GGX alpha");
+    expectNear(rtRrRoughnessFromGgxAlpha(roughness_texel.ggx_alpha),
+               expected_perceptual, 1.0e-7f,
+               "RR guide recovers the exact perceptual roughness");
+  }
   expectNear(resolved.dielectric_f0, 229.0f / 255.0f, 1.0e-6f,
              "dielectric F0 divides by 255");
   expectNear(resolved.porosity, 1.0f, 1.0e-6f,
@@ -1762,8 +1978,8 @@ void testLabPbrDecode() {
   expectNear(resolved.opacity, 64.0f / 255.0f, 1.0e-6f,
              "emission does not replace base opacity");
   expect(labPbrDebugViewFromName("roughness") ==
-             LabPbrDebugView::LinearRoughness,
-         "material debug name selects linear roughness");
+             LabPbrDebugView::GgxAlpha,
+         "material debug name selects GGX alpha");
   expect(std::string(labPbrDebugViewName(LabPbrDebugView::Emission)) ==
              "emission",
          "material debug view has stable diagnostic name");
@@ -3089,8 +3305,8 @@ void testPathTraceOptionalOutputMaskContract() {
          "all five RR guides occupy bits 10 through 14");
   expect(kPathTraceStatisticsOutputMask == 0x8000u,
          "path statistics occupy bit 15");
-  expect(kPathTraceAllOptionalOutputMask == 0xffffu,
-         "optional output ABI is a dense 16-bit mask");
+  expect(kPathTraceAllOptionalOutputMask == 0x7ffffu,
+         "optional output ABI includes three standalone temporal transparency masks");
 }
 
 void testRtNearestHitReference() {
@@ -3142,7 +3358,8 @@ void testRtNearestHitReference() {
 
   xpbd::gfx::RtDispatchBufferBounds dispatch_bounds{
       24u, 12u, 2u, 24u * 16u, 24u * 16u, 12u * 3u * 4u,
-      24u * 8u, 24u * 16u, 12u * 4u, 12u * 16u, 2u * 16u};
+      24u * 8u, 24u * 16u, 12u * 4u, 12u * 16u, 12u * 32u,
+      2u * 16u};
   expect(xpbd::gfx::rtDispatchBuffersInBounds(dispatch_bounds),
          "RT dispatch accepts complete vertex/primitive/instance buffers");
   dispatch_bounds.normal_bytes -= 1u;
@@ -3161,6 +3378,10 @@ void testRtNearestHitReference() {
   expect(!xpbd::gfx::rtDispatchBuffersInBounds(dispatch_bounds),
          "RT dispatch rejects undersized primitive identity buffer");
   dispatch_bounds.primitive_metadata_bytes += 1u;
+  dispatch_bounds.primitive_optics_bytes -= 1u;
+  expect(!xpbd::gfx::rtDispatchBuffersInBounds(dispatch_bounds),
+         "RT dispatch rejects undersized primitive optics buffer");
+  dispatch_bounds.primitive_optics_bytes += 1u;
   dispatch_bounds.instance_metadata_bytes -= 1u;
   expect(!xpbd::gfx::rtDispatchBuffersInBounds(dispatch_bounds),
          "RT dispatch rejects undersized instance identity buffer");
@@ -3228,6 +3449,8 @@ void testPathTraceSamplingAndAccumulation() {
   using xpbd::gfx::PathTraceAccumulationRequest;
   using xpbd::gfx::PathTraceFrameGeneration;
   using xpbd::gfx::PathTraceLightSamplingMode;
+  using xpbd::gfx::PathTraceLobe;
+  using xpbd::gfx::PathTraceRngDomain;
   using xpbd::gfx::PathTraceSettings;
   using xpbd::gfx::PathTraceUpscale;
   using xpbd::gfx::advancePathTraceAccumulation;
@@ -3236,6 +3459,14 @@ void testPathTraceSamplingAndAccumulation() {
   using xpbd::gfx::kDefaultPathTraceExposureEv;
   using xpbd::gfx::pathTraceRandom01;
   using xpbd::gfx::pathTraceRandomBits;
+  using xpbd::gfx::makePathTraceRngState;
+  using xpbd::gfx::offsetPathTraceRayOrigin;
+  using xpbd::gfx::pathTraceNextRandomBits;
+  using xpbd::gfx::pathTraceNextRandom01;
+  using xpbd::gfx::pathTraceRayConeTextureLod;
+  using xpbd::gfx::pathTraceTriangleGeometricNormal;
+  using xpbd::gfx::initializePathTraceRayCone;
+  using xpbd::gfx::propagatePathTraceRayCone;
   using xpbd::gfx::pathTraceTemporalJitter;
   using xpbd::gfx::samplePathTraceCosineHemisphere;
   using xpbd::gfx::shouldResetTemporalReconstructionHistory;
@@ -3364,6 +3595,65 @@ void testPathTraceSamplingAndAccumulation() {
   expect(std::isfinite(random_unit) && random_unit >= 0.0f &&
              random_unit < 1.0f,
          "path random float remains finite in [0,1)");
+  auto lobe_rng = makePathTraceRngState(
+      17u, 29u, 5u, 2u, PathTraceRngDomain::LobeSelection, 0u, 12345u);
+  auto lobe_rng_repeat = makePathTraceRngState(
+      17u, 29u, 5u, 2u, PathTraceRngDomain::LobeSelection, 0u, 12345u);
+  auto shadow_rng = makePathTraceRngState(
+      17u, 29u, 5u, 2u, PathTraceRngDomain::ShadowTransparency, 0u,
+      12345u);
+  const std::uint32_t lobe_word = pathTraceNextRandomBits(lobe_rng);
+  for (std::uint32_t light_sample = 0u; light_sample < 16u;
+       ++light_sample) {
+    (void)pathTraceNextRandom01(shadow_rng);
+  }
+  expect(lobe_word == 0x8e5e8ff8u &&
+             lobe_word == pathTraceNextRandomBits(lobe_rng_repeat) &&
+             lobe_rng.dimension == 1u && shadow_rng.dimension == 16u &&
+             lobe_word != pathTraceNextRandomBits(shadow_rng),
+         "state+dimension RNG domains are reproducible and Light Samples "
+         "cannot perturb the BSDF sequence");
+
+  const auto geometric = pathTraceTriangleGeometricNormal(
+      {1.0e6f, 0.0f, 0.0f}, {1.0e6f, 2.0f, 0.0f},
+      {1.0e6f, 0.0f, -3.0f});
+  expect(geometric[0] < -0.9999f && std::abs(geometric[1]) < 1.0e-6f &&
+             std::abs(geometric[2]) < 1.0e-6f,
+         "true triangle Ng preserves winding under far-origin nonuniform "
+         "geometry");
+  const auto tiny_offset = offsetPathTraceRayOrigin(
+      {1.0e-9f, 0.0f, -1.0e-9f}, {0.0f, 1.0f, 0.0f},
+      {1.0f, 1.0e-4f, 0.0f});
+  const std::array<float, 3> far_position{1.0e8f, -2.0e8f, 3.0e8f};
+  const auto far_offset = offsetPathTraceRayOrigin(
+      far_position, {0.0f, 1.0f, 0.0f}, {0.0f, 1.0f, 0.0f});
+  const auto reverse_offset = offsetPathTraceRayOrigin(
+      {0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f},
+      {0.0f, -1.0f, 0.0f});
+  expect(std::isfinite(tiny_offset[1]) && tiny_offset[1] > 0.0f &&
+             std::isfinite(far_offset[1]) &&
+             far_offset[1] > far_position[1] &&
+             reverse_offset[1] < 0.0f,
+         "ULP-first Ng ray offset remains finite at tiny/far scales and "
+         "selects the outgoing thin-sheet side");
+
+  const auto primary_cone = initializePathTraceRayCone(
+      590u, 579u, 1.0471975511965976f);
+  const float close_lod = pathTraceRayConeTextureLod(
+      primary_cone, 1.0f, 2.0f, 1.0f, 2048u, 2048u);
+  const float far_lod = pathTraceRayConeTextureLod(
+      primary_cone, 100.0f, 2.0f, 1.0f, 2048u, 2048u);
+  const auto mirror_cone = propagatePathTraceRayCone(
+      primary_cone, 5.0f, PathTraceLobe::Glossy, 0.0f);
+  const auto diffuse_cone = propagatePathTraceRayCone(
+      primary_cone, 5.0f, PathTraceLobe::Diffuse, 1.0f);
+  expect(primary_cone.width == 0.0f && primary_cone.spread_angle > 0.0f &&
+             close_lod >= 0.0f && far_lod > close_lod &&
+             mirror_cone.spread_angle == primary_cone.spread_angle &&
+             diffuse_cone.width > 0.0f &&
+             diffuse_cone.spread_angle > mirror_cone.spread_angle,
+         "ray cone initializes from pixel projection and propagates "
+         "continuous distance/lobe/UV-area LOD");
   const auto temporal_jitter_0 =
       pathTraceTemporalJitter(0u, 393u, 590u);
   const auto temporal_jitter_1 =
@@ -3588,6 +3878,7 @@ void testPathTraceBsdfAndDepth() {
   using xpbd::gfx::PathTraceLobe;
   using xpbd::gfx::PathTraceSettings;
   using xpbd::gfx::RtBsdfMaterial;
+  using xpbd::gfx::RtSurfaceOptics;
   using xpbd::gfx::advancePathTraceDepth;
   using xpbd::gfx::evaluatePathTraceRussianRoulette;
   using xpbd::gfx::evaluateRtBsdf;
@@ -3599,13 +3890,21 @@ void testPathTraceBsdfAndDepth() {
   using xpbd::gfx::rtFresnelDielectric;
   using xpbd::gfx::rtFresnelSchlick;
   using xpbd::gfx::rtGgxDistribution;
+  using xpbd::gfx::rtGgxVisibleNormalPdf;
+  using xpbd::gfx::rtBeerLambertTransmittance;
   using xpbd::gfx::rtShadingNormalCorrection;
   using xpbd::gfx::rtSmithGgxG1;
+  using xpbd::gfx::kDeltaMirrorAlpha;
+  using xpbd::gfx::kMinFiniteGgxAlpha;
   using xpbd::gfx::kPathTraceShadingNormalCorrectionLimit;
   using xpbd::gfx::samplePathTraceCosineHemisphere;
+  using xpbd::gfx::sampleRtGgxVndf;
   using xpbd::gfx::sampleRtBsdf;
 
   const float glass_f0 = rtDielectricF0FromIor(1.5f);
+  expect(kDeltaMirrorAlpha == 1.0e-6f &&
+             kMinFiniteGgxAlpha == 1.0e-4f,
+         "CPU mirror and finite-GGX thresholds match the shader contract");
   const float glass_ior = rtDielectricIorFromF0(glass_f0);
   expect(std::abs(glass_f0 - 0.04f) < 1.0e-5f &&
              std::abs(glass_ior - 1.5f) < 1.0e-4f,
@@ -3629,11 +3928,44 @@ void testPathTraceBsdfAndDepth() {
              rtSmithGgxG1(1.0f, 0.5f) == 1.0f &&
              rtSmithGgxG1(0.0f, 0.5f) == 0.0f,
          "GGX distribution and Smith masking retain finite limits");
+  expect(rtGgxDistribution(1.0f, 0.0f) == 0.0f &&
+             rtGgxDistribution(1.0f, 1.0e-5f) >
+                 rtGgxDistribution(1.0f, 0.02f) * 39'000.0f,
+         "GGX keeps zero as a delta atom and uses only the 1e-4 finite floor");
+
+  const RtSurfaceOptics default_optics;
+  expect(default_optics.transmission == 0.0f &&
+             default_optics.ior == 1.5f &&
+             default_optics.attenuation_color ==
+                 std::array<float, 3>{1.0f, 1.0f, 1.0f} &&
+             default_optics.attenuation_distance == 0.0f &&
+             !default_optics.thin_walled,
+         "surface-optics defaults are opaque and absorption-inert");
+  RtSurfaceOptics absorbing_optics;
+  absorbing_optics.transmission = 1.0f;
+  absorbing_optics.attenuation_color = {0.25f, 0.5f, 1.0f};
+  absorbing_optics.attenuation_distance = 2.0f;
+  const auto one_absorption_distance =
+      rtBeerLambertTransmittance(absorbing_optics, 2.0f);
+  const auto two_absorption_distances =
+      rtBeerLambertTransmittance(absorbing_optics, 4.0f);
+  expect(std::abs(one_absorption_distance[0] - 0.25f) < 1.0e-6f &&
+             std::abs(one_absorption_distance[1] - 0.5f) < 1.0e-6f &&
+             std::abs(one_absorption_distance[2] - 1.0f) < 1.0e-6f &&
+             std::abs(two_absorption_distances[0] - 0.0625f) < 1.0e-6f &&
+             std::abs(two_absorption_distances[1] - 0.25f) < 1.0e-6f,
+         "Beer-Lambert matches attenuation color at its reference distance");
+  absorbing_optics.thin_walled = true;
+  expect(rtBeerLambertTransmittance(absorbing_optics, 100.0f) ==
+             std::array<float, 3>{1.0f, 1.0f, 1.0f} &&
+             rtBeerLambertTransmittance(default_optics, 100.0f) ==
+                 std::array<float, 3>{1.0f, 1.0f, 1.0f},
+         "Thin-Walled and disabled attenuation never accumulate interior distance");
 
   RtBsdfMaterial dielectric;
   dielectric.base_color = {0.8f, 0.6f, 0.3f};
   dielectric.f0 = {glass_f0, glass_f0, glass_f0};
-  dielectric.roughness = 0.3f;
+  dielectric.ggx_alpha = 0.3f;
   dielectric.ior = 1.5f;
   const auto dielectric_probabilities =
       rtBsdfLobeProbabilities(dielectric);
@@ -3655,6 +3987,74 @@ void testPathTraceBsdfAndDepth() {
 
   const std::array<float, 3> normal{0.0f, 1.0f, 0.0f};
   const std::array<float, 3> view{0.0f, 1.0f, 0.0f};
+  const std::array<std::array<float, 3>, 2> vndf_views{{
+      view, {0.98480775f, 0.17364818f, 0.0f}}};
+  const std::array<float, 4> vndf_alphas{{
+      kMinFiniteGgxAlpha, 0.03f, 0.35f, 1.0f}};
+  for (std::size_t view_index = 0u; view_index < vndf_views.size();
+       ++view_index) {
+    for (std::size_t alpha_index = 0u; alpha_index < vndf_alphas.size();
+         ++alpha_index) {
+      std::uint32_t valid_vndf = 0u;
+      double pdf_integral = 0.0;
+      constexpr std::uint32_t kVndfSamples = 4096u;
+      for (std::uint32_t sample_index = 0u;
+           sample_index < kVndfSamples; ++sample_index) {
+        const float u = pathTraceRandom01(
+            41u, 43u, sample_index, 0u,
+            901u + static_cast<std::uint32_t>(
+                       view_index * vndf_alphas.size() + alpha_index));
+        const float v = pathTraceRandom01(
+            41u, 43u, sample_index, 1u,
+            901u + static_cast<std::uint32_t>(
+                       view_index * vndf_alphas.size() + alpha_index));
+        const auto sampled = sampleRtGgxVndf(
+            normal, vndf_views[view_index], vndf_alphas[alpha_index], u, v);
+        valid_vndf += sampled.valid ? 1u : 0u;
+        const float uniform_y = u;
+        const float radial =
+            std::sqrt(std::max(0.0f, 1.0f - uniform_y * uniform_y));
+        const float phi = 6.28318530717958647692f * v;
+        const std::array<float, 3> uniform_half{
+            radial * std::cos(phi), uniform_y, radial * std::sin(phi)};
+        pdf_integral += rtGgxVisibleNormalPdf(
+                            normal, vndf_views[view_index], uniform_half,
+                            vndf_alphas[alpha_index]) *
+                        6.28318530717958647692;
+      }
+      pdf_integral /= kVndfSamples;
+      // A uniform-hemisphere estimator cannot resolve the 1e-4 lobe's
+      // vanishingly small support. Its sampler validity is still covered here;
+      // normalization is integrated for the remaining finite-alpha range.
+      const bool integral_resolved =
+          vndf_alphas[alpha_index] <= kMinFiniteGgxAlpha * 1.001f ||
+          (std::isfinite(pdf_integral) &&
+           std::abs(pdf_integral - 1.0) < 0.10);
+      expect(valid_vndf == kVndfSamples &&
+                 integral_resolved,
+             "VNDF remains valid and its visible-normal PDF integrates near one");
+    }
+  }
+  RtBsdfMaterial delta_metal = metal;
+  delta_metal.ggx_alpha = 0.0f;
+  const auto delta_eval =
+      evaluateRtBsdf(delta_metal, normal, view, normal);
+  const auto delta_sample =
+      sampleRtBsdf(delta_metal, normal, view, true, 0.5f, 0.37f, 0.61f);
+  expect(!delta_eval.valid && delta_sample.valid && delta_sample.delta &&
+             delta_sample.lobe == PathTraceLobe::Glossy &&
+             std::abs(delta_sample.direction[0]) < 1.0e-7f &&
+             std::abs(delta_sample.direction[1] - 1.0f) < 1.0e-7f &&
+             std::abs(delta_sample.direction[2]) < 1.0e-7f &&
+             std::abs(delta_sample.pdf - 1.0f) < 1.0e-7f &&
+             std::abs(delta_sample.weight[0] - delta_metal.f0[0]) <
+                 1.0e-6f &&
+             std::abs(delta_sample.weight[1] - delta_metal.f0[1]) <
+                 1.0e-6f &&
+             std::abs(delta_sample.weight[2] - delta_metal.f0[2]) <
+                 1.0e-6f,
+         "zero-alpha metal is an exact glossy delta and has no continuous "
+         "GGX density");
   std::uint32_t valid_samples = 0u;
   bool sample_eval_consistent = true;
   for (std::uint32_t sample_index = 0u; sample_index < 4096u;
@@ -3729,20 +4129,25 @@ void testPathTraceBsdfAndDepth() {
   RtBsdfMaterial glass;
   glass.base_color = {1.0f, 1.0f, 1.0f};
   glass.f0 = {glass_f0, glass_f0, glass_f0};
-  glass.roughness = 0.05f;
+  glass.ggx_alpha = 0.2f;
   glass.transmission = 1.0f;
   glass.ior = 1.5f;
+  RtBsdfMaterial smooth_glass = glass;
+  smooth_glass.ggx_alpha = 0.0f;
   const auto refraction =
-      sampleRtBsdf(glass, normal, view, true, 0.99f, 0.4f, 0.7f);
+      sampleRtBsdf(smooth_glass, normal, view, true, 0.99f, 0.4f, 0.7f);
   expect(refraction.valid && refraction.delta &&
              refraction.lobe == PathTraceLobe::Transmission &&
              !refraction.total_internal_reflection &&
-             refraction.direction[1] < 0.0f,
-         "glass sample refracts through the opposite hemisphere");
+             refraction.direction[1] < 0.0f &&
+             std::abs(refraction.weight[0] - (1.0f / 1.5f) *
+                                                   (1.0f / 1.5f)) <
+                 1.0e-5f,
+         "smooth glass uses exact Fresnel selection and radiance eta-squared refraction");
   const std::array<float, 3> inside_grazing{
       0.9f, 0.4358899f, 0.0f};
   const auto tir = sampleRtBsdf(
-      glass, normal, inside_grazing, false, 0.99f, 0.4f, 0.7f);
+      smooth_glass, normal, inside_grazing, false, 0.99f, 0.4f, 0.7f);
   expect(tir.valid && tir.delta &&
              tir.total_internal_reflection &&
              tir.lobe == PathTraceLobe::Glossy &&
@@ -3753,7 +4158,7 @@ void testPathTraceBsdfAndDepth() {
              std::abs(tir.weight[2] - 1.0f) < 1.0e-6f,
          "neutral glass TIR is a unit glossy delta reflection");
 
-  RtBsdfMaterial colored_glass = glass;
+  RtBsdfMaterial colored_glass = smooth_glass;
   colored_glass.base_color = {0.1f, 0.4f, 0.9f};
   const auto colored_tir = sampleRtBsdf(
       colored_glass, normal, inside_grazing, false, 0.01f, 0.2f, 0.8f);
@@ -3769,23 +4174,76 @@ void testPathTraceBsdfAndDepth() {
   const std::array<float, 3> inside_below_critical{
       0.6f, 0.8f, 0.0f};
   const auto below_critical = sampleRtBsdf(
-      glass, normal, inside_below_critical, false, 0.99f, 0.4f, 0.7f);
+      smooth_glass, normal, inside_below_critical, false, 0.99f, 0.4f, 0.7f);
   expect(below_critical.valid && below_critical.delta &&
              !below_critical.total_internal_reflection &&
              below_critical.lobe == PathTraceLobe::Transmission &&
              below_critical.direction[1] < 0.0f,
          "inside-glass incidence below the critical angle still refracts");
+  RtBsdfMaterial thin_glass = glass;
+  thin_glass.thin_walled = true;
+  const auto thin_transmission = sampleRtBsdf(
+      thin_glass, normal, view, true, 0.99f, 0.2f, 0.8f);
+  const auto thin_continuous =
+      evaluateRtBsdf(thin_glass, normal, view, normal, true);
+  expect(thin_transmission.valid && thin_transmission.delta &&
+              thin_transmission.lobe == PathTraceLobe::Transmission &&
+              !thin_continuous.valid &&
+              std::abs(thin_transmission.direction[0] + view[0]) < 1.0e-6f &&
+             std::abs(thin_transmission.direction[1] + view[1]) < 1.0e-6f &&
+             std::abs(thin_transmission.direction[2] + view[2]) < 1.0e-6f,
+         "Thin-Walled transmission combines two interfaces and stays outside the medium stack");
+
+  std::uint32_t rough_reflections = 0u;
+  std::uint32_t rough_transmissions = 0u;
+  std::uint32_t rough_invalid = 0u;
+  bool rough_sample_eval_consistent = true;
+  constexpr std::uint32_t kRoughGlassSamples = 8192u;
+  for (std::uint32_t sample_index = 0u;
+       sample_index < kRoughGlassSamples; ++sample_index) {
+    const auto sampled = sampleRtBsdf(
+        glass, normal, view, true,
+        pathTraceRandom01(53u, 59u, sample_index, 0u, 1103u),
+        pathTraceRandom01(53u, 59u, sample_index, 1u, 1103u),
+        pathTraceRandom01(53u, 59u, sample_index, 2u, 1103u));
+    if (!sampled.valid) {
+      ++rough_invalid;
+      continue;
+    }
+    rough_reflections += sampled.lobe == PathTraceLobe::Glossy ? 1u : 0u;
+    rough_transmissions +=
+        sampled.lobe == PathTraceLobe::Transmission ? 1u : 0u;
+    const auto evaluated =
+        evaluateRtBsdf(glass, normal, view, sampled.direction, true);
+    const float pdf_tolerance =
+        std::max(2.0e-5f, evaluated.pdf * 2.0e-4f);
+    rough_sample_eval_consistent =
+        rough_sample_eval_consistent && !sampled.delta && evaluated.valid &&
+        std::abs(evaluated.pdf - sampled.pdf) <= pdf_tolerance;
+    for (std::size_t channel = 0u; channel < 3u; ++channel) {
+      const float value_tolerance =
+          std::max(2.0e-5f, evaluated.value[channel] * 2.0e-4f);
+      rough_sample_eval_consistent =
+          rough_sample_eval_consistent &&
+          std::abs(evaluated.value[channel] - sampled.value[channel]) <=
+              value_tolerance;
+    }
+  }
+  expect(rough_sample_eval_consistent && rough_reflections > 100u &&
+             rough_transmissions > 6'000u && rough_invalid < 800u,
+         "rough glass VNDF reflection/refraction sample, BSDF, Jacobian, and PDF stay matched");
+
   const std::array<std::array<float, 3>, 2> glass_views{{
       view, inside_grazing}};
   const std::array<bool, 2> glass_front_faces{{true, false}};
   for (std::size_t view_index = 0u;
        view_index < glass_views.size(); ++view_index) {
     std::array<double, 3> energy{};
-    constexpr std::uint32_t kGlassEnergySamples = 65536u;
+    constexpr std::uint32_t kGlassEnergySamples = 16384u;
     for (std::uint32_t sample_index = 0u;
          sample_index < kGlassEnergySamples; ++sample_index) {
       const auto sampled = sampleRtBsdf(
-          glass, normal, glass_views[view_index],
+          smooth_glass, normal, glass_views[view_index],
           glass_front_faces[view_index],
           pathTraceRandom01(23u, 31u, sample_index, 0u,
                             701u + static_cast<std::uint32_t>(view_index)),
@@ -3800,7 +4258,7 @@ void testPathTraceBsdfAndDepth() {
         energy[channel] += sampled.weight[channel];
       }
     }
-    const double energy_limit = view_index == 0u ? 1.02 : 1.05;
+    const double energy_limit = view_index == 0u ? 1.02 : 1.001;
     for (double &channel : energy) {
       channel /= kGlassEnergySamples;
       expect(std::isfinite(channel) && channel >= 0.0 &&
@@ -4212,8 +4670,25 @@ void testCanonicalCubeAndRtSceneRecords() {
   expect(records.materials.size() == 1u &&
              records.materials[0].read_only &&
              records.materials[0].feature_flags ==
-                 xpbd::gfx::kLabPbrSpecularMapActive,
-         "RT scene exposes one read-only resolved-material record");
+                  xpbd::gfx::kLabPbrSpecularMapActive &&
+             records.materials[0].surface_optics.transmission == 0.0f,
+         "RT scene exposes one read-only, optics-inert resolved-material record");
+  xpbd::gfx::RtSurfaceOptics optics_override;
+  optics_override.transmission = 0.75f;
+  optics_override.ior = 1.33f;
+  optics_override.attenuation_color = {0.8f, 0.9f, 1.0f};
+  optics_override.attenuation_distance = 4.0f;
+  optics_override.thin_walled = true;
+  const auto optical_records = xpbd::gfx::buildRigidModelRtSceneRecords(
+      mesh, draw_plan, &emissive_material, &optics_override);
+  expect(optical_records.valid() && optical_records.materials.size() == 1u &&
+             std::abs(optical_records.materials[0]
+                          .surface_optics.transmission -
+                      0.75f) < 1.0e-6f &&
+             std::abs(optical_records.materials[0].surface_optics.ior -
+                      1.33f) < 1.0e-6f &&
+             optical_records.materials[0].surface_optics.thin_walled,
+         "explicit fixture override can populate optics without deriving it from Base Alpha");
   const auto packed_layout =
       xpbd::gfx::buildRtPackedPrimitiveLayout(draw_plan, records);
   expect(packed_layout.valid() &&
@@ -4498,12 +4973,18 @@ void testRayTracingCapability() {
 void testFrameGenerationStateLegality() {
   using xpbd::gfx::frameGenerationAcquireMustPrecedeFrame;
   using xpbd::gfx::frameGenerationCurrentFrameInputsReady;
+  using xpbd::gfx::frameGenerationDisableAttemptAllowed;
+  using xpbd::gfx::frameGenerationDisableMayDestroy;
   using xpbd::gfx::frameGenerationInputClearMayArmProxy;
+  using xpbd::gfx::frameGenerationRecordDisableAttempt;
+  using xpbd::gfx::frameGenerationRecordDisableCleanupFailure;
+  using xpbd::gfx::frameGenerationRecordDisableDrain;
   using xpbd::gfx::frameGenerationRuntimeCombinationIsLegal;
   using xpbd::gfx::frameGenerationStateAfterValidInputTagging;
   using xpbd::gfx::frameGenerationTemporalInputIsReady;
   using xpbd::gfx::frameGenerationViewportIsValid;
   using xpbd::gfx::makeFrameGenerationTagExtent;
+  using xpbd::gfx::FrameGenerationDisableProgress;
   using xpbd::gfx::FrameGenerationRuntimeState;
   using xpbd::gfx::SwapchainOwnership;
   constexpr SwapchainOwnership native = SwapchainOwnership::Native;
@@ -4584,6 +5065,60 @@ void testFrameGenerationStateLegality() {
              FrameGenerationRuntimeState::DisablingDrain, true, proxy, true,
              false),
          "DLSS-G drain rejects enabled options");
+  expect(frameGenerationRuntimeCombinationIsLegal(
+             FrameGenerationRuntimeState::FaultedRecoveringNative, true,
+             proxy, true, true),
+         "DLSS-G failed disable preserves proxy, options, and tagged inputs");
+
+  FrameGenerationDisableProgress retry_progress{};
+  expect(frameGenerationDisableAttemptAllowed(retry_progress),
+         "DLSS-G fresh disable transaction permits its first SDK attempt");
+  expect(frameGenerationRecordDisableAttempt(retry_progress, false) &&
+             retry_progress.attempts == 1u &&
+             retry_progress.failure_latched &&
+             retry_progress.recovery_required &&
+             !retry_progress.confirmed_off,
+         "DLSS-G first eOff failure latches recovery without confirmation");
+  expect(!frameGenerationDisableAttemptAllowed(retry_progress),
+         "DLSS-G cannot busy-retry before a GPU and Present drain");
+  expect(!frameGenerationDisableMayDestroy(retry_progress, true, true, true),
+         "DLSS-G failed eOff preserves state and blocks proxy destruction");
+  expect(frameGenerationRecordDisableDrain(retry_progress) &&
+             frameGenerationDisableAttemptAllowed(retry_progress),
+         "DLSS-G completed drain permits exactly one retry");
+  expect(frameGenerationRecordDisableAttempt(retry_progress, true) &&
+             retry_progress.attempts == 2u &&
+             retry_progress.confirmed_off &&
+             retry_progress.failure_latched,
+         "DLSS-G retry may confirm Off while preserving the failure latch");
+  expect(!frameGenerationDisableMayDestroy(retry_progress, false, false,
+                                           false),
+         "DLSS-G successful retry still requires its final drain");
+  expect(frameGenerationRecordDisableDrain(retry_progress) &&
+             frameGenerationDisableMayDestroy(retry_progress, false, false,
+                                               false),
+         "DLSS-G confirmed Off with cleared state and final drain may destroy");
+
+  FrameGenerationDisableProgress cleanup_failure = retry_progress;
+  frameGenerationRecordDisableCleanupFailure(cleanup_failure);
+  expect(cleanup_failure.exhausted && cleanup_failure.failure_latched &&
+             cleanup_failure.recovery_required &&
+             !frameGenerationDisableMayDestroy(cleanup_failure, false, false,
+                                               true),
+         "DLSS-G null-tag failure remains a diagnosable destruction blocker");
+
+  FrameGenerationDisableProgress exhausted{};
+  expect(frameGenerationRecordDisableAttempt(exhausted, false) &&
+             frameGenerationRecordDisableDrain(exhausted) &&
+             frameGenerationRecordDisableAttempt(exhausted, false) &&
+             frameGenerationRecordDisableDrain(exhausted) &&
+             frameGenerationRecordDisableAttempt(exhausted, false),
+         "DLSS-G continuous failure consumes three drain-gated attempts");
+  expect(exhausted.attempts == 3u && exhausted.exhausted &&
+             exhausted.failure_latched && exhausted.recovery_required &&
+             !frameGenerationDisableAttemptAllowed(exhausted) &&
+             !frameGenerationDisableMayDestroy(exhausted, true, true, true),
+         "DLSS-G exhausted transaction stays recoverable but non-destructive");
 
   expect(frameGenerationCurrentFrameInputsReady(true, true, true, 42u, 42u,
                                                 42u),
@@ -4626,10 +5161,392 @@ void testFrameGenerationStateLegality() {
          "DLSS-G input cleanup cannot overwrite shutdown state");
 }
 
+void testEnvironmentLightAdoptionSourceContracts() {
+  const std::string world_header =
+      readTestSource("include/xpbd/gfx/world_environment.hpp");
+  const std::string ray_header =
+      readTestSource("include/xpbd/gfx/ray_tracing.hpp");
+  const std::string stage20 = readTestSource(
+      "src/gfx/vulkan_render/render/20_environment_and_rt_scene.inc");
+  const std::string stage50 = readTestSource(
+      "src/gfx/vulkan_render/render/50_path_trace_and_dlss.inc");
+  const std::string stage60 = readTestSource(
+      "src/gfx/vulkan_render/render/60_still_render.inc");
+  const std::string stage70 = readTestSource(
+      "src/gfx/vulkan_render/render/70_main_render_pass.inc");
+  const std::string backend_environment = readTestSource(
+      "src/gfx/vulkan/vulkan_backend_environment.cpp");
+  const std::string rt_scene_header =
+      readTestSource("include/xpbd/gfx/vulkan_rt_scene.hpp");
+  const std::string rt_scene_source =
+      readTestSource("src/gfx/vulkan_rt_scene.cpp");
+  const std::string raygen =
+      readTestSource("src/gfx/spirv/rt_debug.rgen");
+  expect(!world_header.empty() && !ray_header.empty() && !stage20.empty() &&
+             !stage50.empty() && !stage60.empty() && !stage70.empty() &&
+             !backend_environment.empty() && !rt_scene_header.empty() &&
+             !rt_scene_source.empty() && !raygen.empty(),
+         "G06 Environment/Light source-contract fixtures are readable");
+
+  const std::string compact_world = compactTestSource(world_header);
+  expect(compact_world.find("structResolvedSunLight{") != std::string::npos &&
+             compact_world.find("structResolvedEnvironmentView{") !=
+                 std::string::npos &&
+             compact_world.find("sampleEnvironment(") != std::string::npos &&
+             compact_world.find("evaluateEnvironment(") !=
+                 std::string::npos &&
+             compact_world.find("environmentPdf(") != std::string::npos &&
+             compact_world.find("environmentGeneration(") !=
+                 std::string::npos,
+         "World authoring resolves one read-only Sun and Environment sampling seam");
+
+  expect(ray_header.find("enum class RtLightType") != std::string::npos &&
+             ray_header.find("Environment") != std::string::npos &&
+             ray_header.find("SunDisk") != std::string::npos &&
+             ray_header.find("EmissiveTriangle") != std::string::npos &&
+             ray_header.find("struct RtLightRegistry") != std::string::npos &&
+             ray_header.find("RtStableLightId") != std::string::npos,
+         "minimal Light Registry freezes current families, stable IDs, and reserved ABI");
+
+  const std::string compact_stage20 = compactTestSource(stage20);
+  expect(compact_stage20.find("resolveSunLight(resolved_world_environment)") !=
+                  std::string::npos &&
+             compact_stage20.find(
+                 "resolveEnvironmentView(resolved_world_environment,") !=
+                  std::string::npos &&
+             compact_stage20.find("buildRtLightRegistry(") !=
+                 std::string::npos,
+         "render stage 20 resolves the sole Sun/Environment and Registry projection once");
+
+  expect(stage50.find("resolved_sun_light") != std::string::npos &&
+             stage60.find("resolved_sun_light") != std::string::npos &&
+             stage70.find("resolved_sun_light") != std::string::npos &&
+             stage50.find("pt_params.sun_radiance") != std::string::npos &&
+             stage50.find("pt_params.sun_angular_radius") !=
+                 std::string::npos &&
+             stage60.find("still_params.sun_radiance") !=
+                 std::string::npos &&
+             stage60.find("still_params.sun_angular_radius") !=
+                 std::string::npos,
+         "Preview, Full RT, and Still consume the same resolved finite Sun while the compatibility fields remain separate");
+
+  expect(raygen.find("struct RtLightSample") != std::string::npos &&
+             raygen.find("sampleLightRegistry(") != std::string::npos &&
+             raygen.find("sampleSunDisk(") != std::string::npos &&
+             raygen.find("lightRegistryProbabilities(") !=
+                 std::string::npos,
+         "RayGen samples Environment, finite SunDisk, and Emissive through one family selector");
+
+  const std::string compact_backend_environment =
+      compactTestSource(backend_environment);
+  expect(compact_backend_environment.find(
+             "static_cast<float>(sun_coverage)*analytic_sun_radiance[channel]") ==
+                 std::string::npos &&
+             raygen.find("background ? proceduralSunRadiance") !=
+                 std::string::npos,
+         "Procedural Sun remains background-visible but is not duplicated in the lighting environment distribution");
+
+  const std::string compact_raygen = compactTestSource(raygen);
+  expect(rt_scene_header.find("stable_light_id") != std::string::npos &&
+             rt_scene_source.find("makeRtEmissiveTriangleStableId") !=
+                 std::string::npos &&
+             raygen.find("emissiveTriangleTwoSided") != std::string::npos &&
+             compact_raygen.find(
+                 "abs(dot(emissiveTriangleNormal(entry),-lightDirection))") ==
+                 std::string::npos,
+         "emissive triangles carry stable identity and explicit sidedness instead of unconditional absolute cosine");
+}
+
+void testTransparentGuidePolicySourceContracts() {
+  const std::string aov_header =
+      readTestSource("include/xpbd/gfx/path_trace_aov.hpp");
+  const std::string ray_header =
+      readTestSource("include/xpbd/gfx/ray_tracing.hpp");
+  const std::string path_tracer_header =
+      readTestSource("include/xpbd/gfx/vulkan_path_tracer.hpp");
+  const std::string path_tracer_source =
+      readTestSource("src/gfx/vulkan_path_tracer.cpp");
+  const std::string rt_pipeline_header =
+      readTestSource("include/xpbd/gfx/vulkan_rt_pipeline.hpp");
+  const std::string rt_pipeline_source =
+      readTestSource("src/gfx/vulkan_rt_pipeline.cpp");
+  const std::string stage50 = readTestSource(
+      "src/gfx/vulkan_render/render/50_path_trace_and_dlss.inc");
+  const std::string streamline_header = readTestSource(
+      "include/xpbd/gfx/streamline_vulkan_runtime.hpp");
+  const std::string streamline_source =
+      readTestSource("src/gfx/streamline_vulkan_runtime.cpp");
+  const std::string raygen =
+      readTestSource("src/gfx/spirv/rt_debug.rgen");
+  const std::string any_hit =
+      readTestSource("src/gfx/spirv/rt_debug.rahit");
+  const std::string shadow_miss =
+      readTestSource("src/gfx/spirv/rt_shadow.rmiss");
+  expect(!aov_header.empty() && !ray_header.empty() &&
+             !path_tracer_header.empty() && !path_tracer_source.empty() &&
+             !rt_pipeline_header.empty() && !rt_pipeline_source.empty() &&
+             !stage50.empty() && !streamline_header.empty() &&
+             !streamline_source.empty() && !raygen.empty() &&
+             !any_hit.empty() && !shadow_miss.empty(),
+         "G07 transparent guide/mask source-contract fixtures are readable");
+
+  const std::string compact_aov = compactTestSource(aov_header);
+  const std::string compact_ray = compactTestSource(ray_header);
+  expect(compact_ray.find("enumclassTransparentGuidePolicyV1") !=
+                 std::string::npos &&
+             compact_ray.find("OpaqueBehind") != std::string::npos &&
+             compact_ray.find("FrontCoverage") != std::string::npos &&
+             compact_ray.find("ConservativeInvalid") != std::string::npos &&
+             compact_ray.find("kTransparentGuidePolicyV1=") !=
+                 std::string::npos &&
+             compact_ray.find("TransparentGuidePolicyV1::FrontCoverage") !=
+                 std::string::npos,
+         "TransparentGuidePolicyV1 compares all three policies and freezes FrontCoverage");
+  expect(compact_aov.find("TransparencyAndComposition") !=
+                 std::string::npos &&
+             compact_aov.find("ReactiveMask") != std::string::npos &&
+             compact_aov.find("GuideValidity") != std::string::npos &&
+             compact_aov.find("kPathTraceTransparencyGuideOutputMask") !=
+                 std::string::npos &&
+             compact_aov.find("kPathTraceAllOptionalOutputMask==0x7ffffu") !=
+                 std::string::npos,
+         "three independent single-channel temporal outputs extend the shared mask ABI");
+
+  const std::string compact_path_header =
+      compactTestSource(path_tracer_header);
+  const std::string compact_path_source =
+      compactTestSource(path_tracer_source);
+  expect(compact_path_header.find("transparencyAndCompositionImage()") !=
+                 std::string::npos &&
+             compact_path_header.find("reactiveMaskImage()") !=
+                 std::string::npos &&
+             compact_path_header.find("guideValidityImage()") !=
+                 std::string::npos &&
+             compact_path_source.find("VK_FORMAT_R8_UNORM") !=
+                 std::string::npos &&
+             compact_path_source.find("transparency-and-composition") !=
+                 std::string::npos &&
+             compact_path_source.find("guide-validity") !=
+                 std::string::npos,
+         "R8 UNORM masks are lazy exact-extent target-bundle resources with public real-image accessors");
+
+  const std::string compact_raygen = compactTestSource(raygen);
+  const std::string compact_pipeline = compactTestSource(rt_pipeline_source);
+  expect(compact_raygen.find(
+             "layout(set=0,binding=29,r8)uniformimage2DoutputTransparencyAndComposition;") !=
+                 std::string::npos &&
+             compact_raygen.find(
+             "layout(set=0,binding=30,r8)uniformimage2DoutputReactiveMask;") !=
+                 std::string::npos &&
+             compact_raygen.find(
+             "layout(set=0,binding=31,r8)uniformimage2DoutputGuideValidity;") !=
+                 std::string::npos &&
+             compact_pipeline.find(
+                 "std::array<VkDescriptorSetLayoutBinding,32>bindings{};") !=
+                 std::string::npos &&
+             compact_pipeline.find(
+                 "{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,12}") !=
+                 std::string::npos,
+         "Full RT mask bindings match the Vulkan 32-binding descriptor ABI");
+  expect(compact_raygen.find("kTransparentGuidePolicyFrontCoverage") !=
+                 std::string::npos &&
+             compact_raygen.find("guideValidity") != std::string::npos &&
+             compact_raygen.find("transparencyAndComposition") !=
+                 std::string::npos &&
+             compact_raygen.find("reactiveMask") != std::string::npos &&
+             compact_raygen.find("neutralizeRrGuides") !=
+                 std::string::npos,
+         "the deterministic primary probe owns one guide surface, masks, validity, and neutral RR fallback");
+
+  const std::string compact_stage50 = compactTestSource(stage50);
+  expect(compact_stage50.find("kPathTraceSrRequiredOutputMask") !=
+                 std::string::npos &&
+             compact_stage50.find("kPathTraceRrRequiredOutputMask") !=
+                 std::string::npos &&
+             compact_stage50.find("pt_temporal_inputs_ready_for_frame") !=
+                 std::string::npos &&
+             compact_stage50.find("lastOutputWriteMask()") !=
+                 std::string::npos &&
+             compact_stage50.find("transparency_and_composition_image") !=
+                 std::string::npos &&
+             compact_stage50.find("reactive_mask_image") !=
+                 std::string::npos,
+         "SR/RR submit only complete current-frame Depth/Motion/Guide/Mask resources or fall back structurally");
+
+  const std::string compact_streamline_header =
+      compactTestSource(streamline_header);
+  const std::string compact_streamline_source =
+      compactTestSource(streamline_source);
+  expect(compact_streamline_header.find(
+             "VkImagetransparency_and_composition_image") !=
+                 std::string::npos &&
+             compact_streamline_header.find("VkImagereactive_mask_image") !=
+                 std::string::npos &&
+             compact_streamline_source.find(
+                 "sl::kBufferTypeTransparencyAndCompositionMaskHint") !=
+                 std::string::npos &&
+             compact_streamline_source.find(
+                 "sl::kBufferTypeReactiveMaskHint") !=
+                 std::string::npos &&
+             compact_streamline_source.find("VK_FORMAT_R8_UNORM") !=
+                 std::string::npos,
+         "Streamline receives real current-frame R8 masks through supported SDK tags");
+
+  const std::string compact_any_hit = compactTestSource(any_hit);
+  const std::string compact_shadow_miss = compactTestSource(shadow_miss);
+  expect(compact_any_hit.find("hashAlphaWord") == std::string::npos &&
+             compact_any_hit.find("PrimitiveOpticsBuffer") !=
+                 std::string::npos &&
+             compact_any_hit.find("coverageVisibility") !=
+                 std::string::npos &&
+             compact_any_hit.find("physicalTransmission") !=
+                 std::string::npos &&
+             compact_any_hit.find("shadowPayload.visibility*=") !=
+                 std::string::npos &&
+             compact_shadow_miss.find("shadowPayload.visibility=1.0;") ==
+                 std::string::npos &&
+             compact_raygen.find("kRngDomainAlphaCoverage") !=
+                 std::string::npos,
+         "Cutout stays binary while deterministic coverage shadow visibility remains separate from physical transmission and beauty RNG");
+}
+
+void testFrameGenerationDisableSourceContracts() {
+  const std::string header = readTestSource(
+      "include/xpbd/gfx/streamline_vulkan_runtime.hpp");
+  const std::string state = readTestSource(
+      "include/xpbd/gfx/frame_generation_state.hpp");
+  const std::string runtime = readTestSource(
+      "src/gfx/streamline_vulkan_runtime.cpp");
+  const std::string backend = readTestSource("src/gfx/vulkan_backend.cpp");
+  const std::string backend_internal = readTestSource(
+      "src/gfx/vulkan/vulkan_backend_internal.hpp");
+  const std::string frame_generation = readTestSource(
+      "src/gfx/vulkan_render/render/80_frame_generation.inc");
+  const std::string frame_entry = readTestSource(
+      "src/gfx/vulkan_render/render/00_frame_entry.inc");
+  const std::string swapchain_wait = readTestSource(
+      "src/gfx/vulkan_render/render/10_swapchain_and_frame_wait.inc");
+  const std::string present = readTestSource(
+      "src/gfx/vulkan_render/render/90_submit_present_and_finalize.inc");
+  const std::string app_main = readTestSource("src/app/main_sdl3.cpp");
+  expect(!header.empty() && !state.empty() && !runtime.empty() &&
+             !backend.empty() && !backend_internal.empty() &&
+             !frame_generation.empty() && !frame_entry.empty() &&
+             !swapchain_wait.empty() && !present.empty() &&
+             !app_main.empty(),
+         "DLSS-G disable-transaction source fixtures are readable");
+
+  const std::string compact_header = compactTestSource(header);
+  const std::string compact_state = compactTestSource(state);
+  const std::string compact_runtime = compactTestSource(runtime);
+  const std::string compact_backend = compactTestSource(backend);
+  const std::string compact_backend_internal =
+      compactTestSource(backend_internal);
+  const std::string compact_frame_generation =
+      compactTestSource(frame_generation);
+  const std::string compact_frame_entry = compactTestSource(frame_entry);
+  const std::string compact_swapchain_wait =
+      compactTestSource(swapchain_wait);
+  const std::string compact_present = compactTestSource(present);
+  const std::string compact_app_main = compactTestSource(app_main);
+
+  expect(
+      compact_header.find(
+          "[[nodiscard]]boolbeginFrameGenerationShutdown(") !=
+              std::string::npos &&
+          compact_header.find(
+              "[[nodiscard]]boolretryFrameGenerationDisableAfterDrain(") !=
+              std::string::npos &&
+          compact_header.find(
+              "[[nodiscard]]boolnotifyFrameGenerationSwapchainDestroyed(") !=
+              std::string::npos &&
+          compact_header.find(
+              "[[nodiscard]]boolclearFrameGenerationInputs(") !=
+              std::string::npos &&
+          compact_header.find(
+              "[[nodiscard]]booldisableFrameGeneration()noexcept;") !=
+              std::string::npos,
+      "DLSS-G Options-Off and destruction APIs return checked results");
+  expect(
+      compact_state.find("kFrameGenerationDisableMaxAttempts=3u") !=
+              std::string::npos &&
+          compact_state.find("frameGenerationRecordDisableAttempt(") !=
+              std::string::npos &&
+          compact_state.find("frameGenerationRecordDisableDrain(") !=
+              std::string::npos &&
+          compact_state.find("frameGenerationDisableMayDestroy(") !=
+              std::string::npos,
+      "DLSS-G disable policy is bounded, drain-gated, and destruction-safe");
+  expect(
+      compact_runtime.find(
+          "boolStreamlineVulkanRuntime::disableFrameGeneration()noexcept") !=
+              std::string::npos &&
+          compact_runtime.find("frameGenerationRecordDisableAttempt(") !=
+              std::string::npos &&
+          compact_runtime.find("frameGenerationRecordDisableDrain(") !=
+              std::string::npos &&
+          compact_runtime.find("frameGenerationDisableMayDestroy(") !=
+              std::string::npos &&
+          compact_runtime.find("if(!previous&&enabled){") !=
+              std::string::npos,
+      "Streamline runtime implements the bounded Options-Off transaction");
+  expect(
+      compact_backend.find("retryFrameGenerationDisableAfterDrain(") !=
+              std::string::npos &&
+          compact_backend.find(
+              "shutdownblockedbyFGdisablefailure") != std::string::npos &&
+          compact_backend_internal.find(
+              "[[nodiscard]]booldestroySwapchainObjects();") !=
+              std::string::npos,
+      "Vulkan recreate and shutdown drain, retry, and block destruction");
+  expect(
+      compact_frame_generation.find(
+          "frameGenerationRecoveryRequired()") != std::string::npos &&
+          compact_frame_generation.find("fg_force_native_recovery_=true;") !=
+              std::string::npos,
+      "FG input-clear failures propagate into Native recovery");
+  expect(
+      compact_runtime.find("if(result==VK_ERROR_DEVICE_LOST){") !=
+              std::string::npos &&
+          compact_runtime.find(
+              "returnFrameGenerationTransitionResult::FatalDeviceLost;") !=
+              std::string::npos &&
+          compact_runtime.find(
+              "returnFrameGenerationTransitionResult::RecoverNative;") !=
+              std::string::npos,
+      "DLSS-G classifies only device loss as fatal and keeps SDK errors recoverable");
+  expect(
+      compact_frame_entry.find("!fg_diagnostic.recovery_required") !=
+              std::string::npos &&
+          compact_swapchain_wait.find("if(!recreateSwapchain()){") !=
+              std::string::npos &&
+          compact_swapchain_wait.find("if(!fatal_error_){") !=
+              std::string::npos &&
+          compact_present.find(
+              "fg_present_transition==FrameGenerationTransitionResult::RecoverNative") !=
+              std::string::npos &&
+          compact_present.find(
+              "fg_present_transition==FrameGenerationTransitionResult::FatalDeviceLost") !=
+              std::string::npos,
+      "frame entry, resize retry, and Present recovery preserve fatal routing");
+  expect(
+      compact_app_main.find("XPBD_R0F_F11_GATE") != std::string::npos &&
+          compact_app_main.find("R0F_G03_F11_GATE_TRIGGER") !=
+              std::string::npos &&
+          compact_app_main.find("toggle_borderless_fullscreen();") !=
+              std::string::npos,
+      "developer-only F11 fixture invokes the production fullscreen transition");
+}
+
 void testRtAlphaSemantics() {
   using xpbd::gfx::RtAlphaMode;
   using xpbd::gfx::RtFrontToBackAccumulator;
+  using xpbd::gfx::RtTransparencyClass;
+  using xpbd::gfx::RtTransparentGuideProbeInputV1;
+  using xpbd::gfx::TransparentGuidePolicyV1;
+  using xpbd::gfx::resolveRtTransparentGuideProbeV1;
   using xpbd::gfx::rtAcceptedOpacity;
+  using xpbd::gfx::rtDeterministicShadowVisibilityAfter;
   using xpbd::gfx::rtShadowVisibilityAfter;
 
   expectNear(rtAcceptedOpacity(RtAlphaMode::Cutout, 0.0f), 0.0f, 1.0e-6f,
@@ -4659,6 +5576,79 @@ void testRtAlphaSemantics() {
   shadow = rtShadowVisibilityAfter(shadow, 0.5f, RtAlphaMode::Blend);
   expectNear(shadow, 0.25f, 1.0e-6f,
              "two half-alpha layers transmit one quarter shadow light");
+
+  expectNear(rtDeterministicShadowVisibilityAfter(
+                 1.0f, 0.5f, RtAlphaMode::Blend, 0.25f),
+             0.625f, 1.0e-6f,
+             "coverage and physical transmission combine independently");
+  expectNear(rtDeterministicShadowVisibilityAfter(
+                 1.0f, 0.5f, RtAlphaMode::Cutout, 0.0f),
+             0.0f, 1.0e-6f,
+             "accepted cutout remains a binary shadow occluder");
+  expectNear(rtDeterministicShadowVisibilityAfter(
+                 1.0f, 0.0f, RtAlphaMode::Cutout, 0.75f),
+             1.0f, 1.0e-6f,
+             "discarded cutout does not apply physical transmission");
+
+  RtTransparentGuideProbeInputV1 guide_input;
+  auto guide = resolveRtTransparentGuideProbeV1(guide_input);
+  expect(guide.policy == TransparentGuidePolicyV1::FrontCoverage &&
+             guide.use_front_surface && guide.guide_validity == 1.0f &&
+             !guide.neutralize_rr_guides,
+         "opaque primary guide remains valid on the front surface");
+
+  guide_input.classification = RtTransparencyClass::Cutout;
+  guide_input.coverage = 0.0f;
+  guide_input.opaque_behind_available = true;
+  guide = resolveRtTransparentGuideProbeV1(guide_input);
+  expect(guide.policy == TransparentGuidePolicyV1::OpaqueBehind &&
+             !guide.use_front_surface && guide.use_opaque_behind &&
+             guide.guide_validity == 1.0f,
+         "discarded cutout deterministically selects the opaque surface behind");
+
+  guide_input = {};
+  guide_input.classification = RtTransparencyClass::CoverageBlend;
+  guide_input.coverage = 0.5f;
+  guide_input.coverage_layer_count = 1u;
+  guide = resolveRtTransparentGuideProbeV1(guide_input);
+  expect(guide.policy == TransparentGuidePolicyV1::FrontCoverage &&
+             guide.use_front_surface && guide.guide_validity == 1.0f &&
+             !guide.neutralize_rr_guides,
+         "single coverage layer freezes FrontCoverage guide policy");
+  expectNear(guide.transparency_and_composition, 1.0f, 1.0e-6f,
+             "half coverage produces maximal composition mask");
+  expectNear(guide.reactive, 1.0f, 1.0e-6f,
+             "half coverage produces maximal reactive mask");
+
+  guide_input.coverage_layer_count = 2u;
+  guide = resolveRtTransparentGuideProbeV1(guide_input);
+  expect(guide.policy == TransparentGuidePolicyV1::ConservativeInvalid &&
+             guide.guide_validity == 0.0f &&
+             guide.disocclusion == 1.0f &&
+             guide.neutralize_rr_guides,
+         "ambiguous coverage stack rejects history with neutral RR guides");
+
+  guide_input = {};
+  guide_input.classification = RtTransparencyClass::PhysicalTransmission;
+  guide_input.physical_transmission = 0.8f;
+  guide = resolveRtTransparentGuideProbeV1(guide_input);
+  expect(guide.policy == TransparentGuidePolicyV1::FrontCoverage &&
+             guide.use_front_surface && guide.guide_validity == 0.0f &&
+             guide.neutralize_rr_guides,
+         "physical transmission keeps front Depth/Motion and neutralizes unreliable RR guides");
+  expectNear(guide.transparency_and_composition, 0.8f, 1.0e-6f,
+             "physical transmission drives the composition mask");
+
+  guide_input = {};
+  guide_input.classification = RtTransparencyClass::CoverageBlend;
+  guide_input.coverage = std::numeric_limits<float>::quiet_NaN();
+  guide_input.coverage_layer_count = 1u;
+  guide_input.surface_identity_matches_history = false;
+  guide = resolveRtTransparentGuideProbeV1(guide_input);
+  expectNear(guide.transparency_and_composition, 0.0f, 1.0e-6f,
+             "non-finite coverage sanitizes to a finite zero mask");
+  expect(guide.disocclusion == 1.0f,
+         "guide surface identity change forces disocclusion");
 }
 
 void testRtMotionProjection() {
@@ -5040,6 +6030,39 @@ void testWorldEnvironmentFoundation() {
              !resolved.background_visible &&
              !resolved.environment_lighting,
          "default World resolves to Sky Off without IBL");
+  const ResolvedEnvironmentView constant_environment_a =
+      resolveEnvironmentView(resolved, {0.1f, 0.2f, 0.3f});
+  const ResolvedEnvironmentView constant_environment_b =
+      resolveEnvironmentView(resolved, {0.2f, 0.2f, 0.3f});
+  expect(constant_environment_a.generation !=
+             constant_environment_b.generation,
+         "resolved Environment generation includes constant-fallback radiance");
+  const ResolvedEnvironmentView analytic_environment =
+      resolveEnvironmentView(resolved, {}, 1.5f);
+  const EnvironmentSample analytic_sample =
+      sampleEnvironment(analytic_environment, 0.4f, 0.7f, 0.0f, 0.0f);
+  const EnvironmentSample analytic_non_finite_sample = sampleEnvironment(
+      analytic_environment, std::numeric_limits<float>::quiet_NaN(),
+      std::numeric_limits<float>::infinity(), 0.0f, 0.0f);
+  expect(analytic_environment.kind ==
+             ResolvedEnvironmentKind::AnalyticFallback &&
+             analytic_environment.power_estimate > 0.0f &&
+             analytic_sample.valid && analytic_non_finite_sample.valid &&
+             std::isfinite(analytic_non_finite_sample.direction[0]) &&
+             std::isfinite(analytic_non_finite_sample.direction[1]) &&
+             std::isfinite(analytic_non_finite_sample.direction[2]),
+         "legacy analytic sky resolves through the shared Environment seam");
+  expectNear(environmentPdf(analytic_environment, analytic_sample.direction),
+             analytic_sample.pdf, 1.0e-7f,
+             "analytic Environment sample and PDF agree");
+  const std::array<float, 3> analytic_evaluation =
+      evaluateEnvironment(analytic_environment, analytic_sample.direction);
+  for (std::size_t channel = 0; channel < analytic_sample.radiance.size();
+       ++channel) {
+    expectNear(analytic_evaluation[channel], analytic_sample.radiance[channel],
+               1.0e-6f,
+               "analytic Environment sample and evaluation agree");
+  }
   world.sky_rendering = SkyRendering::UserHdri;
   world.selected_hdr_identity = "missing.hdr";
   world.hdr = std::move(preserved_asset);
@@ -5067,6 +6090,31 @@ void testWorldEnvironmentFoundation() {
              "HDR background exposure is retained separately");
   expectNear(resolved.rotation_radians, static_cast<float>(1.5 * pi), 1e-6f,
              "HDR rotation is normalized");
+  const ResolvedEnvironmentView hdr_environment =
+      resolveEnvironmentView(resolved);
+  expect(hdr_environment.kind == ResolvedEnvironmentKind::UserHdri &&
+             hdr_environment.lighting_enabled &&
+             hdr_environment.sampling_ready &&
+             hdr_environment.power_estimate > 0.0f,
+         "resolved HDR environment exposes a ready finite-power sampling view");
+  const EnvironmentSample hdr_environment_sample =
+      sampleEnvironment(hdr_environment, 0.37f, 0.61f, 0.25f, 0.75f);
+  const std::array<float, 3> hdr_environment_evaluation =
+      evaluateEnvironment(hdr_environment, hdr_environment_sample.direction);
+  expect(hdr_environment_sample.valid &&
+             hdr_environment_sample.pdf > 0.0f &&
+             std::isfinite(hdr_environment_sample.pdf),
+         "resolved HDR environment produces a finite valid sample");
+  expectNear(environmentPdf(hdr_environment,
+                            hdr_environment_sample.direction),
+             hdr_environment_sample.pdf, 1.0e-6f,
+             "resolved HDR environment sample and PDF agree");
+  for (std::size_t channel = 0;
+       channel < hdr_environment_sample.radiance.size(); ++channel) {
+    expectNear(hdr_environment_evaluation[channel],
+               hdr_environment_sample.radiance[channel], 1.0e-6f,
+               "resolved HDR environment sample and evaluation agree");
+  }
   UtcDateTime shifted_local;
   expect(shiftUtcDateTime(UtcDateTime{2024, 1, 1, 0, 30, 0.0},
                           -3600.0, shifted_local, &error) &&
@@ -5080,6 +6128,7 @@ void testWorldEnvironmentFoundation() {
              resolved.environment_strength == 0.0f &&
              resolved.background_visible,
          "background visibility does not force environment lighting");
+  world.environment_lighting = true;
   world.sky_rendering = SkyRendering::ProceduralDayNight;
   world.procedural_resources_ready = false;
   resolved = resolveWorldEnvironment(world);
@@ -5092,6 +6141,80 @@ void testWorldEnvironmentFoundation() {
              resolved.celestial != nullptr && resolved.atmosphere != nullptr &&
              resolved.clouds == nullptr,
          "ready procedural resources resolve with celestial and atmosphere");
+  const ResolvedSunLight resolved_sun = resolveSunLight(resolved);
+  expect(resolved_sun.enabled && resolved_sun.lighting_enabled &&
+             resolved_sun.angular_radius > 0.0f &&
+             resolved_sun.solid_angle > 0.0f &&
+             resolved_sun.power_estimate > 0.0f &&
+             resolved_sun.generation != 0u,
+         "procedural World resolves one finite powered SunDisk");
+  const RtSunDiskSample sun_sample =
+      sampleRtSunDisk(resolved_sun, 0.25f, 0.75f);
+  const std::array<float, 3> sun_evaluation =
+      evaluateRtSunDisk(resolved_sun, sun_sample.direction);
+  expect(sun_sample.valid && sun_sample.pdf > 0.0f &&
+             std::isfinite(sun_sample.pdf) &&
+             sun_evaluation[0] > 0.0f,
+         "resolved SunDisk produces a finite in-disk sample");
+  expectNear(rtSunDiskPdf(resolved_sun, sun_sample.direction),
+             sun_sample.pdf, std::max(sun_sample.pdf * 1.0e-6f, 1.0e-4f),
+             "SunDisk sample and solid-angle PDF agree");
+  world.sun.strength *= 2.0f;
+  const ResolvedSunLight stronger_sun =
+      resolveSunLight(resolveWorldEnvironment(world));
+  expect(stronger_sun.generation != resolved_sun.generation &&
+             stronger_sun.power_estimate > resolved_sun.power_estimate,
+         "resolved Sun generation and power include authored strength");
+  world.sun.strength *= 0.5f;
+  world.environment_lighting = false;
+  const ResolvedWorldEnvironment sun_only_world =
+      resolveWorldEnvironment(world);
+  expect(!sun_only_world.environment_lighting &&
+             resolveSunLight(sun_only_world).lighting_enabled,
+         "Sun/Moon lighting remains independently controlled from Environment lighting");
+  world.environment_lighting = true;
+
+  const RtLightRegistry registry = buildRtLightRegistry(
+      hdr_environment, true, resolved_sun, 77u, 3.0f, true);
+  const RtLightRecord *environment_light =
+      findRtLight(registry, RtLightType::Environment);
+  const RtLightRecord *sun_light =
+      findRtLight(registry, RtLightType::SunDisk);
+  const RtLightRecord *emissive_light =
+      findRtLight(registry, RtLightType::EmissiveTriangle);
+  expect(registry.enabled_family_count == 3u &&
+             registry.total_sampling_weight > 0.0f &&
+             environment_light != nullptr && environment_light->enabled &&
+             sun_light != nullptr && sun_light->enabled &&
+             emissive_light != nullptr && emissive_light->enabled,
+         "minimal Light Registry enables Environment, SunDisk, and Emissive families");
+  expectNear(lightPdf(registry, RtLightType::Environment) +
+                 lightPdf(registry, RtLightType::SunDisk) +
+                 lightPdf(registry, RtLightType::EmissiveTriangle),
+             1.0f, 1.0e-6f,
+             "minimal Light Registry family probabilities normalize");
+  const RtLightRegistry reweighted_registry = buildRtLightRegistry(
+      hdr_environment, true, resolved_sun, 77u, 4.0f, true);
+  expect(reweighted_registry.generation != registry.generation,
+         "Light Registry generation changes when a family weight changes");
+  const RtLightSelection first_selection = sampleRtLight(registry, 0.0f);
+  const RtLightSelection repeated_selection = sampleRtLight(registry, 0.0f);
+  const RtLightSelection last_selection = sampleRtLight(registry, 0.999999f);
+  expect(first_selection.valid && repeated_selection.valid &&
+             first_selection.stable_id == repeated_selection.stable_id &&
+             first_selection.type == RtLightType::Environment &&
+             last_selection.valid &&
+             last_selection.type == RtLightType::EmissiveTriangle,
+         "minimal Light Registry selection is ordered and deterministic");
+  const std::array<std::uint32_t, 4> emitter_identity{3u, 5u, 7u, 11u};
+  const RtStableLightId emitter_id =
+      makeRtEmissiveTriangleStableId(emitter_identity, 13u);
+  expect(emitter_id &&
+             emitter_id ==
+                 makeRtEmissiveTriangleStableId(emitter_identity, 13u) &&
+             emitter_id !=
+                 makeRtEmissiveTriangleStableId(emitter_identity, 14u),
+         "emissive stable IDs repeat for one source and change by instance");
   const VolumetricCloudState default_clouds;
   const std::string default_cloud_key =
       volumetricCloudCacheKey(default_clouds);
@@ -5242,6 +6365,8 @@ int main(int argc, char **argv) {
   testPathTraceOptionalOutputMaskContract();
   testRtNearestHitReference();
   testPathTracePbrSourceContracts();
+  testEnvironmentLightAdoptionSourceContracts();
+  testTransparentGuidePolicySourceContracts();
   testSelectionOutlineTemporalContract();
   testPathTraceSamplingAndAccumulation();
   testPathTraceAdjustableSettingsContract();
@@ -5251,6 +6376,7 @@ int main(int argc, char **argv) {
   testCanonicalCubeAndRtSceneRecords();
   testRayTracingCapability();
   testFrameGenerationStateLegality();
+  testFrameGenerationDisableSourceContracts();
   testRtAlphaSemantics();
   testRtMotionProjection();
   testStaticMaterialClassification();

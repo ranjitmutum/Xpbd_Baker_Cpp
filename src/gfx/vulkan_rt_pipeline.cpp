@@ -8,6 +8,7 @@
 #include <array>
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <iterator>
 #include <limits>
@@ -258,7 +259,7 @@ bool VulkanRtPipeline::createDescriptorResources() {
   constexpr VkShaderStageFlags kAllRtStages =
       VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
       VK_SHADER_STAGE_ANY_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
-  std::array<VkDescriptorSetLayoutBinding, 28> bindings{};
+  std::array<VkDescriptorSetLayoutBinding, 32> bindings{};
   for (std::uint32_t index = 0; index < bindings.size(); ++index) {
     bindings[index].binding = index;
     bindings[index].descriptorCount = 1;
@@ -284,17 +285,23 @@ bool VulkanRtPipeline::createDescriptorResources() {
   bindings[25].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
   bindings[26].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
   bindings[27].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  bindings[29].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  bindings[30].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  bindings[31].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 
   VkDescriptorSetLayoutCreateInfo layout_info{
       VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
   layout_info.bindingCount =
       static_cast<std::uint32_t>(bindings.size());
   layout_info.pBindings = bindings.data();
-  std::array<VkDescriptorBindingFlags, 28> binding_flags{};
+  std::array<VkDescriptorBindingFlags, 32> binding_flags{};
   VkDescriptorSetLayoutBindingFlagsCreateInfo binding_flags_info{
       VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
   if (descriptor_binding_partially_bound_enabled_) {
     for (std::uint32_t binding = 21u; binding <= 27u; ++binding) {
+      binding_flags[binding] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+    }
+    for (std::uint32_t binding = 29u; binding <= 31u; ++binding) {
       binding_flags[binding] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
     }
     binding_flags_info.bindingCount =
@@ -309,8 +316,8 @@ bool VulkanRtPipeline::createDescriptorResources() {
 
   const std::array<VkDescriptorPoolSize, 4> pool_sizes{{
       {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
-      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 9},
-      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 14},
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 12},
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 15},
       {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4},
   }};
   VkDescriptorPoolCreateInfo pool_info{
@@ -522,6 +529,16 @@ bool VulkanRtPipeline::record(
           params.rr_specular_hit_distance_view,
           pathTraceOptionalOutputBit(
               PathTraceOptionalOutput::RrSpecularHitDistance)) ||
+      missing_optional_view(
+          params.transparency_and_composition_view,
+          pathTraceOptionalOutputBit(
+              PathTraceOptionalOutput::TransparencyAndComposition)) ||
+      missing_optional_view(
+          params.reactive_mask_view,
+          pathTraceOptionalOutputBit(PathTraceOptionalOutput::ReactiveMask)) ||
+      missing_optional_view(
+          params.guide_validity_view,
+          pathTraceOptionalOutputBit(PathTraceOptionalOutput::GuideValidity)) ||
       params.albedo_view == VK_NULL_HANDLE ||
       params.normal_view == VK_NULL_HANDLE ||
       params.specular_view == VK_NULL_HANDLE ||
@@ -566,6 +583,7 @@ bool VulkanRtPipeline::record(
       scene.colorBufferBytes(),
       scene.primitiveFlagBufferBytes(),
       scene.primitiveMetadataBufferBytes(),
+      scene.primitiveOpticsBufferBytes(),
       scene.instanceMetadataBufferBytes()};
   const bool buffers_valid =
       scene.normalBuffer() != VK_NULL_HANDLE &&
@@ -575,6 +593,7 @@ bool VulkanRtPipeline::record(
       scene.colorBuffer() != VK_NULL_HANDLE &&
       scene.primitiveFlagBuffer() != VK_NULL_HANDLE &&
       scene.primitiveMetadataBuffer() != VK_NULL_HANDLE &&
+      scene.primitiveOpticsBuffer() != VK_NULL_HANDLE &&
       scene.instanceMetadataBuffer() != VK_NULL_HANDLE &&
       scene.emissiveTriangleBuffer() != VK_NULL_HANDLE &&
       scene.positionBuffer() != VK_NULL_HANDLE &&
@@ -601,7 +620,7 @@ bool VulkanRtPipeline::record(
   VkAccelerationStructureKHR tlas = scene.tlas();
   acceleration_info.accelerationStructureCount = 1;
   acceleration_info.pAccelerationStructures = &tlas;
-  std::array<VkDescriptorImageInfo, 13> images{};
+  std::array<VkDescriptorImageInfo, 16> images{};
   images[0].imageView = params.output_view;
   images[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
   images[1].imageView = params.albedo_view;
@@ -632,17 +651,23 @@ bool VulkanRtPipeline::record(
   images[11].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
   images[12].imageView = params.rr_normal_roughness_view;
   images[12].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+  images[13].imageView = params.transparency_and_composition_view;
+  images[13].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+  images[14].imageView = params.reactive_mask_view;
+  images[14].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+  images[15].imageView = params.guide_validity_view;
+  images[15].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-  std::array<VkDescriptorBufferInfo, 14> buffers{};
-  const std::array<VkBuffer, 14> buffer_handles{
+  std::array<VkDescriptorBufferInfo, 15> buffers{};
+  const std::array<VkBuffer, 15> buffer_handles{
       scene.normalBuffer(), scene.indexAttribBuffer(), scene.uvBuffer(),
       scene.colorBuffer(), scene.primitiveFlagBuffer(),
       scene.primitiveMetadataBuffer(), scene.instanceMetadataBuffer(),
       scene.tangentBuffer(), params.environment_distribution,
       scene.emissiveTriangleBuffer(), scene.positionBuffer(),
       scene.previousPositionBuffer(), scene.instanceMotionBuffer(),
-      params.motion_frame_buffer};
-  const std::array<VkDeviceSize, 14> buffer_sizes{
+      params.motion_frame_buffer, scene.primitiveOpticsBuffer()};
+  const std::array<VkDeviceSize, 15> buffer_sizes{
       scene.normalBufferBytes(), scene.indexAttribBufferBytes(),
       scene.uvBufferBytes(), scene.colorBufferBytes(),
       scene.primitiveFlagBufferBytes(), scene.primitiveMetadataBufferBytes(),
@@ -650,13 +675,13 @@ bool VulkanRtPipeline::record(
       params.environment_distribution_bytes,
       scene.emissiveTriangleBufferBytes(), scene.positionBufferBytes(),
       scene.previousPositionBufferBytes(), scene.instanceMotionBufferBytes(),
-      params.motion_frame_buffer_bytes};
+      params.motion_frame_buffer_bytes, scene.primitiveOpticsBufferBytes()};
   for (std::size_t index = 0; index < buffers.size(); ++index) {
     buffers[index].buffer = buffer_handles[index];
     buffers[index].range = buffer_sizes[index];
   }
 
-  std::array<VkWriteDescriptorSet, 28> writes{};
+  std::array<VkWriteDescriptorSet, 32> writes{};
   for (std::uint32_t binding = 0; binding < writes.size(); ++binding) {
     writes[binding].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[binding].dstSet = descriptor_set_;
@@ -711,6 +736,13 @@ bool VulkanRtPipeline::record(
   writes[26].pImageInfo = &images[11];
   writes[27].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
   writes[27].pImageInfo = &images[12];
+  writes[28].pBufferInfo = &buffers[14];
+  writes[29].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  writes[29].pImageInfo = &images[13];
+  writes[30].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  writes[30].pImageInfo = &images[14];
+  writes[31].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  writes[31].pImageInfo = &images[15];
   DescriptorKey descriptor_key{};
   descriptor_key.tlas = tlas;
   for (std::size_t index = 0; index < images.size(); ++index) {
@@ -722,7 +754,7 @@ bool VulkanRtPipeline::record(
   if (descriptor_key_valid_ && descriptor_key == descriptor_key_) {
     ++descriptor_cache_hits_;
   } else {
-    std::array<VkWriteDescriptorSet, 28> valid_writes{};
+    std::array<VkWriteDescriptorSet, 32> valid_writes{};
     std::uint32_t valid_write_count = 0u;
     for (const VkWriteDescriptorSet &write : writes) {
       const bool missing_optional_storage_image =
@@ -787,11 +819,25 @@ bool VulkanRtPipeline::record(
   push.light_direction_ambient[0] = params.light_direction[0];
   push.light_direction_ambient[1] = params.light_direction[1];
   push.light_direction_ambient[2] = params.light_direction[2];
-  push.light_direction_ambient[3] = params.ambient;
-  push.light_color_intensity[0] = params.light_color[0];
-  push.light_color_intensity[1] = params.light_color[1];
-  push.light_color_intensity[2] = params.light_color[2];
-  push.light_color_intensity[3] = params.light_intensity;
+  const float sun_radius =
+      std::isfinite(params.sun_angular_radius)
+          ? std::max(params.sun_angular_radius, 0.0f)
+          : 0.0f;
+  push.light_direction_ambient[3] =
+      params.sun_casts_shadow ? sun_radius : -sun_radius;
+  push.light_color_intensity[0] =
+      std::isfinite(params.sun_radiance[0])
+          ? std::max(params.sun_radiance[0], 0.0f)
+          : 0.0f;
+  push.light_color_intensity[1] =
+      std::isfinite(params.sun_radiance[1])
+          ? std::max(params.sun_radiance[1], 0.0f)
+          : 0.0f;
+  push.light_color_intensity[2] =
+      std::isfinite(params.sun_radiance[2])
+          ? std::max(params.sun_radiance[2], 0.0f)
+          : 0.0f;
+  push.light_color_intensity[3] = sun_radius > 0.0f ? 1.0f : 0.0f;
   push.depth_limits[0] = settings.max_diffuse_bounces;
   push.depth_limits[1] = settings.max_glossy_bounces;
   push.depth_limits[2] = settings.max_transmission_bounces;

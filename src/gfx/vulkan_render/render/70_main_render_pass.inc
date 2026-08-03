@@ -61,25 +61,24 @@
       float mvp_gl[16];
       mulMat(frame.proj_matrix, frame.view_matrix, mvp_gl);
       glMvpToVulkan(mvp_gl, mesh_pc.mvp);
-      if (raster != nullptr) {
-        mesh_pc.light_dir[0] = raster->lighting.direction[0];
-        mesh_pc.light_dir[1] = raster->lighting.direction[1];
-        mesh_pc.light_dir[2] = raster->lighting.direction[2];
-        mesh_pc.ambient = raster->lighting.ambient;
-        mesh_pc.light_color[0] = raster->lighting.color[0];
-        mesh_pc.light_color[1] = raster->lighting.color[1];
-        mesh_pc.light_color[2] = raster->lighting.color[2];
-        mesh_pc.intensity = raster->lighting.intensity;
-      } else {
-        mesh_pc.light_dir[0] = 0.35f;
-        mesh_pc.light_dir[1] = 0.85f;
-        mesh_pc.light_dir[2] = 0.40f;
-        mesh_pc.ambient = 0.38f;
-        mesh_pc.light_color[0] = 1.0f;
-        mesh_pc.light_color[1] = 1.0f;
-        mesh_pc.light_color[2] = 1.0f;
-        mesh_pc.intensity = 0.85f;
-      }
+      mesh_pc.light_dir[0] = resolved_sun_light.direction[0];
+      mesh_pc.light_dir[1] = resolved_sun_light.direction[1];
+      mesh_pc.light_dir[2] = resolved_sun_light.direction[2];
+      mesh_pc.ambient =
+          raster != nullptr ? raster->lighting.ambient : 0.38f;
+      mesh_pc.light_color[0] = resolved_sun_light.color[0];
+      mesh_pc.light_color[1] = resolved_sun_light.color[1];
+      mesh_pc.light_color[2] = resolved_sun_light.color[2];
+      const float resolved_sun_color_luminance =
+          0.2126f * resolved_sun_light.color[0] +
+          0.7152f * resolved_sun_light.color[1] +
+          0.0722f * resolved_sun_light.color[2];
+      mesh_pc.intensity =
+          resolved_sun_light.lighting_enabled &&
+                  resolved_sun_color_luminance > 1.0e-6f
+              ? resolved_sun_light.power_estimate /
+                    resolved_sun_color_luminance
+              : 0.0f;
       mesh_pc.material_debug[0] =
           static_cast<std::uint32_t>(frame.material_debug_view);
       mesh_pc.material_debug[1] =

@@ -354,6 +354,8 @@ VulkanPathTracer::targetFormatFeatures(VkFormat format) const noexcept {
     return rg32_target_features_;
   case VK_FORMAT_R32_SFLOAT:
     return r32_target_features_;
+  case VK_FORMAT_R8_UNORM:
+    return r8_target_features_;
   default:
     return 0u;
   }
@@ -372,6 +374,7 @@ bool VulkanPathTracer::queryTargetFormatCapabilities() {
   query(VK_FORMAT_R32_SFLOAT, r32_target_features_);
   query(VK_FORMAT_R32G32_SFLOAT, rg32_target_features_);
   query(VK_FORMAT_R32G32B32A32_SFLOAT, rgba32_target_features_);
+  query(VK_FORMAT_R8_UNORM, r8_target_features_);
   target_formats_queried_ = true;
 
   PathTraceTargetFailure required_failure;
@@ -423,6 +426,8 @@ bool VulkanPathTracer::queryTargetFormatCapabilities() {
            kPathTraceRrMotionOutputMask, false);
   validate(VK_FORMAT_R32G32B32A32_SFLOAT, "statistics-format",
            kPathTraceStatisticsOutputMask, false);
+  validate(VK_FORMAT_R8_UNORM, "temporal-transparency-mask-format",
+           kPathTraceTransparencyGuideOutputMask, false);
 
   required_target_formats_supported_ = !required_failure.failed();
   if (!required_target_formats_supported_) {
@@ -436,6 +441,8 @@ bool VulkanPathTracer::queryTargetFormatCapabilities() {
       !pathTraceFormatSupports(rg32_target_features_,
                                VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) ||
       !pathTraceFormatSupports(rgba32_target_features_,
+                               VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) ||
+      !pathTraceFormatSupports(r8_target_features_,
                                VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
   if (missing_optional_storage_format &&
       !descriptor_binding_partially_bound_enabled_) {
@@ -607,7 +614,7 @@ void VulkanPathTracer::destroyTargetBundle(TargetBundle &bundle) {
       vkDestroyImageView(device_, view, nullptr);
     }
   }
-  const std::array<VkImageView, 9> views{
+  const std::array<VkImageView, 12> views{
       bundle.aov_array_view,
       bundle.statistics_image_view,
       bundle.rr_motion_image_view,
@@ -615,6 +622,9 @@ void VulkanPathTracer::destroyTargetBundle(TargetBundle &bundle) {
       bundle.rr_specular_albedo_image_view,
       bundle.rr_normal_roughness_image_view,
       bundle.rr_specular_hit_distance_image_view,
+      bundle.transparency_and_composition_image_view,
+      bundle.reactive_mask_image_view,
+      bundle.guide_validity_image_view,
       bundle.depth_image_view,
       bundle.image_view};
   for (const VkImageView view : views) {
@@ -622,7 +632,7 @@ void VulkanPathTracer::destroyTargetBundle(TargetBundle &bundle) {
       vkDestroyImageView(device_, view, nullptr);
     }
   }
-  const std::array<VkImage, 9> images{
+  const std::array<VkImage, 12> images{
       bundle.aov_image,
       bundle.statistics_image,
       bundle.rr_motion_image,
@@ -630,6 +640,9 @@ void VulkanPathTracer::destroyTargetBundle(TargetBundle &bundle) {
       bundle.rr_specular_albedo_image,
       bundle.rr_normal_roughness_image,
       bundle.rr_specular_hit_distance_image,
+      bundle.transparency_and_composition_image,
+      bundle.reactive_mask_image,
+      bundle.guide_validity_image,
       bundle.depth_image,
       bundle.image};
   for (const VkImage image : images) {
@@ -637,7 +650,7 @@ void VulkanPathTracer::destroyTargetBundle(TargetBundle &bundle) {
       vkDestroyImage(device_, image, nullptr);
     }
   }
-  const std::array<VkDeviceMemory, 9> memories{
+  const std::array<VkDeviceMemory, 12> memories{
       bundle.aov_image_memory,
       bundle.statistics_image_memory,
       bundle.rr_motion_image_memory,
@@ -645,6 +658,9 @@ void VulkanPathTracer::destroyTargetBundle(TargetBundle &bundle) {
       bundle.rr_specular_albedo_image_memory,
       bundle.rr_normal_roughness_image_memory,
       bundle.rr_specular_hit_distance_image_memory,
+      bundle.transparency_and_composition_image_memory,
+      bundle.reactive_mask_image_memory,
+      bundle.guide_validity_image_memory,
       bundle.depth_image_memory,
       bundle.image_memory};
   for (const VkDeviceMemory memory : memories) {
@@ -687,6 +703,18 @@ void VulkanPathTracer::swapActiveTarget(TargetBundle &bundle) noexcept {
        bundle.rr_specular_hit_distance_image_memory);
   swap(rr_specular_hit_distance_image_view_,
        bundle.rr_specular_hit_distance_image_view);
+  swap(transparency_and_composition_image_,
+       bundle.transparency_and_composition_image);
+  swap(transparency_and_composition_image_memory_,
+       bundle.transparency_and_composition_image_memory);
+  swap(transparency_and_composition_image_view_,
+       bundle.transparency_and_composition_image_view);
+  swap(reactive_mask_image_, bundle.reactive_mask_image);
+  swap(reactive_mask_image_memory_, bundle.reactive_mask_image_memory);
+  swap(reactive_mask_image_view_, bundle.reactive_mask_image_view);
+  swap(guide_validity_image_, bundle.guide_validity_image);
+  swap(guide_validity_image_memory_, bundle.guide_validity_image_memory);
+  swap(guide_validity_image_view_, bundle.guide_validity_image_view);
   swap(image_w_, bundle.width);
   swap(image_h_, bundle.height);
   swap(target_requested_output_mask_, bundle.requested_output_mask);
@@ -704,6 +732,10 @@ void VulkanPathTracer::swapActiveTarget(TargetBundle &bundle) noexcept {
   swap(rr_normal_roughness_image_layout_, bundle.rr_normal_roughness_image_layout);
   swap(rr_specular_hit_distance_image_layout_,
        bundle.rr_specular_hit_distance_image_layout);
+  swap(transparency_and_composition_image_layout_,
+       bundle.transparency_and_composition_image_layout);
+  swap(reactive_mask_image_layout_, bundle.reactive_mask_image_layout);
+  swap(guide_validity_image_layout_, bundle.guide_validity_image_layout);
 }
 
 void VulkanPathTracer::destroyImage() {
@@ -1322,25 +1354,25 @@ bool VulkanPathTracer::ensureFallbackAlbedo() {
 
 void VulkanPathTracer::destroyDummyStorageImages() {
   if (device_ != VK_NULL_HANDLE) {
-    const std::array<VkImageView, 5> views{
+    const std::array<VkImageView, 6> views{
         dummy_rgba16_array_view_, dummy_rgba16_view_, dummy_rgba32_view_,
-        dummy_rg32_view_, dummy_r32_view_};
+        dummy_rg32_view_, dummy_r32_view_, dummy_r8_view_};
     for (const VkImageView view : views) {
       if (view != VK_NULL_HANDLE) {
         vkDestroyImageView(device_, view, nullptr);
       }
     }
-    const std::array<VkImage, 4> images{
+    const std::array<VkImage, 5> images{
         dummy_rgba16_image_, dummy_rgba32_image_, dummy_rg32_image_,
-        dummy_r32_image_};
+        dummy_r32_image_, dummy_r8_image_};
     for (const VkImage image : images) {
       if (image != VK_NULL_HANDLE) {
         vkDestroyImage(device_, image, nullptr);
       }
     }
-    const std::array<VkDeviceMemory, 4> memories{
+    const std::array<VkDeviceMemory, 5> memories{
         dummy_rgba16_memory_, dummy_rgba32_memory_, dummy_rg32_memory_,
-        dummy_r32_memory_};
+        dummy_r32_memory_, dummy_r8_memory_};
     for (const VkDeviceMemory memory : memories) {
       if (memory != VK_NULL_HANDLE) {
         vkFreeMemory(device_, memory, nullptr);
@@ -1364,6 +1396,10 @@ void VulkanPathTracer::destroyDummyStorageImages() {
   dummy_r32_memory_ = VK_NULL_HANDLE;
   dummy_r32_view_ = VK_NULL_HANDLE;
   dummy_r32_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+  dummy_r8_image_ = VK_NULL_HANDLE;
+  dummy_r8_memory_ = VK_NULL_HANDLE;
+  dummy_r8_view_ = VK_NULL_HANDLE;
+  dummy_r8_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
 }
 
 bool VulkanPathTracer::ensureDummyStorageImages() {
@@ -1371,11 +1407,14 @@ bool VulkanPathTracer::ensureDummyStorageImages() {
       rgba32_target_features_, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
   const bool rg32_storage_supported = pathTraceFormatSupports(
       rg32_target_features_, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
+  const bool r8_storage_supported = pathTraceFormatSupports(
+      r8_target_features_, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
   if (dummy_rgba16_array_view_ != VK_NULL_HANDLE &&
       dummy_rgba16_view_ != VK_NULL_HANDLE &&
-      (!rgba32_storage_supported || dummy_rgba32_view_ != VK_NULL_HANDLE) &&
-      (!rg32_storage_supported || dummy_rg32_view_ != VK_NULL_HANDLE) &&
-      dummy_r32_view_ != VK_NULL_HANDLE) {
+       (!rgba32_storage_supported || dummy_rgba32_view_ != VK_NULL_HANDLE) &&
+       (!rg32_storage_supported || dummy_rg32_view_ != VK_NULL_HANDLE) &&
+       (!r8_storage_supported || dummy_r8_view_ != VK_NULL_HANDLE) &&
+       dummy_r32_view_ != VK_NULL_HANDLE) {
     return true;
   }
   destroyDummyStorageImages();
@@ -1385,12 +1424,14 @@ bool VulkanPathTracer::ensureDummyStorageImages() {
                           VkImageView &view) {
     const VkDeviceSize estimated_bytes =
         static_cast<VkDeviceSize>(array_layers) *
-        (format == VK_FORMAT_R32G32B32A32_SFLOAT
+        (format == VK_FORMAT_R8_UNORM
+             ? 1u
+             : (format == VK_FORMAT_R32G32B32A32_SFLOAT
              ? 16u
              : (format == VK_FORMAT_R32G32_SFLOAT ||
-                        format == VK_FORMAT_R16G16B16A16_SFLOAT
-                    ? 8u
-                    : 4u));
+                         format == VK_FORMAT_R16G16B16A16_SFLOAT
+                     ? 8u
+                     : 4u)));
     auto log_failure = [&](const char *api, VkResult result,
                            VkDeviceSize bytes) {
       xpbd::log::errorf(
@@ -1495,9 +1536,13 @@ bool VulkanPathTracer::ensureDummyStorageImages() {
                      dummy_rgba32_view_)) ||
       (rg32_storage_supported &&
        !create_dummy(VK_FORMAT_R32G32_SFLOAT, 1u,
-                     VK_IMAGE_VIEW_TYPE_2D, "dummy-rg32",
-                     dummy_rg32_image_, dummy_rg32_memory_,
-                     dummy_rg32_view_))) {
+                      VK_IMAGE_VIEW_TYPE_2D, "dummy-rg32",
+                      dummy_rg32_image_, dummy_rg32_memory_,
+                      dummy_rg32_view_)) ||
+      (r8_storage_supported &&
+       !create_dummy(VK_FORMAT_R8_UNORM, 1u, VK_IMAGE_VIEW_TYPE_2D,
+                     "dummy-r8", dummy_r8_image_, dummy_r8_memory_,
+                     dummy_r8_view_))) {
     destroyDummyStorageImages();
     return false;
   }
@@ -1589,6 +1634,7 @@ void VulkanPathTracer::shutdown() {
   rgba32_target_features_ = 0u;
   rg32_target_features_ = 0u;
   r32_target_features_ = 0u;
+  r8_target_features_ = 0u;
   target_formats_queried_ = false;
   required_target_formats_supported_ = false;
   memory_budget_supported_ = false;
@@ -1786,18 +1832,19 @@ bool VulkanPathTracer::createPipelines(VkRenderPass render_pass) {
     return false;
   }
 
-  // Keep every pixel-art material channel nearest-filtered at base level so
-  // albedo, alpha, normal, and LabPBR parameter texels cannot bleed across
-  // atlas boundaries. Normal/specular images remain linear UNORM data.
+  // Keep every pixel-art material channel nearest-filtered within a selected
+  // mip. Full RT chooses that mip explicitly from its ray cone; the fallback
+  // 1x1 image naturally clamps to level zero. Normal/specular remain linear
+  // UNORM data.
   VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
   si.magFilter = VK_FILTER_NEAREST;
   si.minFilter = VK_FILTER_NEAREST;
-  si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+  si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
   si.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
   si.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
   si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
   si.minLod = 0.0f;
-  si.maxLod = 0.0f;
+  si.maxLod = VK_LOD_CLAMP_NONE;
   if (vkCreateSampler(device_, &si, nullptr, &sampler_) != VK_SUCCESS) {
     return false;
   }
@@ -2023,12 +2070,28 @@ PathTraceTargetResult VulkanPathTracer::ensureTarget(
                    PathTraceOptionalOutput::RrNormalRoughness),
                rr_normal_roughness_image_, rr_normal_roughness_image_memory_,
                rr_normal_roughness_image_view_) &&
+            guide_complete(
+                pathTraceOptionalOutputBit(
+                    PathTraceOptionalOutput::RrSpecularHitDistance),
+                rr_specular_hit_distance_image_,
+                rr_specular_hit_distance_image_memory_,
+                rr_specular_hit_distance_image_view_) &&
            guide_complete(
                pathTraceOptionalOutputBit(
-                   PathTraceOptionalOutput::RrSpecularHitDistance),
-               rr_specular_hit_distance_image_,
-               rr_specular_hit_distance_image_memory_,
-               rr_specular_hit_distance_image_view_);
+                   PathTraceOptionalOutput::TransparencyAndComposition),
+               transparency_and_composition_image_,
+               transparency_and_composition_image_memory_,
+               transparency_and_composition_image_view_) &&
+           guide_complete(
+               pathTraceOptionalOutputBit(
+                   PathTraceOptionalOutput::ReactiveMask),
+               reactive_mask_image_, reactive_mask_image_memory_,
+               reactive_mask_image_view_) &&
+           guide_complete(
+               pathTraceOptionalOutputBit(
+                   PathTraceOptionalOutput::GuideValidity),
+               guide_validity_image_, guide_validity_image_memory_,
+               guide_validity_image_view_);
   };
   const bool any_active = active_complete_for(target_allocated_output_mask_);
   if (estimate_valid && image_w_ == width && image_h_ == height &&
@@ -2344,6 +2407,28 @@ PathTraceTargetResult VulkanPathTracer::ensureTarget(
                     candidate.rr_specular_hit_distance_image_view)) {
     return finish_failure();
   }
+  if (needs(PathTraceOptionalOutput::TransparencyAndComposition) &&
+      !create_image(VK_FORMAT_R8_UNORM, 1u, VK_IMAGE_VIEW_TYPE_2D,
+                    "transparency-and-composition",
+                    candidate.transparency_and_composition_image,
+                    candidate.transparency_and_composition_image_memory,
+                    candidate.transparency_and_composition_image_view)) {
+    return finish_failure();
+  }
+  if (needs(PathTraceOptionalOutput::ReactiveMask) &&
+      !create_image(VK_FORMAT_R8_UNORM, 1u, VK_IMAGE_VIEW_TYPE_2D,
+                    "reactive-mask", candidate.reactive_mask_image,
+                    candidate.reactive_mask_image_memory,
+                    candidate.reactive_mask_image_view)) {
+    return finish_failure();
+  }
+  if (needs(PathTraceOptionalOutput::GuideValidity) &&
+      !create_image(VK_FORMAT_R8_UNORM, 1u, VK_IMAGE_VIEW_TYPE_2D,
+                    "guide-validity", candidate.guide_validity_image,
+                    candidate.guide_validity_image_memory,
+                    candidate.guide_validity_image_view)) {
+    return finish_failure();
+  }
 
   swapActiveTarget(candidate);
   destroyTargetBundle(candidate);
@@ -2520,7 +2605,8 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
   const bool rt_optional_descriptors_ready =
       descriptor_binding_partially_bound_enabled_ ||
       (dummy_rgba32_view_ != VK_NULL_HANDLE &&
-       dummy_rg32_view_ != VK_NULL_HANDLE);
+       dummy_rg32_view_ != VK_NULL_HANDLE &&
+       dummy_r8_view_ != VK_NULL_HANDLE);
   const bool try_rt_pipeline =
       rt_pipeline_.ready() &&
       settings.nvidia_rt_core_acceleration &&
@@ -2584,7 +2670,7 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
     fallback_albedo_cleared_ = true;
   }
 
-  std::array<VkImageMemoryBarrier, 4> dummy_barriers{};
+  std::array<VkImageMemoryBarrier, 5> dummy_barriers{};
   std::uint32_t dummy_barrier_count = 0u;
   auto prepare_dummy = [&](VkImage image, VkImageLayout &layout,
                            std::uint32_t layer_count) {
@@ -2611,6 +2697,7 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
   prepare_dummy(dummy_rgba32_image_, dummy_rgba32_layout_, 1u);
   prepare_dummy(dummy_rg32_image_, dummy_rg32_layout_, 1u);
   prepare_dummy(dummy_r32_image_, dummy_r32_layout_, 1u);
+  prepare_dummy(dummy_r8_image_, dummy_r8_layout_, 1u);
   if (dummy_barrier_count > 0u) {
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                          dispatch_stages, 0u, 0u, nullptr, 0u, nullptr,
@@ -2670,6 +2757,22 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
           : dummy_r32_view_;
   rr_specular_hit_distance_img.imageLayout =
       VK_IMAGE_LAYOUT_GENERAL;
+  VkDescriptorImageInfo transparency_and_composition_img{};
+  transparency_and_composition_img.imageView =
+      transparency_and_composition_image_view_ != VK_NULL_HANDLE
+          ? transparency_and_composition_image_view_
+          : dummy_r8_view_;
+  transparency_and_composition_img.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+  VkDescriptorImageInfo reactive_mask_img{};
+  reactive_mask_img.imageView = reactive_mask_image_view_ != VK_NULL_HANDLE
+                                    ? reactive_mask_image_view_
+                                    : dummy_r8_view_;
+  reactive_mask_img.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+  VkDescriptorImageInfo guide_validity_img{};
+  guide_validity_img.imageView = guide_validity_image_view_ != VK_NULL_HANDLE
+                                     ? guide_validity_image_view_
+                                     : dummy_r8_view_;
+  guide_validity_img.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
   VkDescriptorBufferInfo nbuf{};
   nbuf.buffer = scene.normalBuffer();
@@ -2933,7 +3036,7 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
 
   // Transition only allocated full-resolution targets to GENERAL. Missing
   // optional bindings point at persistent dummies that remain in GENERAL.
-  std::array<VkImageMemoryBarrier, 9> barriers{};
+  std::array<VkImageMemoryBarrier, 12> barriers{};
   std::uint32_t target_barrier_count = 0u;
   auto prepare_store_barrier = [&](VkImage image, VkImageLayout &old_layout,
                                    std::uint32_t layer_count) {
@@ -2971,6 +3074,11 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
                         rr_normal_roughness_image_layout_, 1u);
   prepare_store_barrier(rr_specular_hit_distance_image_,
                         rr_specular_hit_distance_image_layout_, 1u);
+  prepare_store_barrier(transparency_and_composition_image_,
+                        transparency_and_composition_image_layout_, 1u);
+  prepare_store_barrier(reactive_mask_image_, reactive_mask_image_layout_, 1u);
+  prepare_store_barrier(guide_validity_image_, guide_validity_image_layout_,
+                        1u);
   vkCmdPipelineBarrier(cmd,
                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
                            dispatch_stages,
@@ -3084,6 +3192,11 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
     rt_params.light_color[1] = params.light_color[1];
     rt_params.light_color[2] = params.light_color[2];
     rt_params.light_intensity = params.intensity;
+    rt_params.sun_radiance[0] = params.sun_radiance[0];
+    rt_params.sun_radiance[1] = params.sun_radiance[1];
+    rt_params.sun_radiance[2] = params.sun_radiance[2];
+    rt_params.sun_angular_radius = params.sun_angular_radius;
+    rt_params.sun_casts_shadow = params.sun_casts_shadow;
     const bool hdr_environment =
         params.hdr_environment &&
         params.environment_view != VK_NULL_HANDLE &&
@@ -3111,6 +3224,10 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
     rt_params.rr_normal_roughness_view = rr_normal_roughness_img.imageView;
     rt_params.rr_specular_hit_distance_view =
         rr_specular_hit_distance_img.imageView;
+    rt_params.transparency_and_composition_view =
+        transparency_and_composition_img.imageView;
+    rt_params.reactive_mask_view = reactive_mask_img.imageView;
+    rt_params.guide_validity_view = guide_validity_img.imageView;
     rt_params.albedo_view = albedo.imageView;
     rt_params.normal_view = normal_map.imageView;
     rt_params.specular_view = specular_map.imageView;
@@ -3172,6 +3289,10 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
     const std::uint32_t gx = (params.width + 7u) / 8u;
     const std::uint32_t gy = (params.height + 7u) / 8u;
     vkCmdDispatch(cmd, gx, gy, 1);
+    // The compatibility shader intentionally keeps its frozen descriptor and
+    // functional ABI. It cannot claim the Full-RT-only transparency masks;
+    // callers use the actual write mask to reject temporal SDK submission.
+    last_output_write_mask_ &= ~kPathTraceTransparencyGuideOutputMask;
   }
   last_dispatch_recorded_ = true;
 
@@ -3217,7 +3338,7 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
             : (capture_runtime_depth ? color_bytes + depth_bytes
                                      : color_bytes);
     if (ensureCaptureBuffer(capture_bytes)) {
-      std::array<VkImageMemoryBarrier, 9> capture_to_transfer = barriers;
+      std::array<VkImageMemoryBarrier, 12> capture_to_transfer = barriers;
       for (std::uint32_t index = 0u; index < target_barrier_count; ++index) {
         VkImageMemoryBarrier &barrier = capture_to_transfer[index];
         barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -3279,7 +3400,7 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
             capture_buffer_.buffer, 1, &depth_copy);
       }
 
-      std::array<VkImageMemoryBarrier, 9> capture_to_read =
+      std::array<VkImageMemoryBarrier, 12> capture_to_read =
           capture_to_transfer;
       for (std::uint32_t index = 0u; index < target_barrier_count; ++index) {
         VkImageMemoryBarrier &barrier = capture_to_read[index];
@@ -3392,6 +3513,16 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
   if (rr_specular_hit_distance_image_ != VK_NULL_HANDLE) {
     rr_specular_hit_distance_image_layout_ =
         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  }
+  if (transparency_and_composition_image_ != VK_NULL_HANDLE) {
+    transparency_and_composition_image_layout_ =
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  }
+  if (reactive_mask_image_ != VK_NULL_HANDLE) {
+    reactive_mask_image_layout_ = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  }
+  if (guide_validity_image_ != VK_NULL_HANDLE) {
+    guide_validity_image_layout_ = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   }
 }
 

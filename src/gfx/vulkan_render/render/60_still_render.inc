@@ -193,6 +193,20 @@
               still_params.intensity =
                   frame.raster_scene->lighting.intensity;
             }
+            // Full RT consumes these fields; the compatibility compute fields
+            // above retain their established semantics.
+            still_params.sun_radiance[0] =
+                resolved_sun_light.radiance[0];
+            still_params.sun_radiance[1] =
+                resolved_sun_light.radiance[1];
+            still_params.sun_radiance[2] =
+                resolved_sun_light.radiance[2];
+            still_params.sun_angular_radius =
+                resolved_sun_light.lighting_enabled
+                    ? resolved_sun_light.angular_radius
+                    : 0.0f;
+            still_params.sun_casts_shadow =
+                resolved_sun_light.casts_shadow;
             still_params.clear_r = frame.clear_r;
             still_params.clear_g = frame.clear_g;
             still_params.clear_b = frame.clear_b;
@@ -255,6 +269,8 @@
                                         frame.static_texture_generation);
             appendPathTraceHistoryValue(
                 history_key, resolved_world_environment.generation);
+            appendPathTraceHistoryValue(
+                history_key, rt_light_registry.generation);
             appendPathTraceHistoryValue(
                 history_key,
                 resolved_world_environment.lighting_generation);

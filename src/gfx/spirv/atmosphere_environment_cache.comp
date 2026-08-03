@@ -593,7 +593,8 @@ void main() {
   // not rasterize it into this low-resolution cache: a sub-texel disk would
   // otherwise become a square texel in the background.  The cache still
   // carries the atmosphere and cloud transmittance used around the disk, and
-  // the CPU distribution adds a matching circular importance lobe.
+  // the CPU distribution excludes the disk; the Light Registry samples the
+  // same resolved finite Sun as a separate solid-angle family.
   const float moon_angular_radius =
       max(environment_push.moon_direction_angular_radius.w, 1.0e-6);
   const vec3 moon_radiance =

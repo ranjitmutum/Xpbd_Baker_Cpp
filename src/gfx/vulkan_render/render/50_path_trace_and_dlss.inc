@@ -6,6 +6,9 @@
     bool pt_motion_guide_ready_for_frame = false;
     bool pt_dispatch_recorded_for_frame = false;
     bool pt_temporal_reconstruction_requested_for_frame = false;
+    bool pt_temporal_inputs_ready_for_frame = false;
+    std::uint32_t pt_temporal_required_output_mask_for_frame = 0u;
+    std::uint32_t pt_actual_output_write_mask_for_frame = 0u;
     bool pt_history_reset = true;
     bool pt_streamline_history_reset = true;
     std::uint64_t pt_streamline_history_key = 0u;
@@ -42,25 +45,34 @@
       bool pt_rr_requested =
           pt_post.active_denoiser ==
           PathTraceDenoiser::DlssRayReconstruction;
-      pt_temporal_reconstruction_requested_for_frame =
-          pt_rr_requested ||
-          pt_post.active_upscale != PathTraceUpscale::Off;
       const std::uint32_t supported_target_outputs =
           path_tracer.supportedTargetOutputMask();
-      if (pt_rr_requested &&
-          (supported_target_outputs & kPathTraceAllRrGuideOutputMask) !=
-              kPathTraceAllRrGuideOutputMask) {
+      const std::uint32_t requested_temporal_output_mask =
+          pt_rr_requested
+              ? kPathTraceRrRequiredOutputMask
+              : (pt_post.active_upscale != PathTraceUpscale::Off
+                     ? kPathTraceSrRequiredOutputMask
+                     : 0u);
+      if (requested_temporal_output_mask != 0u &&
+          (supported_target_outputs & requested_temporal_output_mask) !=
+              requested_temporal_output_mask) {
         if (!streamline_rr_target_format_failure_logged_) {
           xpbd::log::warnf(
-              "DLSS Ray Reconstruction disabled: required target formats "
-              "unsupported (required=0x%04x supported=0x%04x)",
-              static_cast<unsigned>(kPathTraceAllRrGuideOutputMask),
+              "%s disabled: required target formats unsupported "
+              "(required=0x%05x supported=0x%05x)",
+              pt_rr_requested ? "DLSS Ray Reconstruction"
+                              : "DLSS Super Resolution",
+              static_cast<unsigned>(requested_temporal_output_mask),
               static_cast<unsigned>(supported_target_outputs));
           streamline_rr_target_format_failure_logged_ = true;
         }
-        pt_rr_requested = false;
-        pt_post.active_denoiser = PathTraceDenoiser::Raw;
-        pt_post.reconstruction_mode = PathTraceUpscale::Off;
+        if (pt_rr_requested) {
+          pt_rr_requested = false;
+          pt_post.active_denoiser = PathTraceDenoiser::Raw;
+          pt_post.reconstruction_mode = PathTraceUpscale::Off;
+        } else {
+          pt_post.active_upscale = PathTraceUpscale::Off;
+        }
         streamline_vulkan_runtime_.invalidateDlssHistory();
       } else {
         streamline_rr_target_format_failure_logged_ = false;
@@ -78,6 +90,7 @@
                 streamline_vulkan_runtime_.status().c_str());
             streamline_dlss_failure_logged_ = true;
           }
+          pt_rr_requested = false;
           pt_post.active_denoiser = PathTraceDenoiser::Raw;
           pt_post.reconstruction_mode = PathTraceUpscale::Off;
           streamline_vulkan_runtime_.invalidateDlssHistory();
@@ -99,6 +112,15 @@
           streamline_vulkan_runtime_.invalidateDlssHistory();
         }
       }
+      pt_temporal_reconstruction_requested_for_frame =
+          dlss_settings.valid &&
+          (pt_rr_requested ||
+           pt_post.active_upscale != PathTraceUpscale::Off);
+      pt_temporal_required_output_mask_for_frame =
+          dlss_settings.valid
+              ? (pt_rr_requested ? kPathTraceRrRequiredOutputMask
+                                 : kPathTraceSrRequiredOutputMask)
+              : 0u;
       const float preview_scale =
           path_settings.preview_resolution_scale;
       const std::uint32_t requested_ptw =
@@ -120,13 +142,11 @@
               requested_ptw, requested_pth, path_tracer.targetWidth(),
               path_tracer.targetHeight(), interactive_preview_resize);
       std::uint32_t requested_output_mask = 0u;
-      if (dlss_settings.valid ||
-          (desired_frame_generation && !interactive_preview_resize)) {
+      if (desired_frame_generation && !interactive_preview_resize) {
         requested_output_mask |= kPathTraceRrMotionOutputMask;
       }
-      if (dlss_settings.valid && pt_rr_requested) {
-        requested_output_mask |= kPathTraceAllRrGuideOutputMask;
-      }
+      requested_output_mask |=
+          pt_temporal_required_output_mask_for_frame;
       const PathTraceTargetResult target_result = path_tracer.ensureTarget(
           target_extent.width, target_extent.height,
           PathTraceTargetRequirements{requested_output_mask});
@@ -149,6 +169,8 @@
           pt_post.active_denoiser = PathTraceDenoiser::Raw;
           pt_post.active_upscale = PathTraceUpscale::Off;
           requested_output_mask = 0u;
+          pt_temporal_required_output_mask_for_frame = 0u;
+          pt_temporal_reconstruction_requested_for_frame = false;
           streamline_vulkan_runtime_.invalidateDlssHistory();
           streamline_temporal_history_valid_ = false;
         }
@@ -174,7 +196,7 @@
         pt_params.ray_reconstruction_guides =
             dlss_settings.valid && pt_rr_requested;
         pt_params.output_write_mask = requested_output_mask;
-        if (frame.raster_scene) {
+        if (frame.raster_scene != nullptr) {
           pt_params.light_dir[0] = frame.raster_scene->lighting.direction[0];
           pt_params.light_dir[1] = frame.raster_scene->lighting.direction[1];
           pt_params.light_dir[2] = frame.raster_scene->lighting.direction[2];
@@ -184,6 +206,16 @@
           pt_params.light_color[2] = frame.raster_scene->lighting.color[2];
           pt_params.intensity = frame.raster_scene->lighting.intensity;
         }
+        // These fields are consumed only by the Full RT pipeline. The legacy
+        // fields above intentionally retain path_trace.comp behavior.
+        pt_params.sun_radiance[0] = resolved_sun_light.radiance[0];
+        pt_params.sun_radiance[1] = resolved_sun_light.radiance[1];
+        pt_params.sun_radiance[2] = resolved_sun_light.radiance[2];
+        pt_params.sun_angular_radius =
+            resolved_sun_light.lighting_enabled
+                ? resolved_sun_light.angular_radius
+                : 0.0f;
+        pt_params.sun_casts_shadow = resolved_sun_light.casts_shadow;
         pt_params.clear_r = frame.clear_r;
         pt_params.clear_g = frame.clear_g;
         pt_params.clear_b = frame.clear_b;
@@ -212,8 +244,8 @@
         pt_params.material_feature_flags =
             labPbrFeatureFlags(frame.static_model_material);
         if (procedural_environment_ready) {
-          // The finite solar disk is already part of the importance-sampled
-          // dynamic cache; avoid double-counting a legacy directional light.
+          // Preserve the compatibility compute path's existing suppression;
+          // Full RT reads the separate finite-Sun fields above.
           pt_params.ambient = 0.0f;
           pt_params.intensity = 0.0f;
         }
@@ -266,6 +298,12 @@
         appendPathTraceHistoryBytes(history_key, pt_params.light_color,
                                     sizeof(pt_params.light_color));
         appendPathTraceHistoryValue(history_key, pt_params.intensity);
+        appendPathTraceHistoryBytes(history_key, pt_params.sun_radiance,
+                                    sizeof(pt_params.sun_radiance));
+        appendPathTraceHistoryValue(history_key,
+                                    pt_params.sun_angular_radius);
+        appendPathTraceHistoryValue(history_key,
+                                    pt_params.sun_casts_shadow);
         appendPathTraceHistoryValue(history_key, pt_params.clear_r);
         appendPathTraceHistoryValue(history_key, pt_params.clear_g);
         appendPathTraceHistoryValue(history_key, pt_params.clear_b);
@@ -343,6 +381,8 @@
             history_key, resolved_world_environment.target_generation);
         appendPathTraceHistoryValue(
             history_key, resolved_world_environment.generation);
+        appendPathTraceHistoryValue(history_key,
+                                    rt_light_registry.generation);
         appendPathTraceHistoryValue(
             history_key, resolved_world_environment.environment_lighting);
         appendPathTraceHistoryValue(
@@ -547,8 +587,14 @@
                                      static_specular_sampler_);
           pt_dispatch_recorded_for_frame =
               path_tracer.lastDispatchRecorded();
-          stats_.rt_aov_write_mask = path_tracer.lastOutputWriteMask();
+          pt_actual_output_write_mask_for_frame =
+              pt_dispatch_recorded_for_frame
+                  ? path_tracer.lastOutputWriteMask()
+                  : 0u;
+          stats_.rt_aov_write_mask =
+              pt_actual_output_write_mask_for_frame;
         } else {
+          pt_actual_output_write_mask_for_frame = 0u;
           stats_.rt_aov_write_mask = 0u;
         }
         const VulkanPathTracer::DescriptorStats path_descriptor_stats =
@@ -560,7 +606,15 @@
         stats_.cpu_descriptor_update_ms += path_descriptor_stats.update_ms;
         write_timestamp(GpuTimestampQuery::PathTraceEnd,
                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-        if (dlss_settings.valid && pt_dispatch_recorded_for_frame) {
+        pt_temporal_inputs_ready_for_frame =
+            dlss_settings.valid && pt_target_exact_for_frame &&
+            pt_dispatch_recorded_for_frame &&
+            pt_temporal_required_output_mask_for_frame != 0u &&
+            (pt_actual_output_write_mask_for_frame &
+             pt_temporal_required_output_mask_for_frame) ==
+                pt_temporal_required_output_mask_for_frame;
+        if (pt_temporal_inputs_ready_for_frame) {
+          streamline_transparency_contract_failure_logged_ = false;
           auto fill_dlss_frame =
               [&](StreamlineDlssFrame &dlss_frame,
                   PathTraceUpscale mode) {
@@ -577,6 +631,24 @@
             dlss_frame.motion_image = path_tracer.rrMotionImage();
             dlss_frame.motion_memory = path_tracer.rrMotionMemory();
             dlss_frame.motion_view = path_tracer.rrMotionView();
+            dlss_frame.transparency_and_composition_image =
+                path_tracer.transparencyAndCompositionImage();
+            dlss_frame.transparency_and_composition_memory =
+                path_tracer.transparencyAndCompositionMemory();
+            dlss_frame.transparency_and_composition_view =
+                path_tracer.transparencyAndCompositionView();
+            dlss_frame.reactive_mask_image =
+                path_tracer.reactiveMaskImage();
+            dlss_frame.reactive_mask_memory =
+                path_tracer.reactiveMaskMemory();
+            dlss_frame.reactive_mask_view =
+                path_tracer.reactiveMaskView();
+            dlss_frame.guide_validity_image =
+                path_tracer.guideValidityImage();
+            dlss_frame.guide_validity_memory =
+                path_tracer.guideValidityMemory();
+            dlss_frame.guide_validity_view =
+                path_tracer.guideValidityView();
             dlss_frame.view = pt_params.view;
             dlss_frame.projection = pt_params.proj;
             dlss_frame.previous_view = pt_params.previous_view;
@@ -675,6 +747,21 @@
             // late dispatch prerequisites can leave last frame's guides in
             // place. Never advance Streamline history with stale inputs.
             streamline_vulkan_runtime_.invalidateDlssHistory();
+            if (!streamline_transparency_contract_failure_logged_) {
+              xpbd::log::warnf(
+                  "R0F_G07_TEMPORAL_INPUT_REJECT mode=%s required=0x%05x "
+                  "actual=0x%05x allocated=0x%05x exact=%d dispatch=%d",
+                  pt_rr_requested ? "rr" : "sr",
+                  static_cast<unsigned>(
+                      pt_temporal_required_output_mask_for_frame),
+                  static_cast<unsigned>(
+                      pt_actual_output_write_mask_for_frame),
+                  static_cast<unsigned>(
+                      target_result.allocated_output_mask),
+                  pt_target_exact_for_frame ? 1 : 0,
+                  pt_dispatch_recorded_for_frame ? 1 : 0);
+              streamline_transparency_contract_failure_logged_ = true;
+            }
           }
           streamline_temporal_history_valid_ = false;
         }

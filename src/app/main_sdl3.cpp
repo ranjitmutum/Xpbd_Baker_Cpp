@@ -1450,6 +1450,12 @@ int app_main(int argc, char **argv) {
   bool unattended_resize_gate = false;
   apply_path_trace_bool(
       "XPBD_UNATTENDED_RESIZE_GATE", unattended_resize_gate);
+  bool r0f_g03_f11_gate = false;
+  apply_path_trace_bool("XPBD_R0F_F11_GATE", r0f_g03_f11_gate);
+  bool r0f_g03_f11_triggered = false;
+  if (r0f_g03_f11_gate) {
+    xpbd::log::info("R0F_G03_F11_GATE_ARMED frame=120");
+  }
   bool perf_diagnostics = false;
   apply_path_trace_bool("XPBD_PERF_DIAGNOSTICS", perf_diagnostics);
   bool vulkan_diagnostics = false;
@@ -2348,6 +2354,12 @@ int app_main(int argc, char **argv) {
       --completion_diagnostic_frames;
     }
     ++render_frame_number;
+    if (r0f_g03_f11_gate && !r0f_g03_f11_triggered &&
+        render_frame_number == 120u) {
+      r0f_g03_f11_triggered = true;
+      xpbd::log::info("R0F_G03_F11_GATE_TRIGGER frame=120");
+      toggle_borderless_fullscreen();
+    }
     if (unattended_resize_gate) {
       auto resize_window = [&](int width, int height) {
         if (!SDL_SetWindowSize(window, width, height)) {

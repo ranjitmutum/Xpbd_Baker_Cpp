@@ -571,13 +571,15 @@ bool VulkanBackend::init(SDL_Window *window) {
     if (!createFramebuffers()) {
       return false;
     }
-    streamline_vulkan_runtime_.completeFrameGenerationSwapchainTransition(
-        streamline_vulkan_runtime_.swapchainOwnership(),
-        streamline_vulkan_runtime_.swapchainOwnership() ==
-                SwapchainOwnership::StreamlineFrameGenerationProxy &&
-            fg_swapchain_resources_ready_,
-        static_cast<std::uint64_t>(frame_index_),
-        "initial native swapchain");
+    if (!streamline_vulkan_runtime_.completeFrameGenerationSwapchainTransition(
+            streamline_vulkan_runtime_.swapchainOwnership(),
+            streamline_vulkan_runtime_.swapchainOwnership() ==
+                    SwapchainOwnership::StreamlineFrameGenerationProxy &&
+                fg_swapchain_resources_ready_,
+            static_cast<std::uint64_t>(frame_index_),
+            "initial native swapchain")) {
+      return false;
+    }
     if (!createDescriptors()) {
       return false;
     }
@@ -641,34 +643,82 @@ void VulkanBackend::shutdown() {
     if (device_) {
       // Turn interpolation off before draining or destroying any presentation
       // object. The feature itself is unloaded after the swapchain is gone.
-      streamline_vulkan_runtime_.beginFrameGenerationShutdown(
-          static_cast<std::uint64_t>(frame_index_));
+      const std::uint64_t shutdown_frame =
+          static_cast<std::uint64_t>(frame_index_);
+      const bool frame_generation_disable_started =
+          streamline_vulkan_runtime_.beginFrameGenerationShutdown(
+              shutdown_frame);
+      bool frame_generation_disable_ready = false;
+      if (!frame_generation_disable_started) {
+        fg_recovery_reason_ =
+            streamline_vulkan_runtime_.frameGenerationDiagnostic().status;
+      }
       swapchain_recreate_target_ = SwapchainOwnership::Native;
       fg_force_native_recovery_ = true;
-      const FrameSync &sync = frames_[frame_index_];
-      const auto idle_start = Clock::now();
-      logDiagnosticApi("vkDeviceWaitIdle.shutdown", "before", std::nullopt,
-                       0.0, UINT32_MAX, sync.fence, VK_NULL_HANDLE, sync.cmd,
-                       true, true);
-      const VkResult idle_result =
-          streamline_vulkan_runtime_.deviceWaitIdle(device_);
-      logDiagnosticApi(
-          "vkDeviceWaitIdle.shutdown", "after", idle_result,
-          std::chrono::duration<double, std::milli>(Clock::now() - idle_start)
-              .count(),
-          UINT32_MAX, sync.fence, VK_NULL_HANDLE, sync.cmd, true, false);
-      if (idle_result != VK_SUCCESS) {
-        SDL_Log("Vulkan device idle wait during shutdown failed: %d",
-                static_cast<int>(idle_result));
-      } else if (!waitForPendingPresentFences("shutdown")) {
-        SDL_Log("Vulkan present completion wait during shutdown failed");
+      for (std::uint32_t drain_cycle = 0u;
+           !frame_generation_disable_ready &&
+           drain_cycle <= kFrameGenerationDisableMaxAttempts;
+           ++drain_cycle) {
+        const FrameSync &sync = frames_[frame_index_];
+        const auto idle_start = Clock::now();
+        logDiagnosticApi("vkDeviceWaitIdle.shutdown", "before", std::nullopt,
+                         0.0, UINT32_MAX, sync.fence, VK_NULL_HANDLE, sync.cmd,
+                         true, true);
+        const VkResult idle_result =
+            streamline_vulkan_runtime_.deviceWaitIdle(device_);
+        logDiagnosticApi(
+            "vkDeviceWaitIdle.shutdown", "after", idle_result,
+            std::chrono::duration<double, std::milli>(Clock::now() -
+                                                      idle_start)
+                .count(),
+            UINT32_MAX, sync.fence, VK_NULL_HANDLE, sync.cmd, true, false);
+        if (idle_result != VK_SUCCESS) {
+          SDL_Log("Vulkan device idle wait during shutdown failed: %d",
+                  static_cast<int>(idle_result));
+          if (idle_result == VK_ERROR_DEVICE_LOST) {
+            fatal_error_ = true;
+            fatal_error_detail_ =
+                "VK_ERROR_DEVICE_LOST while draining DLSS-G shutdown";
+          }
+          xpbd::log::error(
+              "shutdown blocked by FG disable failure");
+          return;
+        }
+        if (!waitForPendingPresentFences("shutdown")) {
+          SDL_Log("Vulkan present completion wait during shutdown failed");
+          xpbd::log::error(
+              "shutdown blocked by FG disable failure");
+          return;
+        }
+        frame_generation_disable_ready =
+            streamline_vulkan_runtime_
+                .retryFrameGenerationDisableAfterDrain(
+                    shutdown_frame, "shutdown drain completed");
+        if (!frame_generation_disable_ready &&
+            streamline_vulkan_runtime_.frameGenerationDiagnostic()
+                .disable_exhausted) {
+          break;
+        }
+      }
+      if (!frame_generation_disable_ready) {
+        const FrameGenerationDiagnostic diagnostic =
+            streamline_vulkan_runtime_.frameGenerationDiagnostic();
+        fg_recovery_reason_ = diagnostic.status;
+        xpbd::log::errorf(
+            "shutdown blocked by FG disable failure: %s",
+            diagnostic.status.c_str());
+        return;
       }
     }
-    destroySwapchainObjects();
+    if (!destroySwapchainObjects()) {
+      xpbd::log::error("shutdown blocked by FG disable failure");
+      return;
+    }
     if (!streamline_vulkan_runtime_.unloadFrameGenerationForShutdown()) {
-      xpbd::log::warn(
-          "DLSS Frame Generation plugin did not unload cleanly during "
-          "shutdown");
+      xpbd::log::error(
+          "shutdown blocked by FG disable failure: DLSS-G plugin remained "
+          "loaded");
+      return;
     }
     if (font_view_) {
       vkDestroyImageView(device_, font_view_, nullptr);
@@ -2565,7 +2615,9 @@ bool VulkanBackend::createSwapchain(
     if (images_result != VK_SUCCESS || ic == 0) {
       SDL_Log("Vulkan swapchain image-count query failed: %d",
               static_cast<int>(images_result));
-      destroySwapchainObjects();
+      if (!destroySwapchainObjects()) {
+        return false;
+      }
       return false;
     }
     swap_images_.resize(ic);
@@ -2575,7 +2627,9 @@ bool VulkanBackend::createSwapchain(
     if (images_result != VK_SUCCESS || ic == 0) {
       SDL_Log("Vulkan swapchain image query failed: %d",
               static_cast<int>(images_result));
-      destroySwapchainObjects();
+      if (!destroySwapchainObjects()) {
+        return false;
+      }
       return false;
     }
     swap_images_.resize(ic);
@@ -2596,7 +2650,9 @@ bool VulkanBackend::createSwapchain(
       if (result != VK_SUCCESS) {
         SDL_Log("Vulkan swapchain image-view creation failed: %d",
                 static_cast<int>(result));
-        destroySwapchainObjects();
+        if (!destroySwapchainObjects()) {
+          return false;
+        }
         return false;
       }
 
@@ -2606,7 +2662,9 @@ bool VulkanBackend::createSwapchain(
       if (result != VK_SUCCESS) {
         SDL_Log("Vulkan present semaphore creation failed: %d",
                 static_cast<int>(result));
-        destroySwapchainObjects();
+        if (!destroySwapchainObjects()) {
+          return false;
+        }
         return false;
       }
       if (presentFenceLifecycleEnabled()) {
@@ -2615,7 +2673,9 @@ bool VulkanBackend::createSwapchain(
         if (result != VK_SUCCESS) {
           SDL_Log("Vulkan present fence creation failed: %d",
                   static_cast<int>(result));
-          destroySwapchainObjects();
+          if (!destroySwapchainObjects()) {
+            return false;
+          }
           return false;
         }
       }
@@ -2635,7 +2695,9 @@ bool VulkanBackend::createSwapchain(
       if (result != VK_SUCCESS) {
         SDL_Log("Vulkan depth image creation failed: %d",
                 static_cast<int>(result));
-        destroySwapchainObjects();
+        if (!destroySwapchainObjects()) {
+          return false;
+        }
         return false;
       }
       VkMemoryRequirements requirements{};
@@ -2645,7 +2707,9 @@ bool VulkanBackend::createSwapchain(
           requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
       if (!memory_type) {
         writeLog("Vulkan depth image has no compatible memory type");
-        destroySwapchainObjects();
+        if (!destroySwapchainObjects()) {
+          return false;
+        }
         return false;
       }
       VkMemoryAllocateInfo allocation{
@@ -2657,7 +2721,9 @@ bool VulkanBackend::createSwapchain(
       if (result != VK_SUCCESS) {
         SDL_Log("Vulkan depth memory allocation failed: %d",
                 static_cast<int>(result));
-        destroySwapchainObjects();
+        if (!destroySwapchainObjects()) {
+          return false;
+        }
         return false;
       }
       result = vkBindImageMemory(device_, resource.depth_image,
@@ -2665,7 +2731,9 @@ bool VulkanBackend::createSwapchain(
       if (result != VK_SUCCESS) {
         SDL_Log("Vulkan depth memory bind failed: %d",
                 static_cast<int>(result));
-        destroySwapchainObjects();
+        if (!destroySwapchainObjects()) {
+          return false;
+        }
         return false;
       }
       VkImageViewCreateInfo depth_view_info{
@@ -2680,7 +2748,9 @@ bool VulkanBackend::createSwapchain(
       if (result != VK_SUCCESS) {
         SDL_Log("Vulkan depth image-view creation failed: %d",
                 static_cast<int>(result));
-        destroySwapchainObjects();
+        if (!destroySwapchainObjects()) {
+          return false;
+        }
         return false;
       }
       if (allocate_fg_resources) {
@@ -2824,13 +2894,17 @@ void VulkanBackend::destroySwapchainImageObjects() {
     fg_swapchain_resources_ready_ = false;
   }
 
-void VulkanBackend::destroySwapchainObjects() {
+bool VulkanBackend::destroySwapchainObjects() {
     if (swapchain_ != VK_NULL_HANDLE ||
         streamline_vulkan_runtime_.swapchainOwnership() ==
             SwapchainOwnership::StreamlineFrameGenerationProxy) {
-      streamline_vulkan_runtime_.notifyFrameGenerationSwapchainDestroyed(
-          static_cast<std::uint64_t>(frame_index_),
-          "swapchain destroyed");
+      if (!streamline_vulkan_runtime_.notifyFrameGenerationSwapchainDestroyed(
+              static_cast<std::uint64_t>(frame_index_),
+              "swapchain destroyed")) {
+        xpbd::log::error(
+            "DLSS Frame Generation blocked unsafe swapchain destruction");
+        return false;
+      }
     }
     destroySwapchainImageObjects();
     if (swapchain_) {
@@ -2839,6 +2913,7 @@ void VulkanBackend::destroySwapchainObjects() {
       swapchain_ = VK_NULL_HANDLE;
     }
     swapchain_recreate_target_ = SwapchainOwnership::Native;
+    return true;
   }
 
 bool VulkanBackend::recreateSwapchain() {
@@ -2890,43 +2965,78 @@ bool VulkanBackend::recreateSwapchain() {
         fg_recovery_reason_.empty()
             ? "swapchain recreate"
             : fg_recovery_reason_.c_str();
-    if (!streamline_vulkan_runtime_.beginFrameGenerationSwapchainTransition(
-            target_ownership, transition_frame, transition_reason)) {
+    const bool frame_generation_disable_started =
+        streamline_vulkan_runtime_.beginFrameGenerationSwapchainTransition(
+            target_ownership, transition_frame, transition_reason);
+    if (!frame_generation_disable_started) {
       fg_force_native_recovery_ = true;
+      target_ownership = SwapchainOwnership::Native;
       swapchain_recreate_target_ = SwapchainOwnership::Native;
-      return false;
+      fg_recovery_reason_ =
+          streamline_vulkan_runtime_.frameGenerationDiagnostic().status;
     }
 
-    const FrameSync &sync = frames_[frame_index_];
-    const auto idle_start = Clock::now();
-    logDiagnosticApi("vkDeviceWaitIdle.swapchain_recreate", "before",
-                     std::nullopt, 0.0, UINT32_MAX, sync.fence,
-                     VK_NULL_HANDLE, sync.cmd, true, true);
-    const VkResult idle_result =
-        streamline_vulkan_runtime_.deviceWaitIdle(device_);
-    logDiagnosticApi(
-        "vkDeviceWaitIdle.swapchain_recreate", "after", idle_result,
-        std::chrono::duration<double, std::milli>(Clock::now() - idle_start)
-            .count(),
-        UINT32_MAX, sync.fence, VK_NULL_HANDLE, sync.cmd, true, false);
-    if (idle_result != VK_SUCCESS) {
-      SDL_Log("Vulkan device idle wait before swapchain recreate failed: %d",
-              static_cast<int>(idle_result));
-      fatal_error_ = true;
-      return false;
+    bool frame_generation_disable_ready = false;
+    for (std::uint32_t drain_cycle = 0u;
+         !frame_generation_disable_ready &&
+         drain_cycle <= kFrameGenerationDisableMaxAttempts;
+         ++drain_cycle) {
+      const FrameSync &sync = frames_[frame_index_];
+      const auto idle_start = Clock::now();
+      logDiagnosticApi("vkDeviceWaitIdle.swapchain_recreate", "before",
+                       std::nullopt, 0.0, UINT32_MAX, sync.fence,
+                       VK_NULL_HANDLE, sync.cmd, true, true);
+      const VkResult idle_result =
+          streamline_vulkan_runtime_.deviceWaitIdle(device_);
+      logDiagnosticApi(
+          "vkDeviceWaitIdle.swapchain_recreate", "after", idle_result,
+          std::chrono::duration<double, std::milli>(Clock::now() - idle_start)
+              .count(),
+          UINT32_MAX, sync.fence, VK_NULL_HANDLE, sync.cmd, true, false);
+      if (idle_result != VK_SUCCESS) {
+        SDL_Log("Vulkan device idle wait before swapchain recreate failed: %d",
+                static_cast<int>(idle_result));
+        if (idle_result == VK_ERROR_DEVICE_LOST) {
+          fatal_error_ = true;
+          fatal_error_detail_ =
+              "VK_ERROR_DEVICE_LOST while draining DLSS-G transition";
+        }
+        return false;
+      }
+      // Proxy presents do not expose an application maintenance1 fence.
+      // Native fences are still drained before their swapchain is destroyed.
+      if (!waitForPendingPresentFences("swapchain_recreate")) {
+        return false;
+      }
+      frame_generation_disable_ready =
+          streamline_vulkan_runtime_
+              .retryFrameGenerationDisableAfterDrain(
+                  transition_frame, "swapchain recreate drain completed");
+      if (!frame_generation_disable_ready &&
+          streamline_vulkan_runtime_.frameGenerationDiagnostic()
+              .disable_exhausted) {
+        break;
+      }
     }
-    // Proxy presents do not expose an application maintenance1 fence. Native
-    // fences are still drained before their swapchain is destroyed.
-    if (!waitForPendingPresentFences("swapchain_recreate")) {
-      fatal_error_ = true;
+    if (!frame_generation_disable_ready) {
+      const FrameGenerationDiagnostic diagnostic =
+          streamline_vulkan_runtime_.frameGenerationDiagnostic();
+      fg_force_native_recovery_ = true;
+      swapchain_recreate_target_ = SwapchainOwnership::Native;
+      fg_recovery_reason_ = diagnostic.status;
+      xpbd::log::errorf(
+          "DLSS Frame Generation swapchain transition blocked: %s",
+          diagnostic.status.c_str());
       return false;
     }
 
     VkSwapchainKHR old_swapchain = swapchain_;
+    if (!streamline_vulkan_runtime_.notifyFrameGenerationSwapchainDestroyed(
+            transition_frame, "old swapchain destroyed")) {
+      return false;
+    }
     swapchain_ = VK_NULL_HANDLE;
     destroySwapchainImageObjects();
-    streamline_vulkan_runtime_.notifyFrameGenerationSwapchainDestroyed(
-        transition_frame, "old swapchain destroyed");
     if (old_swapchain) {
       streamline_vulkan_runtime_.destroySwapchain(
           device_, old_swapchain, nullptr);
@@ -2955,13 +3065,11 @@ bool VulkanBackend::recreateSwapchain() {
                 fg_recovery_reason_.c_str())) {
           xpbd::log::error(
               "DLSS Frame Generation could not reach a safe Native state");
-          fatal_error_ = true;
           return false;
         }
       } else {
         xpbd::log::error(
             "DLSS Frame Generation could not reach a safe Native state");
-        fatal_error_ = true;
         return false;
       }
     }
@@ -2979,7 +3087,9 @@ bool VulkanBackend::recreateSwapchain() {
       // A proxy creation failure must not take down SR/RR/native rendering.
       // Tear down any partial objects, unload DLSS-G, and retry once as
       // Native in the same transaction.
-      destroySwapchainObjects();
+      if (!destroySwapchainObjects()) {
+        return false;
+      }
       effective_proxy_target = false;
       target_ownership = SwapchainOwnership::Native;
       fg_force_native_recovery_ = true;
@@ -2999,7 +3109,9 @@ bool VulkanBackend::recreateSwapchain() {
       xpbd::log::warn(
           "DLSS Frame Generation guide resources unavailable; retrying "
           "Native swapchain");
-      destroySwapchainObjects();
+      if (!destroySwapchainObjects()) {
+        return false;
+      }
       effective_proxy_target = false;
       target_ownership = SwapchainOwnership::Native;
       fg_force_native_recovery_ = true;
@@ -3058,7 +3170,9 @@ bool VulkanBackend::recreateSwapchain() {
           render_pass_ = VK_NULL_HANDLE;
           render_pass_format_ = VK_FORMAT_UNDEFINED;
         }
-        destroySwapchainObjects();
+        if (!destroySwapchainObjects()) {
+          return false;
+        }
         return false;
       }
       if (rt_capability_.device_extensions_enabled && render_pass_) {
@@ -3095,15 +3209,20 @@ bool VulkanBackend::recreateSwapchain() {
       setVulkanPathTraceAvailability(path_tracer_ready, rt_pipeline_ready);
     }
     if (!createFramebuffers()) {
-      destroySwapchainObjects();
+      if (!destroySwapchainObjects()) {
+        return false;
+      }
       return false;
     }
     actual_ownership = streamline_vulkan_runtime_.swapchainOwnership();
-    streamline_vulkan_runtime_.completeFrameGenerationSwapchainTransition(
-        actual_ownership,
-        actual_ownership == SwapchainOwnership::StreamlineFrameGenerationProxy &&
-        fg_swapchain_resources_ready_,
-        transition_frame, transition_reason);
+    if (!streamline_vulkan_runtime_.completeFrameGenerationSwapchainTransition(
+            actual_ownership,
+            actual_ownership ==
+                    SwapchainOwnership::StreamlineFrameGenerationProxy &&
+                fg_swapchain_resources_ready_,
+            transition_frame, transition_reason)) {
+      return false;
+    }
     if (actual_ownership == SwapchainOwnership::Native) {
       // A forced recovery is consumed only after a complete Native rebuild.
       fg_force_native_recovery_ = false;
@@ -3337,12 +3456,14 @@ bool VulkanBackend::createDescriptors() {
         VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     static_sampler_info.magFilter = VK_FILTER_NEAREST;
     static_sampler_info.minFilter = VK_FILTER_NEAREST;
-    static_sampler_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    // Preserve nearest texel lookup inside each atlas mip while blending
+    // continuously between adjacent ray-cone LODs.
+    static_sampler_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
     static_sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     static_sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     static_sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     static_sampler_info.minLod = 0.0f;
-    static_sampler_info.maxLod = 0.0f;
+    static_sampler_info.maxLod = VK_LOD_CLAMP_NONE;
     if (vkCreateSampler(device_, &static_sampler_info, nullptr,
                         &static_albedo_sampler_) != VK_SUCCESS) {
       return false;

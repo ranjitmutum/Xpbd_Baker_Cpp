@@ -32,6 +32,9 @@ struct RtPipelineDispatchParams {
   float ambient = 0.38f;
   float light_color[3]{1.0f, 1.0f, 1.0f};
   float light_intensity = 0.85f;
+  float sun_radiance[3]{0.0f, 0.0f, 0.0f};
+  float sun_angular_radius = 0.0f;
+  bool sun_casts_shadow = true;
   bool hdr_environment = false;
   VkImageView environment_view = VK_NULL_HANDLE;
   VkSampler environment_sampler = VK_NULL_HANDLE;
@@ -46,6 +49,9 @@ struct RtPipelineDispatchParams {
   VkImageView rr_specular_albedo_view = VK_NULL_HANDLE;
   VkImageView rr_normal_roughness_view = VK_NULL_HANDLE;
   VkImageView rr_specular_hit_distance_view = VK_NULL_HANDLE;
+  VkImageView transparency_and_composition_view = VK_NULL_HANDLE;
+  VkImageView reactive_mask_view = VK_NULL_HANDLE;
+  VkImageView guide_validity_view = VK_NULL_HANDLE;
   VkImageView albedo_view = VK_NULL_HANDLE;
   VkImageView normal_view = VK_NULL_HANDLE;
   VkImageView specular_view = VK_NULL_HANDLE;
@@ -122,10 +128,10 @@ private:
 
   struct DescriptorKey {
     VkAccelerationStructureKHR tlas = VK_NULL_HANDLE;
-    std::array<VkImageView, 13> image_views{};
-    std::array<VkSampler, 13> image_samplers{};
-    std::array<VkBuffer, 14> buffers{};
-    std::array<VkDeviceSize, 14> buffer_sizes{};
+    std::array<VkImageView, 16> image_views{};
+    std::array<VkSampler, 16> image_samplers{};
+    std::array<VkBuffer, 15> buffers{};
+    std::array<VkDeviceSize, 15> buffer_sizes{};
 
     [[nodiscard]] constexpr bool operator==(const DescriptorKey &) const =
         default;

@@ -437,6 +437,85 @@ struct ResolvedWorldEnvironment {
 [[nodiscard]] ResolvedWorldEnvironment
 resolveWorldEnvironment(const WorldEnvironmentState &state);
 
+// Read-only rendering projection of the World-owned Sun.  It never stores
+// authoring state: every value is derived from ResolvedWorldEnvironment and
+// its generation domains for the current frame.
+struct ResolvedSunLight {
+  std::array<float, 3> direction{0.0f, 1.0f, 0.0f};
+  std::array<float, 3> color{1.0f, 1.0f, 1.0f};
+  std::array<float, 3> radiance{0.0f, 0.0f, 0.0f};
+  float angular_radius = 0.00465047f;
+  float solid_angle = 0.0f;
+  float strength = 0.0f;
+  float power_estimate = 0.0f;
+  bool enabled = false;
+  bool disk_visible = false;
+  bool casts_shadow = true;
+  bool lighting_enabled = false;
+  std::uint64_t generation = 0;
+  std::uint64_t cloud_generation = 0;
+};
+
+[[nodiscard]] ResolvedSunLight
+resolveSunLight(const ResolvedWorldEnvironment &resolved) noexcept;
+
+enum class ResolvedEnvironmentKind : std::uint8_t {
+  Constant = 0,
+  UserHdri = 1,
+  ProceduralDayNight = 2,
+  AnalyticFallback = 3,
+};
+
+// Logical sample/evaluate/pdf projection. HDRI owns CPU sampling data directly;
+// a procedural GPU cache may attach an equivalent immutable radiance/PDF pair
+// for CPU reference tests without exposing Bruneton LUT internals.
+struct ResolvedEnvironmentView {
+  ResolvedEnvironmentKind kind = ResolvedEnvironmentKind::Constant;
+  const FloatEnvironmentImage *radiance = nullptr;
+  const EnvironmentDistribution *distribution = nullptr;
+  std::array<float, 3> constant_radiance{0.0f, 0.0f, 0.0f};
+  float analytic_strength = 0.0f;
+  float lighting_strength = 0.0f;
+  float background_multiplier = 0.0f;
+  float rotation_radians = 0.0f;
+  float power_estimate = 0.0f;
+  bool lighting_enabled = false;
+  bool background_visible = false;
+  bool sampling_ready = false;
+  bool gpu_cache_required = false;
+  std::uint64_t generation = 0;
+};
+
+struct EnvironmentSample {
+  std::array<float, 3> direction{0.0f, 1.0f, 0.0f};
+  std::array<float, 3> radiance{0.0f, 0.0f, 0.0f};
+  float pdf = 0.0f;
+  bool valid = false;
+};
+
+[[nodiscard]] float estimateEnvironmentPower(
+    const FloatEnvironmentImage &image, float lighting_strength) noexcept;
+[[nodiscard]] ResolvedEnvironmentView resolveEnvironmentView(
+    const ResolvedWorldEnvironment &resolved,
+    const std::array<float, 3> &constant_fallback =
+        {0.0f, 0.0f, 0.0f},
+    float analytic_fallback_strength = 0.0f) noexcept;
+[[nodiscard]] ResolvedEnvironmentView attachEnvironmentSamplingData(
+    ResolvedEnvironmentView view, const FloatEnvironmentImage &radiance,
+    const EnvironmentDistribution &distribution,
+    std::uint64_t cache_generation) noexcept;
+[[nodiscard]] EnvironmentSample sampleEnvironment(
+    const ResolvedEnvironmentView &environment, float column_sample,
+    float coin_sample, float jitter_u, float jitter_v) noexcept;
+[[nodiscard]] std::array<float, 3> evaluateEnvironment(
+    const ResolvedEnvironmentView &environment,
+    const std::array<float, 3> &direction) noexcept;
+[[nodiscard]] float environmentPdf(
+    const ResolvedEnvironmentView &environment,
+    const std::array<float, 3> &direction) noexcept;
+[[nodiscard]] std::uint64_t environmentGeneration(
+    const ResolvedEnvironmentView &environment) noexcept;
+
 struct EmissivePatch {
   std::uint32_t triangle_index = 0;
   std::uint16_t tile_x = 0;

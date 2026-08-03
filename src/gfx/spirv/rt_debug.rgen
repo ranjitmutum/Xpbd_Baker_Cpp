@@ -23,6 +23,8 @@ layout(set = 0, binding = 15, std430) readonly buffer EnvironmentBuffer {
   vec4 environmentMoonDirectionAngularRadius;
   vec4 environmentMoonPhaseLibration;
   vec4 environmentSunColorStrength;
+  // x = Environment power, y = SunDisk power; z/w reserved.
+  vec4 environmentLightPower;
   EnvironmentAliasEntry environmentAlias[];
 };
 
@@ -32,6 +34,8 @@ struct EmissiveTriangleEntry {
   vec4 p2Area;
   vec4 emissionLuminance;
   uvec4 metadata;
+  // xy = stable 64-bit light ID, z = sidedness flags, w = source primitive.
+  uvec4 stableLightId;
 };
 
 layout(set = 0, binding = 16, std430) readonly buffer EmissiveTriangleBuffer {
@@ -68,6 +72,17 @@ layout(set = 0, binding = 26, rgba16f)
     uniform image2D outputRrSpecularAlbedo;
 layout(set = 0, binding = 27, rgba16f)
     uniform image2D outputRrNormalRoughness;
+struct SurfaceOpticsGpu {
+  vec4 parameters;
+  vec4 attenuationColor;
+};
+layout(set = 0, binding = 28, std430) readonly buffer PrimitiveOpticsBuffer {
+  SurfaceOpticsGpu primitiveOptics[];
+};
+layout(set = 0, binding = 29, r8)
+    uniform image2D outputTransparencyAndComposition;
+layout(set = 0, binding = 30, r8) uniform image2D outputReactiveMask;
+layout(set = 0, binding = 31, r8) uniform image2D outputGuideValidity;
 
 const int kAovGeometry = 0;
 const int kAovShading = 1;
@@ -85,6 +100,15 @@ const uint kOutputRrDiffuseAlbedo = 1u << 12u;
 const uint kOutputRrSpecularAlbedo = 1u << 13u;
 const uint kOutputRrNormalRoughness = 1u << 14u;
 const uint kOutputStatistics = 1u << 15u;
+const uint kOutputTransparencyAndComposition = 1u << 16u;
+const uint kOutputReactiveMask = 1u << 17u;
+const uint kOutputGuideValidity = 1u << 18u;
+
+const uint kTransparentGuidePolicyOpaqueBehind = 0u;
+const uint kTransparentGuidePolicyFrontCoverage = 1u;
+const uint kTransparentGuidePolicyConservativeInvalid = 2u;
+const uint kTransparentGuidePolicyV1 =
+    kTransparentGuidePolicyFrontCoverage;
 
 layout(push_constant) uniform PC {
   mat4 invViewProj;
@@ -111,16 +135,25 @@ struct PrimaryPayload {
   vec3 baseColor;
   float t;
   vec3 shadingNormal;
-  float roughness;
+  float ggxAlpha;
   vec3 geometricNormal;
   float ior;
   vec3 f0;
   float transmission;
   vec3 emission;
   float opacity;
+  vec4 attenuation;
   uvec4 status;
   // xy barycentrics, z uintBitsToFloat(instance id), w reserved.
   vec4 hitData;
+  // x = cone width at the ray origin, y = angular spread.
+  vec2 rayCone;
+};
+
+struct ShadowPayload {
+  float visibility;
+  float reserved;
+  vec2 rayCone;
 };
 
 const uint kMaterialBlend = 1u << 2u;
@@ -132,9 +165,22 @@ const uint kSunCastsShadows = 1u << 8u;
 const uint kMoonCastsShadows = 1u << 9u;
 const uint kMoonSurfaceDetail = 1u << 10u;
 const uint kMoonManualPhase = 1u << 11u;
+const float kDeltaMirrorAlpha = 1.0e-6;
+const float kMinFiniteGgxAlpha = 1.0e-4;
+
+const uint kRngDomainCameraJitter = 0x43414d45u;
+const uint kRngDomainAlphaCoverage = 0x414c5048u;
+const uint kRngDomainLobeSelection = 0x4c4f4245u;
+const uint kRngDomainDirection = 0x44495245u;
+const uint kRngDomainEnvironment = 0x454e5652u;
+const uint kRngDomainEmissive = 0x454d4954u;
+const uint kRngDomainLightRegistry = 0x4c524547u;
+const uint kRngDomainRussianRoulette = 0x52524f55u;
+const uint kRngDomainVolume = 0x564f4c55u;
+const uint kRngDomainRestir = 0x52535452u;
 
 layout(location = 0) rayPayloadEXT PrimaryPayload payload;
-layout(location = 1) rayPayloadEXT float shadowVisibility;
+layout(location = 1) rayPayloadEXT ShadowPayload shadowPayload;
 
 struct EnvironmentSample {
   vec3 direction;
@@ -148,6 +194,30 @@ struct MeshLightSample {
   vec3 radiance;
   float distance;
   bool valid;
+};
+
+const uint kRtLightEnvironment = 0u;
+const uint kRtLightSunDisk = 1u;
+const uint kRtLightEmissiveTriangle = 2u;
+
+struct RtLightSample {
+  vec3 direction;
+  float pdf;
+  vec3 radiance;
+  float distance;
+  uint type;
+  bool castsShadow;
+  bool valid;
+};
+
+struct PathRngState {
+  uint state;
+  uint dimension;
+};
+
+struct RayCone {
+  float width;
+  float spreadAngle;
 };
 
 uint hashPathTraceWord(uint value) {
@@ -167,9 +237,26 @@ uint randomBits(uvec2 pixel, uint sampleIndex, uint dimension, uint seed) {
   return hashPathTraceWord(state ^ (dimension + 0x27d4eb2fu));
 }
 
-float random01(uvec2 pixel, uint sampleIndex, uint dimension, uint seed) {
-  return float(randomBits(pixel, sampleIndex, dimension, seed) >> 8u) *
-         (1.0 / 16777216.0);
+PathRngState makePathRng(uvec2 pixel, uint sampleIndex, uint bounce,
+                         uint domain, uint stream, uint seed) {
+  uint domainKey = hashPathTraceWord(domain);
+  domainKey = hashPathTraceWord(domainKey ^ (bounce + 0x68bc21ebu));
+  domainKey = hashPathTraceWord(domainKey ^ (stream + 0x02e5be93u));
+  PathRngState rng;
+  rng.state = randomBits(pixel, sampleIndex, domainKey, seed);
+  rng.dimension = 0u;
+  return rng;
+}
+
+uint nextRandomBits(inout PathRngState rng) {
+  rng.state = hashPathTraceWord(
+      rng.state ^ (rng.dimension + 0x9e3779b9u));
+  ++rng.dimension;
+  return rng.state;
+}
+
+float nextRandom(inout PathRngState rng) {
+  return float(nextRandomBits(rng) >> 8u) * (1.0 / 16777216.0);
 }
 
 bool finite3(vec3 value) {
@@ -187,6 +274,111 @@ vec3 safeNormalize(vec3 value, vec3 fallback) {
   return finite3(value) && lengthSquared > 1.0e-12
              ? value * inversesqrt(lengthSquared)
              : fallback;
+}
+
+bool finitePosition3(vec3 value) {
+  return !any(isnan(value)) && !any(isinf(value));
+}
+
+vec3 offsetRayOrigin(vec3 position, vec3 geometricNormal,
+                     vec3 outgoingDirection) {
+  if (!finitePosition3(position) || !finitePosition3(geometricNormal) ||
+      !finitePosition3(outgoingDirection)) {
+    return position;
+  }
+  vec3 orientedNormal =
+      safeNormalize(geometricNormal, vec3(0.0, 1.0, 0.0));
+  if (dot(orientedNormal, outgoingDirection) < 0.0) {
+    orientedNormal = -orientedNormal;
+  }
+
+  const float nearOrigin = 1.0 / 32.0;
+  const float nearScale = 1.0 / 65536.0;
+  const float ulpScale = 256.0;
+  ivec3 ulps = ivec3(ulpScale * orientedNormal);
+  vec3 candidate;
+  for (int component = 0; component < 3; ++component) {
+    if (abs(position[component]) < nearOrigin) {
+      candidate[component] =
+          position[component] + nearScale * orientedNormal[component];
+    } else {
+      int bits = floatBitsToInt(position[component]);
+      bits += position[component] < 0.0 ? -ulps[component]
+                                        : ulps[component];
+      candidate[component] = intBitsToFloat(bits);
+    }
+  }
+  vec3 movement = candidate - position;
+  if (finitePosition3(candidate) && dot(movement, orientedNormal) > 0.0) {
+    return candidate;
+  }
+
+  vec3 absolutePosition = abs(position);
+  float sceneScale =
+      max(1.0, max(absolutePosition.x,
+                   max(absolutePosition.y, absolutePosition.z)));
+  float fallbackDistance =
+      max(nearScale, sceneScale * 1.1920928955078125e-7 * 4.0);
+  vec3 fallbackPosition = position + orientedNormal * fallbackDistance;
+  return finitePosition3(fallbackPosition) ? fallbackPosition : position;
+}
+
+vec3 cameraRayDirection(vec2 uv) {
+  vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+  vec4 farWorldH = pc.invViewProj * vec4(ndc, 1.0, 1.0);
+  vec3 farWorld =
+      farWorldH.xyz / max(abs(farWorldH.w), 1.0e-6);
+  return safeNormalize(farWorld - pc.cameraEnvironment.xyz,
+                       vec3(0.0, 0.0, -1.0));
+}
+
+RayCone initialRayCone(vec2 uv, vec3 direction) {
+  vec2 inverseSize = 1.0 / max(vec2(pc.sizeMode.xy), vec2(1.0));
+  // Do not clamp the adjacent projected rays at the viewport edge. The
+  // inverse projection remains valid just outside the viewport and preserves
+  // a non-zero one-sided footprint for the rightmost/bottommost pixels.
+  vec3 directionX = cameraRayDirection(
+      uv + vec2(inverseSize.x, 0.0));
+  vec3 directionY = cameraRayDirection(
+      uv + vec2(0.0, inverseSize.y));
+  float spread = max(
+      acos(clamp(dot(direction, directionX), -1.0, 1.0)),
+      acos(clamp(dot(direction, directionY), -1.0, 1.0)));
+  RayCone cone;
+  cone.width = 0.0;
+  cone.spreadAngle = finitePosition3(vec3(spread)) ? spread : 0.0;
+  return cone;
+}
+
+float rayConeWidthAtDistance(RayCone cone, float distance) {
+  return max(cone.width, 0.0) +
+         abs(distance) * max(cone.spreadAngle, 0.0);
+}
+
+RayCone propagateRayCone(RayCone cone, float distance, uint lobe,
+                         float ggxAlpha, float etaRatio) {
+  cone.width = rayConeWidthAtDistance(cone, distance);
+  float alpha = clamp(ggxAlpha, 0.0, 1.0);
+  float lobeSpread = 0.0;
+  if (lobe == 0u) {
+    lobeSpread = 0.5;
+  } else if (lobe == 1u) {
+    lobeSpread = 0.5 * sqrt(alpha);
+  } else if (lobe == 2u) {
+    lobeSpread =
+        0.25 * sqrt(alpha) + 0.05 * abs(etaRatio - 1.0);
+  }
+  cone.spreadAngle =
+      min(1.5707963267948966,
+          max(max(cone.spreadAngle, 0.0), lobeSpread));
+  return cone;
+}
+
+float rayConeEnvironmentLod(RayCone cone) {
+  ivec2 extent = textureSize(environmentTexture, 0);
+  float texels = max(cone.spreadAngle, 0.0) *
+                 float(max(extent.x, extent.y));
+  return texels > 1.0 ? max(log2(texels), 0.0) : 0.0;
 }
 
 float max3(vec3 value) {
@@ -244,12 +436,12 @@ vec3 cosineHemisphere(vec3 normal, float sampleU, float sampleV) {
       normal);
 }
 
-float ggxDistribution(float normalDotHalf, float roughness) {
+float ggxDistribution(float normalDotHalf, float ggxAlpha) {
   float noH = clamp(normalDotHalf, 0.0, 1.0);
-  if (!(noH > 0.0)) {
+  if (!(noH > 0.0) || ggxAlpha <= kDeltaMirrorAlpha) {
     return 0.0;
   }
-  float alpha = clamp(roughness, 0.02, 1.0);
+  float alpha = clamp(ggxAlpha, kMinFiniteGgxAlpha, 1.0);
   float alphaSquared = alpha * alpha;
   float denominator =
       noH * noH * (alphaSquared - 1.0) + 1.0;
@@ -258,12 +450,12 @@ float ggxDistribution(float normalDotHalf, float roughness) {
              1.0e-12);
 }
 
-float smithGgxG1(float normalDotDirection, float roughness) {
+float smithGgxG1(float normalDotDirection, float ggxAlpha) {
   float cosine = clamp(normalDotDirection, 0.0, 1.0);
-  if (!(cosine > 0.0)) {
+  if (!(cosine > 0.0) || ggxAlpha <= kDeltaMirrorAlpha) {
     return 0.0;
   }
-  float alpha = clamp(roughness, 0.02, 1.0);
+  float alpha = clamp(ggxAlpha, kMinFiniteGgxAlpha, 1.0);
   float root = sqrt(alpha * alpha +
                     (1.0 - alpha * alpha) * cosine * cosine);
   return 2.0 * cosine / max(cosine + root, 1.0e-8);
@@ -293,31 +485,102 @@ float dielectricFresnel(float cosineIncident, float etaIncident,
 }
 
 void lobeProbabilities(vec3 baseColor, vec3 f0, bool metal,
-                       float transmission, out vec3 probabilities) {
-  float f0Importance = clamp(max3(f0), 0.0, 0.99);
+                       float transmission, float ior,
+                       out vec3 probabilities) {
+  float normalFresnel =
+      metal ? clamp(max3(f0), 0.0, 0.99)
+            : dielectricFresnel(1.0, 1.0, ior);
   float diffuseImportance =
       metal ? 0.0
-            : (1.0 - transmission) * (1.0 - f0Importance) *
+            : (1.0 - transmission) * (1.0 - normalFresnel) *
                   max(luminance(baseColor), 0.05);
-  float glossyImportance = max(f0Importance, 0.02);
-  float transmissionImportance =
-      metal ? 0.0
-            : transmission * (1.0 - f0Importance) *
-                  max(luminance(baseColor), 0.05);
-  float total =
-      diffuseImportance + glossyImportance + transmissionImportance;
-  probabilities =
-      total > 1.0e-8
-          ? vec3(diffuseImportance, glossyImportance,
-                 transmissionImportance) /
-                total
-          : vec3(0.0, 1.0, 0.0);
+  float interfaceImportance =
+      metal ? max(normalFresnel, 0.02)
+            : normalFresnel + transmission * (1.0 - normalFresnel);
+  float total = diffuseImportance + interfaceImportance;
+  if (!(total > 1.0e-8)) {
+    probabilities = vec3(0.0, 1.0, 0.0);
+    return;
+  }
+  float diffuseProbability = diffuseImportance / total;
+  float interfaceProbability = interfaceImportance / total;
+  float reflectionWeight = metal ? 1.0 : normalFresnel;
+  float transmissionWeight =
+      metal ? 0.0 : transmission * (1.0 - normalFresnel);
+  float interfaceTotal = reflectionWeight + transmissionWeight;
+  float reflectionProbability =
+      interfaceTotal > 0.0
+          ? interfaceProbability * reflectionWeight / interfaceTotal
+          : interfaceProbability;
+  probabilities = vec3(
+      diffuseProbability, reflectionProbability,
+      max(0.0, interfaceProbability - reflectionProbability));
+}
+
+float ggxVisibleNormalPdf(vec3 normal, vec3 view, vec3 halfVector,
+                          float ggxAlpha) {
+  if (ggxAlpha <= kDeltaMirrorAlpha) {
+    return 0.0;
+  }
+  float noV = dot(normal, view);
+  float noH = dot(normal, halfVector);
+  float voH = dot(view, halfVector);
+  if (!(noV > 0.0) || !(noH > 0.0) || !(voH > 0.0)) {
+    return 0.0;
+  }
+  return ggxDistribution(noH, ggxAlpha) *
+         smithGgxG1(noV, ggxAlpha) * voH / noV;
+}
+
+vec3 sampleGgxVndf(vec3 normal, vec3 view, float ggxAlpha,
+                   float sampleU, float sampleV, out bool valid) {
+  valid = false;
+  if (ggxAlpha <= kDeltaMirrorAlpha || !(dot(normal, view) > 0.0)) {
+    return normal;
+  }
+  vec3 up = abs(normal.z) < 0.999 ? vec3(0.0, 0.0, 1.0)
+                                  : vec3(0.0, 1.0, 0.0);
+  vec3 tangent = safeNormalize(cross(up, normal), vec3(1.0, 0.0, 0.0));
+  vec3 bitangent = cross(normal, tangent);
+  vec3 localView = vec3(dot(view, tangent), dot(view, bitangent),
+                        dot(view, normal));
+  float alpha = clamp(ggxAlpha, kMinFiniteGgxAlpha, 1.0);
+  vec3 stretchedView = safeNormalize(
+      vec3(alpha * localView.x, alpha * localView.y, localView.z),
+      vec3(0.0, 0.0, 1.0));
+  float lensq = dot(stretchedView.xy, stretchedView.xy);
+  vec3 basisX = lensq > 1.0e-20
+                    ? vec3(-stretchedView.y, stretchedView.x, 0.0) /
+                          sqrt(lensq)
+                    : vec3(1.0, 0.0, 0.0);
+  vec3 basisY = cross(stretchedView, basisX);
+  float radius = sqrt(clamp(sampleU, 0.0, 0.99999994));
+  float phi = 6.28318530718 * clamp(sampleV, 0.0, 0.99999994);
+  float diskX = radius * cos(phi);
+  float diskY = radius * sin(phi);
+  float blend = 0.5 * (1.0 + stretchedView.z);
+  diskY = (1.0 - blend) * sqrt(max(0.0, 1.0 - diskX * diskX)) +
+          blend * diskY;
+  float diskZ = sqrt(max(0.0, 1.0 - diskX * diskX - diskY * diskY));
+  vec3 stretchedNormal =
+      diskX * basisX + diskY * basisY + diskZ * stretchedView;
+  vec3 localHalf = safeNormalize(
+      vec3(alpha * stretchedNormal.x, alpha * stretchedNormal.y,
+           max(stretchedNormal.z, 0.0)),
+      vec3(0.0, 0.0, 1.0));
+  vec3 halfVector = safeNormalize(
+      tangent * localHalf.x + bitangent * localHalf.y + normal * localHalf.z,
+      normal);
+  valid = ggxVisibleNormalPdf(normal, view, halfVector, ggxAlpha) > 0.0 &&
+          finite3(halfVector);
+  return halfVector;
 }
 
 void evaluateBsdfComponents(
-    vec3 baseColor, vec3 f0, vec3 reflectionTint, float roughness,
-    float transmission, bool metal, vec3 normal, vec3 view, vec3 light,
-    out vec3 diffuse, out vec3 specular, out float pdf) {
+    vec3 baseColor, vec3 f0, vec3 reflectionTint, float ggxAlpha,
+    float transmission, float ior, bool metal, bool thinWalled, bool frontFace,
+    vec3 normal, vec3 view, vec3 light, out vec3 diffuse,
+    out vec3 specular, out float pdf) {
   pdf = 0.0;
   diffuse = vec3(0.0);
   specular = vec3(0.0);
@@ -332,63 +595,134 @@ void evaluateBsdfComponents(
   if (!(noH > 0.0) || !(voH > 0.0)) {
     return;
   }
-  float distribution = ggxDistribution(noH, roughness);
-  float geometry =
-      smithGgxG1(noV, roughness) * smithGgxG1(noL, roughness);
-  vec3 fresnel = fresnelSchlick(f0, voH);
+  bool deltaInterface =
+      ggxAlpha <= kDeltaMirrorAlpha ||
+      (!metal && thinWalled && transmission > 0.0);
+  float distribution = 0.0;
+  float geometry = 0.0;
+  if (!deltaInterface) {
+    distribution = ggxDistribution(noH, ggxAlpha);
+    geometry =
+        smithGgxG1(noV, ggxAlpha) * smithGgxG1(noL, ggxAlpha);
+  }
+  float etaIncident = frontFace ? 1.0 : ior;
+  float etaTransmitted = frontFace ? ior : 1.0;
+  vec3 fresnel = metal
+                     ? fresnelSchlick(f0, voH)
+                     : vec3(dielectricFresnel(
+                           voH, etaIncident, etaTransmitted));
+  float scalarFresnel = max3(fresnel);
   specular =
-      reflectionTint * fresnel * distribution * geometry /
-      max(4.0 * noV * noL, 1.0e-8);
+      deltaInterface
+          ? vec3(0.0)
+          : reflectionTint * fresnel * distribution * geometry /
+                max(4.0 * noV * noL, 1.0e-8);
   diffuse =
       metal ? vec3(0.0)
-            : baseColor * (1.0 - transmission) *
-                  (1.0 - max3(fresnel)) *
+             : baseColor * (1.0 - transmission) *
+                  (1.0 - scalarFresnel) *
                   (1.0 / 3.14159265358979323846);
   vec3 probabilities;
-  lobeProbabilities(baseColor, f0, metal, transmission,
+  lobeProbabilities(baseColor, f0, metal, transmission, ior,
                     probabilities);
   float diffusePdf = noL * (1.0 / 3.14159265358979323846);
+  float interfaceProbability = probabilities.y + probabilities.z;
+  float reflectionWeight = metal ? 1.0 : scalarFresnel;
+  float transmissionWeight =
+      metal ? 0.0 : transmission * (1.0 - scalarFresnel);
+  float interfaceTotal = reflectionWeight + transmissionWeight;
+  float conditionalReflection =
+      interfaceTotal > 0.0 ? reflectionWeight / interfaceTotal : 1.0;
   float glossyPdf =
-      distribution * noH / max(4.0 * voH, 1.0e-8);
+      deltaInterface
+          ? 0.0
+          : interfaceProbability * conditionalReflection *
+                ggxVisibleNormalPdf(normal, view, halfVector, ggxAlpha) /
+                max(4.0 * abs(voH), 1.0e-8);
   pdf = probabilities.x * diffusePdf +
-        probabilities.y * glossyPdf;
+        glossyPdf;
 }
 
 vec3 evaluateBsdf(vec3 baseColor, vec3 f0, vec3 reflectionTint,
-                  float roughness, float transmission, bool metal, vec3 normal,
+                  float ggxAlpha, float transmission, float ior,
+                  bool metal, bool thinWalled, bool frontFace, vec3 normal,
                   vec3 view, vec3 light, out float pdf) {
   vec3 diffuse;
   vec3 specular;
   evaluateBsdfComponents(
-      baseColor, f0, reflectionTint, roughness, transmission, metal,
-      normal, view,
+      baseColor, f0, reflectionTint, ggxAlpha, transmission, ior,
+      metal, thinWalled, frontFace, normal, view,
       light, diffuse, specular, pdf);
   return diffuse + specular;
 }
 
-vec3 sampleGgx(vec3 normal, vec3 view, float roughness,
-               float sampleU, float sampleV, out bool valid) {
-  float alpha = clamp(roughness, 0.02, 1.0);
-  float alphaSquared = alpha * alpha;
-  float phi = 6.28318530718 * clamp(sampleV, 0.0, 0.99999994);
-  float cosine = sqrt(max(
-      0.0, (1.0 - sampleU) /
-               (1.0 + (alphaSquared - 1.0) * sampleU)));
-  float sine = sqrt(max(0.0, 1.0 - cosine * cosine));
-  vec3 up = abs(normal.z) < 0.999 ? vec3(0.0, 0.0, 1.0)
-                                 : vec3(0.0, 1.0, 0.0);
-  vec3 tangent = safeNormalize(cross(up, normal), vec3(1.0, 0.0, 0.0));
-  vec3 bitangent = cross(normal, tangent);
-  vec3 halfVector = safeNormalize(
-      tangent * (sine * cos(phi)) +
-          bitangent * (sine * sin(phi)) + normal * cosine,
-      normal);
+vec3 evaluateMicrofacetTransmission(
+    vec3 baseColor, float ggxAlpha, float transmission, float ior,
+    bool frontFace, vec3 normal, vec3 view, vec3 light, out float pdf) {
+  pdf = 0.0;
+  float noV = dot(normal, view);
+  float noL = dot(normal, light);
+  if (!(noV > 0.0) || !(noL < 0.0) || !(transmission > 0.0) ||
+      ggxAlpha <= kDeltaMirrorAlpha) {
+    return vec3(0.0);
+  }
+  float etaIncident = frontFace ? 1.0 : ior;
+  float etaTransmitted = frontFace ? ior : 1.0;
+  float etaPath = etaTransmitted / etaIncident;
+  vec3 halfVector = safeNormalize(light * etaPath + view, normal);
+  if (dot(halfVector, normal) < 0.0) {
+    halfVector = -halfVector;
+  }
+  float noH = dot(normal, halfVector);
   float voH = dot(view, halfVector);
-  vec3 light =
-      safeNormalize(2.0 * voH * halfVector - view, vec3(0.0));
-  valid = voH > 0.0 && dot(normal, light) > 0.0 &&
-          finite3(light);
-  return light;
+  float loH = dot(light, halfVector);
+  if (!(noH > 0.0) || !(voH > 0.0) || !(loH < 0.0)) {
+    return vec3(0.0);
+  }
+  float fresnel = dielectricFresnel(
+      voH, etaIncident, etaTransmitted);
+  float transmissionWeight = transmission * (1.0 - fresnel);
+  float interfaceTotal = fresnel + transmissionWeight;
+  if (!(interfaceTotal > 0.0)) {
+    return vec3(0.0);
+  }
+  float denominator = loH + voH / etaPath;
+  float denominatorSquared = denominator * denominator;
+  float dwmDwi = abs(loH) / max(denominatorSquared, 1.0e-8);
+  vec3 probabilities;
+  lobeProbabilities(baseColor, vec3(0.04), false, transmission, ior,
+                    probabilities);
+  float interfaceProbability = probabilities.y + probabilities.z;
+  pdf = interfaceProbability * transmissionWeight / interfaceTotal *
+        ggxVisibleNormalPdf(normal, view, halfVector, ggxAlpha) * dwmDwi;
+  float distribution = ggxDistribution(noH, ggxAlpha);
+  float geometry = smithGgxG1(noV, ggxAlpha) *
+                   smithGgxG1(-noL, ggxAlpha);
+  float etaScale = 1.0 / (etaPath * etaPath);
+  float value = transmissionWeight * distribution * geometry *
+                abs(loH * voH /
+                    (max(denominatorSquared, 1.0e-8) * noL * noV)) *
+                etaScale;
+  return vec3(max(value, 0.0));
+}
+
+float thinWalledCombinedFresnel(float fresnel) {
+  float clamped = clamp(fresnel, 0.0, 1.0);
+  return clamp(2.0 * clamped / (1.0 + clamped), 0.0, 1.0);
+}
+
+vec3 beerLambertTransmittance(vec3 attenuationColor,
+                              float attenuationDistance,
+                              float traveledDistance) {
+  if (!(attenuationDistance > 0.0) || !(traveledDistance > 0.0)) {
+    return vec3(1.0);
+  }
+  vec3 color = clamp(attenuationColor, vec3(1.0e-6), vec3(1.0));
+  vec3 sigmaA = -log(color) / attenuationDistance;
+  vec3 transmittance = exp(-sigmaA * traveledDistance);
+  return finite3(transmittance)
+             ? clamp(transmittance, vec3(0.0), vec3(1.0))
+             : vec3(0.0);
 }
 
 float shadingNormalCorrection(vec3 geometricNormal, vec3 shadingNormal,
@@ -418,10 +752,7 @@ vec3 analyticEnvironment(vec3 direction) {
   vec3 horizon = vec3(0.42, 0.55, 0.72);
   vec3 zenith = vec3(0.08, 0.20, 0.48);
   vec3 sky = mix(horizon, zenith, pow(elevation, 0.65));
-  vec3 lightDirection =
-      safeNormalize(pc.lightDirectionAmbient.xyz, vec3(0.0, 1.0, 0.0));
-  float sun = pow(max(dot(direction, lightDirection), 0.0), 512.0);
-  return strength * (sky + sun * vec3(5.0, 4.2, 3.1));
+  return strength * sky;
 }
 
 bool hdrEnvironmentEnabled() {
@@ -645,41 +976,43 @@ vec3 proceduralSunRadiance(vec3 direction, bool background) {
                                 : vec3(0.0);
 }
 
-vec3 hdrEnvironmentTexture(vec3 direction, bool background) {
+vec3 hdrEnvironmentTexture(vec3 direction, bool background,
+                           float textureLodValue) {
   if (!hdrEnvironmentValid()) {
     return vec3(0.0);
   }
   vec3 radiance =
-      max(texture(environmentTexture, environmentUv(direction)).rgb,
+      max(textureLod(environmentTexture, environmentUv(direction),
+                     max(textureLodValue, 0.0)).rgb,
           vec3(0.0)) +
-      proceduralSunRadiance(direction, background) +
+      (background ? proceduralSunRadiance(direction, true) : vec3(0.0)) +
       proceduralMoonRadiance(direction, background);
   return finite3(radiance) ? min(radiance, vec3(65504.0))
                            : vec3(0.0);
 }
 
-vec3 lightingEnvironment(vec3 direction) {
+vec3 lightingEnvironment(vec3 direction, float textureLodValue) {
   if (hdrEnvironmentEnabled()) {
     if (!hdrEnvironmentValid() ||
         (environmentInfo.x & 4u) == 0u ||
         !(environmentParameters.x > 0.0)) {
       return vec3(0.0);
     }
-    return min(hdrEnvironmentTexture(direction, false) *
+    return min(hdrEnvironmentTexture(direction, false, textureLodValue) *
                    environmentParameters.x,
                vec3(65504.0));
   }
   return analyticEnvironment(direction);
 }
 
-vec3 backgroundEnvironment(vec3 direction) {
+vec3 backgroundEnvironment(vec3 direction, float textureLodValue) {
   if (hdrEnvironmentEnabled()) {
     if (!hdrEnvironmentValid() ||
         (environmentInfo.x & 2u) == 0u ||
         !(environmentParameters.y > 0.0)) {
       return vec3(0.0);
     }
-    return min(hdrEnvironmentTexture(direction, true) *
+    return min(hdrEnvironmentTexture(direction, true, textureLodValue) *
                    environmentParameters.y,
                vec3(65504.0));
   }
@@ -727,7 +1060,7 @@ float hdrEnvironmentPdf(vec3 direction) {
 
 float environmentPdf(vec3 direction) {
   if (!integratorFlag(29u)) {
-    return length(lightingEnvironment(direction)) > 0.0
+    return length(lightingEnvironment(direction, 0.0)) > 0.0
                ? 0.07957747154594767
                : 0.0;
   }
@@ -740,14 +1073,6 @@ bool environmentSampleCastsShadow(vec3 direction) {
     return true;
   }
   vec3 cacheDirection = environmentCacheDirection(direction);
-  if ((environmentInfo.x & kSunLightingEnabled) != 0u &&
-      environmentParameters.w > 0.0 &&
-      dot(cacheDirection,
-          safeNormalize(environmentSunDirectionMoonMean.xyz,
-                        vec3(0.0, 1.0, 0.0))) >=
-          cos(environmentParameters.w)) {
-    return (environmentInfo.x & kSunCastsShadows) != 0u;
-  }
   if ((environmentInfo.x & kMoonLightingEnabled) != 0u &&
       environmentMoonDirectionAngularRadius.w > 0.0 &&
       dot(cacheDirection,
@@ -822,7 +1147,7 @@ EnvironmentSample sampleEnvironment(float columnSample, float coinSample,
 
 bool meshLightsValid() {
   return integratorFlag(30u) && emissiveInfo.x > 0u &&
-         emissiveInfo.y > 0u && emissiveInfo.z == 1u;
+         emissiveInfo.y > 0u && emissiveInfo.z == 2u;
 }
 
 vec3 emissiveTriangleNormal(EmissiveTriangleEntry entry) {
@@ -830,6 +1155,16 @@ vec3 emissiveTriangleNormal(EmissiveTriangleEntry entry) {
       cross(entry.p1Acceptance.xyz - entry.p0Probability.xyz,
             entry.p2Area.xyz - entry.p0Probability.xyz),
       vec3(0.0, 1.0, 0.0));
+}
+
+bool emissiveTriangleTwoSided(EmissiveTriangleEntry entry) {
+  return (entry.stableLightId.z & 1u) != 0u;
+}
+
+float emissiveTriangleCosine(EmissiveTriangleEntry entry,
+                             vec3 lightDirection) {
+  float facing = dot(emissiveTriangleNormal(entry), -lightDirection);
+  return emissiveTriangleTwoSided(entry) ? abs(facing) : max(facing, 0.0);
 }
 
 float meshLightPdf(uint primitive, vec3 source, vec3 lightPoint) {
@@ -849,8 +1184,7 @@ float meshLightPdf(uint primitive, vec3 source, vec3 lightPoint) {
     return 0.0;
   }
   vec3 lightDirection = toLight * inversesqrt(distanceSquared);
-  float lightCosine = abs(dot(
-      emissiveTriangleNormal(entry), -lightDirection));
+  float lightCosine = emissiveTriangleCosine(entry, lightDirection);
   return lightCosine > 1.0e-6
              ? selectionPdf * distanceSquared /
                    (area * lightCosine)
@@ -897,8 +1231,7 @@ MeshLightSample sampleMeshLight(
   }
   result.distance = sqrt(distanceSquared);
   result.direction = toLight / result.distance;
-  float lightCosine = abs(dot(
-      emissiveTriangleNormal(entry), -result.direction));
+  float lightCosine = emissiveTriangleCosine(entry, result.direction);
   result.pdf =
       lightCosine > 1.0e-6
           ? entry.p0Probability.w * distanceSquared /
@@ -907,6 +1240,205 @@ MeshLightSample sampleMeshLight(
   result.radiance = max(entry.emissionLuminance.rgb, vec3(0.0));
   result.valid = result.pdf > 0.0 && max3(result.radiance) > 0.0 &&
                  finite3(result.direction) && finite3(result.radiance);
+  return result;
+}
+
+bool environmentLightEnabled() {
+  if (hdrEnvironmentEnabled()) {
+    return hdrEnvironmentValid() && (environmentInfo.x & 4u) != 0u &&
+           environmentParameters.x > 0.0;
+  }
+  return pc.cameraEnvironment.w > 0.0;
+}
+
+float environmentLightPowerEstimate() {
+  if (!environmentLightEnabled()) {
+    return 0.0;
+  }
+  if (hdrEnvironmentValid() && environmentLightPower.x > 0.0) {
+    return environmentLightPower.x;
+  }
+  vec3 meanRadiance =
+      (lightingEnvironment(vec3(0.0, 1.0, 0.0), 0.0) +
+       lightingEnvironment(vec3(1.0, 0.0, 0.0), 0.0) +
+       lightingEnvironment(vec3(0.0, -1.0, 0.0), 0.0)) /
+      3.0;
+  return max(luminance(meanRadiance) * 12.566370614359172, 0.0);
+}
+
+float sunDiskAngularRadius() {
+  return abs(pc.lightDirectionAmbient.w);
+}
+
+float sunDiskSolidAngle() {
+  float radius = sunDiskAngularRadius();
+  return radius > 0.0
+             ? 6.283185307179586 * (1.0 - cos(radius))
+             : 0.0;
+}
+
+bool sunDiskEnabled() {
+  return integratorFlag(25u) && sunDiskAngularRadius() > 0.0 &&
+         pc.lightColorIntensity.w > 0.0 &&
+         max3(max(pc.lightColorIntensity.rgb, vec3(0.0))) > 0.0;
+}
+
+bool sunDiskCastsShadow() {
+  return pc.lightDirectionAmbient.w >= 0.0;
+}
+
+vec3 evaluateSunDisk(vec3 direction) {
+  if (!sunDiskEnabled()) {
+    return vec3(0.0);
+  }
+  vec3 axis = safeNormalize(
+      pc.lightDirectionAmbient.xyz, vec3(0.0, 1.0, 0.0));
+  float radius = sunDiskAngularRadius();
+  float cosine = dot(safeNormalize(direction, axis), axis);
+  if (cosine < cos(radius)) {
+    return vec3(0.0);
+  }
+  float angularDistance = acos(clamp(cosine, -1.0, 1.0));
+  float disk = 1.0 - smoothstep(0.94, 1.0, angularDistance / radius);
+  return max(pc.lightColorIntensity.rgb, vec3(0.0)) *
+         max(pc.lightColorIntensity.w, 0.0) * disk;
+}
+
+float sunDiskPdf(vec3 direction) {
+  if (!sunDiskEnabled()) {
+    return 0.0;
+  }
+  vec3 axis = safeNormalize(
+      pc.lightDirectionAmbient.xyz, vec3(0.0, 1.0, 0.0));
+  float solidAngle = sunDiskSolidAngle();
+  return solidAngle > 0.0 &&
+                 dot(safeNormalize(direction, axis), axis) >=
+                     cos(sunDiskAngularRadius())
+             ? 1.0 / solidAngle
+             : 0.0;
+}
+
+RtLightSample sampleSunDisk(float sampleU, float sampleV) {
+  RtLightSample result;
+  result.direction = vec3(0.0, 1.0, 0.0);
+  result.pdf = 0.0;
+  result.radiance = vec3(0.0);
+  result.distance = 10000.0;
+  result.type = kRtLightSunDisk;
+  result.castsShadow = sunDiskCastsShadow();
+  result.valid = false;
+  if (!sunDiskEnabled()) {
+    return result;
+  }
+  vec3 axis = safeNormalize(
+      pc.lightDirectionAmbient.xyz, vec3(0.0, 1.0, 0.0));
+  vec3 tangent =
+      abs(axis.y) < 0.999
+          ? safeNormalize(cross(vec3(0.0, 1.0, 0.0), axis),
+                          vec3(1.0, 0.0, 0.0))
+          : vec3(1.0, 0.0, 0.0);
+  vec3 bitangent = safeNormalize(cross(axis, tangent),
+                                 vec3(0.0, 0.0, 1.0));
+  float cosine = mix(1.0, cos(sunDiskAngularRadius()),
+                     clamp(sampleU, 0.0, 0.99999994));
+  float sine = sqrt(max(1.0 - cosine * cosine, 0.0));
+  float phi = 6.283185307179586 * clamp(sampleV, 0.0, 0.99999994);
+  result.direction = safeNormalize(
+      axis * cosine + tangent * (sine * cos(phi)) +
+          bitangent * (sine * sin(phi)),
+      axis);
+  result.pdf = sunDiskPdf(result.direction);
+  result.radiance = evaluateSunDisk(result.direction);
+  result.valid = result.pdf > 0.0 && max3(result.radiance) > 0.0 &&
+                 finite3(result.direction) && finite3(result.radiance);
+  return result;
+}
+
+float sunDiskPowerEstimate() {
+  return sunDiskEnabled()
+             ? max(luminance(max(pc.lightColorIntensity.rgb, vec3(0.0))) *
+                       max(pc.lightColorIntensity.w, 0.0) *
+                       sunDiskSolidAngle(),
+                   0.0)
+             : 0.0;
+}
+
+float emissiveLightPowerEstimate() {
+  float power = uintBitsToFloat(emissiveInfo.w);
+  return meshLightsValid() && integratorFlag(26u) && !isnan(power) &&
+                 !isinf(power)
+             ? max(power * max(pc.integrator.z, 0.0), 0.0)
+             : 0.0;
+}
+
+vec3 lightRegistryProbabilities() {
+  bool enabledEnvironment = environmentLightEnabled();
+  bool enabledSun = sunDiskEnabled();
+  bool enabledEmissive = meshLightsValid() && integratorFlag(26u);
+  const float minimumEnabledWeight = 1.0e-6;
+  vec3 weights = vec3(
+      enabledEnvironment
+          ? max(environmentLightPowerEstimate(), minimumEnabledWeight)
+          : 0.0,
+      enabledSun ? max(sunDiskPowerEstimate(), minimumEnabledWeight) : 0.0,
+      enabledEmissive
+          ? max(emissiveLightPowerEstimate(), minimumEnabledWeight)
+          : 0.0);
+  float maximumWeight = max3(weights);
+  if (!(maximumWeight > 0.0) || isnan(maximumWeight) ||
+      isinf(maximumWeight)) {
+    return vec3(0.0);
+  }
+  vec3 scaledWeights = weights / maximumWeight;
+  float scaledTotal = scaledWeights.x + scaledWeights.y + scaledWeights.z;
+  return scaledTotal > 0.0 && !isnan(scaledTotal) && !isinf(scaledTotal)
+             ? scaledWeights / scaledTotal
+             : vec3(0.0);
+}
+
+RtLightSample sampleLightRegistry(
+    vec3 source, float environmentLod, float familySample,
+    float sample0, float sample1, float sample2, float sample3) {
+  RtLightSample result;
+  result.direction = vec3(0.0, 1.0, 0.0);
+  result.pdf = 0.0;
+  result.radiance = vec3(0.0);
+  result.distance = 10000.0;
+  result.type = kRtLightEnvironment;
+  result.castsShadow = true;
+  result.valid = false;
+  vec3 probabilities = lightRegistryProbabilities();
+  float family = clamp(familySample, 0.0, 0.99999994);
+  if (family < probabilities.x) {
+    EnvironmentSample environmentSample = sampleEnvironment(
+        sample0, sample1, sample2, sample3);
+    result.direction = environmentSample.direction;
+    result.pdf = probabilities.x * environmentSample.pdf;
+    result.radiance = lightingEnvironment(result.direction, environmentLod);
+    result.type = kRtLightEnvironment;
+    result.castsShadow = environmentSampleCastsShadow(result.direction);
+    result.valid = environmentSample.valid && result.pdf > 0.0 &&
+                   max3(result.radiance) > 0.0;
+    return result;
+  }
+  if (family < probabilities.x + probabilities.y) {
+    result = sampleSunDisk(sample0, sample1);
+    result.pdf *= probabilities.y;
+    result.valid = result.valid && result.pdf > 0.0;
+    return result;
+  }
+  if (probabilities.z > 0.0) {
+    MeshLightSample meshSample = sampleMeshLight(
+        source, sample0, sample1, sample2, sample3);
+    result.direction = meshSample.direction;
+    result.pdf = probabilities.z * meshSample.pdf;
+    result.radiance = meshSample.radiance * max(pc.integrator.z, 0.0);
+    result.distance = meshSample.distance;
+    result.type = kRtLightEmissiveTriangle;
+    result.castsShadow = true;
+    result.valid = meshSample.valid && result.pdf > 0.0 &&
+                   max3(result.radiance) > 0.0;
+  }
   return result;
 }
 
@@ -921,21 +1453,24 @@ float projectedDepth(vec3 worldPosition) {
              : 1.0;
 }
 
-void tracePrimary(vec3 origin, vec3 direction) {
+void tracePrimary(vec3 origin, vec3 direction, RayCone cone) {
   payload.baseColor = vec3(0.0);
   payload.t = -1.0;
   payload.shadingNormal = vec3(0.0, 1.0, 0.0);
-  payload.roughness = 1.0;
+  payload.ggxAlpha = 1.0;
   payload.geometricNormal = vec3(0.0, 1.0, 0.0);
   payload.ior = 1.5;
   payload.f0 = vec3(0.04);
   payload.transmission = 0.0;
   payload.emission = vec3(0.0);
   payload.opacity = 0.0;
+  payload.attenuation = vec4(1.0, 1.0, 1.0, 0.0);
   payload.status = uvec4(0u);
   payload.hitData = vec4(0.0);
+  payload.rayCone = vec2(max(cone.width, 0.0),
+                         max(cone.spreadAngle, 0.0));
   traceRayEXT(topLevelAS, gl_RayFlagsNoneEXT, 0xff, 0, 1, 0, origin,
-              0.001, direction, 10000.0, 0);
+              0.0, direction, 10000.0, 0);
 }
 
 vec3 packedPosition(uint vertex, bool previous) {
@@ -992,11 +1527,11 @@ vec4 surfaceMotion(uint primitive, uint instanceId, vec2 barycentrics,
 
 // NVIDIA DLSS-RR Programming Guide 4.2.1. Convert material F0 into the
 // environment-integrated specular-albedo guide expected by RR.
-vec3 rrSpecularAlbedo(vec3 specularColor, float linearRoughness,
+vec3 rrSpecularAlbedo(vec3 specularColor, float rrRoughness,
                       float noV) {
   noV = abs(noV);
-  float alpha = clamp(linearRoughness, 0.0, 1.0);
-  alpha *= alpha;
+  rrRoughness = clamp(rrRoughness, 0.0, 1.0);
+  float alpha = rrRoughness * rrRoughness;
   float noV2 = noV * noV;
   float noV3 = noV2 * noV;
   float alpha2 = alpha * alpha;
@@ -1034,6 +1569,11 @@ struct PrimaryAovProbe {
   float deviceDepth;
   float hitDistance;
   float specularHitDistance;
+  float transparencyAndComposition;
+  float reactiveMask;
+  float guideValidity;
+  uint guidePolicy;
+  bool neutralizeRrGuides;
   bool opaqueHit;
 };
 
@@ -1050,20 +1590,56 @@ PrimaryAovProbe probePrimaryAov(vec3 cameraOrigin, vec3 direction,
   result.deviceDepth = 1.0;
   result.hitDistance = 0.0;
   result.specularHitDistance = 0.0;
+  result.transparencyAndComposition = 0.0;
+  result.reactiveMask = 0.0;
+  result.guideValidity = 0.0;
+  result.guidePolicy = kTransparentGuidePolicyV1;
+  result.neutralizeRrGuides = true;
   result.opaqueHit = false;
 
   vec3 origin = cameraOrigin;
+  RayCone cone = initialRayCone(currentUv, direction);
   float remaining = 1.0;
+  PrimaryPayload guidePayload;
+  vec3 guideHitPosition = cameraOrigin;
+  RayCone guideCone = cone;
+  bool guidePayloadValid = false;
+  uint coverageLayerCount = 0u;
+  bool guidePhysicalTransmission = false;
   for (uint layer = 0u; layer < 24u; ++layer) {
-    tracePrimary(origin, direction);
+    tracePrimary(origin, direction, cone);
     if (payload.status.x == 0u || !(payload.t >= 0.0)) {
       break;
     }
     float opacity = clamp(payload.opacity, 0.0, 1.0);
     bool blend = (payload.status.z & kMaterialBlend) != 0u &&
-                 opacity < 0.995;
+                  opacity < 0.995;
     vec3 hitPosition = origin + direction * payload.t;
+    float physicalTransmission = clamp(payload.transmission, 0.0, 1.0);
+    if (!guidePayloadValid &&
+        (kTransparentGuidePolicyV1 ==
+             kTransparentGuidePolicyFrontCoverage ||
+         !blend)) {
+      guidePayload = payload;
+      guideHitPosition = hitPosition;
+      guideCone = cone;
+      guidePhysicalTransmission = physicalTransmission > 0.0;
+      guidePayloadValid = true;
+    }
+    if (physicalTransmission > 0.0) {
+      result.transparencyAndComposition = max(
+          result.transparencyAndComposition, physicalTransmission);
+      result.reactiveMask = max(result.reactiveMask,
+                                physicalTransmission);
+    }
     if (blend) {
+      ++coverageLayerCount;
+      float coverageComposition =
+          clamp(4.0 * opacity * (1.0 - opacity), 0.0, 1.0);
+      result.transparencyAndComposition = max(
+          result.transparencyAndComposition, coverageComposition);
+      result.reactiveMask = max(result.reactiveMask,
+                                coverageComposition);
       vec3 transparentSignal =
           max(payload.baseColor, vec3(0.0)) +
           max(payload.emission, vec3(0.0)) *
@@ -1075,10 +1651,26 @@ PrimaryAovProbe probePrimaryAov(vec3 cameraOrigin, vec3 direction,
       if (remaining <= 0.01) {
         break;
       }
-      origin = hitPosition + direction * 0.001;
+      vec3 transparentNg = safeNormalize(
+          payload.geometricNormal, vec3(0.0, 1.0, 0.0));
+      origin = offsetRayOrigin(hitPosition, transparentNg, direction);
+      cone = propagateRayCone(cone, payload.t, 3u, 0.0, 1.0);
       continue;
     }
 
+    if (!guidePayloadValid) {
+      guidePayload = payload;
+      guideHitPosition = hitPosition;
+      guideCone = cone;
+      guidePhysicalTransmission = physicalTransmission > 0.0;
+      guidePayloadValid = true;
+      result.guidePolicy = kTransparentGuidePolicyOpaqueBehind;
+    }
+    break;
+  }
+
+  if (guidePayloadValid) {
+    payload = guidePayload;
     result.opaqueHit = true;
     vec3 geometricNormal = safeNormalize(
         payload.geometricNormal, vec3(0.0, 1.0, 0.0));
@@ -1087,7 +1679,7 @@ PrimaryAovProbe probePrimaryAov(vec3 cameraOrigin, vec3 direction,
     if (dot(shadingNormal, geometricNormal) < 0.0) {
       shadingNormal = -shadingNormal;
     }
-    float hitDistance = max(payload.t, 0.0);
+    float hitDistance = length(guideHitPosition - cameraOrigin);
     vec4 centerFarWorldH =
         pc.invViewProj * vec4(0.0, 0.0, 1.0, 1.0);
     vec3 centerFarWorld =
@@ -1098,63 +1690,92 @@ PrimaryAovProbe probePrimaryAov(vec3 cameraOrigin, vec3 direction,
         hitDistance * max(dot(direction, cameraForward), 0.0);
     result.hitDistance = hitDistance;
     result.geometry = vec4(geometricNormal, viewZ);
-    result.shading =
-        vec4(shadingNormal, clamp(payload.roughness, 0.02, 1.0));
+    float ggxAlpha = clamp(payload.ggxAlpha, 0.0, 1.0);
+    float rrRoughness = sqrt(ggxAlpha);
+    result.shading = vec4(shadingNormal, rrRoughness);
     bool metal = (payload.status.y & 1u) != 0u;
     bool predefinedMetal = (payload.status.y & 2u) != 0u;
+    bool physicalTransmission = payload.transmission > 0.0;
     vec3 reflectionTint =
         predefinedMetal
             ? clamp(payload.baseColor, vec3(0.0), vec3(1.0))
             : vec3(1.0);
     result.diffuseAlbedo =
-        vec4(metal ? vec3(0.0)
+        vec4(metal || physicalTransmission ? vec3(0.0)
                    : clamp(payload.baseColor, vec3(0.0), vec3(1.0)),
              1.0);
-    float linearRoughness = clamp(payload.roughness, 0.02, 1.0);
     result.specularAlbedo =
         vec4(reflectionTint *
                  rrSpecularAlbedo(
                      clamp(payload.f0, vec3(0.0), vec3(0.99)),
-                     linearRoughness,
+                     rrRoughness,
                      dot(shadingNormal, -direction)),
              0.0);
     result.emission =
         vec4(max(payload.emission, vec3(0.0)) *
                  max(pc.integrator.z, 0.0),
              1.0);
-    result.deviceDepth = projectedDepth(hitPosition);
+    result.deviceDepth = projectedDepth(guideHitPosition);
     uint primitive = payload.status.w - 1u;
     uint instanceId = floatBitsToUint(payload.hitData.z);
     result.motion =
         surfaceMotion(primitive, instanceId, payload.hitData.xy, currentUv);
-    if (integratorFlag(31u)) {
+    result.guideValidity = 1.0;
+    if (coverageLayerCount > 1u || guidePhysicalTransmission ||
+        result.motion.w < 0.5) {
+      result.guidePolicy = kTransparentGuidePolicyConservativeInvalid;
+      result.guideValidity = 0.0;
+      result.reactiveMask = 1.0;
+      result.motion.z = 1.0;
+    }
+    result.neutralizeRrGuides = result.guideValidity < 0.5;
+    if (integratorFlag(31u) && !guidePhysicalTransmission &&
+        !result.neutralizeRrGuides) {
       vec3 reflectedDirection =
           safeNormalize(reflect(direction, shadingNormal),
-                        reflect(direction, geometricNormal));
-      vec3 reflectedOrigin =
-          hitPosition +
-          geometricNormal *
-              (dot(reflectedDirection, geometricNormal) >= 0.0
-                   ? 0.001
-                   : -0.001);
-      tracePrimary(reflectedOrigin, reflectedDirection);
+                         reflect(direction, geometricNormal));
+      vec3 reflectedOrigin = offsetRayOrigin(
+          guideHitPosition, geometricNormal, reflectedDirection);
+      RayCone reflectedCone = propagateRayCone(
+          guideCone, payload.t, 1u, ggxAlpha, 1.0);
+      tracePrimary(reflectedOrigin, reflectedDirection, reflectedCone);
       if (payload.status.x != 0u && payload.t >= 0.0) {
         vec3 reflectedHitPosition =
             reflectedOrigin + reflectedDirection * payload.t;
         result.specularHitDistance =
-            length(reflectedHitPosition - hitPosition);
+            length(reflectedHitPosition - guideHitPosition);
       }
     }
     result.specularAlbedo.w = result.specularHitDistance;
-    break;
-  }
-  if (!result.opaqueHit) {
+    if (result.neutralizeRrGuides) {
+      result.shading = vec4(0.0, 0.0, 1.0, 1.0);
+      result.diffuseAlbedo = vec4(0.0);
+      result.specularAlbedo = vec4(0.0);
+      result.specularHitDistance = 0.0;
+    }
+  } else {
     result.motion =
         motionVector(currentUv, cameraOrigin + direction * 10000.0, true);
   }
+  result.transparencyAndComposition = clamp(
+      result.transparencyAndComposition, 0.0, 1.0);
+  result.reactiveMask = clamp(result.reactiveMask, 0.0, 1.0);
+  result.guideValidity = clamp(result.guideValidity, 0.0, 1.0);
   result.transparency =
       clamp(result.transparency, vec4(0.0), vec4(65504.0));
   return result;
+}
+
+void clearTemporalTransparencyMasks(ivec2 pixel) {
+  if (outputEnabled(kOutputTransparencyAndComposition)) {
+    imageStore(outputTransparencyAndComposition, pixel, vec4(0.0));
+  }
+  if (outputEnabled(kOutputReactiveMask)) {
+    imageStore(outputReactiveMask, pixel, vec4(0.0));
+  }
+  if (outputEnabled(kOutputGuideValidity)) {
+    imageStore(outputGuideValidity, pixel, vec4(0.0));
+  }
 }
 
 void storeSurfaceAovs(ivec2 pixel, PrimaryAovProbe probe) {
@@ -1202,6 +1823,16 @@ void storeSurfaceAovs(ivec2 pixel, PrimaryAovProbe probe) {
   if (outputEnabled(kOutputRrNormalRoughness)) {
     imageStore(outputRrNormalRoughness, pixel, probe.shading);
   }
+  if (outputEnabled(kOutputTransparencyAndComposition)) {
+    imageStore(outputTransparencyAndComposition, pixel,
+               vec4(probe.transparencyAndComposition));
+  }
+  if (outputEnabled(kOutputReactiveMask)) {
+    imageStore(outputReactiveMask, pixel, vec4(probe.reactiveMask));
+  }
+  if (outputEnabled(kOutputGuideValidity)) {
+    imageStore(outputGuideValidity, pixel, vec4(probe.guideValidity));
+  }
 }
 
 void main() {
@@ -1211,6 +1842,7 @@ void main() {
   }
 
   vec3 cameraOrigin = pc.cameraEnvironment.xyz;
+  clearTemporalTransparencyMasks(ivec2(pixel));
   bool temporalReconstruction = pc.cameraJitter.z > 0.5;
   vec2 temporalPixelOffset =
       // Streamline receives +jitter. The inverse projection is unjittered,
@@ -1243,7 +1875,7 @@ void main() {
         farWorldH.xyz / max(abs(farWorldH.w), 1.0e-6);
     vec3 direction =
         safeNormalize(farWorld - cameraOrigin, vec3(0.0, 0.0, -1.0));
-    tracePrimary(cameraOrigin, direction);
+    tracePrimary(cameraOrigin, direction, initialRayCone(uv, direction));
 
     float depth = 1.0;
     float alpha = 0.0;
@@ -1308,12 +1940,15 @@ void main() {
   for (uint localSample = 0u; localSample < dispatchSamples;
        ++localSample) {
     uint sampleIndex = pc.sampling.x + localSample;
+    PathRngState cameraRng = makePathRng(
+        pixel, sampleIndex, 0u, kRngDomainCameraJitter, 0u,
+        pc.sampling.z);
+    float cameraSampleX = nextRandom(cameraRng);
+    float cameraSampleY = nextRandom(cameraRng);
     vec2 jitter =
         temporalReconstruction
             ? temporalPixelOffset
-            : vec2(
-                  random01(pixel, sampleIndex, 0u, pc.sampling.z),
-                  random01(pixel, sampleIndex, 1u, pc.sampling.z));
+            : vec2(cameraSampleX, cameraSampleY);
     vec2 uv = (vec2(pixel) + jitter) / vec2(pc.sizeMode.xy);
     vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     vec4 farWorldH = pc.invViewProj * vec4(ndc, 1.0, 1.0);
@@ -1322,6 +1957,7 @@ void main() {
     vec3 origin = cameraOrigin;
     vec3 direction =
         safeNormalize(farWorld - origin, vec3(0.0, 0.0, -1.0));
+    RayCone rayCone = initialRayCone(uv, direction);
     vec3 throughput = vec3(1.0);
     vec3 sampleRadiance = vec3(0.0);
     vec3 sampleDiffuseRadiance = vec3(0.0);
@@ -1335,28 +1971,50 @@ void main() {
     uint transparentBounces = 0u;
     float previousBsdfPdf = 0.0;
     bool previousWasDelta = true;
+    bool insideSolidMedium = false;
+    vec3 mediumAttenuationColor = vec3(1.0);
+    float mediumAttenuationDistance = 0.0;
 
     uint bounce = 0u;
     while (bounce < maxBounces) {
-      tracePrimary(origin, direction);
+      tracePrimary(origin, direction, rayCone);
       if (payload.status.x == 0u || !(payload.t >= 0.0)) {
-        vec3 missRadiance =
-            bounce == 0u ? backgroundEnvironment(direction)
-                         : lightingEnvironment(direction);
-        float environmentWeight = 1.0;
-        if (bounce > 0u && !previousWasDelta) {
-          float lightPdf = environmentPdf(direction);
-          if (lightPdf > 0.0) {
-            if (lightSamplingMode == kLightSamplingLightOnly) {
-              environmentWeight = 0.0;
-            } else if (lightSamplingMode == kLightSamplingCombined) {
+        float environmentLod = rayConeEnvironmentLod(rayCone);
+        vec3 missRadiance = backgroundEnvironment(direction, environmentLod);
+        if (bounce > 0u) {
+          vec3 familyProbabilities = lightRegistryProbabilities();
+          vec3 environmentRadiance =
+              lightingEnvironment(direction, environmentLod);
+          vec3 sunRadiance = evaluateSunDisk(direction);
+          float environmentWeight = 1.0;
+          float sunWeight = 1.0;
+          if (!previousWasDelta) {
+            float environmentLightPdf =
+                familyProbabilities.x * environmentPdf(direction);
+            float sunLightPdf =
+                familyProbabilities.y * sunDiskPdf(direction);
+            if (environmentLightPdf > 0.0) {
               environmentWeight =
-                  powerHeuristic(previousBsdfPdf, lightPdf);
+                  lightSamplingMode == kLightSamplingLightOnly
+                      ? 0.0
+                      : (lightSamplingMode == kLightSamplingCombined
+                             ? powerHeuristic(previousBsdfPdf,
+                                              environmentLightPdf)
+                             : 1.0);
+            }
+            if (sunLightPdf > 0.0) {
+              sunWeight = lightSamplingMode == kLightSamplingLightOnly
+                              ? 0.0
+                              : (lightSamplingMode == kLightSamplingCombined
+                                     ? powerHeuristic(previousBsdfPdf,
+                                                      sunLightPdf)
+                                     : 1.0);
             }
           }
+          missRadiance = environmentRadiance * environmentWeight +
+                         sunRadiance * sunWeight;
         }
-        vec3 missContribution =
-            throughput * missRadiance * environmentWeight;
+        vec3 missContribution = throughput * missRadiance;
         vec3 clampedMiss = clampContribution(
             missContribution,
             bounce == 0u ? 0.0 : pc.integrator.y);
@@ -1373,16 +2031,22 @@ void main() {
 
       vec3 hitPosition = origin + direction * payload.t;
       samplePathLength += 1.0;
-      uint dimension = 2u + bounce * 12u;
+      if (insideSolidMedium) {
+        throughput *= beerLambertTransmittance(
+            mediumAttenuationColor, mediumAttenuationDistance, payload.t);
+        if (!finite3(throughput) || max3(throughput) <= 1.0e-8) {
+          break;
+        }
+      }
       float hitOpacity = clamp(
           finite3(vec3(payload.opacity)) ? payload.opacity : 1.0,
           0.0, 1.0);
       bool blendMaterial = (payload.status.z & kMaterialBlend) != 0u;
       if (blendMaterial && hitOpacity < 1.0) {
-        float alphaSample = random01(
-            pixel, sampleIndex,
-            dimension + 8u + transparentBounces * 17u,
-            pc.sampling.z);
+        PathRngState alphaRng = makePathRng(
+            pixel, sampleIndex, bounce, kRngDomainAlphaCoverage,
+            transparentBounces, pc.sampling.z);
+        float alphaSample = nextRandom(alphaRng);
         if (alphaSample >= hitOpacity) {
           if (transparentBounces >= pc.depthLimits.w) {
             break;
@@ -1391,7 +2055,11 @@ void main() {
           ++bounce;
           // Stochastic alpha coverage: an unaccepted layer contributes no
           // shading and continues along the same ray to reveal layers behind.
-          origin = hitPosition + direction * 0.001;
+          vec3 transparentNg = safeNormalize(
+              payload.geometricNormal, vec3(0.0, 1.0, 0.0));
+          origin = offsetRayOrigin(hitPosition, transparentNg, direction);
+          rayCone = propagateRayCone(
+              rayCone, payload.t, 3u, 0.0, 1.0);
           continue;
         }
       }
@@ -1417,11 +2085,20 @@ void main() {
           finite3(payload.f0)
               ? clamp(payload.f0, vec3(0.0), vec3(0.99))
               : vec3(0.04);
-      float roughness = clamp(payload.roughness, 0.02, 1.0);
+      float ggxAlpha = clamp(payload.ggxAlpha, 0.0, 1.0);
       float transmission = clamp(payload.transmission, 0.0, 1.0);
       float ior = clamp(payload.ior, 1.0001, 99.0);
       bool metal = (payload.status.y & 1u) != 0u;
       bool predefinedMetal = (payload.status.y & 2u) != 0u;
+      bool thinWalled = (payload.status.y & 4u) != 0u;
+      vec3 attenuationColor =
+          finite3(payload.attenuation.rgb)
+              ? clamp(payload.attenuation.rgb, vec3(1.0e-6), vec3(1.0))
+              : vec3(1.0);
+      float attenuationDistance =
+          !isnan(payload.attenuation.w) && !isinf(payload.attenuation.w)
+              ? max(payload.attenuation.w, 0.0)
+              : 0.0;
       vec3 reflectionTint =
           predefinedMetal ? baseColor : vec3(1.0);
       vec3 emission =
@@ -1437,7 +2114,7 @@ void main() {
       float emissionWeight = 1.0;
       if (bounce > 0u && !previousWasDelta &&
           payload.status.w > 0u && meshLightsValid()) {
-        float lightPdf = meshLightPdf(
+        float lightPdf = lightRegistryProbabilities().z * meshLightPdf(
             payload.status.w - 1u, origin, hitPosition);
         if (lightPdf > 0.0) {
           if (lightSamplingMode == kLightSamplingLightOnly) {
@@ -1459,236 +2136,113 @@ void main() {
         }
       }
 
-      vec3 lightDirection = safeNormalize(
-          pc.lightDirectionAmbient.xyz, vec3(0.0, 1.0, 0.0));
-      float nDotL = max(dot(normal, lightDirection), 0.0);
-      if (neeEnabled && analyticLightsEnabled && nDotL > 0.0 &&
-          pc.lightColorIntensity.w > 0.0) {
-        vec3 directSum = vec3(0.0);
-        vec3 directDiffuseSum = vec3(0.0);
-        vec3 directSpecularSum = vec3(0.0);
-        for (uint lightSample = 0u; lightSample < lightSamples;
-             ++lightSample) {
-        shadowVisibility = random01(
-            pixel, sampleIndex,
-            dimension + 9u + lightSample * 8u, pc.sampling.z);
-        traceRayEXT(
-            topLevelAS,
-            gl_RayFlagsTerminateOnFirstHitEXT |
-                gl_RayFlagsSkipClosestHitShaderEXT,
-            0xff, 0, 1, 1, hitPosition + geometricNormal * 0.001,
-            0.001, lightDirection, 10000.0, 1);
-        float directPdf = 0.0;
-        vec3 directDiffuseBsdf;
-        vec3 directSpecularBsdf;
-        evaluateBsdfComponents(
-            baseColor, f0, reflectionTint, roughness, transmission, metal,
-            normal, view, lightDirection, directDiffuseBsdf,
-            directSpecularBsdf, directPdf);
-        float correction = shadingNormalCorrection(
-            geometricNormal, normal, view, lightDirection);
-        vec3 directScale =
-            throughput * pc.lightColorIntensity.rgb *
-            (pc.lightColorIntensity.w * nDotL *
-             clamp(shadowVisibility, 0.0, 1.0) * correction);
-        directDiffuseSum += directScale * directDiffuseBsdf;
-        directSpecularSum += directScale * directSpecularBsdf;
-        directSum +=
-            directScale * (directDiffuseBsdf + directSpecularBsdf);
-        }
-        vec3 directContribution = clampContribution(
-            directSum / float(lightSamples), pc.integrator.x);
-        sampleRadiance += directContribution;
-        if (bounce == 0u) {
-          sampleDiffuseRadiance += clampContribution(
-              directDiffuseSum / float(lightSamples), pc.integrator.x);
-          sampleSpecularRadiance += clampContribution(
-              directSpecularSum / float(lightSamples), pc.integrator.x);
-        } else if (primaryPathClass == 1u) {
-          sampleDiffuseRadiance += directContribution;
-        } else {
-          sampleSpecularRadiance += directContribution;
-        }
-      }
-
-      vec3 environmentDirectSum = vec3(0.0);
-      vec3 environmentDiffuseSum = vec3(0.0);
-      vec3 environmentSpecularSum = vec3(0.0);
+      vec3 registryDirectSum = vec3(0.0);
+      vec3 registryDiffuseSum = vec3(0.0);
+      vec3 registrySpecularSum = vec3(0.0);
+      RayCone directEnvironmentCone = propagateRayCone(
+          rayCone, payload.t, 1u, ggxAlpha, 1.0);
+      float directEnvironmentLod =
+          rayConeEnvironmentLod(directEnvironmentCone);
       for (uint lightSample = 0u;
            neeEnabled && lightSample < lightSamples; ++lightSample) {
-      uint lightDimension = dimension + lightSample * 8u;
-      EnvironmentSample environmentSample = sampleEnvironment(
-          random01(pixel, sampleIndex, lightDimension + 4u, pc.sampling.z),
-          random01(pixel, sampleIndex, lightDimension + 5u, pc.sampling.z),
-          random01(pixel, sampleIndex, lightDimension + 6u, pc.sampling.z),
-          random01(pixel, sampleIndex, lightDimension + 7u, pc.sampling.z));
-      vec3 environmentDirection = environmentSample.direction;
-      float environmentPdf = environmentSample.pdf;
-      float environmentNoL =
-          max(dot(normal, environmentDirection), 0.0);
-      if (environmentSample.valid && environmentPdf > 0.0 &&
-          environmentNoL > 0.0) {
-        shadowVisibility = 1.0;
-        if (environmentSampleCastsShadow(environmentDirection)) {
-          shadowVisibility = random01(
-              pixel, sampleIndex, lightDimension + 3u, pc.sampling.z);
+        PathRngState registryRng = makePathRng(
+            pixel, sampleIndex, bounce, kRngDomainLightRegistry,
+            lightSample, pc.sampling.z);
+        float familySample = nextRandom(registryRng);
+        float registrySample0 = nextRandom(registryRng);
+        float registrySample1 = nextRandom(registryRng);
+        float registrySample2 = nextRandom(registryRng);
+        float registrySample3 = nextRandom(registryRng);
+        RtLightSample registrySample = sampleLightRegistry(
+            hitPosition, directEnvironmentLod, familySample,
+            registrySample0, registrySample1, registrySample2,
+            registrySample3);
+        float registryNoL = max(dot(normal, registrySample.direction), 0.0);
+        if (!registrySample.valid || !(registrySample.pdf > 0.0) ||
+            !(registryNoL > 0.0)) {
+          continue;
+        }
+        shadowPayload.visibility = 1.0;
+        shadowPayload.reserved = 0.0;
+        shadowPayload.rayCone = vec2(
+            rayConeWidthAtDistance(rayCone, payload.t),
+            max(rayCone.spreadAngle, 0.0));
+        if (registrySample.castsShadow) {
+          vec3 shadowOrigin = offsetRayOrigin(
+              hitPosition, geometricNormal, registrySample.direction);
+          float shadowDistance =
+              registrySample.type == kRtLightEmissiveTriangle
+                  ? registrySample.distance * (1.0 - 1.0e-5)
+                  : 10000.0;
+          if (!(shadowDistance > 0.0)) {
+            continue;
+          }
           traceRayEXT(
               topLevelAS,
               gl_RayFlagsTerminateOnFirstHitEXT |
                   gl_RayFlagsSkipClosestHitShaderEXT,
-              0xff, 0, 1, 1, hitPosition + geometricNormal * 0.001,
-              0.001, environmentDirection, 10000.0, 1);
+              0xff, 0, 1, 1, shadowOrigin, 0.0,
+              registrySample.direction, shadowDistance, 1);
         }
-        float environmentBsdfPdf = 0.0;
-        vec3 environmentDiffuseBsdf;
-        vec3 environmentSpecularBsdf;
+        float registryBsdfPdf = 0.0;
+        vec3 registryDiffuseBsdf;
+        vec3 registrySpecularBsdf;
         evaluateBsdfComponents(
-            baseColor, f0, reflectionTint, roughness, transmission, metal,
-            normal, view, environmentDirection, environmentDiffuseBsdf,
-            environmentSpecularBsdf, environmentBsdfPdf);
+            baseColor, f0, reflectionTint, ggxAlpha, transmission, ior,
+            metal, thinWalled, frontFace, normal, view,
+            registrySample.direction, registryDiffuseBsdf,
+            registrySpecularBsdf, registryBsdfPdf);
         float correction = shadingNormalCorrection(
-            geometricNormal, normal, view, environmentDirection);
+            geometricNormal, normal, view, registrySample.direction);
         float misWeight =
             misEnabled
-                ? powerHeuristic(environmentPdf, environmentBsdfPdf)
+                ? powerHeuristic(registrySample.pdf, registryBsdfPdf)
                 : 1.0;
-        vec3 environmentScale =
-            throughput * lightingEnvironment(environmentDirection) *
-            (environmentNoL * clamp(shadowVisibility, 0.0, 1.0) *
-             correction * misWeight / environmentPdf);
-        environmentDiffuseSum +=
-            environmentScale * environmentDiffuseBsdf;
-        environmentSpecularSum +=
-            environmentScale * environmentSpecularBsdf;
-        environmentDirectSum +=
-            environmentScale *
-            (environmentDiffuseBsdf + environmentSpecularBsdf);
+        vec3 registryScale =
+            throughput * registrySample.radiance *
+            (registryNoL * clamp(shadowPayload.visibility, 0.0, 1.0) *
+             correction * misWeight / registrySample.pdf);
+        registryDiffuseSum += registryScale * registryDiffuseBsdf;
+        registrySpecularSum += registryScale * registrySpecularBsdf;
+        registryDirectSum +=
+            registryScale * (registryDiffuseBsdf + registrySpecularBsdf);
       }
-      }
-      vec3 environmentContribution = clampContribution(
-          environmentDirectSum / float(lightSamples), pc.integrator.x);
-      sampleRadiance += environmentContribution;
+      vec3 registryContribution = clampContribution(
+          registryDirectSum / float(lightSamples), pc.integrator.x);
+      sampleRadiance += registryContribution;
       if (bounce == 0u) {
         sampleDiffuseRadiance += clampContribution(
-            environmentDiffuseSum / float(lightSamples), pc.integrator.x);
+            registryDiffuseSum / float(lightSamples), pc.integrator.x);
         sampleSpecularRadiance += clampContribution(
-            environmentSpecularSum / float(lightSamples), pc.integrator.x);
+            registrySpecularSum / float(lightSamples), pc.integrator.x);
       } else if (primaryPathClass == 1u) {
-        sampleDiffuseRadiance += environmentContribution;
+        sampleDiffuseRadiance += registryContribution;
       } else {
-        sampleSpecularRadiance += environmentContribution;
-      }
-
-      vec3 meshDirectSum = vec3(0.0);
-      vec3 meshDiffuseSum = vec3(0.0);
-      vec3 meshSpecularSum = vec3(0.0);
-      for (uint lightSample = 0u;
-           neeEnabled && emissiveSurfacesEnabled &&
-               lightSample < lightSamples;
-           ++lightSample) {
-        uint lightDimension = dimension + 12u + lightSample * 8u;
-        MeshLightSample meshSample = sampleMeshLight(
-            hitPosition + geometricNormal * 0.001,
-            random01(pixel, sampleIndex, lightDimension + 0u, pc.sampling.z),
-            random01(pixel, sampleIndex, lightDimension + 1u, pc.sampling.z),
-            random01(pixel, sampleIndex, lightDimension + 2u, pc.sampling.z),
-            random01(pixel, sampleIndex, lightDimension + 3u, pc.sampling.z));
-        float meshNoL = max(dot(normal, meshSample.direction), 0.0);
-        if (!meshSample.valid || !(meshNoL > 0.0) ||
-            !(meshSample.distance > 0.003)) {
-          continue;
-        }
-        shadowVisibility = random01(
-            pixel, sampleIndex, lightDimension + 4u, pc.sampling.z);
-        traceRayEXT(
-            topLevelAS,
-            gl_RayFlagsTerminateOnFirstHitEXT |
-                gl_RayFlagsSkipClosestHitShaderEXT,
-            0xff, 0, 1, 1,
-            hitPosition + geometricNormal * 0.001, 0.001,
-            meshSample.direction, meshSample.distance - 0.002, 1);
-        float meshBsdfPdf = 0.0;
-        vec3 meshDiffuseBsdf;
-        vec3 meshSpecularBsdf;
-        evaluateBsdfComponents(
-            baseColor, f0, reflectionTint, roughness, transmission, metal,
-            normal, view, meshSample.direction, meshDiffuseBsdf,
-            meshSpecularBsdf, meshBsdfPdf);
-        float correction = shadingNormalCorrection(
-            geometricNormal, normal, view, meshSample.direction);
-        float misWeight =
-            misEnabled
-                ? powerHeuristic(meshSample.pdf, meshBsdfPdf)
-                : 1.0;
-        vec3 meshScale =
-            throughput * meshSample.radiance *
-            (max(pc.integrator.z, 0.0) * meshNoL *
-             clamp(shadowVisibility, 0.0, 1.0) * correction *
-             misWeight / meshSample.pdf);
-        meshDiffuseSum += meshScale * meshDiffuseBsdf;
-        meshSpecularSum += meshScale * meshSpecularBsdf;
-        meshDirectSum +=
-            meshScale * (meshDiffuseBsdf + meshSpecularBsdf);
-      }
-      vec3 meshContribution = clampContribution(
-          meshDirectSum / float(lightSamples), pc.integrator.x);
-      sampleRadiance += meshContribution;
-      if (bounce == 0u) {
-        sampleDiffuseRadiance += clampContribution(
-            meshDiffuseSum / float(lightSamples), pc.integrator.x);
-        sampleSpecularRadiance += clampContribution(
-            meshSpecularSum / float(lightSamples), pc.integrator.x);
-      } else if (primaryPathClass == 1u) {
-        sampleDiffuseRadiance += meshContribution;
-      } else {
-        sampleSpecularRadiance += meshContribution;
+        sampleSpecularRadiance += registryContribution;
       }
 
       vec3 probabilities;
-      lobeProbabilities(baseColor, f0, metal, transmission,
+      lobeProbabilities(baseColor, f0, metal, transmission, ior,
                         probabilities);
-      float lobeSample =
-          random01(pixel, sampleIndex, dimension, pc.sampling.z);
-      float sampleU =
-          random01(pixel, sampleIndex, dimension + 1u, pc.sampling.z);
-      float sampleV =
-          random01(pixel, sampleIndex, dimension + 2u, pc.sampling.z);
+      PathRngState lobeRng = makePathRng(
+          pixel, sampleIndex, bounce, kRngDomainLobeSelection, 0u,
+          pc.sampling.z);
+      PathRngState directionRng = makePathRng(
+          pixel, sampleIndex, bounce, kRngDomainDirection, 0u,
+          pc.sampling.z);
+      float lobeSample = nextRandom(lobeRng);
+      float sampleU = nextRandom(directionRng);
+      float sampleV = nextRandom(directionRng);
       vec3 nextDirection = vec3(0.0);
       vec3 sampleWeight = vec3(0.0);
       float nextBsdfPdf = 0.0;
       bool nextWasDelta = false;
+      uint nextLobe = 0u;
 
       float etaIncident = frontFace ? 1.0 : ior;
       float etaTransmitted = frontFace ? ior : 1.0;
       float eta = etaIncident / etaTransmitted;
-      float cosI = clamp(dot(normal, view), 0.0, 1.0);
-      float sinTSquared =
-          eta * eta * max(0.0, 1.0 - cosI * cosI);
-      bool totalInternalReflection =
-          probabilities.z > 0.0 && sinTSquared >= 1.0;
-      float reflectionSelectionProbability =
-          probabilities.y + probabilities.z;
-
-      if (totalInternalReflection &&
-          lobeSample >= probabilities.x) {
-        if (!(reflectionSelectionProbability > 0.0) ||
-            glossyBounces >= pc.depthLimits.y) {
-          break;
-        }
-        ++glossyBounces;
-        if (bounce == 0u) {
-          primaryPathClass = 2u;
-        }
-        nextDirection = safeNormalize(
-            2.0 * cosI * normal - view, geometricNormal);
-        // TIR is one neutral delta-reflection event with F=1. The glossy and
-        // transmission selection intervals both choose it, so divide by their
-        // combined probability and apply no base/transmission tint or (1-F).
-        sampleWeight =
-            vec3(1.0 / reflectionSelectionProbability);
-        nextBsdfPdf = reflectionSelectionProbability;
-        nextWasDelta = true;
-      } else if (lobeSample < probabilities.x) {
+      if (lobeSample < probabilities.x) {
         if (diffuseBounces >= pc.depthLimits.x) {
           break;
         }
@@ -1699,58 +2253,169 @@ void main() {
         nextDirection = cosineHemisphere(normal, sampleU, sampleV);
         float pdf = 0.0;
         vec3 value = evaluateBsdf(
-            baseColor, f0, reflectionTint, roughness, transmission, metal,
-            normal, view, nextDirection, pdf);
+            baseColor, f0, reflectionTint, ggxAlpha, transmission, ior,
+            metal, thinWalled, frontFace, normal, view, nextDirection, pdf);
         if (!(pdf > 0.0)) {
           break;
         }
         nextBsdfPdf = pdf;
         sampleWeight =
             value * max(dot(normal, nextDirection), 0.0) / pdf;
-      } else if (lobeSample < probabilities.x + probabilities.y) {
-        if (glossyBounces >= pc.depthLimits.y) {
-          break;
-        }
-        ++glossyBounces;
-        if (bounce == 0u) {
-          primaryPathClass = 2u;
-        }
-        bool validGlossy = false;
-        nextDirection = sampleGgx(
-            normal, view, roughness, sampleU, sampleV, validGlossy);
-        if (!validGlossy) {
-          break;
-        }
-        float pdf = 0.0;
-        vec3 value = evaluateBsdf(
-            baseColor, f0, reflectionTint, roughness, transmission, metal,
-            normal, view, nextDirection, pdf);
-        if (!(pdf > 0.0)) {
-          break;
-        }
-        nextBsdfPdf = pdf;
-        sampleWeight =
-            value * max(dot(normal, nextDirection), 0.0) / pdf;
+        nextLobe = 0u;
       } else {
-        if (!(probabilities.z > 0.0) ||
-            transmissionBounces >= pc.depthLimits.z) {
+        float interfaceProbability = probabilities.y + probabilities.z;
+        if (!(interfaceProbability > 0.0)) {
           break;
         }
-        ++transmissionBounces;
-        if (bounce == 0u) {
-          primaryPathClass = 2u;
+        float interfaceSample = clamp(
+            (lobeSample - probabilities.x) / interfaceProbability,
+            0.0, 0.99999994);
+        if (!metal && thinWalled && transmission > 0.0) {
+          float singleFresnel = dielectricFresnel(
+              dot(normal, view), etaIncident, etaTransmitted);
+          float fresnel = thinWalledCombinedFresnel(singleFresnel);
+          float reflectionWeight = fresnel;
+          float transmissionWeight = transmission * (1.0 - fresnel);
+          float interfaceTotal = reflectionWeight + transmissionWeight;
+          float conditionalReflection =
+              interfaceTotal > 0.0 ? reflectionWeight / interfaceTotal : 1.0;
+          bool reflectEvent = interfaceSample < conditionalReflection;
+          float selectionProbability =
+              interfaceProbability *
+              (reflectEvent ? conditionalReflection
+                            : 1.0 - conditionalReflection);
+          if (!(selectionProbability > 0.0)) {
+            break;
+          }
+          if (reflectEvent) {
+            if (glossyBounces >= pc.depthLimits.y) {
+              break;
+            }
+            ++glossyBounces;
+            nextDirection = reflect(-view, normal);
+            sampleWeight = vec3(reflectionWeight / selectionProbability);
+            nextLobe = 1u;
+          } else {
+            if (transmissionBounces >= pc.depthLimits.z) {
+              break;
+            }
+            ++transmissionBounces;
+            nextDirection = -view;
+            sampleWeight = vec3(transmissionWeight / selectionProbability);
+            nextLobe = 2u;
+          }
+          if (bounce == 0u) {
+            primaryPathClass = 2u;
+          }
+          nextBsdfPdf = selectionProbability;
+          nextWasDelta = true;
+        } else {
+          bool finiteInterface = ggxAlpha > kDeltaMirrorAlpha;
+          vec3 halfVector = normal;
+          if (finiteInterface) {
+            bool validVndf = false;
+            halfVector = sampleGgxVndf(
+                normal, view, ggxAlpha, sampleU, sampleV, validVndf);
+            if (!validVndf) {
+              break;
+            }
+          }
+          float voH = dot(view, halfVector);
+          if (!(voH > 0.0)) {
+            break;
+          }
+          float sinTSquared =
+              eta * eta * max(0.0, 1.0 - voH * voH);
+          bool canRefract = sinTSquared < 1.0;
+          vec3 fresnel = metal
+                             ? fresnelSchlick(f0, voH)
+                             : vec3(canRefract
+                                        ? dielectricFresnel(
+                                              voH, etaIncident,
+                                              etaTransmitted)
+                                        : 1.0);
+          float scalarFresnel = max3(fresnel);
+          float reflectionWeight = metal ? 1.0 : scalarFresnel;
+          float transmissionWeight =
+              metal || !canRefract
+                  ? 0.0
+                  : transmission * (1.0 - scalarFresnel);
+          float interfaceTotal = reflectionWeight + transmissionWeight;
+          if (!(interfaceTotal > 0.0)) {
+            break;
+          }
+          float conditionalReflection = reflectionWeight / interfaceTotal;
+          bool reflectEvent = interfaceSample < conditionalReflection;
+          if (reflectEvent) {
+            if (glossyBounces >= pc.depthLimits.y) {
+              break;
+            }
+            ++glossyBounces;
+            nextDirection = safeNormalize(
+                2.0 * voH * halfVector - view, geometricNormal);
+            if (!(dot(normal, nextDirection) > 0.0)) {
+              break;
+            }
+            nextLobe = 1u;
+          } else {
+            if (!canRefract || transmissionBounces >= pc.depthLimits.z) {
+              break;
+            }
+            ++transmissionBounces;
+            float cosT = sqrt(max(0.0, 1.0 - sinTSquared));
+            nextDirection = safeNormalize(
+                -eta * view + (eta * voH - cosT) * halfVector,
+                -geometricNormal);
+            if (!(dot(normal, nextDirection) < 0.0)) {
+              break;
+            }
+            nextLobe = 2u;
+          }
+          if (bounce == 0u) {
+            primaryPathClass = 2u;
+          }
+          if (!finiteInterface) {
+            float eventProbability =
+                interfaceProbability *
+                (reflectEvent ? conditionalReflection
+                              : 1.0 - conditionalReflection);
+            if (!(eventProbability > 0.0)) {
+              break;
+            }
+            nextBsdfPdf = eventProbability;
+            if (reflectEvent) {
+              sampleWeight = reflectionTint * fresnel / eventProbability;
+            } else {
+              float etaScale = eta * eta;
+              sampleWeight =
+                  vec3(transmissionWeight * etaScale / eventProbability);
+            }
+            nextWasDelta = true;
+          } else if (reflectEvent) {
+            float pdf = 0.0;
+            vec3 value = evaluateBsdf(
+                baseColor, f0, reflectionTint, ggxAlpha, transmission, ior,
+                metal, thinWalled, frontFace, normal, view, nextDirection,
+                pdf);
+            if (!(pdf > 0.0)) {
+              break;
+            }
+            nextBsdfPdf = pdf;
+            sampleWeight =
+                value * abs(dot(normal, nextDirection)) / pdf;
+          } else {
+            float pdf = 0.0;
+            vec3 value = evaluateMicrofacetTransmission(
+                baseColor, ggxAlpha, transmission, ior, frontFace,
+                normal, view, nextDirection, pdf);
+            if (!(pdf > 0.0)) {
+              break;
+            }
+            nextBsdfPdf = pdf;
+            sampleWeight =
+                value * abs(dot(normal, nextDirection)) / pdf;
+          }
         }
-        nextWasDelta = true;
-        nextBsdfPdf = probabilities.z;
-        float cosT = sqrt(max(0.0, 1.0 - sinTSquared));
-        nextDirection = safeNormalize(
-            -eta * view + (eta * cosI - cosT) * normal,
-            -geometricNormal);
-        float fresnel = dielectricFresnel(
-            cosI, etaIncident, etaTransmitted);
-        sampleWeight =
-            baseColor * transmission * (1.0 - fresnel) /
-            probabilities.z;
       }
 
       float correction = shadingNormalCorrection(
@@ -1760,6 +2425,17 @@ void main() {
           max3(throughput) <= 1.0e-5) {
         break;
       }
+      if (nextLobe == 2u && !thinWalled) {
+        if (frontFace) {
+          insideSolidMedium = true;
+          mediumAttenuationColor = attenuationColor;
+          mediumAttenuationDistance = attenuationDistance;
+        } else {
+          insideSolidMedium = false;
+          mediumAttenuationColor = vec3(1.0);
+          mediumAttenuationDistance = 0.0;
+        }
+      }
       previousBsdfPdf = nextBsdfPdf;
       previousWasDelta = nextWasDelta;
       uint completedBounces = bounce + 1u;
@@ -1767,19 +2443,20 @@ void main() {
           completedBounces < maxBounces) {
         float continuation =
             clamp(max3(throughput), 0.05, 0.95);
-        float rrSample = random01(
-            pixel, sampleIndex, dimension + 3u, pc.sampling.z);
+        PathRngState rrRng = makePathRng(
+            pixel, sampleIndex, bounce, kRngDomainRussianRoulette, 0u,
+            pc.sampling.z);
+        float rrSample = nextRandom(rrRng);
         if (rrSample >= continuation) {
           break;
         }
         throughput /= continuation;
       }
-      origin =
-          hitPosition +
-          geometricNormal *
-              (dot(nextDirection, geometricNormal) >= 0.0
-                   ? 0.001
-                   : -0.001);
+      rayCone = propagateRayCone(
+          rayCone, payload.t, nextLobe, ggxAlpha,
+          nextLobe == 2u && thinWalled ? 1.0 : eta);
+      origin = offsetRayOrigin(
+          hitPosition, geometricNormal, nextDirection);
       direction = nextDirection;
       ++bounce;
     }

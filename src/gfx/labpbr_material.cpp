@@ -358,7 +358,7 @@ const char *labPbrDebugViewName(LabPbrDebugView view) noexcept {
     return "normal";
   case LabPbrDebugView::AmbientOcclusion:
     return "ao";
-  case LabPbrDebugView::LinearRoughness:
+  case LabPbrDebugView::GgxAlpha:
     return "roughness";
   case LabPbrDebugView::F0:
     return "f0";
@@ -381,7 +381,7 @@ LabPbrDebugView labPbrDebugViewFromName(std::string_view name) noexcept {
     return LabPbrDebugView::AmbientOcclusion;
   }
   if (name == "roughness" || name == "linear-roughness") {
-    return LabPbrDebugView::LinearRoughness;
+    return LabPbrDebugView::GgxAlpha;
   }
   if (name == "f0" || name == "reflectance") {
     return LabPbrDebugView::F0;
@@ -408,9 +408,8 @@ labPbrDebugColor(const ResolvedMaterialTexel &texel,
   case LabPbrDebugView::AmbientOcclusion:
     return {texel.ambient_occlusion, texel.ambient_occlusion,
             texel.ambient_occlusion};
-  case LabPbrDebugView::LinearRoughness:
-    return {texel.linear_roughness, texel.linear_roughness,
-            texel.linear_roughness};
+  case LabPbrDebugView::GgxAlpha:
+    return {texel.ggx_alpha, texel.ggx_alpha, texel.ggx_alpha};
   case LabPbrDebugView::F0:
     return texel.f0_color;
   case LabPbrDebugView::Emission:
@@ -471,7 +470,7 @@ ResolvedMaterialTexel decodeLabPbrTexel(
     result.perceptual_smoothness =
         static_cast<float>((*specular_rgba)[0]) * kInv255;
     result.perceptual_roughness = 1.0f - result.perceptual_smoothness;
-    result.linear_roughness =
+    result.ggx_alpha =
         result.perceptual_roughness * result.perceptual_roughness;
 
     const std::uint8_t reflectance = (*specular_rgba)[1];

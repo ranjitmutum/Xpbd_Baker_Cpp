@@ -147,7 +147,8 @@ private:
 
   void destroyStaticModelResources();
   bool createStaticTexture(std::uint32_t width, std::uint32_t height,
-                           VkFormat format, ImageResource &out);
+                           VkFormat format, ImageResource &out,
+                           std::uint32_t mip_levels = 1u);
   void destroyStaticMaterialSamplers();
   void updateStaticTextureDescriptors();
   void updateStaticBoneDescriptor(FrameSync &frame);
@@ -202,8 +203,11 @@ private:
     std::array<float, 4> moon_direction_angular_radius{};
     std::array<float, 4> moon_phase_libration{};
     std::array<float, 4> sun_color_strength{};
+    // x = lighting-environment integrated luminance, y = finite-Sun power.
+    // z/w are reserved for Moon and future registry families.
+    std::array<float, 4> light_power{};
   };
-  static_assert(sizeof(WorldEnvironmentGpuHeader) == 96u);
+  static_assert(sizeof(WorldEnvironmentGpuHeader) == 112u);
 
   struct alignas(16) WorldEnvironmentGpuAlias {
     float acceptance = 0.0f;
@@ -253,7 +257,7 @@ private:
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     CelestialState celestial{};
-    SunControls sun{};
+    ResolvedSunLight sun{};
     MoonControls moon{};
     bool background_visible = false;
     bool environment_lighting = false;
@@ -277,6 +281,7 @@ private:
     std::uint32_t brightest_y = 0u;
     double moon_probability = 0.0;
     float moon_peak_luminance = 0.0f;
+    float environment_power_estimate = 0.0f;
   };
   struct DynamicSkyPending {
     ImageResource cache{};
@@ -428,6 +433,7 @@ private:
   ImageResource world_environment_texture_{};
   Buffer world_environment_distribution_{};
   VkDeviceSize world_environment_distribution_bytes_ = 0;
+  float world_environment_power_estimate_ = 0.0f;
   std::uint64_t world_environment_resource_key_ = 0;
   std::uint64_t world_environment_failed_key_ = 0;
   bool world_environment_ready_ = false;
@@ -458,6 +464,7 @@ private:
   DynamicSkyPending atmosphere_environment_pending_{};
   VkFence atmosphere_environment_spare_retirement_fence_ = VK_NULL_HANDLE;
   VkDeviceSize atmosphere_environment_distribution_bytes_ = 0;
+  float atmosphere_environment_power_estimate_ = 0.0f;
   std::string atmosphere_resource_key_;
   std::string atmosphere_failed_key_;
   std::string atmosphere_environment_key_;
@@ -484,6 +491,7 @@ private:
   bool streamline_dlss_failure_logged_ = false;
   bool streamline_rr_active_logged_ = false;
   bool streamline_rr_target_format_failure_logged_ = false;
+  bool streamline_transparency_contract_failure_logged_ = false;
   mutable std::string post_process_status_cache_{};
   std::vector<std::string> enabled_instance_extensions_;
   std::vector<std::string> enabled_device_extensions_;
@@ -638,7 +646,7 @@ private:
       SwapchainOwnership target_ownership = SwapchainOwnership::Native);
   bool waitForPendingPresentFences(const char *reason);
   void destroySwapchainImageObjects();
-  void destroySwapchainObjects();
+  [[nodiscard]] bool destroySwapchainObjects();
   bool recreateSwapchain();
   bool createRenderPass();
   bool createFramebuffers();

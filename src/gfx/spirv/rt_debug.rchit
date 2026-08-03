@@ -28,6 +28,16 @@ layout(set = 0, binding = 11, std430) readonly buffer TangentBuffer {
 };
 layout(set = 0, binding = 12) uniform sampler2D normalTexture;
 layout(set = 0, binding = 13) uniform sampler2D specularTexture;
+layout(set = 0, binding = 17, std430) readonly buffer PositionBuffer {
+  float positions[];
+};
+struct SurfaceOpticsGpu {
+  vec4 parameters;
+  vec4 attenuationColor;
+};
+layout(set = 0, binding = 28, std430) readonly buffer PrimitiveOpticsBuffer {
+  SurfaceOpticsGpu primitiveOptics[];
+};
 
 layout(push_constant) uniform PC {
   mat4 invViewProj;
@@ -45,15 +55,17 @@ struct PrimaryPayload {
   vec3 baseColor;
   float t;
   vec3 shadingNormal;
-  float roughness;
+  float ggxAlpha;
   vec3 geometricNormal;
   float ior;
   vec3 f0;
   float transmission;
   vec3 emission;
   float opacity;
+  vec4 attenuation;
   uvec4 status;
   vec4 hitData;
+  vec2 rayCone;
 };
 
 layout(location = 0) rayPayloadInEXT PrimaryPayload payload;
@@ -84,8 +96,16 @@ vec3 safeNormalizeNormal(vec3 value, vec3 fallbackValue) {
   return value * inversesqrt(lengthSquared);
 }
 
-vec4 sampleAlbedoBaseLevel(vec2 uv) {
-  vec4 packed = textureLod(albedoTexture, uv, 0.0);
+float rayConeTextureLod(sampler2D sampledTexture, float uvFootprint) {
+  ivec2 extent = textureSize(sampledTexture, 0);
+  float texels = max(uvFootprint, 0.0) *
+                 float(max(extent.x, extent.y));
+  return texels > 1.0 ? max(log2(texels), 0.0) : 0.0;
+}
+
+vec4 sampleAlbedoRayCone(vec2 uv, float uvFootprint) {
+  vec4 packed = textureLod(
+      albedoTexture, uv, rayConeTextureLod(albedoTexture, uvFootprint));
   if (any(isnan(packed)) || any(isinf(packed))) {
     return vec4(1.0);
   }
@@ -93,17 +113,42 @@ vec4 sampleAlbedoBaseLevel(vec2 uv) {
   return vec4(srgbToLinear(packed.rgb), packed.a);
 }
 
-vec3 sampleNormalBaseLevel(vec2 uv) {
-  vec3 packed = textureLod(normalTexture, uv, 0.0).rgb;
+vec3 sampleNormalRayCone(vec2 uv, float uvFootprint) {
+  vec3 packed = textureLod(
+      normalTexture, uv, rayConeTextureLod(normalTexture, uvFootprint)).rgb;
   return finite3(packed) ? clamp(packed, vec3(0.0), vec3(1.0))
                          : vec3(0.5, 0.5, 1.0);
 }
 
-vec4 sampleSpecularBaseLevel(vec2 uv) {
-  vec4 packed = textureLod(specularTexture, uv, 0.0);
+vec4 sampleSpecularRayCone(vec2 uv, float uvFootprint) {
+  vec4 packed = textureLod(
+      specularTexture, uv,
+      rayConeTextureLod(specularTexture, uvFootprint));
   return any(isnan(packed)) || any(isinf(packed))
              ? vec4(0.0, 10.0 / 255.0, 0.0, 1.0)
              : clamp(packed, vec4(0.0), vec4(1.0));
+}
+
+vec3 objectPosition(uint vertex) {
+  uint base = vertex * 3u;
+  return vec3(
+      positions[base + 0u], positions[base + 1u], positions[base + 2u]);
+}
+
+float rayConeUvFootprint(vec2 cone, float hitDistance,
+                         vec3 worldEdge1, vec3 worldEdge2,
+                         vec2 uv0, vec2 uv1, vec2 uv2) {
+  float worldDoubleArea = length(cross(worldEdge1, worldEdge2));
+  vec2 uvEdge1 = uv1 - uv0;
+  vec2 uvEdge2 = uv2 - uv0;
+  float uvDoubleArea =
+      abs(uvEdge1.x * uvEdge2.y - uvEdge1.y * uvEdge2.x);
+  if (!(worldDoubleArea > 1.0e-20) || !(uvDoubleArea > 0.0)) {
+    return 0.0;
+  }
+  float coneWidth =
+      max(cone.x, 0.0) + abs(hitDistance) * max(cone.y, 0.0);
+  return coneWidth * sqrt(uvDoubleArea / worldDoubleArea);
 }
 
 vec3 decodeLabPbrNormal(vec3 packed) {
@@ -123,7 +168,7 @@ vec3 decodeLabPbrNormal(vec3 packed) {
 float decodeLabPbrMicrofacetAlpha(float smoothness) {
   float perceptualRoughness =
       finiteFloat(smoothness) ? clamp(1.0 - smoothness, 0.0, 1.0) : 1.0;
-  return max(perceptualRoughness * perceptualRoughness, 0.02);
+  return perceptualRoughness * perceptualRoughness;
 }
 
 float decodeLabPbrEmission(float packed) {
@@ -187,7 +232,7 @@ vec3 identityColor(uint value) {
 }
 
 vec3 labPbrDebugColor(uint view, vec3 baseColor, vec3 tangentNormal,
-                      float ao, float roughness, vec3 f0, vec3 emission,
+                      float ao, float ggxAlpha, vec3 f0, vec3 emission,
                       float opacity) {
   if (view == 1u) {
     return baseColor;
@@ -199,7 +244,7 @@ vec3 labPbrDebugColor(uint view, vec3 baseColor, vec3 tangentNormal,
     return vec3(ao);
   }
   if (view == 4u) {
-    return vec3(roughness);
+    return vec3(ggxAlpha);
   }
   if (view == 5u) {
     return f0;
@@ -222,23 +267,40 @@ void main() {
   uint i1 = indices[globalPrimitive * 3u + 1u];
   uint i2 = indices[globalPrimitive * 3u + 2u];
   float w0 = 1.0 - hitBarycentrics.x - hitBarycentrics.y;
-  vec3 geometricNormal =
+  vec3 interpolatedNormal =
       normals[i0].xyz * w0 +
       normals[i1].xyz * hitBarycentrics.x +
       normals[i2].xyz * hitBarycentrics.y;
-  geometricNormal =
-      safeNormalizeNormal(geometricNormal, vec3(0.0, 1.0, 0.0));
+  interpolatedNormal = safeNormalizeNormal(
+      interpolatedNormal, vec3(0.0, 1.0, 0.0));
+  vec3 objectPosition0 = objectPosition(i0);
+  vec3 objectPosition1 = objectPosition(i1);
+  vec3 objectPosition2 = objectPosition(i2);
+  // Transform edge vectors with w=0 so large instance translations cannot
+  // erase a small triangle before the cross product. This also preserves the
+  // winding flip from negative/non-uniform instance scales.
+  vec3 worldEdge1 = gl_ObjectToWorldEXT *
+                    vec4(objectPosition1 - objectPosition0, 0.0);
+  vec3 worldEdge2 = gl_ObjectToWorldEXT *
+                    vec4(objectPosition2 - objectPosition0, 0.0);
+  vec3 geometricNormal = safeNormalizeNormal(
+      cross(worldEdge1, worldEdge2),
+      interpolatedNormal);
+  if (dot(interpolatedNormal, geometricNormal) < 0.0) {
+    interpolatedNormal = -interpolatedNormal;
+  }
 
   payload.baseColor = vec3(0.0);
   payload.t = gl_HitTEXT;
-  payload.shadingNormal = geometricNormal;
-  payload.roughness = 1.0;
+  payload.shadingNormal = interpolatedNormal;
+  payload.ggxAlpha = 1.0;
   payload.geometricNormal = geometricNormal;
   payload.ior = 1.5;
   payload.f0 = vec3(0.04);
   payload.transmission = 0.0;
   payload.emission = vec3(0.0);
   payload.opacity = 1.0;
+  payload.attenuation = vec4(1.0, 1.0, 1.0, 0.0);
   payload.status =
       uvec4(1u, 0u, primitiveFlags[globalPrimitive],
             globalPrimitive + 1u);
@@ -280,10 +342,13 @@ void main() {
       uvs[i0] * w0 +
       uvs[i1] * hitBarycentrics.x +
       uvs[i2] * hitBarycentrics.y;
+  float uvFootprint = rayConeUvFootprint(
+      payload.rayCone, gl_HitTEXT, worldEdge1, worldEdge2,
+      uvs[i0], uvs[i1], uvs[i2]);
   vec4 baseColor = vertexColor;
   bool textured = (flags & kMaterialTextured) != 0u;
   if (textured) {
-    vec4 sampledAlbedo = sampleAlbedoBaseLevel(uv);
+    vec4 sampledAlbedo = sampleAlbedoRayCone(uv, uvFootprint);
     baseColor = vec4(sampledAlbedo.rgb * vertexColor.rgb,
                      sampledAlbedo.a * vertexColor.a);
   }
@@ -300,39 +365,42 @@ void main() {
       tangents[i2] * hitBarycentrics.y;
   vec3 tangent =
       tangentData.xyz -
-      geometricNormal * dot(geometricNormal, tangentData.xyz);
+      interpolatedNormal * dot(interpolatedNormal, tangentData.xyz);
   float tangentLengthSquared = dot(tangent, tangent);
   if (!finiteFloat(tangentLengthSquared) ||
       tangentLengthSquared <= 1.0e-10) {
-    vec3 helper = abs(geometricNormal.z) < 0.999
+    vec3 helper = abs(interpolatedNormal.z) < 0.999
                       ? vec3(0.0, 0.0, 1.0)
                       : vec3(0.0, 1.0, 0.0);
-    tangent = normalize(cross(helper, geometricNormal));
+    tangent = normalize(cross(helper, interpolatedNormal));
   } else {
     tangent *= inversesqrt(tangentLengthSquared);
   }
   vec3 bitangent =
-      cross(geometricNormal, tangent) *
+      cross(interpolatedNormal, tangent) *
       (tangentData.w < 0.0 ? -1.0 : 1.0);
   vec3 normalSample =
-      normalMapActive ? sampleNormalBaseLevel(uv)
+      normalMapActive ? sampleNormalRayCone(uv, uvFootprint)
                       : vec3(0.5, 0.5, 1.0);
   vec3 tangentNormal =
       normalMapActive ? decodeLabPbrNormal(normalSample)
                       : vec3(0.0, 0.0, 1.0);
   vec3 materialNormal =
-      safeNormalizeNormal(mat3(tangent, bitangent, geometricNormal) *
+      safeNormalizeNormal(mat3(tangent, bitangent, interpolatedNormal) *
                               tangentNormal,
-                          geometricNormal);
+                          interpolatedNormal);
+  if (dot(materialNormal, geometricNormal) < 0.0) {
+    materialNormal = -materialNormal;
+  }
   float ambientOcclusion = clamp(normalSample.b, 0.0, 1.0);
-  float linearRoughness = 1.0;
+  float ggxAlpha = 1.0;
   vec3 f0 = vec3(0.04);
   bool metal = false;
   bool predefinedMetal = false;
   vec3 emission = vec3(0.0);
   if (specularMapActive) {
-    vec4 specularSample = sampleSpecularBaseLevel(uv);
-    linearRoughness = decodeLabPbrMicrofacetAlpha(specularSample.r);
+    vec4 specularSample = sampleSpecularRayCone(uv, uvFootprint);
+    ggxAlpha = decodeLabPbrMicrofacetAlpha(specularSample.r);
     f0 = decodeLabPbrF0(specularSample.g, baseColor.rgb, metal,
                         predefinedMetal);
     emission =
@@ -343,28 +411,35 @@ void main() {
   float ior =
       clamp((1.0 + rootF0) / max(1.0 - rootF0, 0.02),
             1.0001, 99.0);
-  // Base-texture alpha is coverage, not dielectric refraction.  RayGen
-  // handles Blend coverage stochastically and only shades accepted layers.
-  float transmission = 0.0;
+  // Base-texture alpha is coverage, not dielectric refraction. Physical
+  // transmission only comes from the source-independent optics seam.
+  vec4 surfaceOptics = primitiveOptics[globalPrimitive].parameters;
+  vec4 attenuationOptics = primitiveOptics[globalPrimitive].attenuationColor;
 
   payload.baseColor = baseColor.rgb;
   payload.shadingNormal = materialNormal;
-  payload.roughness = clamp(linearRoughness, 0.02, 1.0);
+  payload.ggxAlpha = clamp(ggxAlpha, 0.0, 1.0);
   payload.geometricNormal = geometricNormal;
-  payload.ior = ior;
+  payload.transmission = clamp(surfaceOptics.x, 0.0, 1.0);
+  payload.ior = payload.transmission > 0.0
+                    ? clamp(surfaceOptics.y, 1.0001, 99.0)
+                    : ior;
   payload.f0 = clamp(f0, vec3(0.0), vec3(0.99));
-  payload.transmission = clamp(transmission, 0.0, 1.0);
   payload.emission = max(emission, vec3(0.0));
   payload.opacity = baseColor.a;
+  payload.attenuation = vec4(
+      clamp(attenuationOptics.rgb, vec3(1.0e-6), vec3(1.0)),
+      max(surfaceOptics.z, 0.0));
   // status.y bit 0: metal, bit 1: predefined metal whose complete reflected
   // lobe must be tinted by linear albedo (custom metals already use it as F0).
-  payload.status.y = (metal ? 1u : 0u) | (predefinedMetal ? 2u : 0u);
+  payload.status.y = (metal ? 1u : 0u) | (predefinedMetal ? 2u : 0u) |
+                     ((floatBitsToUint(surfaceOptics.w) != 0u) ? 4u : 0u);
 
   if (mode == 7u) {
     payload.baseColor = baseColor.rgb;
     return;
   } else if (mode == 8u) {
-    payload.baseColor = vec3(linearRoughness);
+    payload.baseColor = vec3(ggxAlpha);
     return;
   } else if (mode == 9u) {
     payload.baseColor = emission;
@@ -375,6 +450,6 @@ void main() {
   if (materialDebug != 0u) {
     payload.baseColor = labPbrDebugColor(
         materialDebug, baseColor.rgb, tangentNormal, ambientOcclusion,
-        linearRoughness, f0, emission, baseColor.a);
+        ggxAlpha, f0, emission, baseColor.a);
   }
 }

@@ -17,26 +17,88 @@ layout(set = 0, binding = 7, std430) readonly buffer PrimitiveFlagBuffer {
 layout(set = 0, binding = 9, std430) readonly buffer InstanceMetadataBuffer {
   uvec4 instanceMetadata[];
 };
+layout(set = 0, binding = 17, std430) readonly buffer PositionBuffer {
+  float positions[];
+};
+struct SurfaceOpticsGpu {
+  vec4 parameters;
+  vec4 attenuationColor;
+};
+layout(set = 0, binding = 28, std430) readonly buffer PrimitiveOpticsBuffer {
+  SurfaceOpticsGpu primitiveOptics[];
+};
 
-layout(location = 1) rayPayloadInEXT float shadowVisibility;
+struct PrimaryPayload {
+  vec3 baseColor;
+  float t;
+  vec3 shadingNormal;
+  float ggxAlpha;
+  vec3 geometricNormal;
+  float ior;
+  vec3 f0;
+  float transmission;
+  vec3 emission;
+  float opacity;
+  vec4 attenuation;
+  uvec4 status;
+  vec4 hitData;
+  vec2 rayCone;
+};
+
+struct ShadowPayload {
+  float visibility;
+  float reserved;
+  vec2 rayCone;
+};
+
+layout(location = 0) rayPayloadInEXT PrimaryPayload primaryPayload;
+layout(location = 1) rayPayloadInEXT ShadowPayload shadowPayload;
 hitAttributeEXT vec2 hitBarycentrics;
 
 const uint kMaterialTextured = 1u << 0u;
 const uint kMaterialBlend = 1u << 2u;
 const float kAlphaCutoff = 0.02;
 
-float sampleAlphaBaseLevel(vec2 uv) {
-  float alpha = textureLod(albedoTexture, uv, 0.0).a;
+float rayConeTextureLod(sampler2D sampledTexture, float uvFootprint) {
+  ivec2 extent = textureSize(sampledTexture, 0);
+  float texels = max(uvFootprint, 0.0) *
+                 float(max(extent.x, extent.y));
+  return texels > 1.0 ? max(log2(texels), 0.0) : 0.0;
+}
+
+float sampleAlphaRayCone(vec2 uv, float uvFootprint) {
+  float alpha = textureLod(
+      albedoTexture, uv,
+      rayConeTextureLod(albedoTexture, uvFootprint)).a;
   return isnan(alpha) || isinf(alpha) ? 1.0 : clamp(alpha, 0.0, 1.0);
 }
 
-uint hashAlphaWord(uint value) {
-  value ^= value >> 16u;
-  value *= 0x7feb352du;
-  value ^= value >> 15u;
-  value *= 0x846ca68bu;
-  value ^= value >> 16u;
-  return value;
+vec3 objectPosition(uint vertex) {
+  uint base = vertex * 3u;
+  return vec3(
+      positions[base + 0u], positions[base + 1u], positions[base + 2u]);
+}
+
+float alphaUvFootprint(uint i0, uint i1, uint i2, vec2 cone) {
+  vec3 p0 = objectPosition(i0);
+  vec3 p1 = objectPosition(i1);
+  vec3 p2 = objectPosition(i2);
+  vec3 worldEdge1 = gl_ObjectToWorldEXT * vec4(p1 - p0, 0.0);
+  vec3 worldEdge2 = gl_ObjectToWorldEXT * vec4(p2 - p0, 0.0);
+  float worldDoubleArea = length(cross(worldEdge1, worldEdge2));
+  vec2 uv0 = uvs[i0];
+  vec2 uv1 = uvs[i1];
+  vec2 uv2 = uvs[i2];
+  vec2 uvEdge1 = uv1 - uv0;
+  vec2 uvEdge2 = uv2 - uv0;
+  float uvDoubleArea =
+      abs(uvEdge1.x * uvEdge2.y - uvEdge1.y * uvEdge2.x);
+  if (!(worldDoubleArea > 1.0e-20) || !(uvDoubleArea > 0.0)) {
+    return 0.0;
+  }
+  float coneWidth = max(cone.x, 0.0) +
+                    abs(gl_HitTEXT) * max(cone.y, 0.0);
+  return coneWidth * sqrt(uvDoubleArea / worldDoubleArea);
 }
 
 void main() {
@@ -50,29 +112,44 @@ void main() {
                 colors[i1].a * hitBarycentrics.x +
                 colors[i2].a * hitBarycentrics.y;
   uint flags = primitiveFlags[globalPrimitive];
+  const bool shadowRay =
+      (gl_IncomingRayFlagsEXT & gl_RayFlagsSkipClosestHitShaderEXT) != 0u;
+  vec2 rayCone = shadowRay ? shadowPayload.rayCone
+                           : primaryPayload.rayCone;
   if ((flags & kMaterialTextured) != 0u) {
     vec2 uv = uvs[i0] * w0 + uvs[i1] * hitBarycentrics.x +
               uvs[i2] * hitBarycentrics.y;
-    alpha *= sampleAlphaBaseLevel(uv);
+    alpha *= sampleAlphaRayCone(
+        uv, alphaUvFootprint(i0, i1, i2, rayCone));
   }
+  alpha = isnan(alpha) || isinf(alpha) ? 1.0
+                                       : clamp(alpha, 0.0, 1.0);
   if (!(alpha >= kAlphaCutoff)) {
     ignoreIntersectionEXT;
   }
-  const bool shadowRay =
-      (gl_IncomingRayFlagsEXT & gl_RayFlagsSkipClosestHitShaderEXT) != 0u;
   if (shadowRay) {
-    if ((flags & kMaterialBlend) != 0u && alpha < 1.0) {
-      uint word = floatBitsToUint(shadowVisibility);
-      word = hashAlphaWord(
-          word ^ globalPrimitive ^
-          (gl_InstanceCustomIndexEXT * 0x9e3779b9u));
-      float sampleValue = float(word >> 8u) * (1.0 / 16777216.0);
-      if (sampleValue >= clamp(alpha, 0.0, 1.0)) {
-        ignoreIntersectionEXT;
-      }
+    bool coverageBlend = (flags & kMaterialBlend) != 0u && alpha < 1.0;
+    float coverageVisibility = coverageBlend ? 1.0 - alpha : 0.0;
+    float physicalTransmission = primitiveOptics[globalPrimitive].parameters.x;
+    physicalTransmission =
+        isnan(physicalTransmission) || isinf(physicalTransmission)
+            ? 0.0
+            : clamp(physicalTransmission, 0.0, 1.0);
+    // Coverage and physical transmission are independent events. A covered
+    // transmissive fraction contributes alpha*T while the uncovered fraction
+    // contributes (1-alpha). Cutout remains binary before this branch.
+    float layerVisibility =
+        physicalTransmission > 0.0
+            ? (coverageBlend
+                   ? coverageVisibility + alpha * physicalTransmission
+                   : physicalTransmission)
+            : coverageVisibility;
+    shadowPayload.visibility *= clamp(layerVisibility, 0.0, 1.0);
+    if (shadowPayload.visibility > 1.0e-4) {
+      // Deterministic transmittance continues through later layers. Physical
+      // Beer-Lambert distance remains owned by the beauty medium path.
+      ignoreIntersectionEXT;
     }
-    // Accepted shadow intersections terminate as fully occluded; ignored
-    // stochastic layers retain the random payload until the miss shader.
-    shadowVisibility = 0.0;
+    shadowPayload.visibility = 0.0;
   }
 }

@@ -28,7 +28,7 @@ enum class LabPbrDebugView : std::uint32_t {
   BaseColor = 1,
   Normal = 2,
   AmbientOcclusion = 3,
-  LinearRoughness = 4,
+  GgxAlpha = 4,
   F0 = 5,
   Emission = 6,
   Opacity = 7,
@@ -58,7 +58,7 @@ struct ResolvedMaterialTexel {
 
   float perceptual_smoothness = 0.0f;
   float perceptual_roughness = 1.0f;
-  float linear_roughness = 1.0f;
+  float ggx_alpha = 1.0f;
   float dielectric_f0 = 0.04f;
   std::array<float, 3> f0_color{0.04f, 0.04f, 0.04f};
   // LabPBR predefined metals keep their optical F0 and use linear albedo to

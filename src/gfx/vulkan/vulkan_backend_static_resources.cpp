@@ -6,12 +6,46 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <utility>
 #include <vector>
 
 namespace xpbd::gfx::detail {
+namespace {
+
+// Developer/fixture-only bridge. The comma-separated value is
+// transmission,ior,attenuation-r,g,b,distance,thin(0|1). It is read only when
+// static resources rebuild; production defaults remain completely inert.
+[[nodiscard]] std::optional<RtSurfaceOptics>
+developerRtSurfaceOpticsOverride() noexcept {
+  const char *value = std::getenv("XPBD_RT_SURFACE_OPTICS");
+  if (value == nullptr || value[0] == '\0') {
+    return std::nullopt;
+  }
+  RtSurfaceOptics optics;
+  int thin_walled = 0;
+  char trailing = '\0';
+  const int parsed = std::sscanf(
+      value, "%f,%f,%f,%f,%f,%f,%d %c", &optics.transmission, &optics.ior,
+      &optics.attenuation_color[0], &optics.attenuation_color[1],
+      &optics.attenuation_color[2], &optics.attenuation_distance,
+      &thin_walled, &trailing);
+  if (parsed != 7 || (thin_walled != 0 && thin_walled != 1)) {
+    xpbd::log::warn(
+        "Ignoring invalid XPBD_RT_SURFACE_OPTICS developer override");
+    return std::nullopt;
+  }
+  optics.thin_walled = thin_walled != 0;
+  xpbd::log::info(
+      "Applying XPBD_RT_SURFACE_OPTICS developer fixture override");
+  return normalizeRtSurfaceOptics(optics);
+}
+
+} // namespace
 
 void VulkanBackend::destroyStaticModelResources() {
     destroyBuffer(static_model_vbo_);
@@ -26,17 +60,27 @@ void VulkanBackend::destroyStaticModelResources() {
     static_index_bytes_ = 0;
     static_model_ready_ = false;
   }bool VulkanBackend::createStaticTexture(std::uint32_t width, std::uint32_t height,
-                           VkFormat format, ImageResource &out) {
+                           VkFormat format, ImageResource &out,
+                           std::uint32_t mip_levels) {
+    const std::uint32_t maximum_dimension = std::max(width, height);
+    std::uint32_t maximum_mip_levels = 1u;
+    for (std::uint32_t dimension = maximum_dimension;
+         dimension > 1u; dimension >>= 1u) {
+      ++maximum_mip_levels;
+    }
+    mip_levels = std::clamp(mip_levels, 1u, maximum_mip_levels);
     VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     image_info.imageType = VK_IMAGE_TYPE_2D;
     image_info.format = format;
     image_info.extent = {width, height, 1};
-    image_info.mipLevels = 1;
+    image_info.mipLevels = mip_levels;
     image_info.arrayLayers = 1;
     image_info.samples = VK_SAMPLE_COUNT_1_BIT;
     image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    image_info.usage =
-        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    image_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                       VK_IMAGE_USAGE_SAMPLED_BIT |
+                       (mip_levels > 1u ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                                        : 0u);
     image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (vkCreateImage(device_, &image_info, nullptr, &out.image) !=
         VK_SUCCESS) {
@@ -66,7 +110,8 @@ void VulkanBackend::destroyStaticModelResources() {
     view_info.image = out.image;
     view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
     view_info.format = format;
-    view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    view_info.subresourceRange = {
+        VK_IMAGE_ASPECT_COLOR_BIT, 0, mip_levels, 0, 1};
     if (vkCreateImageView(device_, &view_info, nullptr, &out.view) !=
         VK_SUCCESS) {
       destroyImage(out);
@@ -314,6 +359,21 @@ void VulkanBackend::destroyStaticMaterialSamplers() {
     const VkDeviceSize staging_bytes =
         vertex_bytes + index_bytes + texture_bytes + normal_bytes +
         specular_bytes;
+    const auto full_mip_levels = [](std::uint32_t width,
+                                    std::uint32_t height) {
+      std::uint32_t levels = 1u;
+      for (std::uint32_t dimension = std::max(width, height);
+           dimension > 1u; dimension >>= 1u) {
+        ++levels;
+      }
+      return levels;
+    };
+    const std::uint32_t texture_mip_levels =
+        full_mip_levels(texture_width, texture_height);
+    const std::uint32_t normal_mip_levels =
+        full_mip_levels(normal_width, normal_height);
+    const std::uint32_t specular_mip_levels =
+        full_mip_levels(specular_width, specular_height);
     if (!createBuffer(staging_bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
@@ -330,13 +390,14 @@ void VulkanBackend::destroyStaticMaterialSamplers() {
                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                                           new_index_buffer)) ||
         !createStaticTexture(texture_width, texture_height,
-                             VK_FORMAT_R8G8B8A8_UNORM, new_texture) ||
+                             VK_FORMAT_R8G8B8A8_UNORM, new_texture,
+                             texture_mip_levels) ||
         !createStaticTexture(normal_width, normal_height,
                              VK_FORMAT_R8G8B8A8_UNORM,
-                             new_normal_texture) ||
+                             new_normal_texture, normal_mip_levels) ||
         !createStaticTexture(specular_width, specular_height,
                              VK_FORMAT_R8G8B8A8_UNORM,
-                             new_specular_texture)) {
+                             new_specular_texture, specular_mip_levels)) {
       cleanup();
       writeLog("Vulkan static device resource allocation failed");
       return false;
@@ -429,7 +490,8 @@ void VulkanBackend::destroyStaticMaterialSamplers() {
 
     const auto upload_image =
         [&](const ImageResource &image, std::uint32_t width,
-            std::uint32_t height, VkDeviceSize offset) {
+            std::uint32_t height, std::uint32_t mip_levels,
+            VkDeviceSize offset) {
           VkImageMemoryBarrier barrier{
               VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
           barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -437,7 +499,8 @@ void VulkanBackend::destroyStaticMaterialSamplers() {
           barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
           barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
           barrier.image = image.image;
-          barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+          barrier.subresourceRange = {
+              VK_IMAGE_ASPECT_COLOR_BIT, 0, mip_levels, 0, 1};
           barrier.srcAccessMask = 0;
           barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
           vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
@@ -450,24 +513,70 @@ void VulkanBackend::destroyStaticMaterialSamplers() {
           vkCmdCopyBufferToImage(command, staging.buffer, image.image,
                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                                  &image_copy);
-          barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-          barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-          barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-          barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
           constexpr VkPipelineStageFlags kTextureConsumerStages =
               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
               VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+          std::uint32_t source_width = width;
+          std::uint32_t source_height = height;
+          for (std::uint32_t level = 1u; level < mip_levels; ++level) {
+            barrier.subresourceRange = {
+                VK_IMAGE_ASPECT_COLOR_BIT, level - 1u, 1u, 0u, 1u};
+            barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                                 nullptr, 0, nullptr, 1, &barrier);
+
+            const std::uint32_t destination_width =
+                std::max(source_width >> 1u, 1u);
+            const std::uint32_t destination_height =
+                std::max(source_height >> 1u, 1u);
+            VkImageBlit blit{};
+            blit.srcSubresource = {
+                VK_IMAGE_ASPECT_COLOR_BIT, level - 1u, 0u, 1u};
+            blit.srcOffsets[1] = {
+                static_cast<std::int32_t>(source_width),
+                static_cast<std::int32_t>(source_height), 1};
+            blit.dstSubresource = {
+                VK_IMAGE_ASPECT_COLOR_BIT, level, 0u, 1u};
+            blit.dstOffsets[1] = {
+                static_cast<std::int32_t>(destination_width),
+                static_cast<std::int32_t>(destination_height), 1};
+            vkCmdBlitImage(
+                command, image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1u,
+                &blit, VK_FILTER_LINEAR);
+
+            barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 kTextureConsumerStages, 0, 0, nullptr, 0,
+                                 nullptr, 1, &barrier);
+            source_width = destination_width;
+            source_height = destination_height;
+          }
+
+          barrier.subresourceRange = {
+              VK_IMAGE_ASPECT_COLOR_BIT, mip_levels - 1u, 1u, 0u, 1u};
+          barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+          barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+          barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+          barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
           vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                kTextureConsumerStages, 0, 0, nullptr, 0,
                                nullptr, 1, &barrier);
         };
     upload_image(new_texture, texture_width, texture_height,
-                 vertex_bytes + index_bytes);
+                 texture_mip_levels, vertex_bytes + index_bytes);
     upload_image(new_normal_texture, normal_width, normal_height,
-                 normal_offset);
+                 normal_mip_levels, normal_offset);
     upload_image(new_specular_texture, specular_width, specular_height,
-                 specular_offset);
+                 specular_mip_levels, specular_offset);
 
     if (vkEndCommandBuffer(command) != VK_SUCCESS) {
       cleanup();
@@ -568,8 +677,11 @@ void VulkanBackend::destroyStaticMaterialSamplers() {
         rest.tangents[i * 4 + 3] = mesh.vertices[i].tangent_handedness;
         rest.bone_indices[i] = mesh.vertices[i].bone_index;
       }
+      const std::optional<RtSurfaceOptics> optics_override =
+          developerRtSurfaceOpticsOverride();
       const RtSceneRecords scene_records = buildRigidModelRtSceneRecords(
-          mesh, static_draw_plan_, material);
+          mesh, static_draw_plan_, material,
+          optics_override ? &*optics_override : nullptr);
       if (!scene_records.valid()) {
         writeLog("Vulkan RT scene-record construction failed");
         return false;
@@ -609,6 +721,8 @@ void VulkanBackend::destroyStaticMaterialSamplers() {
           packed_layout.source_primitive_indices.size());
       rest.primitive_metadata.reserve(
           packed_layout.source_primitive_indices.size());
+      rest.primitive_optics.reserve(
+          packed_layout.source_primitive_indices.size());
       rest.primitive_emission.reserve(
           packed_layout.source_primitive_indices.size());
       for (std::size_t packed_primitive = 0;
@@ -627,6 +741,11 @@ void VulkanBackend::destroyStaticMaterialSamplers() {
             {record.cube_index,
              static_cast<std::uint32_t>(record.face_direction),
              record.material_index, record.primitive_index});
+        rest.primitive_optics.push_back(
+            record.material_index < scene_records.materials.size()
+                ? scene_records.materials[record.material_index]
+                      .surface_optics
+                : RtSurfaceOptics{});
         std::array<float, 3> average_emission{};
         if (material != nullptr && material->valid() &&
             material->specular_map_active &&

@@ -82,7 +82,7 @@ vec3 decodeLabPbrF0(float packed, vec3 baseColor, out bool metal,
 }
 
 vec3 labPbrDebugColor(uint view, vec3 baseColor, vec3 tangentNormal,
-                      float ao, float roughness, vec3 f0, vec3 emission,
+                      float ao, float ggx_alpha, vec3 f0, vec3 emission,
                       float opacity) {
   if (view == 2u) {
     return tangentNormal * 0.5 + 0.5;
@@ -91,7 +91,7 @@ vec3 labPbrDebugColor(uint view, vec3 baseColor, vec3 tangentNormal,
     return vec3(ao);
   }
   if (view == 4u) {
-    return vec3(roughness);
+    return vec3(ggx_alpha);
   }
   if (view == 5u) {
     return f0;
@@ -137,7 +137,7 @@ void main() {
           : vec4(0.0, 0.04, 0.0, 1.0);
   float perceptual_roughness =
       specular_map_active ? 1.0 - specular_sample.r : 1.0;
-  float linear_roughness = perceptual_roughness * perceptual_roughness;
+  float ggx_alpha = perceptual_roughness * perceptual_roughness;
   bool metal = false;
   bool predefined_metal = false;
   vec3 f0 = specular_map_active
@@ -151,7 +151,7 @@ void main() {
   if (textured && pc.materialDebug.x != 0u) {
     FragColor =
         vec4(labPbrDebugColor(pc.materialDebug.x, color.rgb, tangent_normal,
-                              normal_sample.b, linear_roughness, f0, emissive,
+                              normal_sample.b, ggx_alpha, f0, emissive,
                               color.a),
              color.a);
     return;
@@ -166,7 +166,7 @@ void main() {
   if (textured) {
     float shade =
         ambient * normal_sample.b + intensity * wrap * 0.55;
-    float specular_power = mix(96.0, 4.0, linear_roughness);
+    float specular_power = mix(96.0, 4.0, ggx_alpha);
     float specular = pow(max(nd, 0.0), specular_power);
     vec3 diffuse = metal ? vec3(0.0) : color.rgb * shade * light;
     vec3 reflection_tint = predefined_metal ? color.rgb : vec3(1.0);

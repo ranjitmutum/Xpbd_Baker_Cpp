@@ -1,6 +1,7 @@
 #pragma once
 
 #include "xpbd/gfx/labpbr_material.hpp"
+#include "xpbd/gfx/ray_tracing.hpp"
 #include "xpbd/gfx/static_model_draw_plan.hpp"
 
 #include <array>
@@ -73,6 +74,7 @@ struct RtMaterialRecord {
   bool read_only = true;
   bool normal_map_active = false;
   bool specular_map_active = false;
+  RtSurfaceOptics surface_optics{};
 };
 
 struct RtInstanceRecord {
@@ -149,7 +151,8 @@ struct RtSceneRecords {
 
 [[nodiscard]] RtSceneRecords buildRigidModelRtSceneRecords(
     const StaticIndexedModelMesh &mesh, const StaticModelDrawPlan &draw_plan,
-    const ResolvedMaterialTable *material);
+    const ResolvedMaterialTable *material,
+    const RtSurfaceOptics *surface_optics_override = nullptr);
 
 [[nodiscard]] RtPackedPrimitiveLayout buildRtPackedPrimitiveLayout(
     const StaticModelDrawPlan &draw_plan, const RtSceneRecords &records);

@@ -8,7 +8,8 @@ namespace xpbd::gfx {
 
 RtSceneRecords buildRigidModelRtSceneRecords(
     const StaticIndexedModelMesh &mesh, const StaticModelDrawPlan &draw_plan,
-    const ResolvedMaterialTable *material) {
+    const ResolvedMaterialTable *material,
+    const RtSurfaceOptics *surface_optics_override) {
   RtSceneRecords result;
   if (draw_plan.indices.size() % 3u != 0u ||
       draw_plan.primitive_materials.size() !=
@@ -28,6 +29,10 @@ RtSceneRecords buildRigidModelRtSceneRecords(
   result.primitives.reserve(draw_plan.primitive_materials.size());
   RtMaterialRecord material_record;
   material_record.feature_flags = labPbrFeatureFlags(material);
+  if (surface_optics_override != nullptr) {
+    material_record.surface_optics =
+        normalizeRtSurfaceOptics(*surface_optics_override);
+  }
   if (material != nullptr) {
     material_record.width =
         static_cast<std::uint32_t>((std::max)(material->width, 0));

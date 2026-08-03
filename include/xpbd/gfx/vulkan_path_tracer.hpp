@@ -38,6 +38,12 @@ struct PathTraceFrameParams {
   float ambient = 0.38f;
   float light_color[3]{1.0f, 1.0f, 1.0f};
   float intensity = 0.85f;
+  // Full RT consumes the resolved finite Sun as radiance over a solid-angle
+  // disk. The compatibility compute path continues to use the legacy fields
+  // above without changing path_trace.comp semantics.
+  float sun_radiance[3]{0.0f, 0.0f, 0.0f};
+  float sun_angular_radius = 0.0f;
+  bool sun_casts_shadow = true;
   float clear_r = 0.1f;
   float clear_g = 0.12f;
   float clear_b = 0.16f;
@@ -146,6 +152,15 @@ pathTraceTargetBytesPerPixel(std::uint32_t allocated_mask) noexcept {
       bytes += 8u;
     }
   }
+  constexpr std::array<PathTraceOptionalOutput, 3> kR8Masks{
+      PathTraceOptionalOutput::TransparencyAndComposition,
+      PathTraceOptionalOutput::ReactiveMask,
+      PathTraceOptionalOutput::GuideValidity};
+  for (const PathTraceOptionalOutput mask : kR8Masks) {
+    if ((allocated_mask & pathTraceOptionalOutputBit(mask)) != 0u) {
+      bytes += 1u;
+    }
+  }
   return bytes;
 }
 
@@ -155,7 +170,7 @@ static_assert(pathTraceTargetAllocationMask(1u) ==
               pathTraceTargetBytesPerPixel(kPathTraceAllRrGuideOutputMask) ==
                   48u &&
               pathTraceTargetBytesPerPixel(kPathTraceAllOptionalOutputMask) ==
-                  144u,
+                  147u,
               "Path-trace target allocation policy regression");
 
 enum class PathTraceTargetError : std::uint8_t {
@@ -396,6 +411,35 @@ public:
   rrSpecularHitDistanceView() const noexcept {
     return rr_specular_hit_distance_image_view_;
   }
+  [[nodiscard]] VkImage transparencyAndCompositionImage() const noexcept {
+    return transparency_and_composition_image_;
+  }
+  [[nodiscard]] VkDeviceMemory
+  transparencyAndCompositionMemory() const noexcept {
+    return transparency_and_composition_image_memory_;
+  }
+  [[nodiscard]] VkImageView
+  transparencyAndCompositionView() const noexcept {
+    return transparency_and_composition_image_view_;
+  }
+  [[nodiscard]] VkImage reactiveMaskImage() const noexcept {
+    return reactive_mask_image_;
+  }
+  [[nodiscard]] VkDeviceMemory reactiveMaskMemory() const noexcept {
+    return reactive_mask_image_memory_;
+  }
+  [[nodiscard]] VkImageView reactiveMaskView() const noexcept {
+    return reactive_mask_image_view_;
+  }
+  [[nodiscard]] VkImage guideValidityImage() const noexcept {
+    return guide_validity_image_;
+  }
+  [[nodiscard]] VkDeviceMemory guideValidityMemory() const noexcept {
+    return guide_validity_image_memory_;
+  }
+  [[nodiscard]] VkImageView guideValidityView() const noexcept {
+    return guide_validity_image_view_;
+  }
   [[nodiscard]] std::uint32_t targetWidth() const noexcept {
     return image_w_;
   }
@@ -482,6 +526,15 @@ private:
     VkImage rr_specular_hit_distance_image = VK_NULL_HANDLE;
     VkDeviceMemory rr_specular_hit_distance_image_memory = VK_NULL_HANDLE;
     VkImageView rr_specular_hit_distance_image_view = VK_NULL_HANDLE;
+    VkImage transparency_and_composition_image = VK_NULL_HANDLE;
+    VkDeviceMemory transparency_and_composition_image_memory = VK_NULL_HANDLE;
+    VkImageView transparency_and_composition_image_view = VK_NULL_HANDLE;
+    VkImage reactive_mask_image = VK_NULL_HANDLE;
+    VkDeviceMemory reactive_mask_image_memory = VK_NULL_HANDLE;
+    VkImageView reactive_mask_image_view = VK_NULL_HANDLE;
+    VkImage guide_validity_image = VK_NULL_HANDLE;
+    VkDeviceMemory guide_validity_image_memory = VK_NULL_HANDLE;
+    VkImageView guide_validity_image_view = VK_NULL_HANDLE;
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     std::uint32_t requested_output_mask = 0;
@@ -499,6 +552,10 @@ private:
     VkImageLayout rr_normal_roughness_image_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout rr_specular_hit_distance_image_layout =
         VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout transparency_and_composition_image_layout =
+        VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout reactive_mask_image_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout guide_validity_image_layout = VK_IMAGE_LAYOUT_UNDEFINED;
   };
 
   struct ComputeDescriptorKey {
@@ -580,6 +637,10 @@ private:
   VkDeviceMemory dummy_r32_memory_ = VK_NULL_HANDLE;
   VkImageView dummy_r32_view_ = VK_NULL_HANDLE;
   VkImageLayout dummy_r32_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+  VkImage dummy_r8_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory dummy_r8_memory_ = VK_NULL_HANDLE;
+  VkImageView dummy_r8_view_ = VK_NULL_HANDLE;
+  VkImageLayout dummy_r8_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
   ComputeDescriptorKey compute_descriptor_key_{};
   bool compute_descriptor_key_valid_ = false;
   std::uint64_t descriptor_write_calls_ = 0;
@@ -606,6 +667,7 @@ private:
   VkFormatFeatureFlags rgba32_target_features_ = 0;
   VkFormatFeatureFlags rg32_target_features_ = 0;
   VkFormatFeatureFlags r32_target_features_ = 0;
+  VkFormatFeatureFlags r8_target_features_ = 0;
   bool target_formats_queried_ = false;
   bool required_target_formats_supported_ = false;
   bool memory_budget_supported_ = false;
@@ -641,6 +703,15 @@ private:
   VkImage rr_specular_hit_distance_image_ = VK_NULL_HANDLE;
   VkDeviceMemory rr_specular_hit_distance_image_memory_ = VK_NULL_HANDLE;
   VkImageView rr_specular_hit_distance_image_view_ = VK_NULL_HANDLE;
+  VkImage transparency_and_composition_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory transparency_and_composition_image_memory_ = VK_NULL_HANDLE;
+  VkImageView transparency_and_composition_image_view_ = VK_NULL_HANDLE;
+  VkImage reactive_mask_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory reactive_mask_image_memory_ = VK_NULL_HANDLE;
+  VkImageView reactive_mask_image_view_ = VK_NULL_HANDLE;
+  VkImage guide_validity_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory guide_validity_image_memory_ = VK_NULL_HANDLE;
+  VkImageView guide_validity_image_view_ = VK_NULL_HANDLE;
   Buffer motion_frame_buffer_{};
   void *motion_frame_mapped_ = nullptr;
   std::uint32_t image_w_ = 0;
@@ -658,6 +729,10 @@ private:
       VK_IMAGE_LAYOUT_UNDEFINED;
   VkImageLayout rr_specular_hit_distance_image_layout_ =
       VK_IMAGE_LAYOUT_UNDEFINED;
+  VkImageLayout transparency_and_composition_image_layout_ =
+      VK_IMAGE_LAYOUT_UNDEFINED;
+  VkImageLayout reactive_mask_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+  VkImageLayout guide_validity_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
   std::uint64_t history_key_ = 0;
   std::uint64_t history_generation_ = 0;
   std::uint64_t history_reset_count_ = 0;

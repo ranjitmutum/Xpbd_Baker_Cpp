@@ -9,6 +9,9 @@
 
 namespace xpbd::gfx {
 
+struct ResolvedEnvironmentView;
+struct ResolvedSunLight;
+
 // PCI vendor ID for NVIDIA Corporation.
 inline constexpr std::uint32_t kVendorIdNvidia = 0x10DEu;
 
@@ -23,6 +26,105 @@ enum class RtAlphaMode : std::uint8_t {
   Cutout = 1,
   Blend = 2,
 };
+
+// Base Alpha describes coverage only. PhysicalTransmission is sourced from
+// RtSurfaceOptics and therefore remains a separate material event even when a
+// surface also has fractional coverage.
+enum class RtTransparencyClass : std::uint8_t {
+  Opaque = 0,
+  Cutout,
+  CoverageBlend,
+  PhysicalTransmission,
+};
+
+// Frozen G07 policy comparison. OpaqueBehind is retained for review and for a
+// discarded Cutout texel; ConservativeInvalid is the local fallback for
+// ambiguous stacks. V1 chooses the deterministic front coverage surface so
+// Depth and Motion describe the same visible surface.
+enum class TransparentGuidePolicyV1 : std::uint8_t {
+  OpaqueBehind = 0,
+  FrontCoverage,
+  ConservativeInvalid,
+};
+
+inline constexpr TransparentGuidePolicyV1 kTransparentGuidePolicyV1 =
+    TransparentGuidePolicyV1::FrontCoverage;
+
+struct RtTransparentGuideProbeInputV1 {
+  RtTransparencyClass classification = RtTransparencyClass::Opaque;
+  float coverage = 1.0f;
+  float physical_transmission = 0.0f;
+  std::uint32_t coverage_layer_count = 0u;
+  bool front_surface_available = true;
+  bool opaque_behind_available = false;
+  bool surface_order_stable = true;
+  bool surface_identity_matches_history = true;
+};
+
+struct RtTransparentGuideProbeResultV1 {
+  TransparentGuidePolicyV1 policy = kTransparentGuidePolicyV1;
+  float transparency_and_composition = 0.0f;
+  float reactive = 0.0f;
+  float guide_validity = 1.0f;
+  float disocclusion = 0.0f;
+  bool use_front_surface = true;
+  bool use_opaque_behind = false;
+  bool neutralize_rr_guides = false;
+};
+
+[[nodiscard]] constexpr float rtFiniteUnitInterval(float value) noexcept {
+  if (!(value >= 0.0f)) {
+    return 0.0f;
+  }
+  return value > 1.0f ? 1.0f : value;
+}
+
+[[nodiscard]] constexpr RtTransparentGuideProbeResultV1
+resolveRtTransparentGuideProbeV1(
+    const RtTransparentGuideProbeInputV1 &input) noexcept {
+  RtTransparentGuideProbeResultV1 result;
+  const float coverage = rtFiniteUnitInterval(input.coverage);
+  const float transmission =
+      rtFiniteUnitInterval(input.physical_transmission);
+  const bool ambiguous_stack = input.coverage_layer_count > 1u ||
+                               !input.surface_order_stable;
+
+  if (input.classification == RtTransparencyClass::Cutout &&
+      coverage < 0.02f) {
+    result.policy = TransparentGuidePolicyV1::OpaqueBehind;
+    result.use_front_surface = false;
+    result.use_opaque_behind = input.opaque_behind_available;
+    result.guide_validity = result.use_opaque_behind ? 1.0f : 0.0f;
+  } else if (ambiguous_stack || !input.front_surface_available) {
+    result.policy = TransparentGuidePolicyV1::ConservativeInvalid;
+    result.use_front_surface = input.front_surface_available;
+    result.use_opaque_behind = false;
+    result.guide_validity = 0.0f;
+    result.reactive = 1.0f;
+  }
+
+  if (input.classification == RtTransparencyClass::CoverageBlend) {
+    const float composition = 4.0f * coverage * (1.0f - coverage);
+    result.transparency_and_composition = composition;
+    result.reactive = result.reactive > composition ? result.reactive
+                                                     : composition;
+  } else if (input.classification ==
+             RtTransparencyClass::PhysicalTransmission) {
+    result.transparency_and_composition = transmission;
+    result.reactive = result.reactive > transmission ? result.reactive
+                                                      : transmission;
+    // Refracted/reflected secondary surfaces are not valid substitutes for
+    // first-visible-surface RR channels. Keep front Depth/Motion, but freeze
+    // the RR material guides to neutral values and reject their history.
+    result.guide_validity = 0.0f;
+  }
+
+  if (!input.surface_identity_matches_history || ambiguous_stack) {
+    result.disocclusion = 1.0f;
+  }
+  result.neutralize_rr_guides = result.guide_validity < 0.5f;
+  return result;
+}
 
 enum class RtDebugView : std::uint8_t {
   Off = 0,
@@ -90,6 +192,99 @@ enum class PathTraceLightSamplingMode : std::uint8_t {
   LightOnly = 1,
   Combined = 2,
 };
+
+// Minimal light ABI for R0F. Point and area-light shapes are reserved so later
+// authoring work extends this registry instead of changing RayGen contracts.
+enum class RtLightType : std::uint8_t {
+  Environment = 0,
+  SunDisk = 1,
+  EmissiveTriangle = 2,
+  Point = 3,
+  Spot = 4,
+  Rectangle = 5,
+  Disk = 6,
+  Sphere = 7,
+};
+
+struct RtStableLightId {
+  std::uint64_t value = 0;
+
+  [[nodiscard]] constexpr explicit operator bool() const noexcept {
+    return value != 0u;
+  }
+  [[nodiscard]] constexpr bool
+  operator==(const RtStableLightId &) const noexcept = default;
+};
+
+inline constexpr RtStableLightId kRtEnvironmentLightId{
+    0x656e7669726f6e6dull};
+inline constexpr RtStableLightId kRtSunDiskLightId{
+    0x73756e2d6469736bull};
+inline constexpr RtStableLightId kRtEmissiveFamilyLightId{
+    0x656d697373697665ull};
+
+struct RtLightRecord {
+  RtStableLightId stable_id{};
+  RtLightType type = RtLightType::Environment;
+  std::uint64_t generation = 0;
+  float power_estimate = 0.0f;
+  float sampling_weight = 0.0f;
+  float selection_probability = 0.0f;
+  bool enabled = false;
+  bool casts_shadow = true;
+  bool two_sided = false;
+  bool delta = false;
+};
+
+struct RtLightRegistry {
+  std::array<RtLightRecord, 3> families{};
+  std::uint64_t generation = 0;
+  float total_sampling_weight = 0.0f;
+  std::uint32_t enabled_family_count = 0;
+};
+
+struct RtLightSelection {
+  RtStableLightId stable_id{};
+  RtLightType type = RtLightType::Environment;
+  float selection_probability = 0.0f;
+  bool valid = false;
+};
+
+[[nodiscard]] RtLightRegistry buildRtLightRegistry(
+    const ResolvedEnvironmentView &environment,
+    bool environment_sampling_available, const ResolvedSunLight &sun,
+    std::uint64_t emissive_generation, float emissive_power_estimate,
+    bool emissive_enabled) noexcept;
+[[nodiscard]] const RtLightRecord *
+findRtLight(const RtLightRegistry &registry, RtLightType type) noexcept;
+[[nodiscard]] RtLightSelection sampleRtLight(
+    const RtLightRegistry &registry, float family_sample) noexcept;
+[[nodiscard]] float lightPdf(const RtLightRegistry &registry,
+                             RtLightType type) noexcept;
+[[nodiscard]] float powerEstimate(const RtLightRecord &light) noexcept;
+[[nodiscard]] bool isDeltaLight(const RtLightRecord &light) noexcept;
+[[nodiscard]] bool castsShadow(const RtLightRecord &light) noexcept;
+[[nodiscard]] bool isTwoSided(const RtLightRecord &light) noexcept;
+
+[[nodiscard]] RtStableLightId makeRtEmissiveTriangleStableId(
+    const std::array<std::uint32_t, 4> &source_identity,
+    std::uint32_t source_instance = 0u) noexcept;
+
+struct RtSunDiskSample {
+  std::array<float, 3> direction{0.0f, 1.0f, 0.0f};
+  std::array<float, 3> radiance{0.0f, 0.0f, 0.0f};
+  float pdf = 0.0f;
+  bool valid = false;
+};
+
+[[nodiscard]] RtSunDiskSample sampleRtSunDisk(
+    const ResolvedSunLight &sun, float sample_u, float sample_v) noexcept;
+[[nodiscard]] std::array<float, 3> evaluateRtSunDisk(
+    const ResolvedSunLight &sun,
+    const std::array<float, 3> &direction) noexcept;
+[[nodiscard]] float rtSunDiskPdf(
+    const ResolvedSunLight &sun,
+    const std::array<float, 3> &direction) noexcept;
 
 enum class PathTraceFrameGeneration : std::uint8_t {
   Off = 0,
@@ -294,6 +489,68 @@ pathTraceRandom01(std::uint32_t pixel_x, std::uint32_t pixel_y,
                   std::uint32_t sample_index, std::uint32_t dimension,
                   std::uint32_t seed) noexcept;
 
+// Stable, non-overlapping streams for path decisions. Values are part of the
+// CPU/Shader sequence contract; add new domains instead of renumbering these.
+enum class PathTraceRngDomain : std::uint32_t {
+  CameraJitter = 0x43414d45u,
+  AlphaCoverage = 0x414c5048u,
+  LobeSelection = 0x4c4f4245u,
+  Direction = 0x44495245u,
+  Environment = 0x454e5652u,
+  Emissive = 0x454d4954u,
+  LightRegistry = 0x4c524547u,
+  ShadowTransparency = 0x53484457u,
+  RussianRoulette = 0x52524f55u,
+  Volume = 0x564f4c55u,
+  Restir = 0x52535452u,
+};
+
+struct PathTraceRngState {
+  std::uint32_t state = 0u;
+  std::uint32_t dimension = 0u;
+};
+
+[[nodiscard]] PathTraceRngState makePathTraceRngState(
+    std::uint32_t pixel_x, std::uint32_t pixel_y,
+    std::uint32_t sample_index, std::uint32_t bounce,
+    PathTraceRngDomain domain, std::uint32_t stream,
+    std::uint32_t seed) noexcept;
+[[nodiscard]] std::uint32_t
+pathTraceNextRandomBits(PathTraceRngState &rng) noexcept;
+[[nodiscard]] float pathTraceNextRandom01(PathTraceRngState &rng) noexcept;
+
+// True triangle Ng and a scale-safe ULP-first origin offset shared by CPU
+// regression references and the Full RT shader contract.
+[[nodiscard]] std::array<float, 3> pathTraceTriangleGeometricNormal(
+    const std::array<float, 3> &position0,
+    const std::array<float, 3> &position1,
+    const std::array<float, 3> &position2,
+    const std::array<float, 3> &fallback = {0.0f, 1.0f, 0.0f}) noexcept;
+[[nodiscard]] std::array<float, 3> offsetPathTraceRayOrigin(
+    const std::array<float, 3> &position,
+    const std::array<float, 3> &geometric_normal,
+    const std::array<float, 3> &outgoing_direction) noexcept;
+
+struct PathTraceRayCone {
+  float width = 0.0f;
+  float spread_angle = 0.0f;
+};
+
+enum class PathTraceLobe : std::uint8_t;
+
+[[nodiscard]] PathTraceRayCone initializePathTraceRayCone(
+    std::uint32_t render_width, std::uint32_t render_height,
+    float vertical_fov_radians) noexcept;
+[[nodiscard]] float pathTraceRayConeWidthAtDistance(
+    const PathTraceRayCone &cone, float distance) noexcept;
+[[nodiscard]] PathTraceRayCone propagatePathTraceRayCone(
+    const PathTraceRayCone &cone, float distance, PathTraceLobe lobe,
+    float ggx_alpha, float eta_ratio = 1.0f) noexcept;
+[[nodiscard]] float pathTraceRayConeTextureLod(
+    const PathTraceRayCone &cone, float distance,
+    float triangle_world_double_area, float triangle_uv_double_area,
+    std::uint32_t texture_width, std::uint32_t texture_height) noexcept;
+
 // NVIDIA-style Halton(2,3) camera jitter for temporal reconstruction. Values
 // are pixel offsets from the pixel center in [-0.5, 0.5]. The sequence period
 // follows round(8 * (output_width / render_width)^2).
@@ -348,17 +605,37 @@ evaluatePathTraceRussianRoulette(
     const PathTraceSettings &settings, const PathTraceDepthState &state,
     float throughput_max, float sample_u) noexcept;
 
+inline constexpr float kDeltaMirrorAlpha = 1.0e-6f;
+inline constexpr float kMinFiniteGgxAlpha = 1.0e-4f;
+
+// Minimal source-independent optical surface contract.  Legacy/LabPBR
+// materials keep these defaults, so Base Alpha remains coverage and does not
+// silently become physical transmission.
+struct RtSurfaceOptics {
+  float transmission = 0.0f;
+  float ior = 1.5f;
+  std::array<float, 3> attenuation_color{1.0f, 1.0f, 1.0f};
+  float attenuation_distance = 0.0f;
+  bool thin_walled = false;
+};
+
+[[nodiscard]] RtSurfaceOptics
+normalizeRtSurfaceOptics(RtSurfaceOptics optics) noexcept;
+[[nodiscard]] std::array<float, 3> rtBeerLambertTransmittance(
+    const RtSurfaceOptics &optics, float traveled_distance) noexcept;
+
 struct RtBsdfMaterial {
   std::array<float, 3> base_color{1.0f, 1.0f, 1.0f};
   std::array<float, 3> f0{0.04f, 0.04f, 0.04f};
   // GGX alpha. LabPBR's perceptual roughness is squared before reaching this
   // read-only resolved material representation.
-  float roughness = 0.25f;
+  float ggx_alpha = 0.25f;
   // Phase 5 compatibility bridge: only Blend materials derive this from
   // 1-opacity. Full layered transparency remains Phase 7.
   float transmission = 0.0f;
   float ior = 1.5f;
   bool metal = false;
+  bool thin_walled = false;
 };
 
 struct RtBsdfLobeProbabilities {
@@ -391,20 +668,36 @@ struct RtBsdfSample {
                                         float eta_transmitted) noexcept;
 [[nodiscard]] std::array<float, 3> rtFresnelSchlick(
     const std::array<float, 3> &f0, float cosine) noexcept;
+[[nodiscard]] float rtRrRoughnessFromGgxAlpha(float ggx_alpha) noexcept;
 [[nodiscard]] float rtGgxDistribution(float normal_dot_half,
-                                      float roughness) noexcept;
+                                      float ggx_alpha) noexcept;
 [[nodiscard]] float rtSmithGgxG1(float normal_dot_direction,
-                                 float roughness) noexcept;
+                                  float ggx_alpha) noexcept;
+struct RtGgxVisibleNormalSample {
+  std::array<float, 3> half_vector{0.0f, 1.0f, 0.0f};
+  float pdf = 0.0f;
+  bool valid = false;
+};
+[[nodiscard]] float rtGgxVisibleNormalPdf(
+    const std::array<float, 3> &shading_normal,
+    const std::array<float, 3> &view_direction,
+    const std::array<float, 3> &half_vector, float ggx_alpha) noexcept;
+[[nodiscard]] RtGgxVisibleNormalSample sampleRtGgxVndf(
+    const std::array<float, 3> &shading_normal,
+    const std::array<float, 3> &view_direction, float ggx_alpha,
+    float sample_u, float sample_v) noexcept;
 [[nodiscard]] RtBsdfLobeProbabilities
 rtBsdfLobeProbabilities(const RtBsdfMaterial &material) noexcept;
 
-// All directions point away from the surface. Reflection eval is continuous;
-// ideal refraction is returned as a delta sample by sampleRtBsdf.
+// All directions point away from the surface. Finite-alpha reflection eval is
+// continuous; ideal reflection/refraction is returned as a delta sample by
+// sampleRtBsdf.
 [[nodiscard]] RtBsdfEval evaluateRtBsdf(
     const RtBsdfMaterial &material,
     const std::array<float, 3> &shading_normal,
     const std::array<float, 3> &view_direction,
-    const std::array<float, 3> &light_direction) noexcept;
+    const std::array<float, 3> &light_direction,
+    bool front_face = true) noexcept;
 [[nodiscard]] RtBsdfSample sampleRtBsdf(
     const RtBsdfMaterial &material,
     const std::array<float, 3> &shading_normal,
@@ -487,6 +780,7 @@ struct RtDispatchBufferBounds {
   std::uint64_t color_bytes = 0;
   std::uint64_t primitive_flag_bytes = 0;
   std::uint64_t primitive_metadata_bytes = 0;
+  std::uint64_t primitive_optics_bytes = 0;
   std::uint64_t instance_metadata_bytes = 0;
 };
 
@@ -533,13 +827,37 @@ struct RtFrontToBackAccumulator {
 };
 
 [[nodiscard]] constexpr float
+rtDeterministicShadowVisibilityAfter(
+    float visibility, float source_alpha, RtAlphaMode mode,
+    float physical_transmission,
+    float cutoff = kRtAlphaCutoff) noexcept {
+  const float clamped_visibility =
+      rtFiniteUnitInterval(visibility);
+  const float coverage = rtFiniteUnitInterval(source_alpha);
+  if (!(coverage >= cutoff)) {
+    return clamped_visibility;
+  }
+  const float transmission =
+      rtFiniteUnitInterval(physical_transmission);
+  const bool coverage_blend =
+      mode == RtAlphaMode::Blend && coverage < 1.0f;
+  const float uncovered_visibility =
+      coverage_blend ? 1.0f - coverage : 0.0f;
+  const float layer_visibility =
+      transmission > 0.0f
+          ? (coverage_blend
+                 ? uncovered_visibility + coverage * transmission
+                 : transmission)
+          : uncovered_visibility;
+  return clamped_visibility * layer_visibility;
+}
+
+[[nodiscard]] constexpr float
 rtShadowVisibilityAfter(float visibility, float source_alpha,
                         RtAlphaMode mode,
                         float cutoff = kRtAlphaCutoff) noexcept {
-  const float clamped_visibility =
-      visibility < 0.0f ? 0.0f : (visibility > 1.0f ? 1.0f : visibility);
-  return clamped_visibility *
-         (1.0f - rtAcceptedOpacity(mode, source_alpha, cutoff));
+  return rtDeterministicShadowVisibilityAfter(
+      visibility, source_alpha, mode, 0.0f, cutoff);
 }
 
 struct RtRayTriangleHit {

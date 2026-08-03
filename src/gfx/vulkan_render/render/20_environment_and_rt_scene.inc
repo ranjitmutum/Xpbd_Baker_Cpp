@@ -34,12 +34,118 @@
       resolved_world_environment.environment_strength = 0.0f;
       resolved_world_environment.hdr = nullptr;
     }
+    ResolvedSunLight resolved_sun_light =
+        resolveSunLight(resolved_world_environment);
+    const PathTraceSettings resolved_environment_settings =
+        normalizePathTraceSettings(frame.path_trace_settings);
+    const float analytic_environment_strength =
+        std::max(resolved_environment_settings.analytic_environment_strength,
+                 0.0f);
+    ResolvedEnvironmentView resolved_environment_view =
+        resolveEnvironmentView(
+            resolved_world_environment,
+            {frame.clear_r * analytic_environment_strength,
+             frame.clear_g * analytic_environment_strength,
+             frame.clear_b * analytic_environment_strength},
+            analytic_environment_strength);
+
+    // PreviewSceneLighting remains a compatibility fallback only when World
+    // has no active procedural Sun. Once the World Sun is enabled, every
+    // consumer below sees exactly that one resolved light and the legacy
+    // directional source is ignored.
+    if (!resolved_sun_light.lighting_enabled &&
+        resolved_world_environment.sky_rendering !=
+            SkyRendering::ProceduralDayNight &&
+        frame.raster_scene != nullptr) {
+      const PreviewSceneLighting &legacy = frame.raster_scene->lighting;
+      const double length_squared =
+          static_cast<double>(legacy.direction[0]) * legacy.direction[0] +
+          static_cast<double>(legacy.direction[1]) * legacy.direction[1] +
+          static_cast<double>(legacy.direction[2]) * legacy.direction[2];
+      if (length_squared > 1.0e-20 && std::isfinite(length_squared)) {
+        const float inverse_length =
+            static_cast<float>(1.0 / std::sqrt(length_squared));
+        resolved_sun_light.direction = {
+            legacy.direction[0] * inverse_length,
+            legacy.direction[1] * inverse_length,
+            legacy.direction[2] * inverse_length};
+      } else {
+        resolved_sun_light.direction = {0.0f, 1.0f, 0.0f};
+      }
+      resolved_sun_light.color = {
+          std::isfinite(legacy.color[0])
+              ? std::max(legacy.color[0], 0.0f)
+              : 0.0f,
+          std::isfinite(legacy.color[1])
+              ? std::max(legacy.color[1], 0.0f)
+              : 0.0f,
+          std::isfinite(legacy.color[2])
+              ? std::max(legacy.color[2], 0.0f)
+              : 0.0f};
+      resolved_sun_light.angular_radius = 0.00465047f;
+      resolved_sun_light.solid_angle = static_cast<float>(
+          6.28318530717958647692 *
+          (1.0 - std::cos(resolved_sun_light.angular_radius)));
+      const float legacy_irradiance =
+          std::isfinite(legacy.intensity)
+              ? std::max(legacy.intensity, 0.0f)
+              : 0.0f;
+      const float inverse_solid_angle =
+          resolved_sun_light.solid_angle > 0.0f
+              ? 1.0f / resolved_sun_light.solid_angle
+              : 0.0f;
+      for (std::size_t channel = 0;
+           channel < resolved_sun_light.radiance.size(); ++channel) {
+        resolved_sun_light.radiance[channel] =
+            resolved_sun_light.color[channel] * legacy_irradiance *
+            inverse_solid_angle;
+      }
+      resolved_sun_light.strength = legacy_irradiance;
+      resolved_sun_light.power_estimate =
+          (0.2126f * resolved_sun_light.radiance[0] +
+           0.7152f * resolved_sun_light.radiance[1] +
+           0.0722f * resolved_sun_light.radiance[2]) *
+          resolved_sun_light.solid_angle;
+      resolved_sun_light.enabled = legacy_irradiance > 0.0f;
+      resolved_sun_light.disk_visible = false;
+      resolved_sun_light.casts_shadow = true;
+      resolved_sun_light.lighting_enabled =
+          resolved_sun_light.enabled;
+      std::uint64_t legacy_generation = 14695981039346656037ull;
+      appendPathTraceHistoryBytes(legacy_generation, legacy.direction.data(),
+                                  sizeof(legacy.direction));
+      appendPathTraceHistoryBytes(legacy_generation, legacy.color.data(),
+                                  sizeof(legacy.color));
+      appendPathTraceHistoryValue(legacy_generation, legacy.intensity);
+      resolved_sun_light.generation = legacy_generation;
+    }
     const bool procedural_environment_ready =
         resolved_world_environment.sky_rendering ==
             SkyRendering::ProceduralDayNight &&
         procedural_atmosphere_ready && atmosphere_environment_ready_;
     const bool importance_environment_ready =
         hdr_environment_ready || procedural_environment_ready;
+    if (resolved_environment_view.kind ==
+            ResolvedEnvironmentKind::ProceduralDayNight &&
+        procedural_environment_ready) {
+      resolved_environment_view.sampling_ready =
+          resolved_environment_view.lighting_enabled;
+      resolved_environment_view.gpu_cache_required = false;
+      resolved_environment_view.power_estimate =
+          atmosphere_environment_power_estimate_;
+    } else if (resolved_environment_view.kind ==
+                   ResolvedEnvironmentKind::UserHdri &&
+               hdr_environment_ready) {
+      resolved_environment_view.power_estimate =
+          world_environment_power_estimate_;
+    }
+    const bool environment_sampling_available =
+        importance_environment_ready ||
+        ((resolved_environment_view.kind ==
+              ResolvedEnvironmentKind::Constant ||
+          resolved_environment_view.kind ==
+              ResolvedEnvironmentKind::AnalyticFallback) &&
+         resolved_environment_view.sampling_ready);
 
     const auto rt_scene_cpu_begin = Clock::now();
     // RT acceleration: CPU-skin when poses change, then record BLAS build/refit
@@ -53,6 +159,8 @@
         14695981039346656037ull;
     std::uint64_t rt_streamline_material_hash =
         14695981039346656037ull;
+    std::uint64_t rt_emissive_generation =
+        frame.rt_scene_generations.emission;
     if (active_render_path_ == RenderPath::RayTracing &&
         rt_capability_.device_extensions_enabled && !presentation_suspended_) {
       std::vector<float> packed_bones;
@@ -148,6 +256,7 @@
         effective_generations.emission = rt_fallback_generation_serial_;
         effective_generations.visibility = rt_fallback_generation_serial_;
       }
+      rt_emissive_generation = effective_generations.emission;
       for (std::size_t i = 0; i < geometry_view_count; ++i) {
         RtColoredGeometryView &view = geometry_views[i];
         if (view.content_generation == 0u) {
@@ -335,4 +444,16 @@
                                                    rt_scene_cpu_begin)
               .count();
     }
+    ResolvedSunLight registry_sun_light = resolved_sun_light;
+    registry_sun_light.lighting_enabled =
+        registry_sun_light.lighting_enabled &&
+        resolved_environment_settings.analytic_lights;
+    const RtLightRegistry rt_light_registry = buildRtLightRegistry(
+        resolved_environment_view, environment_sampling_available,
+        registry_sun_light, rt_emissive_generation,
+        rt_scene.emissivePowerEstimate() *
+            std::max(resolved_environment_settings.emissive_multiplier, 0.0f),
+        resolved_environment_settings.emissive_surfaces &&
+            resolved_environment_settings.emissive_mesh_sampling &&
+            rt_scene.ready() && rt_scene.emissiveTriangleCount() > 0u);
 

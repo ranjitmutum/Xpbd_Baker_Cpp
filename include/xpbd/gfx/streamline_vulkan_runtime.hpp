@@ -34,6 +34,17 @@ struct StreamlineDlssFrame {
   VkImage motion_image = VK_NULL_HANDLE;
   VkDeviceMemory motion_memory = VK_NULL_HANDLE;
   VkImageView motion_view = VK_NULL_HANDLE;
+  VkImage transparency_and_composition_image = VK_NULL_HANDLE;
+  VkDeviceMemory transparency_and_composition_memory = VK_NULL_HANDLE;
+  VkImageView transparency_and_composition_view = VK_NULL_HANDLE;
+  VkImage reactive_mask_image = VK_NULL_HANDLE;
+  VkDeviceMemory reactive_mask_memory = VK_NULL_HANDLE;
+  VkImageView reactive_mask_view = VK_NULL_HANDLE;
+  // No Streamline BufferType exists for this internal channel. Its real image
+  // is still required so callers cannot tag masks while validity is absent.
+  VkImage guide_validity_image = VK_NULL_HANDLE;
+  VkDeviceMemory guide_validity_memory = VK_NULL_HANDLE;
+  VkImageView guide_validity_view = VK_NULL_HANDLE;
   const float *view = nullptr;
   const float *projection = nullptr;
   const float *previous_view = nullptr;
@@ -114,6 +125,11 @@ struct FrameGenerationDiagnostic {
   bool recovery_required = false;
   bool present_thread_bound = false;
   std::uint32_t frames_actually_presented = 1u;
+  std::uint32_t disable_attempts = 0u;
+  std::uint32_t disable_completed_drains = 0u;
+  std::int32_t disable_result = 0;
+  bool disable_confirmed_off = false;
+  bool disable_exhausted = false;
   std::uint64_t swapchain_generation = 0u;
   std::uint64_t options_generation = 0u;
   std::uint64_t tag_generation = 0u;
@@ -167,7 +183,13 @@ public:
   // Enter the terminal lifecycle before the backend drains or destroys any
   // presentation object.  This disables Options and nulls all FG tags on the
   // Present thread while preserving the explicit ShuttingDown state.
-  void beginFrameGenerationShutdown(std::uint64_t frame_index) noexcept;
+  [[nodiscard]] bool
+  beginFrameGenerationShutdown(std::uint64_t frame_index) noexcept;
+  // Called only after the backend has drained both device work and pending
+  // presents. It records that drain, performs at most one eligible eOff retry,
+  // and returns true only when proxy destruction is now safe.
+  [[nodiscard]] bool retryFrameGenerationDisableAfterDrain(
+      std::uint64_t frame_index, const char *reason) noexcept;
   [[nodiscard]] bool unloadFrameGenerationForShutdown() noexcept;
   [[nodiscard]] bool beginFrameGenerationSwapchainTransition(
       SwapchainOwnership target, std::uint64_t frame_index,
@@ -175,10 +197,10 @@ public:
   [[nodiscard]] bool configureFrameGenerationFeature(
       SwapchainOwnership target, std::uint64_t frame_index,
       const char *reason) noexcept;
-  void completeFrameGenerationSwapchainTransition(
+  [[nodiscard]] bool completeFrameGenerationSwapchainTransition(
       SwapchainOwnership ownership, bool resources_ready,
       std::uint64_t frame_index, const char *reason) noexcept;
-  void notifyFrameGenerationSwapchainDestroyed(
+  [[nodiscard]] bool notifyFrameGenerationSwapchainDestroyed(
       std::uint64_t frame_index, const char *reason) noexcept;
   void requestFrameGenerationNativeRecovery(
       const char *reason, bool latch_failure) noexcept;
@@ -223,14 +245,12 @@ public:
       const StreamlineFrameGenerationFrame &frame);
   // Expire every per-frame FG tag when the preview cannot provide valid
   // depth/motion/color inputs (loading, collapsed viewport, raster mode).
-  void clearFrameGenerationInputs(VkCommandBuffer command_buffer,
-                                  std::uint32_t frame_index,
-                                  std::uint32_t output_width,
-                                  std::uint32_t output_height,
-                                  std::uint32_t viewport_x,
-                                  std::uint32_t viewport_y,
-                                  std::uint32_t viewport_width,
-                                  std::uint32_t viewport_height) noexcept;
+  [[nodiscard]] bool clearFrameGenerationInputs(
+      VkCommandBuffer command_buffer, std::uint32_t frame_index,
+      std::uint32_t output_width, std::uint32_t output_height,
+      std::uint32_t viewport_x, std::uint32_t viewport_y,
+      std::uint32_t viewport_width,
+      std::uint32_t viewport_height) noexcept;
   // Query after each intercepted present; numFramesActuallyPresented then
   // represents this application's most recent present interval.
   [[nodiscard]] FrameGenerationTransitionResult
@@ -279,7 +299,7 @@ private:
   // lifecycle transition through the public state-machine methods above.
   [[nodiscard]] bool
   setFrameGenerationFeatureLoaded(bool loaded) noexcept;
-  void disableFrameGeneration() noexcept;
+  [[nodiscard]] bool disableFrameGeneration() noexcept;
   std::unique_ptr<Impl> impl_;
 };
 

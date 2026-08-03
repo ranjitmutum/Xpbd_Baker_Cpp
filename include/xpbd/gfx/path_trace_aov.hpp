@@ -33,6 +33,12 @@ enum class PathTraceOptionalOutput : std::uint32_t {
   RrSpecularAlbedo,
   RrNormalRoughness,
   Statistics,
+  // Standalone R8_UNORM temporal inputs. They are deliberately not packed
+  // into the diagnostic RGBA AOV array because Streamline consumes exact
+  // single-channel resources with independent lifetimes.
+  TransparencyAndComposition,
+  ReactiveMask,
+  GuideValidity,
 };
 
 [[nodiscard]] constexpr std::uint32_t
@@ -58,9 +64,19 @@ inline constexpr std::uint32_t kPathTraceAllRrGuideOutputMask =
     pathTraceOptionalOutputBit(PathTraceOptionalOutput::RrNormalRoughness);
 inline constexpr std::uint32_t kPathTraceStatisticsOutputMask =
     pathTraceOptionalOutputBit(PathTraceOptionalOutput::Statistics);
+inline constexpr std::uint32_t kPathTraceTransparencyGuideOutputMask =
+    pathTraceOptionalOutputBit(
+        PathTraceOptionalOutput::TransparencyAndComposition) |
+    pathTraceOptionalOutputBit(PathTraceOptionalOutput::ReactiveMask) |
+    pathTraceOptionalOutputBit(PathTraceOptionalOutput::GuideValidity);
+inline constexpr std::uint32_t kPathTraceSrRequiredOutputMask =
+    kPathTraceRrMotionOutputMask | kPathTraceTransparencyGuideOutputMask;
+inline constexpr std::uint32_t kPathTraceRrRequiredOutputMask =
+    kPathTraceAllRrGuideOutputMask |
+    kPathTraceTransparencyGuideOutputMask;
 inline constexpr std::uint32_t kPathTraceAllOptionalOutputMask =
     kPathTraceAllAovOutputMask | kPathTraceAllRrGuideOutputMask |
-    kPathTraceStatisticsOutputMask;
+    kPathTraceStatisticsOutputMask | kPathTraceTransparencyGuideOutputMask;
 
 static_assert(
     static_cast<std::uint32_t>(PathTraceAovLayer::MotionDisocclusion) == 6u &&
@@ -73,7 +89,12 @@ static_assert(
             PathTraceOptionalOutput::RrNormalRoughness) == 14u &&
         static_cast<std::uint32_t>(
             PathTraceOptionalOutput::Statistics) == 15u &&
-        kPathTraceAllOptionalOutputMask == 0xffffu,
+        static_cast<std::uint32_t>(
+            PathTraceOptionalOutput::TransparencyAndComposition) == 16u &&
+        static_cast<std::uint32_t>(
+            PathTraceOptionalOutput::GuideValidity) == 18u &&
+        kPathTraceTransparencyGuideOutputMask == 0x70000u &&
+        kPathTraceAllOptionalOutputMask == 0x7ffffu,
     "Path-tracing AOV ABI must stay synchronized with both PT shaders");
 
 } // namespace xpbd::gfx
