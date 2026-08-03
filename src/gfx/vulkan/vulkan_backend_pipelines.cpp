@@ -1,6 +1,64 @@
-// VulkanBackend 的物理拆分片段。
-// 本文件仍在 vulkan_backend.cpp 的同一编译单元中展开。
-// 禁止独立编译、迁移资源所有权或在本任务中修改原逻辑。
+#include "vulkan/vulkan_backend_internal.hpp"
+#include "xpbd/log.hpp"
+
+#include <cstddef>
+#include <cstdint>
+
+namespace xpbd::gfx::detail {
+
+struct NkVertex {
+  float pos[2];
+  float uv[2];
+  uint8_t col[4];
+};
+
+static const uint32_t kSpvUiVert[] = {
+#include "spirv/ui.vert.spv.inc"
+};
+
+static const uint32_t kSpvUiFrag[] = {
+#include "spirv/ui.frag.spv.inc"
+};
+
+static const uint32_t kSpvMeshVert[] = {
+#include "spirv/mesh.vert.spv.inc"
+};
+
+static const uint32_t kSpvMeshFrag[] = {
+#include "spirv/mesh.frag.spv.inc"
+};
+
+static const uint32_t kSpvStaticMeshVert[] = {
+#include "spirv/static_mesh.vert.spv.inc"
+};
+
+static const uint32_t kSpvStaticMeshFrag[] = {
+#include "spirv/static_mesh.frag.spv.inc"
+};
+
+static const uint32_t kSpvSkyboxVert[] = {
+#include "spirv/skybox.vert.spv.inc"
+};
+
+static const uint32_t kSpvSkyboxFrag[] = {
+#include "spirv/skybox.frag.spv.inc"
+};
+
+static const uint32_t kSpvMeshRtVert[] = {
+#include "spirv/mesh_rt.vert.spv.inc"
+};
+
+static const uint32_t kSpvMeshRtFrag[] = {
+#include "spirv/mesh_rt.frag.spv.inc"
+};
+
+static const uint32_t kSpvStaticMeshRtVert[] = {
+#include "spirv/static_mesh_rt.vert.spv.inc"
+};
+
+static const uint32_t kSpvStaticMeshRtFrag[] = {
+#include "spirv/static_mesh_rt.frag.spv.inc"
+};
 
 bool VulkanBackend::createPipelines() {
   VkShaderModule ui_vs = makeModule(kSpvUiVert, sizeof(kSpvUiVert) / 4);
@@ -437,3 +495,5 @@ bool VulkanBackend::createPipelines() {
   destroy_modules();
   return true;
 }
+
+} // namespace xpbd::gfx::detail

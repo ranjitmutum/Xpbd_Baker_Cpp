@@ -74,11 +74,7 @@ namespace {
     }                                                                          \
   } while (0)
 
-struct NkVertex {
-  float pos[2];
-  float uv[2];
-  uint8_t col[4];
-};
+
 
 constexpr std::uint64_t kDiagnosticWaitSliceNs = 250'000'000ull;
 constexpr auto kSwapchainRecreateRetryDelay = std::chrono::milliseconds(100);
@@ -241,30 +237,14 @@ VkDebugUtilsMessengerCreateInfoEXT validationMessengerCreateInfo() {
 
 
 
-static const uint32_t kSpvUiVert[] = {
-#include "spirv/ui.vert.spv.inc"
-};
-static const uint32_t kSpvUiFrag[] = {
-#include "spirv/ui.frag.spv.inc"
-};
-static const uint32_t kSpvMeshVert[] = {
-#include "spirv/mesh.vert.spv.inc"
-};
-static const uint32_t kSpvMeshFrag[] = {
-#include "spirv/mesh.frag.spv.inc"
-};
-static const uint32_t kSpvStaticMeshVert[] = {
-#include "spirv/static_mesh.vert.spv.inc"
-};
-static const uint32_t kSpvStaticMeshFrag[] = {
-#include "spirv/static_mesh.frag.spv.inc"
-};
-static const uint32_t kSpvSkyboxVert[] = {
-#include "spirv/skybox.vert.spv.inc"
-};
-static const uint32_t kSpvSkyboxFrag[] = {
-#include "spirv/skybox.frag.spv.inc"
-};
+
+
+
+
+
+
+
+
 static const uint32_t kSpvAtmosphereTransmittanceComp[] = {
 #include "spirv/atmosphere_transmittance.comp.spv.inc"
 };
@@ -286,18 +266,10 @@ static const uint32_t kSpvAtmosphereMultipleScatteringComp[] = {
 static const uint32_t kSpvAtmosphereEnvironmentCacheComp[] = {
 #include "spirv/atmosphere_environment_cache.comp.spv.inc"
 };
-static const uint32_t kSpvMeshRtVert[] = {
-#include "spirv/mesh_rt.vert.spv.inc"
-};
-static const uint32_t kSpvMeshRtFrag[] = {
-#include "spirv/mesh_rt.frag.spv.inc"
-};
-static const uint32_t kSpvStaticMeshRtVert[] = {
-#include "spirv/static_mesh_rt.vert.spv.inc"
-};
-static const uint32_t kSpvStaticMeshRtFrag[] = {
-#include "spirv/static_mesh_rt.frag.spv.inc"
-};
+
+
+
+
 
 // Unit cube (triangle list, 36 verts) for skybox sampling.
 
@@ -3666,7 +3638,6 @@ void VulkanBackend::createTimestampQueryPools() {
 #include "vulkan_backend_parts/vulkan_backend_environment.inc"
 #include "vulkan_backend_parts/vulkan_backend_static_resources_core.inc"
 #include "vulkan_backend_parts/vulkan_backend_static_resources_upload.inc"
-#include "vulkan_backend_parts/vulkan_backend_pipelines.inc"
 
 int VulkanBackend::drawUi(FrameSync &frame, const UiDrawData &ui,
                           bool overlay_only) {
