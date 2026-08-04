@@ -314,7 +314,8 @@ void VulkanBackend::destroyStaticMaterialSamplers() {
           LabPbrMipSemantic::BaseColorCoverage);
       normal_chain = buildLabPbrMipChain(
           normal_source, normal_islands,
-          LabPbrMipSemantic::IrisNormalAoHeight);
+          LabPbrMipSemantic::IrisNormalAoHeight,
+          normal_matches_base ? &albedo_chain : nullptr);
       specular_chain = buildLabPbrMipChain(
           specular_source, specular_islands,
           LabPbrMipSemantic::SpecularPacked,
@@ -327,26 +328,40 @@ void VulkanBackend::destroyStaticMaterialSamplers() {
       xpbd::log::warn("LabPBR mip disabled: unknown builder exception");
       return false;
     }
+    const auto mark_inactive_fallback_full = [](LabPbrMipChain &chain) {
+      chain.status = LabPbrMipBuildStatus::FullChain;
+      chain.stop_reason.clear();
+    };
+    const auto force_base_only = [](LabPbrMipChain &chain,
+                                    const char *reason) {
+      if (chain.levels.size() > 1u) {
+        chain.levels.resize(1u);
+      }
+      chain.safe_max_lod = 0u;
+      chain.status = LabPbrMipBuildStatus::BaseOnlyFallback;
+      chain.stop_reason = reason;
+    };
     if (!has_texture) {
-      albedo_chain.fallback_reason.clear();
+      mark_inactive_fallback_full(albedo_chain);
     } else if (!islands_proven && !island_error.empty()) {
-      albedo_chain.fallback_reason = island_error;
+      force_base_only(albedo_chain, island_error.c_str());
     }
     if (!has_normal) {
-      normal_chain.fallback_reason.clear();
+      mark_inactive_fallback_full(normal_chain);
     } else if (!normal_matches_base) {
-      normal_chain.fallback_reason =
-          "normal sidecar dimensions do not match the base atlas";
+      force_base_only(normal_chain,
+                      "normal sidecar dimensions do not match the base atlas");
     } else if (!islands_proven && !island_error.empty()) {
-      normal_chain.fallback_reason = island_error;
+      force_base_only(normal_chain, island_error.c_str());
     }
     if (!has_specular) {
-      specular_chain.fallback_reason.clear();
+      mark_inactive_fallback_full(specular_chain);
     } else if (!specular_matches_base) {
-      specular_chain.fallback_reason =
-          "specular sidecar dimensions do not match the base atlas";
+      force_base_only(
+          specular_chain,
+          "specular sidecar dimensions do not match the base atlas");
     } else if (!islands_proven && !island_error.empty()) {
-      specular_chain.fallback_reason = island_error;
+      force_base_only(specular_chain, island_error.c_str());
     }
     if (!albedo_chain.valid() || !normal_chain.valid() ||
         !specular_chain.valid() ||
@@ -360,44 +375,40 @@ void VulkanBackend::destroyStaticMaterialSamplers() {
       return false;
     }
 
-    const auto warn_disabled = [](const char *label, bool active,
-                                  const LabPbrMipChain &chain) {
-      if (active && chain.levels.size() == 1u &&
-          !chain.fallback_reason.empty()) {
-        xpbd::log::warnf("LabPBR mip disabled: %s: %s", label,
-                         chain.fallback_reason.c_str());
+    const auto status_name = [](LabPbrMipBuildStatus status) {
+      switch (status) {
+      case LabPbrMipBuildStatus::FullChain:
+        return "full";
+      case LabPbrMipBuildStatus::SafelyTruncated:
+        return "truncated";
+      case LabPbrMipBuildStatus::BaseOnlyFallback:
+        return "base-only";
+      }
+      return "unknown";
+    };
+    const auto log_chain = [&](const char *semantic, std::size_t island_count,
+                               const LabPbrMipChain &chain) {
+      const auto &base = chain.levels.front();
+      const char *stop =
+          chain.stop_reason.empty() ? "<none>" : chain.stop_reason.c_str();
+      const char *status = status_name(chain.status);
+      if (chain.status == LabPbrMipBuildStatus::BaseOnlyFallback) {
+        xpbd::log::warnf(
+            "LabPBR semantic mip: semantic=%s status=%s base=%ux%u "
+            "islands=%zu levels=%zu safeMaxLod=%u stop=\"%s\"",
+            semantic, status, base.width, base.height, island_count,
+            chain.levels.size(), chain.safe_max_lod, stop);
+      } else {
+        xpbd::log::infof(
+            "LabPBR semantic mip: semantic=%s status=%s base=%ux%u "
+            "islands=%zu levels=%zu safeMaxLod=%u stop=\"%s\"",
+            semantic, status, base.width, base.height, island_count,
+            chain.levels.size(), chain.safe_max_lod, stop);
       }
     };
-    warn_disabled("albedo", has_texture, albedo_chain);
-    warn_disabled("normal", has_normal, normal_chain);
-    warn_disabled("specular", has_specular, specular_chain);
-    std::string fallback_summary;
-    const auto append_fallback = [&](const char *label, bool active,
-                                     const LabPbrMipChain &chain) {
-      if (!active || chain.levels.size() != 1u ||
-          chain.fallback_reason.empty()) {
-        return;
-      }
-      if (!fallback_summary.empty()) {
-        fallback_summary += "; ";
-      }
-      fallback_summary += label;
-      fallback_summary += '=';
-      fallback_summary += chain.fallback_reason;
-    };
-    append_fallback("albedo", has_texture, albedo_chain);
-    append_fallback("normal", has_normal, normal_chain);
-    append_fallback("specular", has_specular, specular_chain);
-    if (fallback_summary.empty()) {
-      fallback_summary = "<none>";
-    }
-    xpbd::log::infof(
-        "LabPBR semantic mip: albedo islands=%zu safeLevels=%zu normal "
-        "islands=%zu safeLevels=%zu specular islands=%zu safeLevels=%zu "
-        "fallback=%s",
-        base_islands.size(), albedo_chain.levels.size(), normal_islands.size(),
-        normal_chain.levels.size(), specular_islands.size(),
-        specular_chain.levels.size(), fallback_summary.c_str());
+    log_chain("albedo", base_islands.size(), albedo_chain);
+    log_chain("normal", normal_islands.size(), normal_chain);
+    log_chain("specular", specular_islands.size(), specular_chain);
     xpbd::log::infof(
         "VKDIAG LabPBR GPU material normal=%d specular=%d flags=%u "
         "base=%ux%u normal=%ux%u specular=%ux%u",
@@ -535,7 +546,7 @@ void VulkanBackend::destroyStaticMaterialSamplers() {
                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                                           new_index_buffer)) ||
         !createStaticTexture(texture_width, texture_height,
-                             VK_FORMAT_R8G8B8A8_UNORM, new_texture,
+                             VK_FORMAT_R8G8B8A8_SRGB, new_texture,
                              texture_mip_levels) ||
         !createStaticTexture(normal_width, normal_height,
                              VK_FORMAT_R8G8B8A8_UNORM,

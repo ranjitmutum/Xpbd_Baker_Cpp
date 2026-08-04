@@ -117,9 +117,9 @@
       "target_env": "vulkan1.2",
       "spv": "src/gfx/spirv/path_trace.comp.spv",
       "inc": "src/gfx/spirv/path_trace.comp.spv.inc",
-      "source_sha256": "2f1267aabd139b5b052022515c91b116133cb2e9f9dcaf695639a201cf5327de",
-      "spv_sha256": "e8cd25b0c3a8de5538a32605b4c6ba45317a2494167a6b3fb7c4a1fe464c0d7b",
-      "inc_sha256": "6149c927251c93ac0b7f0d4d70361be38b2372ef98813dc5e294873ad0cb1d45"
+      "source_sha256": "822b833b0dd345f722ed7edd7f4690b54a695a6a4ecce133fbae555211f29412",
+      "spv_sha256": "0f3f624d7fae0938e3cafe2857626b9ab7e3dbec0dc0e2e8172b2a814a692b6d",
+      "inc_sha256": "519314ecd7a36a4d543bd58af156b90b6c521a22fe99250481973eb5affd367d"
     },
     {
       "source": "src/gfx/spirv/pt_composite.frag",
@@ -153,9 +153,9 @@
       "target_env": "vulkan1.2",
       "spv": "src/gfx/spirv/rt_debug.rchit.spv",
       "inc": "src/gfx/spirv/rt_debug.rchit.spv.inc",
-      "source_sha256": "a453c79a8a12cffbe7263607718e80265845cc3d9ed0d0055b0dff45cb76ac80",
-      "spv_sha256": "a058aba257dc1a74397bc1ef2bcccf5f64c9bcf0a9b30e91dfcf5018f745b399",
-      "inc_sha256": "5e18ff8ddba5987df1dddcbebdfe1384b33dfdaa9d0b047d4efad0cbaca2ff52"
+      "source_sha256": "92a9580b67c0d4bbfca49639fea18df2f37968e9a48d6b8d566523e550a0afa1",
+      "spv_sha256": "75e1a26321460dfd093583759986490f14b6ee8bfc09761f521878fa728a1d8a",
+      "inc_sha256": "47bd455167b7e06b358e2f5c27287ef285766fc1afc67f628941dca38891248f"
     },
     {
       "source": "src/gfx/spirv/rt_debug.rgen",
@@ -207,9 +207,9 @@
       "target_env": "vulkan1.0",
       "spv": "src/gfx/spirv/static_mesh.frag.spv",
       "inc": "src/gfx/spirv/static_mesh.frag.spv.inc",
-      "source_sha256": "7ffc647c2ca6387754cbcb9437f6b5831de7211fe44c9f06ee919e4c36fd5895",
-      "spv_sha256": "d2c376759ddf3c8c29ddd4132816f03c942cab386e8dede74d518632528c1a78",
-      "inc_sha256": "8492860fd6e0eecc0537d69dd82d026d5990a1a6c9fd47ba6110c59302cf2355"
+      "source_sha256": "a5d34714bb2fa865bc4f4797f94c46d7d6a2281f4b39182ac2c6ccb0ef861f55",
+      "spv_sha256": "772f77ccf2995e38613854b2aaf2b6c7a07ee6febbc06796353e58c9bbcd2e6f",
+      "inc_sha256": "2cd3d4833c2baf26ca08724d91277ee8a9ed2a2d2fe07f6ca57edd591f3d6e9f"
     },
     {
       "source": "src/gfx/spirv/static_mesh.vert",
@@ -225,9 +225,9 @@
       "target_env": "vulkan1.2",
       "spv": "src/gfx/spirv/static_mesh_rt.frag.spv",
       "inc": "src/gfx/spirv/static_mesh_rt.frag.spv.inc",
-      "source_sha256": "0e72d002b6c85a171cced7874d9c59f2b484604718d589e8943342c0c58668b9",
-      "spv_sha256": "812455b517ae9f90bc455e90a56fce32d4621f6b1e6b7641d3700ccac783e782",
-      "inc_sha256": "f73ea2f053a74ef78b0c923ba0e2caecb46019713b82c96eda21967fd6b00849"
+      "source_sha256": "5b3558438417b5f627557a9a2a084322a88a8401f493485ac82012ef065397bd",
+      "spv_sha256": "94d241a9cb0c078583f87fb337ed51a774e81939417a47b4c5e2c6d8b0e9997a",
+      "inc_sha256": "924e755c362ccd96c1a38613c4b34fae0d443e678cd458b9a7c017c0a6dce227"
     },
     {
       "source": "src/gfx/spirv/static_mesh_rt.vert",

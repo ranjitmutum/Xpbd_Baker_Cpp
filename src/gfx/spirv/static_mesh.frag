@@ -18,13 +18,6 @@ layout(push_constant) uniform PC {
   uvec4 materialDebug;
 } pc;
 
-vec3 srgbToLinear(vec3 value) {
-  bvec3 cutoff = lessThanEqual(value, vec3(0.04045));
-  vec3 low = value / 12.92;
-  vec3 high = pow((value + 0.055) / 1.055, vec3(2.4));
-  return mix(high, low, cutoff);
-}
-
 vec3 decodeLabPbrNormal(vec4 packed) {
   vec2 xy = vec2(packed.r * 2.0 - 1.0, 1.0 - packed.g * 2.0);
   float xy2 = dot(xy, xy);
@@ -110,8 +103,7 @@ void main() {
   vec4 base_sample = textured ? texture(uTexture, vUV) : vec4(1.0);
   vec4 color =
       textured
-          ? vec4(srgbToLinear(base_sample.rgb) * vTint.rgb,
-                 base_sample.a * vTint.a)
+          ? vec4(base_sample.rgb * vTint.rgb, base_sample.a * vTint.a)
           : vTint;
   if (color.a < 0.02) {
     discard;

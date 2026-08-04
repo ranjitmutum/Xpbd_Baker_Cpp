@@ -16,6 +16,12 @@ enum class LabPbrMipSemantic : std::uint8_t {
   SpecularPacked = 2,
 };
 
+enum class LabPbrMipBuildStatus : std::uint8_t {
+  FullChain = 0,
+  SafelyTruncated = 1,
+  BaseOnlyFallback = 2,
+};
+
 struct LabPbrAtlasIsland {
   std::uint32_t x = 0;
   std::uint32_t y = 0;
@@ -39,7 +45,8 @@ struct LabPbrMipChain {
   std::vector<LabPbrMipLevel> levels;
   std::uint32_t safe_max_lod = 0;
   bool atlas_isolation_proven = false;
-  std::string fallback_reason;
+  LabPbrMipBuildStatus status = LabPbrMipBuildStatus::BaseOnlyFallback;
+  std::string stop_reason;
 
   [[nodiscard]] bool valid() const noexcept;
   [[nodiscard]] const LabPbrMipLevel *baseLevel() const noexcept;
@@ -54,7 +61,7 @@ struct LabPbrMipChain {
 
 // Build a deterministic semantic mip chain. The source base level is always
 // retained when source is valid. Unsafe or unprovable island input returns a
-// base-only chain with safe_max_lod == 0 and a structured fallback_reason.
+// base-only chain with safe_max_lod == 0 and a structured stop_reason.
 [[nodiscard]] LabPbrMipChain buildLabPbrMipChain(
     const TextureImage &source, std::span<const LabPbrAtlasIsland> islands,
     LabPbrMipSemantic semantic,

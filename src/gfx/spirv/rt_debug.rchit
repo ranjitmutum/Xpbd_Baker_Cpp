@@ -73,13 +73,6 @@ hitAttributeEXT vec2 hitBarycentrics;
 
 const uint kMaterialTextured = 1u << 0u;
 
-vec3 srgbToLinear(vec3 value) {
-  bvec3 cutoff = lessThanEqual(value, vec3(0.04045));
-  vec3 low = value / 12.92;
-  vec3 high = pow((value + 0.055) / 1.055, vec3(2.4));
-  return mix(high, low, cutoff);
-}
-
 bool finiteFloat(float value) {
   return !isnan(value) && !isinf(value);
 }
@@ -110,7 +103,7 @@ vec4 sampleAlbedoRayCone(vec2 uv, float uvFootprint) {
     return vec4(1.0);
   }
   packed = clamp(packed, vec4(0.0), vec4(1.0));
-  return vec4(srgbToLinear(packed.rgb), packed.a);
+  return packed;
 }
 
 vec3 sampleNormalRayCone(vec2 uv, float uvFootprint) {

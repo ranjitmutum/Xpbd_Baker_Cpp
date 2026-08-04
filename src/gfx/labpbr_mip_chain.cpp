@@ -88,6 +88,31 @@ struct Rect {
 
 using Pixel = std::array<std::uint8_t, 4>;
 
+constexpr std::array<std::uint8_t, 64> kBayer8x8{{
+    0u,  48u, 12u, 60u, 3u,  51u, 15u, 63u, 32u, 16u, 44u,
+    28u, 35u, 19u, 47u, 31u, 8u,  56u, 4u,  52u, 11u, 59u,
+    7u,  55u, 40u, 24u, 36u, 20u, 43u, 27u, 39u, 23u, 2u,
+    50u, 14u, 62u, 1u,  49u, 13u, 61u, 34u, 18u, 46u, 30u,
+    33u, 17u, 45u, 29u, 10u, 58u, 6u,  54u, 9u,  57u, 5u,
+    53u, 42u, 26u, 38u, 22u, 41u, 25u, 37u, 21u}};
+
+[[nodiscard]] std::uint32_t coverageTieRank(std::uint32_t x,
+                                            std::uint32_t y) noexcept {
+  return kBayer8x8[static_cast<std::size_t>(y & 7u) * 8u + (x & 7u)];
+}
+
+[[nodiscard]] float coverageWeight(std::uint8_t alpha,
+                                   const LabPbrAtlasIsland &island) noexcept {
+  const float value = static_cast<float>(alpha) * kInv255;
+  if (island.used_by_cutout) {
+    return value >= kAlphaCutoff ? 1.0f : 0.0f;
+  }
+  if (island.used_by_blend) {
+    return std::clamp(value, 0.0f, 1.0f);
+  }
+  return 1.0f;
+}
+
 [[nodiscard]] Pixel
 readPixel(const LabPbrMipLevel &level, std::uint32_t x,
           std::uint32_t y) noexcept {
@@ -175,11 +200,19 @@ void setPixel(LabPbrMipLevel &level, std::uint32_t x, std::uint32_t y,
   return result;
 }
 
-[[nodiscard]] Pixel filterNormal(std::span<const Pixel> samples) noexcept {
+[[nodiscard]] Pixel filterNormal(std::span<const Pixel> samples,
+                                 std::span<const float> coverages) noexcept {
   std::array<float, 3> normal{};
   float ao = 0.0f;
   float height = 0.0f;
-  for (const auto &sample : samples) {
+  float total_weight = 0.0f;
+  const std::size_t count = (std::min)(samples.size(), coverages.size());
+  for (std::size_t i = 0u; i < count; ++i) {
+    const auto &sample = samples[i];
+    const float weight = std::clamp(coverages[i], 0.0f, 1.0f);
+    if (!(weight > 0.0f)) {
+      continue;
+    }
     float x = 2.0f * static_cast<float>(sample[0]) * kInv255 - 1.0f;
     float y = 1.0f - 2.0f * static_cast<float>(sample[1]) * kInv255;
     const float xy2 = x * x + y * y;
@@ -188,16 +221,21 @@ void setPixel(LabPbrMipLevel &level, std::uint32_t x, std::uint32_t y,
       x *= inv;
       y *= inv;
     }
-    normal[0] += x;
-    normal[1] += y;
-    normal[2] += std::sqrt(std::max(0.0f, 1.0f - x * x - y * y));
-    ao += static_cast<float>(sample[2]) * kInv255;
-    height += static_cast<float>(sample[3]) * kInv255;
+    normal[0] += x * weight;
+    normal[1] += y * weight;
+    normal[2] +=
+        std::sqrt(std::max(0.0f, 1.0f - x * x - y * y)) * weight;
+    ao += static_cast<float>(sample[2]) * kInv255 * weight;
+    height += static_cast<float>(sample[3]) * kInv255 * weight;
+    total_weight += weight;
   }
-  const float inv_count = 1.0f / static_cast<float>(samples.size());
-  normal[0] *= inv_count;
-  normal[1] *= inv_count;
-  normal[2] *= inv_count;
+  if (!(total_weight > kAlphaEpsilon) || !std::isfinite(total_weight)) {
+    return {128u, 128u, 255u, 255u};
+  }
+  const float inverse_weight = 1.0f / total_weight;
+  normal[0] *= inverse_weight;
+  normal[1] *= inverse_weight;
+  normal[2] *= inverse_weight;
   const float length = std::sqrt(normal[0] * normal[0] +
                                  normal[1] * normal[1] +
                                  normal[2] * normal[2]);
@@ -210,109 +248,129 @@ void setPixel(LabPbrMipLevel &level, std::uint32_t x, std::uint32_t y,
     normal[2] *= inv_length;
   }
   return {encodeByte(0.5f * (normal[0] + 1.0f)),
-          encodeByte(0.5f * (1.0f - normal[1])), encodeByte(ao * inv_count),
-          encodeByte(height * inv_count)};
-}
-
-struct SpecSample {
-  std::uint8_t smoothness = 0;
-  std::uint8_t reflectance = 0;
-  std::uint8_t auxiliary = 0;
-  std::uint8_t emission = 255;
-  float coverage = 1.0f;
-};
-
-[[nodiscard]] std::uint8_t
-filterSpecular(std::span<const Pixel> samples,
-               std::span<const float> coverages, std::size_t channel) noexcept {
-  std::array<SpecSample, 4> decoded{};
-  const std::size_t count = (std::min)(samples.size(), decoded.size());
-  float alpha_sum = 0.0f;
-  std::array<float, 3> class_weight{}; // dielectric, predefined, custom
-  std::array<float, 8> predefined{};
-  float dielectric_f0 = 0.0f;
-  std::size_t dielectric_count = 0u;
-  float emission = 0.0f;
-  std::array<std::uint8_t, 4> auxiliaries{};
-  for (std::size_t i = 0; i < count; ++i) {
-    decoded[i].smoothness = samples[i][0];
-    decoded[i].reflectance = samples[i][1];
-    decoded[i].auxiliary = samples[i][2];
-    decoded[i].emission = samples[i][3];
-    decoded[i].coverage = i < coverages.size()
-                              ? std::clamp(coverages[i], 0.0f, 1.0f)
-                              : 1.0f;
-    const float weight = decoded[i].coverage;
-    alpha_sum += std::pow(
-        1.0f - static_cast<float>(decoded[i].smoothness) * kInv255, 2.0f);
-    emission += decoded[i].emission == 255u
-                    ? 0.0f
-                    : static_cast<float>(decoded[i].emission) / 254.0f;
-    auxiliaries[i] = decoded[i].auxiliary;
-    if (decoded[i].reflectance <= 229u) {
-      class_weight[0] += weight;
-      dielectric_f0 += static_cast<float>(decoded[i].reflectance) * kInv255;
-      ++dielectric_count;
-    } else if (decoded[i].reflectance <= 237u) {
-      class_weight[1] += weight;
-      predefined[decoded[i].reflectance - 230u] += weight;
-    } else {
-      class_weight[2] += weight;
-    }
-  }
-  if (channel == 0u) {
-    const float mean_alpha = alpha_sum / static_cast<float>(count);
-    return encodeByte(1.0f - std::sqrt(std::clamp(mean_alpha, 0.0f, 1.0f)));
-  }
-  if (channel == 2u) {
-    std::sort(auxiliaries.begin(), auxiliaries.begin() + count);
-    return auxiliaries[(count - 1u) / 2u];
-  }
-  if (channel == 3u) {
-    return encodeEmission(emission / static_cast<float>(count));
-  }
-
-  const float epsilon = 1.0e-7f;
-  const float dielectric = class_weight[0];
-  const float predefined_weight = class_weight[1];
-  const float custom = class_weight[2];
-  const float metal = predefined_weight + custom;
-  if (dielectric + epsilon >= metal) {
-    const float mean_f0 = dielectric_count > 0u
-                              ? dielectric_f0 /
-                                    static_cast<float>(dielectric_count)
-                              : 0.0f;
-    return static_cast<std::uint8_t>(std::min(
-        229, static_cast<int>(std::lround(std::clamp(mean_f0, 0.0f,
-                                                     229.0f * kInv255) *
-                                            255.0f))));
-  }
-  if (predefined_weight + epsilon >= custom) {
-    std::uint8_t selected = 230u;
-    float selected_weight = -1.0f;
-    for (std::size_t i = 0; i < 8u; ++i) {
-      const float weight = predefined[i];
-      if (weight > selected_weight + epsilon) {
-        selected_weight = weight;
-        selected = static_cast<std::uint8_t>(230u + i);
-      }
-    }
-    return selected;
-  }
-  return 255u;
+          encodeByte(0.5f * (1.0f - normal[1])),
+          encodeByte(ao * inverse_weight), encodeByte(height * inverse_weight)};
 }
 
 [[nodiscard]] Pixel filterSpec(std::span<const Pixel> samples,
-                               std::span<const float> coverages) noexcept {
-  return {filterSpecular(samples, coverages, 0u),
-          filterSpecular(samples, coverages, 1u),
-          filterSpecular(samples, coverages, 2u),
-          filterSpecular(samples, coverages, 3u)};
+                               std::span<const float> coverages,
+                               bool has_emission) noexcept {
+  const std::size_t count = (std::min)(samples.size(), coverages.size());
+  float total_weight = 0.0f;
+  float ggx_alpha_sum = 0.0f;
+  float dielectric_weight = 0.0f;
+  float predefined_weight = 0.0f;
+  float custom_weight = 0.0f;
+  float dielectric_f0_sum = 0.0f;
+  std::array<float, 8> predefined{};
+  std::array<float, 18> custom{};
+  float porosity_weight = 0.0f;
+  float sss_weight = 0.0f;
+  float porosity_sum = 0.0f;
+  float sss_sum = 0.0f;
+  float emission_sum = 0.0f;
+  for (std::size_t i = 0; i < count; ++i) {
+    const Pixel &sample = samples[i];
+    const float weight = std::clamp(coverages[i], 0.0f, 1.0f);
+    if (!(weight > 0.0f)) {
+      continue;
+    }
+    total_weight += weight;
+    const float perceptual_roughness =
+        1.0f - static_cast<float>(sample[0]) * kInv255;
+    ggx_alpha_sum += perceptual_roughness * perceptual_roughness * weight;
+
+    if (sample[1] <= 229u) {
+      dielectric_weight += weight;
+      dielectric_f0_sum += static_cast<float>(sample[1]) * kInv255 * weight;
+    } else if (sample[1] <= 237u) {
+      predefined_weight += weight;
+      predefined[sample[1] - 230u] += weight;
+    } else {
+      custom_weight += weight;
+      custom[sample[1] - 238u] += weight;
+    }
+
+    if (sample[2] <= 64u) {
+      porosity_weight += weight;
+      porosity_sum += static_cast<float>(sample[2]) / 64.0f * weight;
+    } else {
+      sss_weight += weight;
+      sss_sum += static_cast<float>(sample[2] - 65u) / 190.0f * weight;
+    }
+
+    if (has_emission && sample[3] != 255u) {
+      emission_sum += static_cast<float>(sample[3]) / 254.0f * weight;
+    }
+  }
+  if (!(total_weight > kAlphaEpsilon) || !std::isfinite(total_weight)) {
+    return {0u, 0u, 0u, 255u};
+  }
+
+  Pixel result{};
+  const float mean_ggx_alpha =
+      std::clamp(ggx_alpha_sum / total_weight, 0.0f, 1.0f);
+  result[0] = encodeByte(1.0f - std::sqrt(mean_ggx_alpha));
+
+  constexpr float epsilon = 1.0e-7f;
+  const float metal_weight = predefined_weight + custom_weight;
+  if (dielectric_weight + epsilon >= metal_weight) {
+    const float mean_f0 = dielectric_weight > epsilon
+                              ? dielectric_f0_sum / dielectric_weight
+                              : 0.0f;
+    result[1] = static_cast<std::uint8_t>(std::clamp(
+        static_cast<int>(std::lround(mean_f0 * 255.0f)), 0, 229));
+  } else {
+    const auto select_code = [&](bool include_predefined,
+                                 bool include_custom) noexcept {
+      std::uint8_t selected = include_predefined ? 230u : 238u;
+      float selected_weight = -1.0f;
+      if (include_predefined) {
+        for (std::size_t index = 0u; index < predefined.size(); ++index) {
+          if (predefined[index] > selected_weight + epsilon) {
+            selected_weight = predefined[index];
+            selected = static_cast<std::uint8_t>(230u + index);
+          }
+        }
+      }
+      if (include_custom) {
+        for (std::size_t index = 0u; index < custom.size(); ++index) {
+          if (custom[index] > selected_weight + epsilon) {
+            selected_weight = custom[index];
+            selected = static_cast<std::uint8_t>(238u + index);
+          }
+        }
+      }
+      return selected;
+    };
+    if (predefined_weight > custom_weight + epsilon) {
+      result[1] = select_code(true, false);
+    } else if (custom_weight > predefined_weight + epsilon) {
+      result[1] = select_code(false, true);
+    } else {
+      result[1] = select_code(true, true);
+    }
+  }
+
+  if (porosity_weight + epsilon >= sss_weight) {
+    const float parameter = porosity_weight > epsilon
+                                ? porosity_sum / porosity_weight
+                                : 0.0f;
+    result[2] = static_cast<std::uint8_t>(std::clamp(
+        static_cast<int>(std::lround(parameter * 64.0f)), 0, 64));
+  } else {
+    const float parameter = sss_sum / sss_weight;
+    result[2] = static_cast<std::uint8_t>(65 + std::clamp(
+        static_cast<int>(std::lround(parameter * 190.0f)), 0, 190));
+  }
+  result[3] = has_emission ? encodeEmission(emission_sum / total_weight) : 255u;
+  return result;
 }
 
-void preserveCutoutCoverage(LabPbrMipLevel &level, const Rect &previous_rect,
-                            const Rect &destination_rect,
-                            const LabPbrMipLevel &previous) noexcept {
+[[nodiscard]] bool
+preserveCutoutCoverage(LabPbrMipLevel &level, const Rect &previous_rect,
+                       const Rect &destination_rect,
+                       const LabPbrMipLevel &previous) noexcept {
   std::size_t source_covered = 0u;
   std::size_t source_count = 0u;
   for (std::uint32_t y = previous_rect.y;
@@ -327,16 +385,20 @@ void preserveCutoutCoverage(LabPbrMipLevel &level, const Rect &previous_rect,
     }
   }
   if (source_count == 0u) {
-    return;
+    return true;
   }
-  const float target = static_cast<float>(source_covered) /
-                       static_cast<float>(source_count);
+  const double exact_coverage = static_cast<double>(source_covered) /
+                                static_cast<double>(source_count);
+  const float target = static_cast<float>(exact_coverage);
   const std::size_t destination_count =
       static_cast<std::size_t>(destination_rect.width) *
       destination_rect.height;
   if (destination_count == 0u) {
-    return;
+    return true;
   }
+  const std::size_t target_covered = static_cast<std::size_t>(std::clamp(
+      std::llround(exact_coverage * static_cast<double>(destination_count)),
+      0ll, static_cast<long long>(destination_count)));
   auto covered = [&](float scale) {
     std::size_t count = 0u;
     for (std::uint32_t y = destination_rect.y;
@@ -362,6 +424,7 @@ void preserveCutoutCoverage(LabPbrMipLevel &level, const Rect &previous_rect,
     }
   }
   const float scale = target <= 0.0f ? 0.0f : high;
+  std::size_t actual_covered = 0u;
   for (std::uint32_t y = destination_rect.y;
        y < destination_rect.y + destination_rect.height; ++y) {
     for (std::uint32_t x = destination_rect.x;
@@ -375,8 +438,58 @@ void preserveCutoutCoverage(LabPbrMipLevel &level, const Rect &previous_rect,
             std::ceil(kAlphaCutoff * 255.0f));
       }
       level.rgba[offset] = encoded;
+      actual_covered += encoded * kInv255 >= kAlphaCutoff ? 1u : 0u;
     }
   }
+  if (actual_covered == target_covered) {
+    return true;
+  }
+
+  struct CoverageCandidate {
+    std::uint32_t x = 0u;
+    std::uint32_t y = 0u;
+    std::uint8_t adjusted_alpha = 0u;
+    std::uint32_t tie_rank = 0u;
+    std::uint64_t atlas_rank = 0u;
+  };
+  std::vector<CoverageCandidate> candidates;
+  try {
+    candidates.reserve(destination_count);
+    for (std::uint32_t y = destination_rect.y;
+         y < destination_rect.y + destination_rect.height; ++y) {
+      for (std::uint32_t x = destination_rect.x;
+           x < destination_rect.x + destination_rect.width; ++x) {
+        candidates.push_back(
+            {x, y, level.rgba[pixelOffset(level, x, y) + 3u],
+             coverageTieRank(x, y),
+             static_cast<std::uint64_t>(y) * level.width + x});
+      }
+    }
+  } catch (...) {
+    return false;
+  }
+  std::sort(candidates.begin(), candidates.end(),
+            [](const CoverageCandidate &lhs, const CoverageCandidate &rhs) {
+              if (lhs.adjusted_alpha != rhs.adjusted_alpha) {
+                return lhs.adjusted_alpha > rhs.adjusted_alpha;
+              }
+              if (lhs.tie_rank != rhs.tie_rank) {
+                return lhs.tie_rank < rhs.tie_rank;
+              }
+              return lhs.atlas_rank < rhs.atlas_rank;
+            });
+  const std::uint8_t cutoff_byte =
+      static_cast<std::uint8_t>(std::ceil(kAlphaCutoff * 255.0f));
+  for (std::size_t index = 0u; index < candidates.size(); ++index) {
+    const CoverageCandidate &candidate = candidates[index];
+    const std::size_t offset = pixelOffset(level, candidate.x, candidate.y) + 3u;
+    level.rgba[offset] =
+        index < target_covered
+            ? (std::max)(candidate.adjusted_alpha, cutoff_byte)
+            : (std::min)(candidate.adjusted_alpha,
+                         static_cast<std::uint8_t>(cutoff_byte - 1u));
+  }
+  return true;
 }
 
 [[nodiscard]] bool normalizedIsland(const LabPbrAtlasIsland &island,
@@ -578,18 +691,35 @@ LabPbrMipChain buildLabPbrMipChain(
     LabPbrMipSemantic semantic, const LabPbrMipChain *base_color_coverage) {
   LabPbrMipChain chain;
   chain.semantic = semantic;
+  const auto base_only = [&](std::string_view reason) {
+    if (chain.levels.size() > 1u) {
+      chain.levels.resize(1u);
+    }
+    chain.safe_max_lod = 0u;
+    chain.status = LabPbrMipBuildStatus::BaseOnlyFallback;
+    chain.stop_reason = reason;
+  };
+  const auto safe_stop = [&](std::string_view reason) {
+    chain.safe_max_lod = chain.levels.empty()
+                             ? 0u
+                             : static_cast<std::uint32_t>(chain.levels.size() - 1u);
+    chain.status = chain.levels.size() > 1u
+                       ? LabPbrMipBuildStatus::SafelyTruncated
+                       : LabPbrMipBuildStatus::BaseOnlyFallback;
+    chain.stop_reason = reason;
+  };
   if (!source.valid()) {
-    chain.fallback_reason = "invalid source texture";
+    base_only("invalid source texture");
     return chain;
   }
   std::size_t base_bytes = 0u;
   if (!checkedRgbaBytes(static_cast<std::uint32_t>(source.width),
                          static_cast<std::uint32_t>(source.height), base_bytes)) {
-    chain.fallback_reason = "source byte size overflow";
+    base_only("source byte size overflow");
     return chain;
   }
   if (source.rgba.size() != base_bytes) {
-    chain.fallback_reason = "source byte size mismatch";
+    base_only("source byte size mismatch");
     return chain;
   }
   try {
@@ -597,66 +727,84 @@ LabPbrMipChain buildLabPbrMipChain(
                             static_cast<std::uint32_t>(source.height),
                             source.rgba});
   } catch (...) {
-    chain.fallback_reason = "base level allocation failed";
+    base_only("base level allocation failed");
     chain.levels.clear();
     return chain;
   }
 
-  std::vector<LabPbrAtlasIsland> unique;
-  unique.reserve(islands.size());
-  std::vector<Rect> previous_rects;
-  previous_rects.reserve(islands.size());
-  for (const LabPbrAtlasIsland &island : islands) {
-    Rect rect{};
-    if (!normalizedIsland(island, static_cast<std::uint32_t>(source.width),
-                          static_cast<std::uint32_t>(source.height), rect)) {
-      chain.fallback_reason = "atlas island is out of bounds";
-      return chain;
-    }
-    auto duplicate = std::find_if(
-        unique.begin(), unique.end(), [&](const LabPbrAtlasIsland &candidate) {
-          return candidate.x == island.x && candidate.y == island.y &&
-                 candidate.width == island.width && candidate.height == island.height;
-        });
-    if (duplicate != unique.end()) {
-      duplicate->used_by_cutout = duplicate->used_by_cutout || island.used_by_cutout;
-      duplicate->used_by_blend = duplicate->used_by_blend || island.used_by_blend;
-    } else {
-      unique.push_back(island);
-      previous_rects.push_back(rect);
+  const bool specular_has_emission = source.source_channels >= 4;
+  if (semantic == LabPbrMipSemantic::SpecularPacked &&
+      !specular_has_emission) {
+    for (std::size_t offset = 3u; offset < chain.levels.front().rgba.size();
+         offset += 4u) {
+      chain.levels.front().rgba[offset] = 255u;
     }
   }
+
+  std::vector<LabPbrAtlasIsland> unique;
+  std::vector<Rect> previous_rects;
+  try {
+    unique.reserve(islands.size());
+    previous_rects.reserve(islands.size());
+    for (const LabPbrAtlasIsland &island : islands) {
+      Rect rect{};
+      if (!normalizedIsland(island, static_cast<std::uint32_t>(source.width),
+                            static_cast<std::uint32_t>(source.height), rect)) {
+        base_only("atlas island is out of bounds");
+        return chain;
+      }
+      auto duplicate = std::find_if(
+          unique.begin(), unique.end(), [&](const LabPbrAtlasIsland &candidate) {
+            return candidate.x == island.x && candidate.y == island.y &&
+                   candidate.width == island.width &&
+                   candidate.height == island.height;
+          });
+      if (duplicate != unique.end()) {
+        duplicate->used_by_cutout =
+            duplicate->used_by_cutout || island.used_by_cutout;
+        duplicate->used_by_blend =
+            duplicate->used_by_blend || island.used_by_blend;
+      } else {
+        unique.push_back(island);
+        previous_rects.push_back(rect);
+      }
+    }
+  } catch (...) {
+    base_only("atlas island allocation failed");
+    return chain;
+  }
   if (unique.empty()) {
-    chain.fallback_reason = "no provable atlas islands";
+    base_only("no provable atlas islands");
     return chain;
   }
   for (std::size_t i = 0u; i < previous_rects.size(); ++i) {
     for (std::size_t j = i + 1u; j < previous_rects.size(); ++j) {
       if (rectOverlap(previous_rects[i], previous_rects[j])) {
-        chain.fallback_reason = "distinct atlas islands overlap";
+        base_only("distinct atlas islands overlap");
         return chain;
       }
     }
   }
-  if (base_color_coverage != nullptr &&
-      (semantic != LabPbrMipSemantic::SpecularPacked ||
-       !base_color_coverage->valid() ||
-       base_color_coverage->semantic !=
-           LabPbrMipSemantic::BaseColorCoverage ||
-       base_color_coverage->levels.front().width !=
-           static_cast<std::uint32_t>(source.width) ||
-       base_color_coverage->levels.front().height !=
-           static_cast<std::uint32_t>(source.height))) {
-    chain.fallback_reason = "coverage chain is unavailable";
+  const bool needs_coverage =
+      semantic != LabPbrMipSemantic::BaseColorCoverage;
+  const bool coverage_is_compatible =
+      base_color_coverage != nullptr && base_color_coverage->valid() &&
+      base_color_coverage->semantic == LabPbrMipSemantic::BaseColorCoverage &&
+      base_color_coverage->levels.front().width ==
+          static_cast<std::uint32_t>(source.width) &&
+      base_color_coverage->levels.front().height ==
+          static_cast<std::uint32_t>(source.height);
+  if ((needs_coverage && !coverage_is_compatible) ||
+      (!needs_coverage && base_color_coverage != nullptr)) {
+    base_only("coverage chain is unavailable or incompatible");
     return chain;
   }
   chain.atlas_isolation_proven = true;
-  if (semantic == LabPbrMipSemantic::BaseColorCoverage &&
-      std::any_of(unique.begin(), unique.end(), [](const auto &island) {
+  if (std::any_of(unique.begin(), unique.end(), [](const auto &island) {
         return island.used_by_cutout && island.used_by_blend;
       })) {
-    chain.fallback_reason =
-        "atlas island is shared by conflicting Cutout and Blend primitives";
+    base_only(
+        "atlas island is shared by conflicting Cutout and Blend primitives");
     return chain;
   }
 
@@ -665,20 +813,27 @@ LabPbrMipChain buildLabPbrMipChain(
   while (previous_width > 1u || previous_height > 1u) {
     if (base_color_coverage != nullptr &&
         chain.levels.size() >= base_color_coverage->levels.size()) {
-      chain.fallback_reason = "coverage chain ends before semantic chain";
+      safe_stop(base_color_coverage->stop_reason.empty()
+                    ? "coverage chain ends before semantic chain"
+                    : base_color_coverage->stop_reason);
       break;
     }
     std::vector<Rect> destination_rects;
-    destination_rects.reserve(previous_rects.size());
-    for (const Rect &rect : previous_rects) {
-      if (rect.width == 0u || rect.height == 0u) {
-        destination_rects.clear();
-        break;
+    try {
+      destination_rects.reserve(previous_rects.size());
+      for (const Rect &rect : previous_rects) {
+        if (rect.width == 0u || rect.height == 0u) {
+          destination_rects.clear();
+          break;
+        }
+        destination_rects.push_back(nextRect(rect));
       }
-      destination_rects.push_back(nextRect(rect));
+    } catch (...) {
+      base_only("mip rectangle allocation failed");
+      break;
     }
     if (destination_rects.size() != previous_rects.size()) {
-      chain.fallback_reason = "island dimension collapsed";
+      safe_stop("island dimension collapsed");
       break;
     }
     const std::uint32_t destination_width = std::max(previous_width / 2u, 1u);
@@ -701,19 +856,19 @@ LabPbrMipChain buildLabPbrMipChain(
       }
     }
     if (collision) {
-      chain.fallback_reason = "independent atlas islands collide at next mip";
+      safe_stop("independent atlas islands collide at next mip");
       break;
     }
     std::size_t bytes = 0u;
     if (!checkedRgbaBytes(destination_width, destination_height, bytes)) {
-      chain.fallback_reason = "mip byte size overflow";
+      base_only("mip byte size overflow");
       break;
     }
     LabPbrMipLevel next{destination_width, destination_height};
     try {
       next.rgba.assign(bytes, 0u);
     } catch (...) {
-      chain.fallback_reason = "mip level allocation failed";
+      base_only("mip level allocation failed");
       break;
     }
     std::vector<std::int32_t> owners;
@@ -722,7 +877,7 @@ LabPbrMipChain buildLabPbrMipChain(
                         destination_height,
                     -1);
     } catch (...) {
-      chain.fallback_reason = "mip owner allocation failed";
+      base_only("mip owner allocation failed");
       break;
     }
     const LabPbrMipLevel &previous = chain.levels.back();
@@ -731,10 +886,11 @@ LabPbrMipChain buildLabPbrMipChain(
       coverage_level = &base_color_coverage->levels[chain.levels.size() - 1u];
       if (coverage_level->width != previous.width ||
           coverage_level->height != previous.height) {
-        chain.fallback_reason = "coverage chain dimensions diverge";
+        base_only("coverage chain dimensions diverge");
         break;
       }
     }
+    bool filtering_failed = false;
     for (std::size_t island_index = 0u; island_index < unique.size();
          ++island_index) {
       const Rect &destination = destination_rects[island_index];
@@ -758,23 +914,21 @@ LabPbrMipChain buildLabPbrMipChain(
           Pixel filtered{};
           if (semantic == LabPbrMipSemantic::BaseColorCoverage) {
             filtered = filterBase(samples);
-          } else if (semantic == LabPbrMipSemantic::IrisNormalAoHeight) {
-            filtered = filterNormal(samples);
           } else {
             std::array<float, 4> coverage_values{};
-            std::span<const float> coverages;
-            if (coverage_level != nullptr) {
-              for (std::size_t i = 0u; i < footprint.count; ++i) {
-                const auto [cx, cy] = footprint.coordinates[i];
-                coverage_values[i] =
-                    coverage_level->rgba[
-                        pixelOffset(*coverage_level, cx, cy) + 3u] *
-                    kInv255;
-              }
-              coverages = std::span<const float>(coverage_values.data(),
-                                                  footprint.count);
+            for (std::size_t i = 0u; i < footprint.count; ++i) {
+              const auto [cx, cy] = footprint.coordinates[i];
+              const std::uint8_t alpha = coverage_level->rgba[
+                  pixelOffset(*coverage_level, cx, cy) + 3u];
+              coverage_values[i] = coverageWeight(alpha, unique[island_index]);
             }
-            filtered = filterSpec(samples, coverages);
+            const std::span<const float> coverages(coverage_values.data(),
+                                                   footprint.count);
+            if (semantic == LabPbrMipSemantic::IrisNormalAoHeight) {
+              filtered = filterNormal(samples, coverages);
+            } else {
+              filtered = filterSpec(samples, coverages, specular_has_emission);
+            }
           }
           setPixel(next, x, y, filtered);
         }
@@ -788,20 +942,33 @@ LabPbrMipChain buildLabPbrMipChain(
       if (semantic == LabPbrMipSemantic::BaseColorCoverage &&
           unique[island_index].used_by_cutout &&
           !unique[island_index].used_by_blend) {
-        preserveCutoutCoverage(next, previous_rect, destination, previous);
+        if (!preserveCutoutCoverage(next, previous_rect, destination, previous)) {
+          base_only("cutout coverage correction allocation failed");
+          filtering_failed = true;
+          break;
+        }
       }
     }
+    if (filtering_failed) {
+      break;
+    }
     if (collision) {
-      chain.fallback_reason = "island core ownership collision";
+      safe_stop("island core ownership collision");
       break;
     }
     // Add a one-texel nearest-edge gutter only when exactly one island owns the
     // candidate cell and it is not another island's core.
-    std::vector<std::int32_t> gutter_owners(
-        static_cast<std::size_t>(destination_width) * destination_height, -1);
-    std::vector<std::array<std::uint32_t, 2>> gutter_sources(
-        static_cast<std::size_t>(destination_width) * destination_height,
-        {0u, 0u});
+    std::vector<std::int32_t> gutter_owners;
+    std::vector<std::array<std::uint32_t, 2>> gutter_sources;
+    try {
+      const std::size_t pixel_count =
+          static_cast<std::size_t>(destination_width) * destination_height;
+      gutter_owners.assign(pixel_count, -1);
+      gutter_sources.assign(pixel_count, {0u, 0u});
+    } catch (...) {
+      base_only("mip gutter allocation failed");
+      break;
+    }
     bool gutter_collision = false;
     for (std::size_t island_index = 0u; island_index < unique.size();
          ++island_index) {
@@ -839,8 +1006,7 @@ LabPbrMipChain buildLabPbrMipChain(
       }
     }
     if (gutter_collision) {
-      chain.fallback_reason =
-          "independent atlas island gutters collide at next mip";
+      safe_stop("independent atlas island gutters collide at next mip");
       break;
     }
     for (std::size_t i = 0u; i < gutter_owners.size(); ++i) {
@@ -852,10 +1018,19 @@ LabPbrMipChain buildLabPbrMipChain(
       setPixel(next, x, y,
                readPixel(next, gutter_sources[i][0], gutter_sources[i][1]));
     }
-    chain.levels.push_back(std::move(next));
+    try {
+      chain.levels.push_back(std::move(next));
+    } catch (...) {
+      base_only("mip chain allocation failed");
+      break;
+    }
     previous_rects = std::move(destination_rects);
     previous_width = destination_width;
     previous_height = destination_height;
+  }
+  if (previous_width == 1u && previous_height == 1u) {
+    chain.status = LabPbrMipBuildStatus::FullChain;
+    chain.stop_reason.clear();
   }
   chain.safe_max_lod = chain.levels.empty()
                           ? 0u
