@@ -3383,6 +3383,22 @@ bool VulkanBackend::createFramebuffers() {
     return true;
   }
 
+bool VulkanBackend::createStaticMaterialSampler(
+    VkSamplerMipmapMode mipmap_mode, float max_lod, VkSampler &out) {
+    out = VK_NULL_HANDLE;
+    VkSamplerCreateInfo sampler_info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sampler_info.magFilter = VK_FILTER_NEAREST;
+    sampler_info.minFilter = VK_FILTER_NEAREST;
+    sampler_info.mipmapMode = mipmap_mode;
+    sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler_info.minLod = 0.0f;
+    sampler_info.maxLod =
+        std::isfinite(max_lod) ? std::max(max_lod, 0.0f) : 0.0f;
+    return vkCreateSampler(device_, &sampler_info, nullptr, &out) == VK_SUCCESS;
+  }
+
 bool VulkanBackend::createDescriptors() {
     VkDescriptorSetLayoutBinding b{};
     b.binding = 0;
@@ -3452,29 +3468,20 @@ bool VulkanBackend::createDescriptors() {
       frames_[i].static_descriptor_set = static_sets[i];
     }
 
-    VkSamplerCreateInfo static_sampler_info{
-        VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    static_sampler_info.magFilter = VK_FILTER_NEAREST;
-    static_sampler_info.minFilter = VK_FILTER_NEAREST;
-    // Preserve nearest texel lookup inside each atlas mip while blending
-    // continuously between adjacent ray-cone LODs.
-    static_sampler_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-    static_sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    static_sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    static_sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    static_sampler_info.minLod = 0.0f;
-    static_sampler_info.maxLod = VK_LOD_CLAMP_NONE;
-    if (vkCreateSampler(device_, &static_sampler_info, nullptr,
-                        &static_albedo_sampler_) != VK_SUCCESS) {
+    // Descriptor creation precedes model upload, so begin with conservative
+    // LOD0 samplers. A successful semantic-chain transaction replaces all
+    // three with independently clamped candidates.
+    if (!createStaticMaterialSampler(VK_SAMPLER_MIPMAP_MODE_LINEAR, 0.0f,
+                                     static_albedo_sampler_)) {
       return false;
     }
-    if (vkCreateSampler(device_, &static_sampler_info, nullptr,
-                        &static_normal_sampler_) != VK_SUCCESS) {
+    if (!createStaticMaterialSampler(VK_SAMPLER_MIPMAP_MODE_LINEAR, 0.0f,
+                                     static_normal_sampler_)) {
       destroyStaticMaterialSamplers();
       return false;
     }
-    if (vkCreateSampler(device_, &static_sampler_info, nullptr,
-                        &static_specular_sampler_) != VK_SUCCESS) {
+    if (!createStaticMaterialSampler(VK_SAMPLER_MIPMAP_MODE_NEAREST, 0.0f,
+                                     static_specular_sampler_)) {
       destroyStaticMaterialSamplers();
       return false;
     }

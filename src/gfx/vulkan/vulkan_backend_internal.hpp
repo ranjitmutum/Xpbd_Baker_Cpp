@@ -149,6 +149,8 @@ private:
   bool createStaticTexture(std::uint32_t width, std::uint32_t height,
                            VkFormat format, ImageResource &out,
                            std::uint32_t mip_levels = 1u);
+  bool createStaticMaterialSampler(VkSamplerMipmapMode mipmap_mode,
+                                   float max_lod, VkSampler &out);
   void destroyStaticMaterialSamplers();
   void updateStaticTextureDescriptors();
   void updateStaticBoneDescriptor(FrameSync &frame);
@@ -249,6 +251,7 @@ private:
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     std::uint32_t depth = 1;
+    std::uint32_t mip_levels = 1;
   };
   struct DynamicSkyCpuInput {
     const std::uint16_t *readback = nullptr;

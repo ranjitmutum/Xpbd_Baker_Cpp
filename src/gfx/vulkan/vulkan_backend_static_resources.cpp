@@ -1,4 +1,5 @@
 #include "vulkan/vulkan_backend_internal.hpp"
+#include "xpbd/gfx/labpbr_mip_chain.hpp"
 #include "xpbd/gfx/rt_scene_records.hpp"
 #include "xpbd/log.hpp"
 
@@ -9,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <optional>
 #include <utility>
@@ -77,10 +79,8 @@ void VulkanBackend::destroyStaticModelResources() {
     image_info.arrayLayers = 1;
     image_info.samples = VK_SAMPLE_COUNT_1_BIT;
     image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    image_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                       VK_IMAGE_USAGE_SAMPLED_BIT |
-                       (mip_levels > 1u ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-                                        : 0u);
+    image_info.usage =
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (vkCreateImage(device_, &image_info, nullptr, &out.image) !=
         VK_SUCCESS) {
@@ -119,6 +119,7 @@ void VulkanBackend::destroyStaticModelResources() {
     }
     out.width = width;
     out.height = height;
+    out.mip_levels = mip_levels;
     return true;
   }
 
@@ -262,72 +263,219 @@ void VulkanBackend::destroyStaticMaterialSamplers() {
         128, 128, 255, 255};
     constexpr std::array<std::uint8_t, 4> kFallbackSpecularPixel = {
         0, 10, 0, 255};
+    const auto fallback_image = [](const std::array<std::uint8_t, 4> &pixel) {
+      TextureImage image;
+      image.width = 1;
+      image.height = 1;
+      image.source_channels = 4;
+      image.rgba.assign(pixel.begin(), pixel.end());
+      return image;
+    };
     const bool has_texture = texture != nullptr && texture->valid();
-    const std::uint8_t *texture_pixels =
-        has_texture ? texture->rgba.data() : kWhitePixel.data();
-    const std::uint32_t texture_width =
-        has_texture ? static_cast<std::uint32_t>(texture->width) : 1u;
-    const std::uint32_t texture_height =
-        has_texture ? static_cast<std::uint32_t>(texture->height) : 1u;
-    const VkDeviceSize texture_bytes =
-        static_cast<VkDeviceSize>(texture_width) * texture_height * 4u;
     const bool has_normal =
         material != nullptr && material->normal_map_active &&
         material->normal_image.valid();
     const bool has_specular =
         material != nullptr && material->specular_map_active &&
         material->specular_image.valid();
+    const TextureImage fallback_base = fallback_image(kWhitePixel);
+    const TextureImage fallback_normal = fallback_image(kFlatNormalPixel);
+    const TextureImage fallback_specular = fallback_image(kFallbackSpecularPixel);
+    const TextureImage &base_source = has_texture ? *texture : fallback_base;
+    const TextureImage &normal_source =
+        has_normal ? material->normal_image : fallback_normal;
+    const TextureImage &specular_source =
+        has_specular ? material->specular_image : fallback_specular;
+
+    std::vector<LabPbrAtlasIsland> atlas_islands;
+    std::vector<LabPbrAtlasIsland> no_islands;
+    std::string island_error;
+    const bool islands_proven =
+        has_texture &&
+        buildLabPbrAtlasIslands(mesh, base_source, atlas_islands, &island_error);
+    const auto &base_islands = islands_proven ? atlas_islands : no_islands;
+    const bool normal_matches_base =
+        has_normal && normal_source.width == base_source.width &&
+        normal_source.height == base_source.height;
+    const bool specular_matches_base =
+        has_specular && specular_source.width == base_source.width &&
+        specular_source.height == base_source.height;
+    const auto &normal_islands =
+        islands_proven && normal_matches_base ? atlas_islands : no_islands;
+    const auto &specular_islands =
+        islands_proven && specular_matches_base ? atlas_islands : no_islands;
+
+    LabPbrMipChain albedo_chain;
+    LabPbrMipChain normal_chain;
+    LabPbrMipChain specular_chain;
+    try {
+      albedo_chain = buildLabPbrMipChain(
+          base_source, base_islands,
+          LabPbrMipSemantic::BaseColorCoverage);
+      normal_chain = buildLabPbrMipChain(
+          normal_source, normal_islands,
+          LabPbrMipSemantic::IrisNormalAoHeight);
+      specular_chain = buildLabPbrMipChain(
+          specular_source, specular_islands,
+          LabPbrMipSemantic::SpecularPacked,
+          specular_matches_base ? &albedo_chain : nullptr);
+    } catch (const std::exception &exception) {
+      xpbd::log::warnf("LabPBR mip disabled: builder exception: %s",
+                       exception.what());
+      return false;
+    } catch (...) {
+      xpbd::log::warn("LabPBR mip disabled: unknown builder exception");
+      return false;
+    }
+    if (!has_texture) {
+      albedo_chain.fallback_reason.clear();
+    } else if (!islands_proven && !island_error.empty()) {
+      albedo_chain.fallback_reason = island_error;
+    }
+    if (!has_normal) {
+      normal_chain.fallback_reason.clear();
+    } else if (!normal_matches_base) {
+      normal_chain.fallback_reason =
+          "normal sidecar dimensions do not match the base atlas";
+    } else if (!islands_proven && !island_error.empty()) {
+      normal_chain.fallback_reason = island_error;
+    }
+    if (!has_specular) {
+      specular_chain.fallback_reason.clear();
+    } else if (!specular_matches_base) {
+      specular_chain.fallback_reason =
+          "specular sidecar dimensions do not match the base atlas";
+    } else if (!islands_proven && !island_error.empty()) {
+      specular_chain.fallback_reason = island_error;
+    }
+    if (!albedo_chain.valid() || !normal_chain.valid() ||
+        !specular_chain.valid() ||
+        albedo_chain.levels.size() >
+            (std::numeric_limits<std::uint32_t>::max)() ||
+        normal_chain.levels.size() >
+            (std::numeric_limits<std::uint32_t>::max)() ||
+        specular_chain.levels.size() >
+            (std::numeric_limits<std::uint32_t>::max)()) {
+      writeLog("Vulkan static semantic mip chain is invalid");
+      return false;
+    }
+
+    const auto warn_disabled = [](const char *label, bool active,
+                                  const LabPbrMipChain &chain) {
+      if (active && chain.levels.size() == 1u &&
+          !chain.fallback_reason.empty()) {
+        xpbd::log::warnf("LabPBR mip disabled: %s: %s", label,
+                         chain.fallback_reason.c_str());
+      }
+    };
+    warn_disabled("albedo", has_texture, albedo_chain);
+    warn_disabled("normal", has_normal, normal_chain);
+    warn_disabled("specular", has_specular, specular_chain);
+    std::string fallback_summary;
+    const auto append_fallback = [&](const char *label, bool active,
+                                     const LabPbrMipChain &chain) {
+      if (!active || chain.levels.size() != 1u ||
+          chain.fallback_reason.empty()) {
+        return;
+      }
+      if (!fallback_summary.empty()) {
+        fallback_summary += "; ";
+      }
+      fallback_summary += label;
+      fallback_summary += '=';
+      fallback_summary += chain.fallback_reason;
+    };
+    append_fallback("albedo", has_texture, albedo_chain);
+    append_fallback("normal", has_normal, normal_chain);
+    append_fallback("specular", has_specular, specular_chain);
+    if (fallback_summary.empty()) {
+      fallback_summary = "<none>";
+    }
+    xpbd::log::infof(
+        "LabPBR semantic mip: albedo islands=%zu safeLevels=%zu normal "
+        "islands=%zu safeLevels=%zu specular islands=%zu safeLevels=%zu "
+        "fallback=%s",
+        base_islands.size(), albedo_chain.levels.size(), normal_islands.size(),
+        normal_chain.levels.size(), specular_islands.size(),
+        specular_chain.levels.size(), fallback_summary.c_str());
     xpbd::log::infof(
         "VKDIAG LabPBR GPU material normal=%d specular=%d flags=%u "
         "base=%ux%u normal=%ux%u specular=%ux%u",
         has_normal ? 1 : 0, has_specular ? 1 : 0,
-        labPbrFeatureFlags(material), texture_width, texture_height,
-        has_normal ? static_cast<std::uint32_t>(material->normal_image.width)
-                   : 1u,
-        has_normal ? static_cast<std::uint32_t>(material->normal_image.height)
-                   : 1u,
-        has_specular
-            ? static_cast<std::uint32_t>(material->specular_image.width)
-            : 1u,
-        has_specular
-            ? static_cast<std::uint32_t>(material->specular_image.height)
-            : 1u);
-    const std::uint8_t *normal_pixels =
-        has_normal ? material->normal_image.rgba.data()
-                   : kFlatNormalPixel.data();
-    const std::uint8_t *specular_pixels =
-        has_specular ? material->specular_image.rgba.data()
-                     : kFallbackSpecularPixel.data();
-    // Sidecars are required to match the base atlas during LabPBR resolve,
-    // but use their own dimensions here so a malformed/legacy resource can
-    // never make the staging copy read past the sidecar allocation.
-    const std::uint32_t normal_width =
-        has_normal ? static_cast<std::uint32_t>(material->normal_image.width)
-                   : 1u;
-    const std::uint32_t normal_height =
-        has_normal ? static_cast<std::uint32_t>(material->normal_image.height)
-                   : 1u;
-    const std::uint32_t specular_width =
-        has_specular
-            ? static_cast<std::uint32_t>(material->specular_image.width)
-            : 1u;
-    const std::uint32_t specular_height =
-        has_specular
-            ? static_cast<std::uint32_t>(material->specular_image.height)
-            : 1u;
-    const VkDeviceSize normal_bytes =
-        static_cast<VkDeviceSize>(normal_width) * normal_height * 4u;
-    const VkDeviceSize specular_bytes =
-        static_cast<VkDeviceSize>(specular_width) * specular_height * 4u;
-    if (vertex_bytes >
-            (std::numeric_limits<VkDeviceSize>::max)() - index_bytes ||
-        vertex_bytes + index_bytes >
-            (std::numeric_limits<VkDeviceSize>::max)() - texture_bytes ||
-        vertex_bytes + index_bytes + texture_bytes >
-            (std::numeric_limits<VkDeviceSize>::max)() - normal_bytes ||
-        vertex_bytes + index_bytes + texture_bytes + normal_bytes >
-            (std::numeric_limits<VkDeviceSize>::max)() - specular_bytes) {
+        labPbrFeatureFlags(material), albedo_chain.levels.front().width,
+        albedo_chain.levels.front().height, normal_chain.levels.front().width,
+        normal_chain.levels.front().height,
+        specular_chain.levels.front().width,
+        specular_chain.levels.front().height);
+
+    const std::uint32_t texture_width = albedo_chain.levels.front().width;
+    const std::uint32_t texture_height = albedo_chain.levels.front().height;
+    const std::uint32_t normal_width = normal_chain.levels.front().width;
+    const std::uint32_t normal_height = normal_chain.levels.front().height;
+    const std::uint32_t specular_width = specular_chain.levels.front().width;
+    const std::uint32_t specular_height = specular_chain.levels.front().height;
+    const std::uint32_t texture_mip_levels =
+        static_cast<std::uint32_t>(albedo_chain.levels.size());
+    const std::uint32_t normal_mip_levels =
+        static_cast<std::uint32_t>(normal_chain.levels.size());
+    const std::uint32_t specular_mip_levels =
+        static_cast<std::uint32_t>(specular_chain.levels.size());
+
+    VkDeviceSize staging_bytes = 0u;
+    const auto append_size = [&](VkDeviceSize bytes) {
+      if (bytes > (std::numeric_limits<VkDeviceSize>::max)() - staging_bytes) {
+        return false;
+      }
+      staging_bytes += bytes;
+      return true;
+    };
+    if (!append_size(vertex_bytes) || !append_size(index_bytes)) {
       writeLog("Vulkan static resource size overflow");
+      return false;
+    }
+    std::vector<VkBufferImageCopy> texture_copies;
+    std::vector<VkBufferImageCopy> normal_copies;
+    std::vector<VkBufferImageCopy> specular_copies;
+    const auto append_chain_layout =
+        [&](const LabPbrMipChain &chain,
+            std::vector<VkBufferImageCopy> &copies) {
+          copies.reserve(chain.levels.size());
+          for (std::size_t level_index = 0u;
+               level_index < chain.levels.size(); ++level_index) {
+            const auto &level = chain.levels[level_index];
+            const std::size_t byte_count = level.rgba.size();
+            if (byte_count >
+                    static_cast<std::size_t>(
+                        (std::numeric_limits<VkDeviceSize>::max)()) ||
+                !append_size(static_cast<VkDeviceSize>(byte_count))) {
+              return false;
+            }
+            VkBufferImageCopy copy{};
+            copy.bufferOffset = staging_bytes - byte_count;
+            copy.imageSubresource = {
+                VK_IMAGE_ASPECT_COLOR_BIT,
+                static_cast<std::uint32_t>(level_index), 0u, 1u};
+            copy.imageExtent = {level.width, level.height, 1u};
+            copies.push_back(copy);
+          }
+          return true;
+        };
+    bool copy_layouts_valid = false;
+    try {
+      copy_layouts_valid =
+          append_chain_layout(albedo_chain, texture_copies) &&
+          append_chain_layout(normal_chain, normal_copies) &&
+          append_chain_layout(specular_chain, specular_copies);
+    } catch (const std::exception &exception) {
+      xpbd::log::warnf("LabPBR mip disabled: copy layout exception: %s",
+                       exception.what());
+      return false;
+    } catch (...) {
+      xpbd::log::warn("LabPBR mip disabled: unknown copy layout exception");
+      return false;
+    }
+    if (!copy_layouts_valid) {
+      writeLog("Vulkan static semantic mip staging size overflow");
       return false;
     }
 
@@ -337,6 +485,9 @@ void VulkanBackend::destroyStaticMaterialSamplers() {
     ImageResource new_texture{};
     ImageResource new_normal_texture{};
     ImageResource new_specular_texture{};
+    VkSampler new_albedo_sampler = VK_NULL_HANDLE;
+    VkSampler new_normal_sampler = VK_NULL_HANDLE;
+    VkSampler new_specular_sampler = VK_NULL_HANDLE;
     VkCommandBuffer command = VK_NULL_HANDLE;
     VkFence upload_fence = VK_NULL_HANDLE;
     auto cleanup = [&] {
@@ -354,26 +505,20 @@ void VulkanBackend::destroyStaticMaterialSamplers() {
       destroyImage(new_texture);
       destroyImage(new_normal_texture);
       destroyImage(new_specular_texture);
+      if (new_specular_sampler != VK_NULL_HANDLE) {
+        vkDestroySampler(device_, new_specular_sampler, nullptr);
+        new_specular_sampler = VK_NULL_HANDLE;
+      }
+      if (new_normal_sampler != VK_NULL_HANDLE) {
+        vkDestroySampler(device_, new_normal_sampler, nullptr);
+        new_normal_sampler = VK_NULL_HANDLE;
+      }
+      if (new_albedo_sampler != VK_NULL_HANDLE) {
+        vkDestroySampler(device_, new_albedo_sampler, nullptr);
+        new_albedo_sampler = VK_NULL_HANDLE;
+      }
     };
 
-    const VkDeviceSize staging_bytes =
-        vertex_bytes + index_bytes + texture_bytes + normal_bytes +
-        specular_bytes;
-    const auto full_mip_levels = [](std::uint32_t width,
-                                    std::uint32_t height) {
-      std::uint32_t levels = 1u;
-      for (std::uint32_t dimension = std::max(width, height);
-           dimension > 1u; dimension >>= 1u) {
-        ++levels;
-      }
-      return levels;
-    };
-    const std::uint32_t texture_mip_levels =
-        full_mip_levels(texture_width, texture_height);
-    const std::uint32_t normal_mip_levels =
-        full_mip_levels(normal_width, normal_height);
-    const std::uint32_t specular_mip_levels =
-        full_mip_levels(specular_width, specular_height);
     if (!createBuffer(staging_bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
@@ -397,7 +542,19 @@ void VulkanBackend::destroyStaticMaterialSamplers() {
                              new_normal_texture, normal_mip_levels) ||
         !createStaticTexture(specular_width, specular_height,
                              VK_FORMAT_R8G8B8A8_UNORM,
-                             new_specular_texture, specular_mip_levels)) {
+                             new_specular_texture, specular_mip_levels) ||
+        !createStaticMaterialSampler(
+            VK_SAMPLER_MIPMAP_MODE_LINEAR,
+            static_cast<float>(albedo_chain.safe_max_lod),
+            new_albedo_sampler) ||
+        !createStaticMaterialSampler(
+            VK_SAMPLER_MIPMAP_MODE_LINEAR,
+            static_cast<float>(normal_chain.safe_max_lod),
+            new_normal_sampler) ||
+        !createStaticMaterialSampler(
+            VK_SAMPLER_MIPMAP_MODE_NEAREST,
+            static_cast<float>(specular_chain.safe_max_lod),
+            new_specular_sampler)) {
       cleanup();
       writeLog("Vulkan static device resource allocation failed");
       return false;
@@ -412,16 +569,18 @@ void VulkanBackend::destroyStaticMaterialSamplers() {
                   new_plan.indices.data(),
                   static_cast<std::size_t>(index_bytes));
     }
-    std::memcpy(static_cast<std::byte *>(staging.mapped) + vertex_bytes +
-                    index_bytes,
-                texture_pixels, static_cast<std::size_t>(texture_bytes));
-    const VkDeviceSize normal_offset =
-        vertex_bytes + index_bytes + texture_bytes;
-    const VkDeviceSize specular_offset = normal_offset + normal_bytes;
-    std::memcpy(static_cast<std::byte *>(staging.mapped) + normal_offset,
-                normal_pixels, static_cast<std::size_t>(normal_bytes));
-    std::memcpy(static_cast<std::byte *>(staging.mapped) + specular_offset,
-                specular_pixels, static_cast<std::size_t>(specular_bytes));
+    const auto stage_chain = [&](const LabPbrMipChain &chain,
+                                 const std::vector<VkBufferImageCopy> &copies) {
+      for (std::size_t level = 0u; level < chain.levels.size(); ++level) {
+        std::memcpy(static_cast<std::byte *>(staging.mapped) +
+                        copies[level].bufferOffset,
+                    chain.levels[level].rgba.data(),
+                    chain.levels[level].rgba.size());
+      }
+    };
+    stage_chain(albedo_chain, texture_copies);
+    stage_chain(normal_chain, normal_copies);
+    stage_chain(specular_chain, specular_copies);
 
     VkCommandBufferAllocateInfo allocate_info{
         VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -489,9 +648,12 @@ void VulkanBackend::destroyStaticMaterialSamplers() {
     }
 
     const auto upload_image =
-        [&](const ImageResource &image, std::uint32_t width,
-            std::uint32_t height, std::uint32_t mip_levels,
-            VkDeviceSize offset) {
+        [&](const ImageResource &image,
+            const std::vector<VkBufferImageCopy> &staged_copies) {
+          if (staged_copies.empty() ||
+              staged_copies.size() != image.mip_levels) {
+            return false;
+          }
           VkImageMemoryBarrier barrier{
               VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
           barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -500,69 +662,21 @@ void VulkanBackend::destroyStaticMaterialSamplers() {
           barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
           barrier.image = image.image;
           barrier.subresourceRange = {
-              VK_IMAGE_ASPECT_COLOR_BIT, 0, mip_levels, 0, 1};
+              VK_IMAGE_ASPECT_COLOR_BIT, 0, image.mip_levels, 0, 1};
           barrier.srcAccessMask = 0;
           barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
           vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
                                nullptr, 1, &barrier);
-          VkBufferImageCopy image_copy{};
-          image_copy.bufferOffset = offset;
-          image_copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-          image_copy.imageExtent = {width, height, 1};
           vkCmdCopyBufferToImage(command, staging.buffer, image.image,
-                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-                                 &image_copy);
+                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                 static_cast<std::uint32_t>(
+                                     staged_copies.size()),
+                                 staged_copies.data());
           constexpr VkPipelineStageFlags kTextureConsumerStages =
               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
               VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
-          std::uint32_t source_width = width;
-          std::uint32_t source_height = height;
-          for (std::uint32_t level = 1u; level < mip_levels; ++level) {
-            barrier.subresourceRange = {
-                VK_IMAGE_ASPECT_COLOR_BIT, level - 1u, 1u, 0u, 1u};
-            barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
-                                 nullptr, 0, nullptr, 1, &barrier);
-
-            const std::uint32_t destination_width =
-                std::max(source_width >> 1u, 1u);
-            const std::uint32_t destination_height =
-                std::max(source_height >> 1u, 1u);
-            VkImageBlit blit{};
-            blit.srcSubresource = {
-                VK_IMAGE_ASPECT_COLOR_BIT, level - 1u, 0u, 1u};
-            blit.srcOffsets[1] = {
-                static_cast<std::int32_t>(source_width),
-                static_cast<std::int32_t>(source_height), 1};
-            blit.dstSubresource = {
-                VK_IMAGE_ASPECT_COLOR_BIT, level, 0u, 1u};
-            blit.dstOffsets[1] = {
-                static_cast<std::int32_t>(destination_width),
-                static_cast<std::int32_t>(destination_height), 1};
-            vkCmdBlitImage(
-                command, image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1u,
-                &blit, VK_FILTER_LINEAR);
-
-            barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 kTextureConsumerStages, 0, 0, nullptr, 0,
-                                 nullptr, 1, &barrier);
-            source_width = destination_width;
-            source_height = destination_height;
-          }
-
-          barrier.subresourceRange = {
-              VK_IMAGE_ASPECT_COLOR_BIT, mip_levels - 1u, 1u, 0u, 1u};
           barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
           barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
           barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -570,13 +684,15 @@ void VulkanBackend::destroyStaticMaterialSamplers() {
           vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                kTextureConsumerStages, 0, 0, nullptr, 0,
                                nullptr, 1, &barrier);
+          return true;
         };
-    upload_image(new_texture, texture_width, texture_height,
-                 texture_mip_levels, vertex_bytes + index_bytes);
-    upload_image(new_normal_texture, normal_width, normal_height,
-                 normal_mip_levels, normal_offset);
-    upload_image(new_specular_texture, specular_width, specular_height,
-                 specular_mip_levels, specular_offset);
+    if (!upload_image(new_texture, texture_copies) ||
+        !upload_image(new_normal_texture, normal_copies) ||
+        !upload_image(new_specular_texture, specular_copies)) {
+      cleanup();
+      writeLog("Vulkan static semantic mip copy layout is invalid");
+      return false;
+    }
 
     if (vkEndCommandBuffer(command) != VK_SUCCESS) {
       cleanup();
@@ -632,16 +748,23 @@ void VulkanBackend::destroyStaticMaterialSamplers() {
     destroyImage(static_texture_);
     destroyImage(static_normal_texture_);
     destroyImage(static_specular_texture_);
+    destroyStaticMaterialSamplers();
     static_model_vbo_ = new_vertex_buffer;
     static_model_ibo_ = new_index_buffer;
     static_texture_ = new_texture;
     static_normal_texture_ = new_normal_texture;
     static_specular_texture_ = new_specular_texture;
+    static_albedo_sampler_ = new_albedo_sampler;
+    static_normal_sampler_ = new_normal_sampler;
+    static_specular_sampler_ = new_specular_sampler;
     new_vertex_buffer = {};
     new_index_buffer = {};
     new_texture = {};
     new_normal_texture = {};
     new_specular_texture = {};
+    new_albedo_sampler = VK_NULL_HANDLE;
+    new_normal_sampler = VK_NULL_HANDLE;
+    new_specular_sampler = VK_NULL_HANDLE;
     static_draw_plan_ = std::move(new_plan);
     static_bone_count_ = mesh.bone_names.size();
     static_vertex_bytes_ = vertex_bytes;

@@ -406,6 +406,7 @@ if(XPBD_BUILD_TESTS)
         src/gfx/viewport_mesh.cpp
         src/gfx/texture_image.cpp
         src/gfx/labpbr_material.cpp
+        src/gfx/labpbr_mip_chain.cpp
         src/gfx/labpbr_import.cpp
         src/gfx/labpbr_authoring.cpp
         src/gfx/labpbr_export.cpp
@@ -524,6 +525,7 @@ if(XPBD_BUILD_APP)
         src/gfx/still_image_export.cpp
         src/gfx/texture_image.cpp
         src/gfx/labpbr_material.cpp
+        src/gfx/labpbr_mip_chain.cpp
         src/gfx/labpbr_import.cpp
         src/gfx/labpbr_authoring.cpp
         src/gfx/labpbr_export.cpp

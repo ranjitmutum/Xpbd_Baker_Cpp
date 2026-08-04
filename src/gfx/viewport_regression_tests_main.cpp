@@ -8,6 +8,7 @@
 #include "xpbd/gfx/labpbr_export.hpp"
 #include "xpbd/gfx/labpbr_import.hpp"
 #include "xpbd/gfx/labpbr_material.hpp"
+#include "xpbd/gfx/labpbr_mip_chain.hpp"
 #include "xpbd/gfx/labpbr_memory.hpp"
 #include "xpbd/gfx/path_trace_aov.hpp"
 #include "xpbd/gfx/preview_scene.hpp"
@@ -150,6 +151,9 @@ void testPathTracePbrSourceContracts() {
       readTestSource("src/gfx/vulkan_backend.cpp");
   const std::string backend_static = readTestSource(
       "src/gfx/vulkan/vulkan_backend_static_resources.cpp");
+  const std::string mip_header =
+      readTestSource("include/xpbd/gfx/labpbr_mip_chain.hpp");
+  const std::string mip_source = readTestSource("src/gfx/labpbr_mip_chain.cpp");
   const std::string backend_environment = readTestSource(
       "src/gfx/vulkan/vulkan_backend_environment.cpp");
   const std::string path_tracer =
@@ -166,9 +170,10 @@ void testPathTracePbrSourceContracts() {
       readTestSource("src/gfx/vulkan_rt_scene.cpp");
 
   expect(!forward.empty() && !forward_rt.empty() && !closest_hit.empty() &&
-             !any_hit.empty() && !raygen.empty() && !compute.empty() &&
-             !composite.empty() && !backend.empty() &&
-             !backend_static.empty() && !backend_environment.empty() &&
+              !any_hit.empty() && !raygen.empty() && !compute.empty() &&
+              !composite.empty() && !backend.empty() &&
+              !backend_static.empty() && !backend_environment.empty() &&
+              !mip_header.empty() && !mip_source.empty() &&
               !path_tracer.empty() &&
               !rt_pipeline.empty() && !ray_tracing_header.empty() &&
               !ray_tracing_source.empty() && !rt_scene_header.empty() &&
@@ -235,15 +240,31 @@ void testPathTracePbrSourceContracts() {
              any_hit.find("shadowPayload.rayCone") != std::string::npos,
          "Full RT initializes and propagates ray-cone footprint state into "
          "material LOD selection");
-  expect(backend_static.find("full_mip_levels") != std::string::npos &&
-             backend_static.find("vkCmdBlitImage") != std::string::npos &&
-             backend_static.find("mip_levels - 1u") != std::string::npos &&
-             backend.find(
-                 "static_sampler_info.maxLod = VK_LOD_CLAMP_NONE;") !=
+  expect(mip_header.find("enum class LabPbrMipSemantic") !=
                  std::string::npos &&
-             backend.find(
-                 "static_sampler_info.mipmapMode = "
-                 "VK_SAMPLER_MIPMAP_MODE_LINEAR;") !=
+             mip_header.find("struct LabPbrMipChain") !=
+                 std::string::npos &&
+             mip_source.find("buildLabPbrAtlasIslands") !=
+                 std::string::npos &&
+             mip_source.find("buildLabPbrMipChain") != std::string::npos,
+         "CPU LabPBR semantic mip builder is a standalone Owner");
+  expect(backend_static.find("full_mip_levels") == std::string::npos &&
+             backend_static.find("vkCmdBlitImage") == std::string::npos &&
+             backend_static.find("vkCmdCopyBufferToImage") !=
+                 std::string::npos &&
+             backend_static.find("LabPbrMipChain") != std::string::npos &&
+             backend_static.find("safe_max_lod") != std::string::npos &&
+             backend.find("createStaticMaterialSampler") !=
+                 std::string::npos &&
+             backend.find("maxLod") != std::string::npos &&
+             backend.find("VK_SAMPLER_MIPMAP_MODE_NEAREST") !=
+                 std::string::npos,
+         "LabPBR textures use prebuilt semantic mips, multi-copy upload, and "
+         "independent safe sampler ranges");
+  expect(backend.find("static_sampler_info.maxLod = VK_LOD_CLAMP_NONE;") ==
+                 std::string::npos &&
+             backend.find("static_sampler_info.mipmapMode = "
+                         "VK_SAMPLER_MIPMAP_MODE_LINEAR;") ==
                  std::string::npos &&
              backend_environment.find("environment_mip_levels") !=
                  std::string::npos &&
@@ -255,8 +276,8 @@ void testPathTracePbrSourceContracts() {
              path_tracer.find(
                  "si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;") !=
                  std::string::npos,
-         "material images expose complete mip chains to explicit Full RT "
-         "ray-cone LOD");
+          "continuous environment/path-tracer mips remain outside LabPBR "
+          "semantic filtering");
   expect(closest_hit.find("decodeLabPbrMicrofacetAlpha") !=
                  std::string::npos &&
              closest_hit.find("isnan") != std::string::npos &&
@@ -274,17 +295,17 @@ void testPathTracePbrSourceContracts() {
                  std::string::npos,
          "Vulkan descriptors bind distinct pixel-atlas channel samplers");
   expect(countText(
-             backend,
-             "static_sampler_info.magFilter = VK_FILTER_NEAREST;") == 1u &&
+              backend,
+              "sampler_info.magFilter = VK_FILTER_NEAREST;") == 1u &&
              countText(
                  backend,
-                 "static_sampler_info.minFilter = VK_FILTER_NEAREST;") == 1u &&
+                  "sampler_info.minFilter = VK_FILTER_NEAREST;") == 1u &&
              countText(
                  backend,
-                 "static_sampler_info.magFilter = VK_FILTER_LINEAR;") == 0u &&
+                  "sampler_info.magFilter = VK_FILTER_LINEAR;") == 0u &&
              countText(
                  backend,
-                 "static_sampler_info.minFilter = VK_FILTER_LINEAR;") == 0u &&
+                  "sampler_info.minFilter = VK_FILTER_LINEAR;") == 0u &&
              countText(path_tracer,
                        "si.magFilter = VK_FILTER_NEAREST;") == 1u &&
              countText(path_tracer,
@@ -296,16 +317,16 @@ void testPathTracePbrSourceContracts() {
          "Raster and path tracing keep every pixel-atlas channel "
          "nearest-filtered");
   expect(countText(
-             backend,
-             "static_sampler_info.addressModeU = "
+              backend,
+              "sampler_info.addressModeU = "
              "VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;") == 1u &&
              countText(
                  backend,
-                 "static_sampler_info.addressModeV = "
+                  "sampler_info.addressModeV = "
                  "VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;") == 1u &&
              countText(
                  backend,
-                 "static_sampler_info.addressModeW = "
+                  "sampler_info.addressModeW = "
                  "VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;") == 1u &&
              countText(path_tracer,
                        "si.addressModeU = "
@@ -1895,6 +1916,254 @@ void testCc0PreviewSceneAssets() {
              static_ocean.environment.transparent.front().py ==
                  frozen_ocean.front().py,
          "static osgw Ocean freezes its t=0 surface");
+}
+
+void testLabPbrSemanticMip() {
+  using xpbd::gfx::LabPbrAtlasIsland;
+  using xpbd::gfx::LabPbrMipChain;
+  using xpbd::gfx::LabPbrMipSemantic;
+  using xpbd::gfx::StaticIndexedModelMesh;
+  using xpbd::gfx::StaticModelFace;
+  using xpbd::gfx::StaticModelVertex;
+  using xpbd::gfx::TextureImage;
+  using xpbd::gfx::buildLabPbrAtlasIslands;
+  using xpbd::gfx::buildLabPbrMipChain;
+
+  const auto make_image = [](std::array<std::uint8_t, 4> pixel) {
+    TextureImage image;
+    image.width = 16;
+    image.height = 16;
+    image.source_channels = 4;
+    image.rgba.resize(16u * 16u * 4u);
+    for (std::size_t offset = 0u; offset < image.rgba.size(); offset += 4u) {
+      std::copy(pixel.begin(), pixel.end(), image.rgba.begin() + offset);
+    }
+    return image;
+  };
+  const auto write_pixel = [](TextureImage &image, int x, int y,
+                              std::array<std::uint8_t, 4> pixel) {
+    const std::size_t offset =
+        (static_cast<std::size_t>(y) * image.width +
+         static_cast<std::size_t>(x)) *
+        4u;
+    std::copy(pixel.begin(), pixel.end(), image.rgba.begin() + offset);
+  };
+
+  TextureImage base = make_image({255u, 0u, 0u, 255u});
+  TextureImage normal = make_image({128u, 128u, 255u, 255u});
+  TextureImage specular = make_image({0u, 10u, 0u, 255u});
+  for (int y = 0; y < 16; ++y) {
+    for (int x = 0; x < 16; ++x) {
+      if (x >= 8 && y < 8) {
+        const bool covered = ((x + y) & 1) == 0;
+        write_pixel(base, x, y,
+                    covered ? std::array<std::uint8_t, 4>{0u, 255u, 0u, 255u}
+                            : std::array<std::uint8_t, 4>{0u, 0u, 0u, 0u});
+      } else if (x < 8 && y >= 8) {
+        write_pixel(base, x, y, {0u, 0u, 255u, 255u});
+        write_pixel(normal, x, y,
+                    ((x + y) & 1) == 0
+                        ? std::array<std::uint8_t, 4>{200u, 80u, 64u, 32u}
+                        : std::array<std::uint8_t, 4>{180u, 100u, 192u, 224u});
+      } else if (x >= 8 && y >= 8) {
+        write_pixel(base, x, y, {255u, 255u, 0u, 255u});
+        write_pixel(specular, x, y,
+                    ((x + y) & 1) == 0
+                        ? std::array<std::uint8_t, 4>{220u, 230u, 1u, 255u}
+                        : std::array<std::uint8_t, 4>{180u, 230u, 200u, 254u});
+      }
+    }
+  }
+
+  const std::array<LabPbrAtlasIsland, 4> reference_islands{{
+      {0u, 0u, 8u, 8u, 0u, false, false},
+      {8u, 0u, 8u, 8u, 1u, true, false},
+      {0u, 8u, 8u, 8u, 2u, false, false},
+      {8u, 8u, 8u, 8u, 3u, false, false},
+  }};
+
+  StaticIndexedModelMesh mesh;
+  mesh.bone_names.push_back("root");
+  mesh.uv_domain.width = 16.0;
+  mesh.uv_domain.height = 16.0;
+  mesh.uv_domain.imported_width = 16;
+  mesh.uv_domain.imported_height = 16;
+  for (const auto &island : reference_islands) {
+    const std::uint32_t first_vertex =
+        static_cast<std::uint32_t>(mesh.vertices.size());
+    const std::uint32_t first_index =
+        static_cast<std::uint32_t>(mesh.indices.size());
+    const std::array<std::array<double, 2>, 4> corners{{
+        {{static_cast<double>(island.x), static_cast<double>(island.y)}},
+        {{static_cast<double>(island.x + island.width),
+          static_cast<double>(island.y)}},
+        {{static_cast<double>(island.x + island.width),
+          static_cast<double>(island.y + island.height)}},
+        {{static_cast<double>(island.x),
+          static_cast<double>(island.y + island.height)}},
+    }};
+    for (const auto &corner : corners) {
+      StaticModelVertex vertex;
+      vertex.u = static_cast<float>(corner[0] / 16.0);
+      vertex.v = static_cast<float>(corner[1] / 16.0);
+      vertex.raw_u = corner[0];
+      vertex.raw_v = corner[1];
+      mesh.vertices.push_back(vertex);
+    }
+    mesh.indices.insert(mesh.indices.end(),
+                        {first_vertex, first_vertex + 1u, first_vertex + 2u,
+                         first_vertex, first_vertex + 2u,
+                         first_vertex + 3u});
+    StaticModelFace face;
+    face.first_vertex = first_vertex;
+    face.vertex_count = 4u;
+    face.first_index = first_index;
+    face.index_count = 6u;
+    face.textured = true;
+    mesh.faces.push_back(face);
+  }
+
+  std::vector<LabPbrAtlasIsland> islands;
+  std::string island_error;
+  expect(buildLabPbrAtlasIslands(mesh, base, islands, &island_error) &&
+             island_error.empty() && islands.size() == 4u &&
+             islands[1].used_by_cutout && !islands[1].used_by_blend,
+         "labpbr_semantic_mip.v1 derives four deduplicated pixel islands and alpha modes");
+
+  const LabPbrMipChain base_chain = buildLabPbrMipChain(
+      base, islands, LabPbrMipSemantic::BaseColorCoverage);
+  const LabPbrMipChain normal_chain = buildLabPbrMipChain(
+      normal, islands, LabPbrMipSemantic::IrisNormalAoHeight);
+  const LabPbrMipChain specular_chain = buildLabPbrMipChain(
+      specular, islands, LabPbrMipSemantic::SpecularPacked, &base_chain);
+  const auto chain_shape = [](const LabPbrMipChain &chain) {
+    return chain.valid() && chain.atlas_isolation_proven &&
+           chain.levels.size() == 4u && chain.safe_max_lod == 3u &&
+           chain.levels[0].width == 16u && chain.levels[1].width == 8u &&
+           chain.levels[2].width == 4u && chain.levels[3].width == 2u;
+  };
+  expect(chain_shape(base_chain) && chain_shape(normal_chain) &&
+             chain_shape(specular_chain),
+         "labpbr_semantic_mip.v1 stops all semantic chains before four islands collide");
+
+  bool isolated = true;
+  for (const auto &level : base_chain.levels) {
+    const std::uint32_t half = level.width / 2u;
+    const auto sample = [&](std::uint32_t x, std::uint32_t y) {
+      const std::size_t offset =
+          (static_cast<std::size_t>(y) * level.width + x) * 4u;
+      return std::array<std::uint8_t, 4>{
+          level.rgba[offset], level.rgba[offset + 1u],
+          level.rgba[offset + 2u], level.rgba[offset + 3u]};
+    };
+    const auto a = sample(0u, 0u);
+    const auto b = sample(half, 0u);
+    const auto c = sample(0u, half);
+    const auto d = sample(half, half);
+    isolated = isolated && a[0] > 240u && a[1] < 10u && a[2] < 10u &&
+               b[0] < 10u && b[1] > 240u && b[2] < 10u &&
+               c[0] < 10u && c[1] < 10u && c[2] > 240u &&
+               d[0] > 240u && d[1] > 240u && d[2] < 10u;
+  }
+  expect(isolated,
+         "labpbr_semantic_mip.v1 keeps adjacent atlas island colors isolated at every safe level");
+
+  const auto &base_mip1 = base_chain.levels[1];
+  const std::size_t transparent_edge = (0u * base_mip1.width + 4u) * 4u;
+  expect(base_mip1.rgba[transparent_edge + 0u] < 10u &&
+             base_mip1.rgba[transparent_edge + 1u] > 240u &&
+             base_mip1.rgba[transparent_edge + 2u] < 10u,
+         "labpbr_semantic_mip.v1 premultiplied linear filtering avoids transparent black fringe");
+
+  const auto &normal_mip1 = normal_chain.levels[1];
+  const std::size_t normal_offset = (4u * normal_mip1.width + 0u) * 4u;
+  float nx = 2.0f * normal_mip1.rgba[normal_offset] / 255.0f - 1.0f;
+  float ny = 1.0f - 2.0f * normal_mip1.rgba[normal_offset + 1u] / 255.0f;
+  const float xy2 = nx * nx + ny * ny;
+  if (xy2 > 1.0f) {
+    const float inverse = 1.0f / std::sqrt(xy2);
+    nx *= inverse;
+    ny *= inverse;
+  }
+  const float nz = std::sqrt(std::max(0.0f, 1.0f - nx * nx - ny * ny));
+  const float normal_length = std::sqrt(nx * nx + ny * ny + nz * nz);
+  expect(std::abs(normal_length - 1.0f) < 2.0e-3f && nx > 0.25f &&
+             ny > 0.10f,
+         "labpbr_semantic_mip.v1 averages and re-normalizes Iris tangent normals");
+
+  bool metal_preserved = true;
+  for (const auto &level : specular_chain.levels) {
+    const std::uint32_t half = level.width / 2u;
+    const std::size_t offset =
+        (static_cast<std::size_t>(half) * level.width + half) * 4u;
+    metal_preserved = metal_preserved && level.rgba[offset + 1u] == 230u;
+  }
+  const auto &specular_mip1 = specular_chain.levels[1];
+  const std::size_t emission_offset = (4u * specular_mip1.width + 4u) * 4u;
+  expect(metal_preserved && specular_mip1.rgba[emission_offset + 3u] <= 254u,
+         "labpbr_semantic_mip.v1 preserves predefined metal and legally re-encodes mixed emission");
+
+  TextureImage mixed_base;
+  mixed_base.width = 2;
+  mixed_base.height = 2;
+  mixed_base.source_channels = 4;
+  mixed_base.rgba = {255u, 255u, 255u, 255u, 255u, 255u, 255u, 153u,
+                     255u, 255u, 255u, 153u, 255u, 255u, 255u, 0u};
+  TextureImage mixed_specular;
+  mixed_specular.width = 2;
+  mixed_specular.height = 2;
+  mixed_specular.source_channels = 4;
+  mixed_specular.rgba = {0u, 10u, 0u, 255u, 0u, 230u, 0u, 255u,
+                         0u, 255u, 0u, 255u, 0u, 20u, 0u, 255u};
+  const std::array<LabPbrAtlasIsland, 1> mixed_island{{
+      {0u, 0u, 2u, 2u, 0u, false, true},
+  }};
+  const LabPbrMipChain mixed_coverage = buildLabPbrMipChain(
+      mixed_base, mixed_island, LabPbrMipSemantic::BaseColorCoverage);
+  const LabPbrMipChain mixed_specular_chain = buildLabPbrMipChain(
+      mixed_specular, mixed_island, LabPbrMipSemantic::SpecularPacked,
+      &mixed_coverage);
+  expect(mixed_specular_chain.valid() &&
+             mixed_specular_chain.levels.size() == 2u &&
+             mixed_specular_chain.levels[1].rgba[1] == 230u,
+         "labpbr_semantic_mip.v1 compares dielectric against combined metal coverage and breaks metal-code ties deterministically");
+
+  const auto serialize_chain = [](const LabPbrMipChain &chain) {
+    std::vector<std::uint8_t> bytes;
+    const auto append_u32 = [&](std::uint32_t value) {
+      bytes.push_back(static_cast<std::uint8_t>(value));
+      bytes.push_back(static_cast<std::uint8_t>(value >> 8u));
+      bytes.push_back(static_cast<std::uint8_t>(value >> 16u));
+      bytes.push_back(static_cast<std::uint8_t>(value >> 24u));
+    };
+    append_u32(static_cast<std::uint32_t>(chain.semantic));
+    append_u32(chain.safe_max_lod);
+    append_u32(chain.atlas_isolation_proven ? 1u : 0u);
+    for (const auto &level : chain.levels) {
+      append_u32(level.width);
+      append_u32(level.height);
+      bytes.insert(bytes.end(), level.rgba.begin(), level.rgba.end());
+    }
+    bytes.insert(bytes.end(), chain.fallback_reason.begin(),
+                 chain.fallback_reason.end());
+    return bytes;
+  };
+  const LabPbrMipChain repeated_specular = buildLabPbrMipChain(
+      specular, islands, LabPbrMipSemantic::SpecularPacked, &base_chain);
+  const auto first_bytes = serialize_chain(specular_chain);
+  const auto repeated_bytes = serialize_chain(repeated_specular);
+  expect(xpbd::gfx::sha256Hex(first_bytes) ==
+             xpbd::gfx::sha256Hex(repeated_bytes),
+         "labpbr_semantic_mip.v1 is byte-for-byte SHA deterministic");
+
+  const std::array<LabPbrAtlasIsland, 2> overlapping{{
+      {0u, 0u, 8u, 8u, 0u}, {4u, 4u, 8u, 8u, 1u}}};
+  const LabPbrMipChain unsafe = buildLabPbrMipChain(
+      base, overlapping, LabPbrMipSemantic::BaseColorCoverage);
+  expect(unsafe.valid() && unsafe.levels.size() == 1u &&
+             unsafe.safe_max_lod == 0u && !unsafe.atlas_isolation_proven &&
+             !unsafe.fallback_reason.empty(),
+         "labpbr_semantic_mip.v1 degrades unprovable atlas input to diagnosed LOD0");
 }
 
 void testLabPbrDecode() {
@@ -6352,6 +6621,7 @@ int main(int argc, char **argv) {
   testResolvedUvDomainMaterialConsumers();
   testCc0PreviewSceneAssets();
   testEmptyTextureSample();
+  testLabPbrSemanticMip();
   testLabPbrDecode();
   testLabPbrDiscoveryAndFallback();
   testStrictLabPbrSuiteImport();
