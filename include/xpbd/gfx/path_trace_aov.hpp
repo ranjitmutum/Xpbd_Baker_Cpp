@@ -69,11 +69,17 @@ inline constexpr std::uint32_t kPathTraceTransparencyGuideOutputMask =
         PathTraceOptionalOutput::TransparencyAndComposition) |
     pathTraceOptionalOutputBit(PathTraceOptionalOutput::ReactiveMask) |
     pathTraceOptionalOutputBit(PathTraceOptionalOutput::GuideValidity);
+// Only masks with a validated DLSS SR/RR Vulkan tag belong to the runtime
+// contract. GuideValidity remains an internal diagnostics channel and must not
+// make temporal reconstruction depend on an untagged image.
+inline constexpr std::uint32_t kPathTraceStreamlineMaskOutputMask =
+    pathTraceOptionalOutputBit(
+        PathTraceOptionalOutput::TransparencyAndComposition) |
+    pathTraceOptionalOutputBit(PathTraceOptionalOutput::ReactiveMask);
 inline constexpr std::uint32_t kPathTraceSrRequiredOutputMask =
-    kPathTraceRrMotionOutputMask | kPathTraceTransparencyGuideOutputMask;
+    kPathTraceRrMotionOutputMask | kPathTraceStreamlineMaskOutputMask;
 inline constexpr std::uint32_t kPathTraceRrRequiredOutputMask =
-    kPathTraceAllRrGuideOutputMask |
-    kPathTraceTransparencyGuideOutputMask;
+    kPathTraceAllRrGuideOutputMask | kPathTraceStreamlineMaskOutputMask;
 inline constexpr std::uint32_t kPathTraceAllOptionalOutputMask =
     kPathTraceAllAovOutputMask | kPathTraceAllRrGuideOutputMask |
     kPathTraceStatisticsOutputMask | kPathTraceTransparencyGuideOutputMask;

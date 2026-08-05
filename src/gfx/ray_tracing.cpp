@@ -2297,9 +2297,7 @@ RtMotionProjectionResult evaluateRtMotionProjection(
       input.previous_clip[0] * inverse_w * 0.5f + 0.5f,
       input.previous_clip[1] * inverse_w * 0.5f + 0.5f};
   if (!std::isfinite(previous_uv[0]) ||
-      !std::isfinite(previous_uv[1]) ||
-      previous_uv[0] < 0.0f || previous_uv[0] > 1.0f ||
-      previous_uv[1] < 0.0f || previous_uv[1] > 1.0f) {
+      !std::isfinite(previous_uv[1])) {
     return result;
   }
 
@@ -2311,6 +2309,12 @@ RtMotionProjectionResult evaluateRtMotionProjection(
   if (!std::isfinite(result.current_to_previous_pixels[0]) ||
       !std::isfinite(result.current_to_previous_pixels[1])) {
     return {};
+  }
+  const bool inside_previous_viewport =
+      previous_uv[0] >= 0.0f && previous_uv[0] < 1.0f &&
+      previous_uv[1] >= 0.0f && previous_uv[1] < 1.0f;
+  if (!inside_previous_viewport) {
+    return result;
   }
   result.disocclusion = 0.0f;
   result.valid = true;

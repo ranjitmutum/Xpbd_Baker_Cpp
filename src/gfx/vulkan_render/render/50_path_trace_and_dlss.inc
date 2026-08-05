@@ -11,6 +11,8 @@
     std::uint32_t pt_actual_output_write_mask_for_frame = 0u;
     bool pt_history_reset = true;
     bool pt_streamline_history_reset = true;
+    TemporalReconstructionResetReason pt_streamline_history_reset_reason =
+        TemporalReconstructionResetReason::FirstFrame;
     std::uint64_t pt_streamline_history_key = 0u;
     PathTracePostProcessCapabilities pt_post_capabilities{};
     pt_post_capabilities.dlss_ray_reconstruction =
@@ -436,12 +438,56 @@
         appendPathTraceHistoryValue(
             streamline_history_key, preview_output_height);
         pt_streamline_history_key = streamline_history_key;
+        const bool streamline_resolution_changed =
+            streamline_temporal_output_width_ != 0u &&
+            (streamline_temporal_render_width_ != ptw ||
+             streamline_temporal_render_height_ != pth ||
+             streamline_temporal_output_width_ != preview_output_width ||
+             streamline_temporal_output_height_ != preview_output_height);
+        const PathTraceUpscale streamline_mode =
+            pt_rr_requested ? pt_post.reconstruction_mode
+                            : pt_post.active_upscale;
+        const bool streamline_mode_changed =
+            streamline_temporal_output_width_ != 0u &&
+            (streamline_temporal_ray_reconstruction_ != pt_rr_requested ||
+             streamline_temporal_mode_ != streamline_mode);
+        const bool streamline_explicit_discontinuity =
+            streamline_temporal_output_width_ != 0u &&
+            streamline_temporal_reset_generation_ !=
+                pt_params.settings.reset_generation;
+        pt_streamline_history_reset_reason =
+            temporalReconstructionResetReason(
+                TemporalReconstructionResetInput{
+                    streamline_temporal_history_valid_,
+                    streamline_temporal_history_key_,
+                    pt_streamline_history_key,
+                    pt_params.motion_history_valid,
+                    streamline_resolution_changed,
+                    streamline_mode_changed,
+                    streamline_temporal_recovery_pending_,
+                    streamline_explicit_discontinuity});
         pt_streamline_history_reset =
-            shouldResetTemporalReconstructionHistory(
-                streamline_temporal_history_valid_,
-                streamline_temporal_history_key_,
-                pt_streamline_history_key,
-                pt_params.motion_history_valid);
+            pt_streamline_history_reset_reason !=
+            TemporalReconstructionResetReason::None;
+        if (diagnostics_enabled_ &&
+            pt_temporal_reconstruction_requested_for_frame &&
+            diagnostic_sl_history_frames_logged_ < 2048u) {
+          xpbd::log::infof(
+              "SL history: feature=%s reset=%d history_valid=%d "
+              "motion_valid=%d reason=%s frame=%u key=%016llx "
+              "previous_key=%016llx",
+              pt_rr_requested ? "RR" : "SR",
+              pt_streamline_history_reset ? 1 : 0,
+              streamline_temporal_history_valid_ ? 1 : 0,
+              pt_params.motion_history_valid ? 1 : 0,
+              temporalReconstructionResetReasonName(
+                  pt_streamline_history_reset_reason),
+              pt_params.frame_index,
+              static_cast<unsigned long long>(pt_streamline_history_key),
+              static_cast<unsigned long long>(
+                  streamline_temporal_history_key_));
+          ++diagnostic_sl_history_frames_logged_;
+        }
 
         // Raw PT accumulation has stricter compatibility: any camera or
         // deforming-scene change invalidates the per-pixel sample average.
@@ -527,7 +573,8 @@
               "key=%016llx rt=%016llx view=%016llx proj=%016llx "
               "static=%llu/%llu raster=%llu settings=%llu/%llu "
               "world=%llu/%llu/%llu/%llu/%llu light=%016llx "
-              "motion=%d sl_key=%016llx sl_reset=%d sl_valid=%d",
+              "motion=%d sl_key=%016llx sl_reset=%d sl_reason=%s "
+              "sl_valid=%d",
               pt_params.frame_index,
               static_cast<unsigned>(frame_index_),
               static_cast<unsigned long long>(history_key),
@@ -558,14 +605,16 @@
               static_cast<unsigned long long>(
                   pt_streamline_history_key),
               pt_streamline_history_reset ? 1 : 0,
+              temporalReconstructionResetReasonName(
+                  pt_streamline_history_reset_reason),
               streamline_temporal_history_valid_ ? 1 : 0);
           ++diagnostic_pt_history_resets_logged_;
         }
 
         // Sample the static model atlas so path-traced models keep textures
-        // (avoids white clay look). Every pixel-art atlas channel uses nearest
-        // base-level sampling so normal and LabPBR texels stay aligned with
-        // albedo and alpha coverage.
+        // (avoids white clay look). Magnification stays nearest. Albedo/Normal
+        // minification uses semantic linear mips; packed Specular remains
+        // nearest to preserve its discrete LabPBR channel codes.
         const VkImageView albedo_view =
             static_texture_.view != VK_NULL_HANDLE ? static_texture_.view
                                                    : VK_NULL_HANDLE;
@@ -710,6 +759,17 @@
             streamline_temporal_history_key_ =
                 pt_streamline_history_key;
             streamline_temporal_history_valid_ = true;
+            streamline_temporal_render_width_ = ptw;
+            streamline_temporal_render_height_ = pth;
+            streamline_temporal_output_width_ = preview_output_width;
+            streamline_temporal_output_height_ = preview_output_height;
+            streamline_temporal_reset_generation_ =
+                pt_params.settings.reset_generation;
+            streamline_temporal_mode_ =
+                pt_rr_requested ? pt_post.reconstruction_mode
+                                : pt_post.active_upscale;
+            streamline_temporal_ray_reconstruction_ = pt_rr_requested;
+            streamline_temporal_recovery_pending_ = false;
             if (pt_rr_requested &&
                 !streamline_rr_active_logged_) {
               xpbd::log::infof(
@@ -734,6 +794,7 @@
             streamline_dlss_failure_logged_ = false;
           } else {
             streamline_temporal_history_valid_ = false;
+            streamline_temporal_recovery_pending_ = true;
             if (!streamline_dlss_failure_logged_) {
               xpbd::log::warnf(
                   "DLSS reconstruction dispatch disabled: %s",
@@ -764,6 +825,9 @@
             }
           }
           streamline_temporal_history_valid_ = false;
+          if (dlss_settings.valid) {
+            streamline_temporal_recovery_pending_ = true;
+          }
         }
         if (pt_dispatch_recorded_for_frame && frame.view_matrix != nullptr &&
             frame.proj_matrix != nullptr) {

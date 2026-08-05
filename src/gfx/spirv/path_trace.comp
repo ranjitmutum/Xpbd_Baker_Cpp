@@ -296,14 +296,14 @@ vec4 motionVector(vec2 currentUv, vec3 previousWorld, bool valid) {
   // maps directly to the top-left-origin storage-image UV convention.
   vec2 previousUv = previousNdc * 0.5 + 0.5;
   bool inside = all(greaterThanEqual(previousUv, vec2(0.0))) &&
-                all(lessThanEqual(previousUv, vec2(1.0)));
-  if (!inside) {
-    return vec4(0.0, 0.0, 1.0, 0.0);
-  }
+                all(lessThan(previousUv, vec2(1.0)));
   // Pixel-space vector from the current sample to its previous-frame sample.
   vec2 motionPixels =
       (previousUv - currentUv) * vec2(pc.sizeFrame.xy);
-  return vec4(motionPixels, 0.0, 1.0);
+  // Preserve a finite vector even when the previous sample left the viewport.
+  // Z/W carry disocclusion/validity; zeroing XY here creates a false stationary
+  // border exactly where temporal reconstruction needs the real trajectory.
+  return vec4(motionPixels, inside ? 0.0 : 1.0, inside ? 1.0 : 0.0);
 }
 
 vec4 surfaceMotion(uint primitive, uint instanceId, vec2 barycentrics,

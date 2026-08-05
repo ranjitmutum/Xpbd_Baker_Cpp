@@ -421,6 +421,7 @@ struct StreamlineVulkanRuntime::Impl {
   std::uint32_t configured_output_width = 0;
   std::uint32_t configured_output_height = 0;
   bool configured_ray_reconstruction = false;
+  std::string last_tag_validation_failure;
 
   PFN_vkCreateInstance create_instance = nullptr;
   PFN_vkEnumeratePhysicalDevices enumerate_physical_devices = nullptr;
@@ -600,10 +601,10 @@ sl::DLSSOptions makeDlssOptions(
   options.exposureScale = 1.0f;
   options.colorBuffersHDR = sl::Boolean::eTrue;
   options.useAutoExposure = sl::Boolean::eTrue;
-  // The PT color alpha is foreground coverage. It must be reconstructed with
-  // RGB so models/surfaces can be composited over the independent preview sky
-  // without a one-pixel color fringe at depth discontinuities.
-  options.alphaUpscalingEnabled = sl::Boolean::eTrue;
+  // Alpha upscaling is experimental and temporal. XPBD composites DLSS RGB
+  // with a current-frame, spatially upsampled PT coverage mask instead, so a
+  // rotating camera cannot drag stale foreground alpha over the raster sky.
+  options.alphaUpscalingEnabled = sl::Boolean::eFalse;
   options.dlaaPreset = sl::DLSSPreset::ePresetK;
   options.qualityPreset = sl::DLSSPreset::ePresetK;
   options.balancedPreset = sl::DLSSPreset::ePresetK;
@@ -743,7 +744,9 @@ sl::DLSSDOptions makeDlssdOptions(
   options.colorBuffersHDR = sl::Boolean::eTrue;
   options.normalRoughnessMode =
       sl::DLSSDNormalRoughnessMode::ePacked;
-  options.alphaUpscalingEnabled = sl::Boolean::eTrue;
+  // RR reconstructs RGB/radiance only. Current-frame PT coverage owns the
+  // later foreground/sky composite and is intentionally not temporal.
+  options.alphaUpscalingEnabled = sl::Boolean::eFalse;
   options.dlaaPreset = sl::DLSSDPreset::ePresetD;
   options.qualityPreset = sl::DLSSDPreset::ePresetD;
   options.balancedPreset = sl::DLSSDPreset::ePresetD;
@@ -779,6 +782,141 @@ sl::Resource textureResource(
   resource.flags = 0u;
   resource.usage = usage;
   return resource;
+}
+
+struct TaggedTextureExpectation {
+  sl::BufferType type = sl::kBufferTypeDepth;
+  VkFormat format = VK_FORMAT_UNDEFINED;
+  VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+  VkImageUsageFlags required_usage = 0u;
+  std::uint32_t width = 0u;
+  std::uint32_t height = 0u;
+};
+
+const char *taggedTextureValidationFailure(
+    const sl::ResourceTag &tag,
+    const TaggedTextureExpectation &expected) noexcept {
+  if (tag.type != expected.type) {
+    return "buffer-type-mismatch";
+  }
+  if (tag.lifecycle != sl::ResourceLifecycle::eOnlyValidNow) {
+    return "unexpected-lifecycle";
+  }
+  if (tag.resource == nullptr) {
+    return "null-resource-description";
+  }
+  const sl::Resource &resource = *tag.resource;
+  if (resource.type != sl::ResourceType::eTex2d) {
+    return "resource-is-not-tex2d";
+  }
+  if (resource.native == nullptr) {
+    return "null-image";
+  }
+  if (resource.memory == nullptr) {
+    return "null-memory";
+  }
+  if (resource.view == nullptr) {
+    return "null-view";
+  }
+  if (resource.nativeFormat ==
+      static_cast<std::uint32_t>(VK_FORMAT_UNDEFINED)) {
+    return "undefined-format";
+  }
+  if (resource.nativeFormat !=
+      static_cast<std::uint32_t>(expected.format)) {
+    return "format-mismatch";
+  }
+  if (resource.state == (std::numeric_limits<std::uint32_t>::max)() ||
+      resource.state ==
+          static_cast<std::uint32_t>(VK_IMAGE_LAYOUT_UNDEFINED)) {
+    return "undefined-layout";
+  }
+  if (resource.state != static_cast<std::uint32_t>(expected.layout)) {
+    return "layout-mismatch";
+  }
+  if (resource.width != expected.width ||
+      resource.height != expected.height || resource.width == 0u ||
+      resource.height == 0u) {
+    return "resource-extent-mismatch";
+  }
+  if (resource.mipLevels != 1u) {
+    return "invalid-mip-count";
+  }
+  if (resource.arrayLayers != 1u) {
+    return "invalid-array-layer-count";
+  }
+  if ((resource.usage & expected.required_usage) !=
+      expected.required_usage) {
+    return "missing-required-usage";
+  }
+  if (tag.extent.width == 0u || tag.extent.height == 0u) {
+    return "empty-tag-extent";
+  }
+  if (tag.extent.left > resource.width ||
+      tag.extent.width > resource.width - tag.extent.left ||
+      tag.extent.top > resource.height ||
+      tag.extent.height > resource.height - tag.extent.top) {
+    return "tag-extent-out-of-bounds";
+  }
+  if (tag.extent.left != 0u || tag.extent.top != 0u ||
+      tag.extent.width != expected.width ||
+      tag.extent.height != expected.height) {
+    return "tag-extent-mismatch";
+  }
+  return nullptr;
+}
+
+template <std::size_t Count>
+bool validateTaggedTextureSet(
+    const char *feature, std::uint32_t frame_index,
+    const std::array<sl::ResourceTag, Count> &tags,
+    const std::array<TaggedTextureExpectation, Count> &expectations,
+    std::string &last_failure, std::string &status) {
+  for (std::size_t index = 0; index < Count; ++index) {
+    const char *reason =
+        taggedTextureValidationFailure(tags[index], expectations[index]);
+    if (reason == nullptr) {
+      continue;
+    }
+
+    const char *tag_name = sl::getBufferTypeAsStr(expectations[index].type);
+    const std::string signature =
+        std::string(feature) + "/" + tag_name + "/" + reason;
+    status = std::string(feature) +
+             " resource validation failed: tag=" + tag_name +
+             " reason=" + reason;
+    if (last_failure != signature) {
+      const sl::Resource *resource = tags[index].resource;
+      xpbd::log::errorf(
+          "SL_TAG_VALIDATION_FAILED feature=%s frame=%u tag=%s "
+          "reason=%s image=%p memory=%p view=%p format=%u "
+          "expected_format=%u layout=%u expected_layout=%u "
+          "size=%ux%u expected_size=%ux%u mips=%u layers=%u "
+          "usage=0x%08x required_usage=0x%08x "
+          "extent={top:%u,left:%u,width:%u,height:%u}",
+          feature, frame_index, tag_name, reason,
+          resource != nullptr ? resource->native : nullptr,
+          resource != nullptr ? resource->memory : nullptr,
+          resource != nullptr ? resource->view : nullptr,
+          resource != nullptr ? resource->nativeFormat : 0u,
+          static_cast<unsigned>(expectations[index].format),
+          resource != nullptr ? resource->state : 0u,
+          static_cast<unsigned>(expectations[index].layout),
+          resource != nullptr ? resource->width : 0u,
+          resource != nullptr ? resource->height : 0u,
+          expectations[index].width, expectations[index].height,
+          resource != nullptr ? resource->mipLevels : 0u,
+          resource != nullptr ? resource->arrayLayers : 0u,
+          resource != nullptr ? resource->usage : 0u,
+          static_cast<unsigned>(expectations[index].required_usage),
+          tags[index].extent.top, tags[index].extent.left,
+          tags[index].extent.width, tags[index].extent.height);
+    }
+    last_failure = signature;
+    return false;
+  }
+  last_failure.clear();
+  return true;
 }
 
 void transitionDlssOutput(
@@ -2266,29 +2404,12 @@ bool StreamlineVulkanRuntime::recordDlss(
       impl_->device != VK_NULL_HANDLE &&
       impl_->physical_device != VK_NULL_HANDLE &&
       frame.command_buffer != VK_NULL_HANDLE &&
-      frame.color_image != VK_NULL_HANDLE &&
-      frame.color_memory != VK_NULL_HANDLE &&
-      frame.color_view != VK_NULL_HANDLE &&
-      frame.depth_image != VK_NULL_HANDLE &&
-      frame.depth_memory != VK_NULL_HANDLE &&
-      frame.depth_view != VK_NULL_HANDLE &&
-      frame.motion_image != VK_NULL_HANDLE &&
-      frame.motion_memory != VK_NULL_HANDLE &&
-      frame.motion_view != VK_NULL_HANDLE &&
-      frame.transparency_and_composition_image != VK_NULL_HANDLE &&
-      frame.transparency_and_composition_memory != VK_NULL_HANDLE &&
-      frame.transparency_and_composition_view != VK_NULL_HANDLE &&
-      frame.reactive_mask_image != VK_NULL_HANDLE &&
-      frame.reactive_mask_memory != VK_NULL_HANDLE &&
-      frame.reactive_mask_view != VK_NULL_HANDLE &&
-      frame.guide_validity_image != VK_NULL_HANDLE &&
-      frame.guide_validity_memory != VK_NULL_HANDLE &&
-      frame.guide_validity_view != VK_NULL_HANDLE &&
       frame.view != nullptr && frame.projection != nullptr &&
       frame.render_width > 0u && frame.render_height > 0u &&
       frame.output_width > 0u && frame.output_height > 0u &&
       frame.mode != PathTraceUpscale::Off;
   if (!valid) {
+    impl_->status = "DLSS SR submission prerequisites invalid";
     impl_->force_history_reset = true;
     return false;
   }
@@ -2430,6 +2551,34 @@ bool StreamlineVulkanRuntime::recordDlss(
       {&reactive_mask, sl::kBufferTypeReactiveMaskHint,
        sl::ResourceLifecycle::eOnlyValidNow, &input_extent},
   }};
+  const std::array<TaggedTextureExpectation, 6> expectations{{
+      {sl::kBufferTypeScalingInputColor,
+       VK_FORMAT_R16G16B16A16_SFLOAT,
+       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, kInputUsage,
+       frame.render_width, frame.render_height},
+      {sl::kBufferTypeScalingOutputColor,
+       VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_LAYOUT_GENERAL,
+       VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+       frame.output_width, frame.output_height},
+      {sl::kBufferTypeDepth, VK_FORMAT_R32_SFLOAT,
+       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, kInputUsage,
+       frame.render_width, frame.render_height},
+      {sl::kBufferTypeMotionVectors, VK_FORMAT_R32G32_SFLOAT,
+       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, kInputUsage,
+       frame.render_width, frame.render_height},
+      {sl::kBufferTypeTransparencyAndCompositionMaskHint,
+       VK_FORMAT_R8_UNORM, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+       kInputUsage, frame.render_width, frame.render_height},
+      {sl::kBufferTypeReactiveMaskHint, VK_FORMAT_R8_UNORM,
+       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, kInputUsage,
+       frame.render_width, frame.render_height},
+  }};
+  if (!validateTaggedTextureSet(
+          "DLSS-SR", frame.frame_index, tags, expectations,
+          impl_->last_tag_validation_failure, impl_->status)) {
+    impl_->force_history_reset = true;
+    return false;
+  }
   sl::CommandBuffer *command_buffer =
       reinterpret_cast<sl::CommandBuffer *>(frame.command_buffer);
   const sl::Result tag_result = impl_->sl_set_tag_for_frame(
@@ -2499,42 +2648,14 @@ bool StreamlineVulkanRuntime::recordDlssRayReconstruction(
       impl_->device != VK_NULL_HANDLE &&
       impl_->physical_device != VK_NULL_HANDLE &&
       frame.command_buffer != VK_NULL_HANDLE &&
-      frame.color_image != VK_NULL_HANDLE &&
-      frame.color_memory != VK_NULL_HANDLE &&
-      frame.color_view != VK_NULL_HANDLE &&
-      frame.depth_image != VK_NULL_HANDLE &&
-      frame.depth_memory != VK_NULL_HANDLE &&
-      frame.depth_view != VK_NULL_HANDLE &&
-      frame.motion_image != VK_NULL_HANDLE &&
-      frame.motion_memory != VK_NULL_HANDLE &&
-      frame.motion_view != VK_NULL_HANDLE &&
-      frame.transparency_and_composition_image != VK_NULL_HANDLE &&
-      frame.transparency_and_composition_memory != VK_NULL_HANDLE &&
-      frame.transparency_and_composition_view != VK_NULL_HANDLE &&
-      frame.reactive_mask_image != VK_NULL_HANDLE &&
-      frame.reactive_mask_memory != VK_NULL_HANDLE &&
-      frame.reactive_mask_view != VK_NULL_HANDLE &&
-      frame.guide_validity_image != VK_NULL_HANDLE &&
-      frame.guide_validity_memory != VK_NULL_HANDLE &&
-      frame.guide_validity_view != VK_NULL_HANDLE &&
-      frame.diffuse_albedo_image != VK_NULL_HANDLE &&
-      frame.diffuse_albedo_memory != VK_NULL_HANDLE &&
-      frame.diffuse_albedo_view != VK_NULL_HANDLE &&
-      frame.specular_albedo_image != VK_NULL_HANDLE &&
-      frame.specular_albedo_memory != VK_NULL_HANDLE &&
-      frame.specular_albedo_view != VK_NULL_HANDLE &&
-      frame.normal_roughness_image != VK_NULL_HANDLE &&
-      frame.normal_roughness_memory != VK_NULL_HANDLE &&
-      frame.normal_roughness_view != VK_NULL_HANDLE &&
-      frame.specular_hit_distance_image != VK_NULL_HANDLE &&
-      frame.specular_hit_distance_memory != VK_NULL_HANDLE &&
-      frame.specular_hit_distance_view != VK_NULL_HANDLE &&
       frame.view != nullptr && frame.projection != nullptr &&
       frame.render_width > 0u && frame.render_height > 0u &&
       frame.output_width > 0u && frame.output_height > 0u &&
       frame.mode != PathTraceUpscale::Off &&
       frame.mode != PathTraceUpscale::Dlaa;
   if (!valid) {
+    impl_->status =
+        "DLSS Ray Reconstruction submission prerequisites invalid";
     impl_->force_history_reset = true;
     return false;
   }
@@ -2730,6 +2851,48 @@ bool StreamlineVulkanRuntime::recordDlssRayReconstruction(
       {&reactive_mask, sl::kBufferTypeReactiveMaskHint,
        sl::ResourceLifecycle::eOnlyValidNow, &input_extent},
   }};
+  const std::array<TaggedTextureExpectation, 10> expectations{{
+      {sl::kBufferTypeScalingInputColor,
+       VK_FORMAT_R16G16B16A16_SFLOAT,
+       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, kInputUsage,
+       frame.render_width, frame.render_height},
+      {sl::kBufferTypeScalingOutputColor,
+       VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_LAYOUT_GENERAL,
+       VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+       frame.output_width, frame.output_height},
+      {sl::kBufferTypeDepth, VK_FORMAT_R32_SFLOAT,
+       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, kInputUsage,
+       frame.render_width, frame.render_height},
+      {sl::kBufferTypeMotionVectors, VK_FORMAT_R32G32_SFLOAT,
+       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, kInputUsage,
+       frame.render_width, frame.render_height},
+      {sl::kBufferTypeAlbedo, VK_FORMAT_R16G16B16A16_SFLOAT,
+       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, kInputUsage,
+       frame.render_width, frame.render_height},
+      {sl::kBufferTypeSpecularAlbedo,
+       VK_FORMAT_R16G16B16A16_SFLOAT,
+       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, kInputUsage,
+       frame.render_width, frame.render_height},
+      {sl::kBufferTypeNormalRoughness,
+       VK_FORMAT_R16G16B16A16_SFLOAT,
+       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, kInputUsage,
+       frame.render_width, frame.render_height},
+      {sl::kBufferTypeSpecularHitDistance, VK_FORMAT_R32_SFLOAT,
+       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, kInputUsage,
+       frame.render_width, frame.render_height},
+      {sl::kBufferTypeTransparencyAndCompositionMaskHint,
+       VK_FORMAT_R8_UNORM, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+       kInputUsage, frame.render_width, frame.render_height},
+      {sl::kBufferTypeReactiveMaskHint, VK_FORMAT_R8_UNORM,
+       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, kInputUsage,
+       frame.render_width, frame.render_height},
+  }};
+  if (!validateTaggedTextureSet(
+          "DLSS-RR", frame.frame_index, tags, expectations,
+          impl_->last_tag_validation_failure, impl_->status)) {
+    impl_->force_history_reset = true;
+    return false;
+  }
   sl::CommandBuffer *command_buffer =
       reinterpret_cast<sl::CommandBuffer *>(frame.command_buffer);
   const sl::Result tag_result = impl_->sl_set_tag_for_frame(

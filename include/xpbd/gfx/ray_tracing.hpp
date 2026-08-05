@@ -329,12 +329,88 @@ hasPathTraceChange(PathTraceChangeClass value,
 // Streamline owns temporal reconstruction history independently from the raw
 // path-trace sample accumulator. Ordinary camera/object motion is represented
 // by dense motion vectors and must not be treated as a camera cut.
+enum class TemporalReconstructionResetReason : std::uint8_t {
+  None = 0,
+  FirstFrame,
+  InvalidMotionHistory,
+  IncompatibleInput,
+  ResolutionChange,
+  ModeChange,
+  RecoveryAfterFailure,
+  ExplicitDiscontinuity,
+};
+
+struct TemporalReconstructionResetInput {
+  bool history_valid = false;
+  std::uint64_t previous_compatibility_key = 0u;
+  std::uint64_t current_compatibility_key = 0u;
+  bool motion_history_valid = false;
+  bool resolution_changed = false;
+  bool mode_changed = false;
+  bool recovery_after_failure = false;
+  bool explicit_discontinuity = false;
+};
+
+[[nodiscard]] constexpr TemporalReconstructionResetReason
+temporalReconstructionResetReason(
+    const TemporalReconstructionResetInput &input) noexcept {
+  if (input.explicit_discontinuity) {
+    return TemporalReconstructionResetReason::ExplicitDiscontinuity;
+  }
+  if (input.recovery_after_failure) {
+    return TemporalReconstructionResetReason::RecoveryAfterFailure;
+  }
+  if (input.resolution_changed) {
+    return TemporalReconstructionResetReason::ResolutionChange;
+  }
+  if (input.mode_changed) {
+    return TemporalReconstructionResetReason::ModeChange;
+  }
+  if (!input.history_valid) {
+    return TemporalReconstructionResetReason::FirstFrame;
+  }
+  if (!input.motion_history_valid) {
+    return TemporalReconstructionResetReason::InvalidMotionHistory;
+  }
+  if (input.previous_compatibility_key !=
+      input.current_compatibility_key) {
+    return TemporalReconstructionResetReason::IncompatibleInput;
+  }
+  return TemporalReconstructionResetReason::None;
+}
+
+[[nodiscard]] constexpr const char *temporalReconstructionResetReasonName(
+    TemporalReconstructionResetReason reason) noexcept {
+  switch (reason) {
+  case TemporalReconstructionResetReason::None:
+    return "None";
+  case TemporalReconstructionResetReason::FirstFrame:
+    return "FirstFrame";
+  case TemporalReconstructionResetReason::InvalidMotionHistory:
+    return "InvalidMotionHistory";
+  case TemporalReconstructionResetReason::IncompatibleInput:
+    return "IncompatibleInput";
+  case TemporalReconstructionResetReason::ResolutionChange:
+    return "ResolutionChange";
+  case TemporalReconstructionResetReason::ModeChange:
+    return "ModeChange";
+  case TemporalReconstructionResetReason::RecoveryAfterFailure:
+    return "RecoveryAfterFailure";
+  case TemporalReconstructionResetReason::ExplicitDiscontinuity:
+    return "ExplicitDiscontinuity";
+  }
+  return "Unknown";
+}
+
 [[nodiscard]] constexpr bool shouldResetTemporalReconstructionHistory(
     bool history_valid, std::uint64_t previous_compatibility_key,
     std::uint64_t current_compatibility_key,
     bool motion_history_valid) noexcept {
-  return !history_valid || !motion_history_valid ||
-         previous_compatibility_key != current_compatibility_key;
+  return temporalReconstructionResetReason(
+             TemporalReconstructionResetInput{
+                 history_valid, previous_compatibility_key,
+                 current_compatibility_key, motion_history_valid}) !=
+         TemporalReconstructionResetReason::None;
 }
 
 inline constexpr float kDefaultPathTraceExposureEv = 0.0f;
@@ -915,8 +991,9 @@ struct RtMotionProjectionResult {
 };
 
 // CPU reference for the motion/disocclusion contract shared by the compute and
-// RT-pipeline shaders. Invalid history, non-finite/behind-camera clip values,
-// and previous samples outside the viewport are explicitly disoccluded.
+// RT-pipeline shaders. Invalid history and non-finite/behind-camera clip values
+// have no usable vector. Previous samples outside the viewport retain their
+// finite current-to-previous motion but are explicitly disoccluded.
 [[nodiscard]] RtMotionProjectionResult
 evaluateRtMotionProjection(const RtMotionProjectionInput &input) noexcept;
 

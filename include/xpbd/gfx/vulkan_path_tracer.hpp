@@ -712,8 +712,11 @@ private:
   VkImage guide_validity_image_ = VK_NULL_HANDLE;
   VkDeviceMemory guide_validity_image_memory_ = VK_NULL_HANDLE;
   VkImageView guide_validity_image_view_ = VK_NULL_HANDLE;
-  Buffer motion_frame_buffer_{};
-  void *motion_frame_mapped_ = nullptr;
+  // The backend records two frames in flight. Previous-camera constants must
+  // therefore be slot-local; a single persistently mapped buffer can be
+  // overwritten by the CPU while the other frame is still reading it.
+  std::array<Buffer, 2> motion_frame_buffers_{};
+  std::array<void *, 2> motion_frame_mapped_{};
   std::uint32_t image_w_ = 0;
   std::uint32_t image_h_ = 0;
   VkImageLayout image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;

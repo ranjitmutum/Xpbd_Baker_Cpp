@@ -30,27 +30,67 @@ vec3 linearToSrgb(vec3 value) {
   return mix(high, low, cutoff);
 }
 
-vec4 samplePathColor(vec2 uv) {
-  return (composite_push.flags.x & 2u) != 0u
-             ? texture(uReconstructed, uv)
-             : texture(uPathTrace, uv);
+bool reconstructedEnabled() {
+  return (composite_push.flags.x & 2u) != 0u;
+}
+
+vec2 currentRawUv(vec2 outputUv) {
+  if (!reconstructedEnabled()) {
+    return outputUv;
+  }
+  // Temporal primary rays use pixelCenter-jitter. DLSS output is in
+  // unjittered output space, so address the current raw frame at +jitter.
+  vec2 jitterPixels = uintBitsToFloat(composite_push.flags.yz);
+  return outputUv +
+         jitterPixels / vec2(textureSize(uPathTrace, 0));
+}
+
+float sampleCurrentCoverage(vec2 rawUv) {
+  if (any(lessThan(rawUv, vec2(0.0))) ||
+      any(greaterThanEqual(rawUv, vec2(1.0)))) {
+    return 0.0;
+  }
+  // Spatially upscale this frame's coverage without temporal history. The
+  // shared sampler remains nearest for pixel-art color/depth, so perform the
+  // four-tap coverage filter explicitly.
+  ivec2 size = textureSize(uPathTrace, 0);
+  vec2 pixel = rawUv * vec2(size) - vec2(0.5);
+  ivec2 base = ivec2(floor(pixel));
+  vec2 weight = fract(pixel);
+  ivec2 maximum = size - ivec2(1);
+  ivec2 p00 = clamp(base, ivec2(0), maximum);
+  ivec2 p10 = clamp(base + ivec2(1, 0), ivec2(0), maximum);
+  ivec2 p01 = clamp(base + ivec2(0, 1), ivec2(0), maximum);
+  ivec2 p11 = clamp(base + ivec2(1, 1), ivec2(0), maximum);
+  float a00 = texelFetch(uPathTrace, p00, 0).a;
+  float a10 = texelFetch(uPathTrace, p10, 0).a;
+  float a01 = texelFetch(uPathTrace, p01, 0).a;
+  float a11 = texelFetch(uPathTrace, p11, 0).a;
+  return clamp(mix(mix(a00, a10, weight.x),
+                   mix(a01, a11, weight.x), weight.y),
+               0.0, 1.0);
+}
+
+vec4 sampleDisplayColor(vec2 outputUv) {
+  if (!reconstructedEnabled()) {
+    vec4 raw = texture(uPathTrace, outputUv);
+    raw.a = clamp(raw.a, 0.0, 1.0);
+    return raw;
+  }
+  vec4 reconstructed = texture(uReconstructed, outputUv);
+  // Never consume DLSS output alpha here. It is temporal and can trail across
+  // the independent raster sky while the camera rotates.
+  reconstructed.a = sampleCurrentCoverage(currentRawUv(outputUv));
+  return reconstructed;
 }
 
 void main() {
-  vec4 color = samplePathColor(vUV);
-  color.a = clamp(color.a, 0.0, 1.0);
-  vec2 depthUv = vUV;
-  if ((composite_push.flags.x & 2u) != 0u) {
-    // Temporal primary rays use pixelCenter-jitter. Reconstructed color is
-    // back in unjittered output space, so query raw render-resolution depth
-    // with the inverse (+jitter) offset before later raster overlays test it.
-    vec2 jitterPixels = uintBitsToFloat(composite_push.flags.yz);
-    depthUv += jitterPixels / vec2(textureSize(uPathDepth, 0));
-  }
+  vec2 depthUv = currentRawUv(vUV);
+  vec4 color = sampleDisplayColor(vUV);
   float depth = clamp(texture(uPathDepth, depthUv).r, 0.0, 1.0);
-  bool transparentBackground =
-      (composite_push.flags.x & 1u) != 0u && depth >= 0.999999;
-  if (color.a < 0.001 || transparentBackground) {
+  // Current-frame coverage is the single authority for foreground visibility.
+  // Do not combine temporally reconstructed alpha with raw current depth.
+  if (color.a < 0.001) {
     discard;
   }
 
@@ -73,7 +113,7 @@ void main() {
     for (int y = -1; y <= 1; ++y) {
       for (int x = -1; x <= 1; ++x) {
         vec4 sampleValue =
-            samplePathColor(vUV + vec2(x, y) * texel);
+            sampleDisplayColor(vUV + vec2(x, y) * texel);
         vec3 sampleColor =
             sampleValue.rgb * clamp(sampleValue.a, 0.0, 1.0) *
             max(composite_push.display.x, 0.0) * whiteBalanceScale;

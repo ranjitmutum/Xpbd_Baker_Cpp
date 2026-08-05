@@ -1483,7 +1483,7 @@ vec3 packedPosition(uint vertex, bool previous) {
                     positions[base + 2u]);
 }
 
-vec4 motionVector(vec2 currentUv, vec3 previousWorld, bool valid) {
+vec4 motionVector(vec2 motionUv, vec3 previousWorld, bool valid) {
   if (!valid || motionInfo.x == 0u) {
     return vec4(0.0, 0.0, 1.0, 0.0);
   }
@@ -1496,17 +1496,16 @@ vec4 motionVector(vec2 currentUv, vec3 previousWorld, bool valid) {
   // maps directly to the top-left-origin storage-image UV convention.
   vec2 previousUv = previousNdc * 0.5 + 0.5;
   bool inside = all(greaterThanEqual(previousUv, vec2(0.0))) &&
-                all(lessThanEqual(previousUv, vec2(1.0)));
-  if (!inside) {
-    return vec4(0.0, 0.0, 1.0, 0.0);
-  }
+                all(lessThan(previousUv, vec2(1.0)));
+  // Keep the real vector even when reprojection leaves the viewport. A zero
+  // vector would make Streamline sample stale history at the current pixel.
   vec2 motionPixels =
-      (previousUv - currentUv) * vec2(pc.sizeMode.xy);
-  return vec4(motionPixels, 0.0, 1.0);
+      (previousUv - motionUv) * vec2(pc.sizeMode.xy);
+  return vec4(motionPixels, inside ? 0.0 : 1.0, inside ? 1.0 : 0.0);
 }
 
 vec4 surfaceMotion(uint primitive, uint instanceId, vec2 barycentrics,
-                   vec2 currentUv) {
+                   vec2 motionUv) {
   uint i0 = indices[primitive * 3u + 0u];
   uint i1 = indices[primitive * 3u + 1u];
   uint i2 = indices[primitive * 3u + 2u];
@@ -1522,7 +1521,7 @@ vec4 surfaceMotion(uint primitive, uint instanceId, vec2 barycentrics,
             ? instanceMotion[instanceId].previousTransform
             : instanceMotion[instanceId].currentTransform) *
        vec4(previousLocal, 1.0)).xyz;
-  return motionVector(currentUv, previousWorld, true);
+  return motionVector(motionUv, previousWorld, true);
 }
 
 // NVIDIA DLSS-RR Programming Guide 4.2.1. Convert material F0 into the
@@ -1578,7 +1577,7 @@ struct PrimaryAovProbe {
 };
 
 PrimaryAovProbe probePrimaryAov(vec3 cameraOrigin, vec3 direction,
-                                vec2 currentUv) {
+                                vec2 motionUv, RayCone initialCone) {
   PrimaryAovProbe result;
   result.geometry = vec4(0.0, 0.0, 1.0, 0.0);
   result.shading = vec4(0.0, 0.0, 1.0, 1.0);
@@ -1598,7 +1597,7 @@ PrimaryAovProbe probePrimaryAov(vec3 cameraOrigin, vec3 direction,
   result.opaqueHit = false;
 
   vec3 origin = cameraOrigin;
-  RayCone cone = initialRayCone(currentUv, direction);
+  RayCone cone = initialCone;
   float remaining = 1.0;
   PrimaryPayload guidePayload;
   vec3 guideHitPosition = cameraOrigin;
@@ -1719,7 +1718,7 @@ PrimaryAovProbe probePrimaryAov(vec3 cameraOrigin, vec3 direction,
     uint primitive = payload.status.w - 1u;
     uint instanceId = floatBitsToUint(payload.hitData.z);
     result.motion =
-        surfaceMotion(primitive, instanceId, payload.hitData.xy, currentUv);
+        surfaceMotion(primitive, instanceId, payload.hitData.xy, motionUv);
     result.guideValidity = 1.0;
     if (coverageLayerCount > 1u || guidePhysicalTransmission ||
         result.motion.w < 0.5) {
@@ -1755,7 +1754,18 @@ PrimaryAovProbe probePrimaryAov(vec3 cameraOrigin, vec3 direction,
     }
   } else {
     result.motion =
-        motionVector(currentUv, cameraOrigin + direction * 10000.0, true);
+        motionVector(motionUv, cameraOrigin + direction * 10000.0, true);
+    if (result.motion.w < 0.5) {
+      result.reactiveMask = 1.0;
+      result.motion.z = 1.0;
+    }
+    // When the preview sky is composed by the raster pass, a PT miss is not
+    // part of the reconstructed foreground. Bias DLSS toward the current
+    // transparent sample so old terrain/model RGB cannot linger at silhouettes.
+    if (!environmentBackgroundVisible()) {
+      result.reactiveMask = 1.0;
+      result.transparencyAndComposition = 1.0;
+    }
   }
   result.transparencyAndComposition = clamp(
       result.transparencyAndComposition, 0.0, 1.0);
@@ -1853,6 +1863,24 @@ void main() {
       (vec2(pixel) +
        (temporalReconstruction ? temporalPixelOffset : vec2(0.5))) /
       vec2(pc.sizeMode.xy);
+  // Streamline receives jitter separately and motionVectorsJittered=false.
+  // Keep the ray-cone footprint stable at the unjittered pixel center, but
+  // compute motion from primaryUv: the AOV hit was traced through that
+  // sub-pixel sample using unjittered camera matrices.
+  vec2 footprintUv =
+      (vec2(pixel) + vec2(0.5)) / vec2(pc.sizeMode.xy);
+  vec2 footprintNdc =
+      vec2(footprintUv.x * 2.0 - 1.0, 1.0 - footprintUv.y * 2.0);
+  vec4 footprintFarWorldH =
+      pc.invViewProj * vec4(footprintNdc, 1.0, 1.0);
+  vec3 footprintFarWorld =
+      footprintFarWorldH.xyz / max(abs(footprintFarWorldH.w), 1.0e-6);
+  vec3 footprintDirection =
+      safeNormalize(footprintFarWorld - cameraOrigin,
+                    vec3(0.0, 0.0, -1.0));
+  RayCone footprintCone =
+      initialRayCone(footprintUv, footprintDirection);
+
   vec2 centerNdc =
       vec2(primaryUv.x * 2.0 - 1.0, 1.0 - primaryUv.y * 2.0);
   vec4 centerFarWorldH =
@@ -1863,7 +1891,7 @@ void main() {
       safeNormalize(centerFarWorld - cameraOrigin,
                     vec3(0.0, 0.0, -1.0));
   PrimaryAovProbe aovProbe =
-      probePrimaryAov(cameraOrigin, centerDirection, primaryUv);
+      probePrimaryAov(cameraOrigin, centerDirection, primaryUv, footprintCone);
   storeSurfaceAovs(ivec2(pixel), aovProbe);
   uint debugMode = pc.sizeMode.z;
   uint materialDebug = (pc.sampling.w >> 16u) & 0xffu;
@@ -1875,7 +1903,7 @@ void main() {
         farWorldH.xyz / max(abs(farWorldH.w), 1.0e-6);
     vec3 direction =
         safeNormalize(farWorld - cameraOrigin, vec3(0.0, 0.0, -1.0));
-    tracePrimary(cameraOrigin, direction, initialRayCone(uv, direction));
+    tracePrimary(cameraOrigin, direction, footprintCone);
 
     float depth = 1.0;
     float alpha = 0.0;
@@ -1957,7 +1985,11 @@ void main() {
     vec3 origin = cameraOrigin;
     vec3 direction =
         safeNormalize(farWorld - origin, vec3(0.0, 0.0, -1.0));
-    RayCone rayCone = initialRayCone(uv, direction);
+    // RR/SR jitter changes the sample position, not the pixel's texture
+    // footprint. Raw multi-sample PT keeps its per-sample cone.
+    RayCone rayCone =
+        temporalReconstruction ? footprintCone
+                               : initialRayCone(uv, direction);
     vec3 throughput = vec3(1.0);
     vec3 sampleRadiance = vec3(0.0);
     vec3 sampleDiffuseRadiance = vec3(0.0);

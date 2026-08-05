@@ -160,6 +160,8 @@ void testPathTracePbrSourceContracts() {
       readTestSource("src/gfx/vulkan_path_tracer.cpp");
   const std::string rt_pipeline =
       readTestSource("src/gfx/vulkan_rt_pipeline.cpp");
+  const std::string stage50 = readTestSource(
+      "src/gfx/vulkan_render/render/50_path_trace_and_dlss.inc");
   const std::string ray_tracing_header =
       readTestSource("include/xpbd/gfx/ray_tracing.hpp");
   const std::string ray_tracing_source =
@@ -174,8 +176,8 @@ void testPathTracePbrSourceContracts() {
               !composite.empty() && !backend.empty() &&
               !backend_static.empty() && !backend_environment.empty() &&
               !mip_header.empty() && !mip_source.empty() &&
-              !path_tracer.empty() &&
-              !rt_pipeline.empty() && !ray_tracing_header.empty() &&
+              !path_tracer.empty() && !rt_pipeline.empty() &&
+              !stage50.empty() && !ray_tracing_header.empty() &&
               !ray_tracing_source.empty() && !rt_scene_header.empty() &&
               !rt_scene_source.empty(),
           "PBR source-contract fixtures are readable");
@@ -318,27 +320,38 @@ void testPathTracePbrSourceContracts() {
                  std::string::npos,
          "Vulkan descriptors bind distinct pixel-atlas channel samplers");
   expect(countText(
-              backend,
-              "sampler_info.magFilter = VK_FILTER_NEAREST;") == 1u &&
-             countText(
-                 backend,
-                  "sampler_info.minFilter = VK_FILTER_NEAREST;") == 1u &&
-             countText(
-                 backend,
-                  "sampler_info.magFilter = VK_FILTER_LINEAR;") == 0u &&
-             countText(
-                 backend,
-                  "sampler_info.minFilter = VK_FILTER_LINEAR;") == 0u &&
+             backend,
+             "sampler_info.magFilter = VK_FILTER_NEAREST;") == 1u &&
+             backend.find("sampler_info.minFilter =") != std::string::npos &&
+             backend.find("? VK_FILTER_LINEAR") != std::string::npos &&
+             backend.find(": VK_FILTER_NEAREST;") != std::string::npos &&
+             backend.find("sampler_info.mipmapMode = mipmap_mode;") !=
+                 std::string::npos &&
+             countText(backend_static,
+                       "VK_SAMPLER_MIPMAP_MODE_LINEAR") == 2u &&
+             countText(backend_static,
+                       "VK_SAMPLER_MIPMAP_MODE_NEAREST") == 1u &&
              countText(path_tracer,
                        "si.magFilter = VK_FILTER_NEAREST;") == 1u &&
              countText(path_tracer,
                        "si.minFilter = VK_FILTER_NEAREST;") == 1u &&
-             countText(path_tracer,
-                       "si.magFilter = VK_FILTER_LINEAR;") == 0u &&
-             countText(path_tracer,
-                       "si.minFilter = VK_FILTER_LINEAR;") == 0u,
-         "Raster and path tracing keep every pixel-atlas channel "
-         "nearest-filtered");
+             stage50.find("static_albedo_sampler_") != std::string::npos &&
+             stage50.find("static_normal_sampler_") != std::string::npos &&
+             stage50.find("static_specular_sampler_") != std::string::npos,
+         "Albedo/Normal use nearest-mag linear-min/mip while packed "
+         "Specular and fallback atlas sampling remain nearest");
+  const std::size_t streamline_key_position = stage50.find(
+      "std::uint64_t streamline_history_key = history_key;");
+  const std::size_t current_view_history_position = stage50.find(
+      "appendPathTraceHistoryBytes(history_key, frame.view_matrix");
+  expect(streamline_key_position != std::string::npos &&
+             current_view_history_position != std::string::npos &&
+             streamline_key_position < current_view_history_position &&
+             stage50.find(
+                 "SL history: feature=%s reset=%d history_valid=%d") !=
+                 std::string::npos,
+         "Streamline snapshots compatibility before camera matrices enter "
+         "the stricter Raw PT history and exposes per-frame Reset reasons");
   expect(countText(
               backend,
               "sampler_info.addressModeU = "
@@ -384,6 +397,14 @@ void testPathTracePbrSourceContracts() {
       compactTestSource(rt_scene_header);
   const std::string compact_rt_scene_source =
       compactTestSource(rt_scene_source);
+  expect(compact_compute.find(
+             "returnvec4(motionPixels,inside?0.0:1.0,inside?1.0:0.0);") !=
+                 std::string::npos &&
+             compact_raygen.find(
+             "returnvec4(motionPixels,inside?0.0:1.0,inside?1.0:0.0);") !=
+                 std::string::npos,
+         "compute and Full RT preserve finite off-screen motion while "
+         "marking history disoccluded");
   expect(compact_closest_hit.find("floatggxAlpha;") != std::string::npos &&
              compact_closest_hit.find(
                  "returnperceptualRoughness*perceptualRoughness;") !=
@@ -623,17 +644,25 @@ void testSelectionOutlineTemporalContract() {
               std::string::npos,
       "reconstructed composite receives the current pixel-space jitter");
   expect(
-      compact_composite.find(
-          "if((composite_push.flags.x&2u)!=0u){") != std::string::npos &&
+      compact_composite.find("boolreconstructedEnabled()") !=
+              std::string::npos &&
           compact_composite.find(
               "vec2jitterPixels=uintBitsToFloat("
               "composite_push.flags.yz);") != std::string::npos &&
           compact_composite.find(
-              "depthUv+=jitterPixels/"
-              "vec2(textureSize(uPathDepth,0));") != std::string::npos &&
+              "returnoutputUv+jitterPixels/"
+              "vec2(textureSize(uPathTrace,0));") !=
+              std::string::npos &&
+          compact_composite.find("floatsampleCurrentCoverage") !=
+              std::string::npos &&
+          compact_composite.find(
+              "reconstructed.a=sampleCurrentCoverage("
+              "currentRawUv(outputUv));") != std::string::npos &&
           compact_composite.find("texture(uPathDepth,depthUv)") !=
+              std::string::npos &&
+          compact_composite.find("transparentBackground") ==
               std::string::npos,
-      "post-DLSS depth lookup reverses primary-ray jitter in render pixels");
+      "post-DLSS composite pairs current raw coverage/depth in jitter-corrected render space instead of consuming temporal alpha");
 
   expect(
       compact_backend_internal.find(
@@ -3962,6 +3991,10 @@ void testPathTraceSamplingAndAccumulation() {
   using xpbd::gfx::pathTraceTemporalJitter;
   using xpbd::gfx::samplePathTraceCosineHemisphere;
   using xpbd::gfx::shouldResetTemporalReconstructionHistory;
+  using xpbd::gfx::temporalReconstructionResetReason;
+  using xpbd::gfx::temporalReconstructionResetReasonName;
+  using xpbd::gfx::TemporalReconstructionResetInput;
+  using xpbd::gfx::TemporalReconstructionResetReason;
 
   PathTraceSettings invalid;
   invalid.samples_per_frame = 0u;
@@ -4175,6 +4208,45 @@ void testPathTraceSamplingAndAccumulation() {
                  true, 7u, 7u, false),
          "Streamline history resets only for first/incompatible/invalid-motion "
          "frames, not ordinary dense-motion camera frames");
+  TemporalReconstructionResetInput reset_input{
+      true, 7u, 7u, true};
+  expect(temporalReconstructionResetReason(reset_input) ==
+                 TemporalReconstructionResetReason::None &&
+             std::string_view(temporalReconstructionResetReasonName(
+                 temporalReconstructionResetReason(reset_input))) == "None",
+         "ordinary dense-motion camera frames report Reset reason None");
+  reset_input.history_valid = false;
+  expect(temporalReconstructionResetReason(reset_input) ==
+             TemporalReconstructionResetReason::FirstFrame,
+         "missing initial Streamline history reports FirstFrame");
+  reset_input.history_valid = true;
+  reset_input.motion_history_valid = false;
+  expect(temporalReconstructionResetReason(reset_input) ==
+             TemporalReconstructionResetReason::InvalidMotionHistory,
+         "missing dense motion reports InvalidMotionHistory");
+  reset_input.motion_history_valid = true;
+  reset_input.current_compatibility_key = 8u;
+  expect(temporalReconstructionResetReason(reset_input) ==
+             TemporalReconstructionResetReason::IncompatibleInput,
+         "generic compatibility changes report IncompatibleInput");
+  reset_input.resolution_changed = true;
+  expect(temporalReconstructionResetReason(reset_input) ==
+             TemporalReconstructionResetReason::ResolutionChange,
+         "resolution transitions report ResolutionChange");
+  reset_input.resolution_changed = false;
+  reset_input.mode_changed = true;
+  expect(temporalReconstructionResetReason(reset_input) ==
+             TemporalReconstructionResetReason::ModeChange,
+         "SR/RR mode transitions report ModeChange");
+  reset_input.mode_changed = false;
+  reset_input.recovery_after_failure = true;
+  expect(temporalReconstructionResetReason(reset_input) ==
+             TemporalReconstructionResetReason::RecoveryAfterFailure,
+         "a failed submission reports RecoveryAfterFailure on retry");
+  reset_input.explicit_discontinuity = true;
+  expect(temporalReconstructionResetReason(reset_input) ==
+             TemporalReconstructionResetReason::ExplicitDiscontinuity,
+         "explicit discontinuity has highest-priority Reset diagnosis");
 
   const auto hemisphere = samplePathTraceCosineHemisphere(
       {0.0f, 1.0f, 0.0f}, random_unit,
@@ -5800,9 +5872,11 @@ void testTransparentGuidePolicySourceContracts() {
              compact_aov.find("GuideValidity") != std::string::npos &&
              compact_aov.find("kPathTraceTransparencyGuideOutputMask") !=
                  std::string::npos &&
+             compact_aov.find("kPathTraceStreamlineMaskOutputMask") !=
+                 std::string::npos &&
              compact_aov.find("kPathTraceAllOptionalOutputMask==0x7ffffu") !=
                  std::string::npos,
-         "three independent single-channel temporal outputs extend the shared mask ABI");
+         "three independent single-channel outputs retain the ABI while only validated masks enter the Streamline runtime contract");
 
   const std::string compact_path_header =
       compactTestSource(path_tracer_header);
@@ -5846,9 +5920,15 @@ void testTransparentGuidePolicySourceContracts() {
              compact_raygen.find("transparencyAndComposition") !=
                  std::string::npos &&
              compact_raygen.find("reactiveMask") != std::string::npos &&
+             compact_raygen.find(
+                 "imageStore(outputGuideValidity,pixel,vec4(probe.guideValidity));") !=
+                 std::string::npos &&
+             compact_raygen.find(
+                 "if(!environmentBackgroundVisible()){") !=
+                 std::string::npos &&
              compact_raygen.find("neutralizeRrGuides") !=
                  std::string::npos,
-         "the deterministic primary probe owns one guide surface, masks, validity, and neutral RR fallback");
+         "the deterministic primary probe keeps validity internal and marks raster-sky misses reactive");
 
   const std::string compact_stage50 = compactTestSource(stage50);
   expect(compact_stage50.find("kPathTraceSrRequiredOutputMask") !=
@@ -5880,9 +5960,56 @@ void testTransparentGuidePolicySourceContracts() {
              compact_streamline_source.find(
                  "sl::kBufferTypeReactiveMaskHint") !=
                  std::string::npos &&
+             compact_streamline_source.find(
+                 "sl::kBufferTypeDisocclusionMask") ==
+                 std::string::npos &&
+             compact_streamline_source.find(
+                 "options.alphaUpscalingEnabled=sl::Boolean::eFalse;") !=
+                 std::string::npos &&
              compact_streamline_source.find("VK_FORMAT_R8_UNORM") !=
                  std::string::npos,
-         "Streamline receives real current-frame R8 masks through supported SDK tags");
+         "Streamline receives only validated current-frame R8 mask tags and reconstructs RGB without temporal alpha");
+  const std::size_t sr_validation = compact_streamline_source.find(
+      "validateTaggedTextureSet(\"DLSS-SR\"");
+  const std::size_t rr_validation = compact_streamline_source.find(
+      "validateTaggedTextureSet(\"DLSS-RR\"");
+  const std::size_t sr_tag = compact_streamline_source.find(
+      "impl_->sl_set_tag_for_frame(", sr_validation);
+  const std::size_t rr_tag = compact_streamline_source.find(
+      "impl_->sl_set_tag_for_frame(", rr_validation);
+  expect(compact_streamline_source.find(
+             "constchar*taggedTextureValidationFailure(") !=
+                 std::string::npos &&
+             compact_streamline_source.find("undefined-format") !=
+                 std::string::npos &&
+             compact_streamline_source.find("undefined-layout") !=
+                 std::string::npos &&
+             compact_streamline_source.find("null-image") !=
+                 std::string::npos &&
+             compact_streamline_source.find("null-memory") !=
+                 std::string::npos &&
+             compact_streamline_source.find("null-view") !=
+                 std::string::npos &&
+             compact_streamline_source.find("invalid-mip-count") !=
+                 std::string::npos &&
+             compact_streamline_source.find("invalid-array-layer-count") !=
+                 std::string::npos &&
+             compact_streamline_source.find("missing-required-usage") !=
+                 std::string::npos &&
+             compact_streamline_source.find("tag-extent-out-of-bounds") !=
+                 std::string::npos &&
+             compact_streamline_source.find("SL_TAG_VALIDATION_FAILED") !=
+                 std::string::npos &&
+             sr_validation != std::string::npos &&
+             rr_validation != std::string::npos &&
+             sr_tag != std::string::npos && rr_tag != std::string::npos &&
+             sr_validation < sr_tag && rr_validation < rr_tag &&
+             countText(
+                 compact_streamline_source,
+                 "impl_->last_tag_validation_failure,impl_->status)){"
+                 "impl_->force_history_reset=true;returnfalse;}"
+                 "sl::CommandBuffer*command_buffer=") == 2u,
+         "SR/RR validate every Vulkan texture contract before Tag/Evaluate");
 
   const std::string compact_any_hit = compactTestSource(any_hit);
   const std::string compact_shadow_miss = compactTestSource(shadow_miss);
@@ -6196,6 +6323,17 @@ void testRtMotionProjection() {
   projected = evaluateRtMotionProjection(input);
   expect(!projected.valid && projected.disocclusion == 1.0f,
          "motion marks previous sample outside viewport disoccluded");
+  expectNear(projected.current_to_previous_pixels[0], 2880.0f, 1.0e-4f,
+             "off-screen motion preserves the real horizontal trajectory");
+  expectNear(projected.current_to_previous_pixels[1], 0.0f, 1.0e-4f,
+             "off-screen motion preserves the real vertical trajectory");
+
+  input.previous_clip = {1.0f, 0.0f, 0.5f, 1.0f};
+  projected = evaluateRtMotionProjection(input);
+  expect(!projected.valid && projected.disocclusion == 1.0f,
+         "the exclusive upper UV edge is outside temporal history");
+  expectNear(projected.current_to_previous_pixels[0], 960.0f, 1.0e-4f,
+             "upper-edge rejection still preserves finite motion");
 
   input.previous_clip = {
       std::numeric_limits<float>::infinity(), 0.0f, 0.5f, 1.0f};

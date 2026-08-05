@@ -40,8 +40,9 @@ struct StreamlineDlssFrame {
   VkImage reactive_mask_image = VK_NULL_HANDLE;
   VkDeviceMemory reactive_mask_memory = VK_NULL_HANDLE;
   VkImageView reactive_mask_view = VK_NULL_HANDLE;
-  // No Streamline BufferType exists for this internal channel. Its real image
-  // is still required so callers cannot tag masks while validity is absent.
+  // Internal RR guide-validity/debug channel. Do not tag this image as a
+  // generic Streamline disocclusion resource: the bundled Vulkan DLSS/RR
+  // plugin rejects that global tag and emits undefined-format errors.
   VkImage guide_validity_image = VK_NULL_HANDLE;
   VkDeviceMemory guide_validity_memory = VK_NULL_HANDLE;
   VkImageView guide_validity_view = VK_NULL_HANDLE;

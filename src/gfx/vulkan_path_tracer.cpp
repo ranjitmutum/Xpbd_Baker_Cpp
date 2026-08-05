@@ -754,100 +754,119 @@ void VulkanPathTracer::destroyImage() {
 
 void VulkanPathTracer::destroyMotionFrame() {
   if (device_ != VK_NULL_HANDLE) {
-    if (motion_frame_mapped_ != nullptr &&
-        motion_frame_buffer_.memory != VK_NULL_HANDLE) {
-      vkUnmapMemory(device_, motion_frame_buffer_.memory);
+    for (std::size_t slot = 0; slot < motion_frame_buffers_.size(); ++slot) {
+      auto &buffer = motion_frame_buffers_[slot];
+      if (motion_frame_mapped_[slot] != nullptr &&
+          buffer.memory != VK_NULL_HANDLE) {
+        vkUnmapMemory(device_, buffer.memory);
+      }
+      if (buffer.buffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(device_, buffer.buffer, nullptr);
+      }
+      if (buffer.memory != VK_NULL_HANDLE) {
+        vkFreeMemory(device_, buffer.memory, nullptr);
+      }
+      buffer = {};
+      motion_frame_mapped_[slot] = nullptr;
     }
-    if (motion_frame_buffer_.buffer != VK_NULL_HANDLE) {
-      vkDestroyBuffer(device_, motion_frame_buffer_.buffer, nullptr);
-    }
-    if (motion_frame_buffer_.memory != VK_NULL_HANDLE) {
-      vkFreeMemory(device_, motion_frame_buffer_.memory, nullptr);
-    }
+  } else {
+    motion_frame_buffers_ = {};
+    motion_frame_mapped_ = {};
   }
-  motion_frame_buffer_ = {};
-  motion_frame_mapped_ = nullptr;
 }
 
 bool VulkanPathTracer::ensureMotionFrame() {
-  if (motion_frame_buffer_.buffer != VK_NULL_HANDLE &&
-      motion_frame_mapped_ != nullptr &&
-      motion_frame_buffer_.capacity >= sizeof(PathTraceMotionFrameGpu)) {
+  bool ready = true;
+  for (std::size_t slot = 0; slot < motion_frame_buffers_.size(); ++slot) {
+    const auto &buffer = motion_frame_buffers_[slot];
+    ready = ready && buffer.buffer != VK_NULL_HANDLE &&
+            motion_frame_mapped_[slot] != nullptr &&
+            buffer.capacity >= sizeof(PathTraceMotionFrameGpu);
+  }
+  if (ready) {
     return true;
   }
+
   destroyMotionFrame();
-  VkBufferCreateInfo buffer_info{
-      VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-  buffer_info.size = sizeof(PathTraceMotionFrameGpu);
-  buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-  buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-  const VkResult create_result = vkCreateBuffer(
-      device_, &buffer_info, nullptr, &motion_frame_buffer_.buffer);
-  if (create_result != VK_SUCCESS) {
-    xpbd::log::errorf(
-        "Path-trace buffer failure: api=vkCreateBuffer VkResult=%d "
-        "resource=motion-frame size=%llu usage=0x%x",
-        static_cast<int>(create_result),
-        static_cast<unsigned long long>(buffer_info.size),
-        static_cast<unsigned>(buffer_info.usage));
-    destroyMotionFrame();
-    return false;
+  for (std::size_t slot = 0; slot < motion_frame_buffers_.size(); ++slot) {
+    auto &buffer = motion_frame_buffers_[slot];
+    VkBufferCreateInfo buffer_info{
+        VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    buffer_info.size = sizeof(PathTraceMotionFrameGpu);
+    buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    const VkResult create_result =
+        vkCreateBuffer(device_, &buffer_info, nullptr, &buffer.buffer);
+    if (create_result != VK_SUCCESS) {
+      xpbd::log::errorf(
+          "Path-trace buffer failure: api=vkCreateBuffer VkResult=%d "
+          "resource=motion-frame slot=%zu size=%llu usage=0x%x",
+          static_cast<int>(create_result), slot,
+          static_cast<unsigned long long>(buffer_info.size),
+          static_cast<unsigned>(buffer_info.usage));
+      destroyMotionFrame();
+      return false;
+    }
+
+    VkMemoryRequirements requirements{};
+    vkGetBufferMemoryRequirements(device_, buffer.buffer, &requirements);
+    const std::uint32_t memory_type = findMemoryType(
+        requirements.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (memory_type == (std::numeric_limits<std::uint32_t>::max)()) {
+      destroyMotionFrame();
+      return false;
+    }
+
+    VkMemoryAllocateInfo allocate_info{
+        VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocate_info.allocationSize = requirements.size;
+    allocate_info.memoryTypeIndex = memory_type;
+    const VkResult allocation_result =
+        vkAllocateMemory(device_, &allocate_info, nullptr, &buffer.memory);
+    if (allocation_result != VK_SUCCESS) {
+      xpbd::log::errorf(
+          "Path-trace buffer failure: api=vkAllocateMemory VkResult=%d "
+          "resource=motion-frame slot=%zu size=%llu usage=0x%x "
+          "memory_type=%u",
+          static_cast<int>(allocation_result), slot,
+          static_cast<unsigned long long>(requirements.size),
+          static_cast<unsigned>(buffer_info.usage), memory_type);
+      destroyMotionFrame();
+      return false;
+    }
+
+    const VkResult bind_result =
+        vkBindBufferMemory(device_, buffer.buffer, buffer.memory, 0);
+    if (bind_result != VK_SUCCESS) {
+      xpbd::log::errorf(
+          "Path-trace buffer failure: api=vkBindBufferMemory VkResult=%d "
+          "resource=motion-frame slot=%zu size=%llu usage=0x%x "
+          "memory_type=%u",
+          static_cast<int>(bind_result), slot,
+          static_cast<unsigned long long>(requirements.size),
+          static_cast<unsigned>(buffer_info.usage), memory_type);
+      destroyMotionFrame();
+      return false;
+    }
+
+    const VkResult map_result = vkMapMemory(
+        device_, buffer.memory, 0, sizeof(PathTraceMotionFrameGpu), 0,
+        &motion_frame_mapped_[slot]);
+    if (map_result != VK_SUCCESS) {
+      xpbd::log::errorf(
+          "Path-trace buffer failure: api=vkMapMemory VkResult=%d "
+          "resource=motion-frame slot=%zu size=%llu usage=0x%x "
+          "memory_type=%u",
+          static_cast<int>(map_result), slot,
+          static_cast<unsigned long long>(requirements.size),
+          static_cast<unsigned>(buffer_info.usage), memory_type);
+      destroyMotionFrame();
+      return false;
+    }
+    buffer.capacity = sizeof(PathTraceMotionFrameGpu);
   }
-  VkMemoryRequirements requirements{};
-  vkGetBufferMemoryRequirements(device_, motion_frame_buffer_.buffer,
-                                &requirements);
-  const std::uint32_t memory_type = findMemoryType(
-      requirements.memoryTypeBits,
-      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-  if (memory_type == (std::numeric_limits<std::uint32_t>::max)()) {
-    destroyMotionFrame();
-    return false;
-  }
-  VkMemoryAllocateInfo allocate_info{
-      VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-  allocate_info.allocationSize = requirements.size;
-  allocate_info.memoryTypeIndex = memory_type;
-  const VkResult allocation_result = vkAllocateMemory(
-      device_, &allocate_info, nullptr, &motion_frame_buffer_.memory);
-  if (allocation_result != VK_SUCCESS) {
-    xpbd::log::errorf(
-        "Path-trace buffer failure: api=vkAllocateMemory VkResult=%d "
-        "resource=motion-frame size=%llu usage=0x%x memory_type=%u",
-        static_cast<int>(allocation_result),
-        static_cast<unsigned long long>(requirements.size),
-        static_cast<unsigned>(buffer_info.usage), memory_type);
-    destroyMotionFrame();
-    return false;
-  }
-  const VkResult bind_result =
-      vkBindBufferMemory(device_, motion_frame_buffer_.buffer,
-                         motion_frame_buffer_.memory, 0);
-  if (bind_result != VK_SUCCESS) {
-    xpbd::log::errorf(
-        "Path-trace buffer failure: api=vkBindBufferMemory VkResult=%d "
-        "resource=motion-frame size=%llu usage=0x%x memory_type=%u",
-        static_cast<int>(bind_result),
-        static_cast<unsigned long long>(requirements.size),
-        static_cast<unsigned>(buffer_info.usage), memory_type);
-    destroyMotionFrame();
-    return false;
-  }
-  const VkResult map_result =
-      vkMapMemory(device_, motion_frame_buffer_.memory, 0,
-                  sizeof(PathTraceMotionFrameGpu), 0,
-                  &motion_frame_mapped_);
-  if (map_result != VK_SUCCESS) {
-    xpbd::log::errorf(
-        "Path-trace buffer failure: api=vkMapMemory VkResult=%d "
-        "resource=motion-frame size=%llu usage=0x%x memory_type=%u",
-        static_cast<int>(map_result),
-        static_cast<unsigned long long>(requirements.size),
-        static_cast<unsigned>(buffer_info.usage), memory_type);
-    destroyMotionFrame();
-    return false;
-  }
-  motion_frame_buffer_.capacity = sizeof(PathTraceMotionFrameGpu);
   return true;
 }
 
@@ -2555,6 +2574,14 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
     return;
   }
 
+  const std::size_t motion_frame_slot =
+      static_cast<std::size_t>(params.frame_slot) %
+      motion_frame_buffers_.size();
+  Buffer &motion_frame_buffer =
+      motion_frame_buffers_[motion_frame_slot];
+  void *motion_frame_mapped =
+      motion_frame_mapped_[motion_frame_slot];
+
   const bool use_fallback = albedo_view == VK_NULL_HANDLE;
   const PathTraceSettings settings =
       normalizePathTraceSettings(params.settings);
@@ -2815,7 +2842,7 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
   instance_motionbuf.offset = 0;
   instance_motionbuf.range = scene.instanceMotionBufferBytes();
   VkDescriptorBufferInfo motion_framebuf{};
-  motion_framebuf.buffer = motion_frame_buffer_.buffer;
+  motion_framebuf.buffer = motion_frame_buffer.buffer;
   motion_framebuf.offset = 0;
   motion_framebuf.range = sizeof(PathTraceMotionFrameGpu);
 
@@ -3137,7 +3164,7 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
       std::bit_cast<float>(last_output_write_mask_);
 
   auto *motion_frame =
-      static_cast<PathTraceMotionFrameGpu *>(motion_frame_mapped_);
+      static_cast<PathTraceMotionFrameGpu *>(motion_frame_mapped);
   *motion_frame = {};
   const bool camera_motion_valid =
       params.motion_history_valid && params.previous_view != nullptr &&
@@ -3234,7 +3261,7 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
     rt_params.albedo_sampler = albedo.sampler;
     rt_params.normal_sampler = normal_map.sampler;
     rt_params.specular_sampler = specular_map.sampler;
-    rt_params.motion_frame_buffer = motion_frame_buffer_.buffer;
+    rt_params.motion_frame_buffer = motion_frame_buffer.buffer;
     rt_params.motion_frame_buffer_bytes =
         sizeof(PathTraceMotionFrameGpu);
     traced_with_rt_pipeline =

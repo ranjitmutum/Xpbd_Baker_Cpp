@@ -411,9 +411,9 @@ private:
   VkPipelineLayout static_mesh_layout_ = VK_NULL_HANDLE;
   VkPipeline static_mesh_pipeline_ = VK_NULL_HANDLE;
   VkPipeline static_mesh_pipeline_blend_ = VK_NULL_HANDLE;
-  // Pixel-art atlas channels all stay nearest-filtered so base color, normal,
-  // and LabPBR parameter texels remain aligned. The sidecars are still linear
-  // UNORM data; color-space interpretation is independent of filtering.
+  // Pixel-art atlas magnification is always nearest. Albedo/Normal use linear
+  // minification across their semantic mip chains; packed LabPBR Specular
+  // remains nearest within and between mips so discrete channel codes survive.
   VkSampler static_albedo_sampler_ = VK_NULL_HANDLE;
   VkSampler static_normal_sampler_ = VK_NULL_HANDLE;
   VkSampler static_specular_sampler_ = VK_NULL_HANDLE;
@@ -529,8 +529,17 @@ private:
   bool rt_motion_camera_history_valid_ = false;
   std::uint64_t streamline_temporal_history_key_ = 0u;
   bool streamline_temporal_history_valid_ = false;
+  std::uint32_t streamline_temporal_render_width_ = 0u;
+  std::uint32_t streamline_temporal_render_height_ = 0u;
+  std::uint32_t streamline_temporal_output_width_ = 0u;
+  std::uint32_t streamline_temporal_output_height_ = 0u;
+  std::uint64_t streamline_temporal_reset_generation_ = 0u;
+  PathTraceUpscale streamline_temporal_mode_ = PathTraceUpscale::Off;
+  bool streamline_temporal_ray_reconstruction_ = false;
+  bool streamline_temporal_recovery_pending_ = false;
   std::uint64_t diagnostic_rt_as_events_logged_ = 0;
   std::uint64_t diagnostic_pt_history_resets_logged_ = 0;
+  std::uint64_t diagnostic_sl_history_frames_logged_ = 0;
 
   // Optional RT descriptor layouts / pipelines (ray-query hybrid shadows).
   VkDescriptorSetLayout mesh_rt_desc_layout_ = VK_NULL_HANDLE;

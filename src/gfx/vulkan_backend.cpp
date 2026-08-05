@@ -3388,7 +3388,13 @@ bool VulkanBackend::createStaticMaterialSampler(
     out = VK_NULL_HANDLE;
     VkSamplerCreateInfo sampler_info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     sampler_info.magFilter = VK_FILTER_NEAREST;
-    sampler_info.minFilter = VK_FILTER_NEAREST;
+    // Albedo/Normal use LINEAR mip mode and are safe to filter while shrinking.
+    // Packed Specular uses NEAREST mip mode, so its discrete G/B codes remain
+    // point sampled both within and between mip levels.
+    sampler_info.minFilter =
+        mipmap_mode == VK_SAMPLER_MIPMAP_MODE_LINEAR
+            ? VK_FILTER_LINEAR
+            : VK_FILTER_NEAREST;
     sampler_info.mipmapMode = mipmap_mode;
     sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
