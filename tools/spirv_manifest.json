@@ -126,9 +126,9 @@
       "target_env": "vulkan1.0",
       "spv": "src/gfx/spirv/pt_composite.frag.spv",
       "inc": "src/gfx/spirv/pt_composite.frag.spv.inc",
-      "source_sha256": "797e8b5451d027a51121c5930cc00a541066048c033800f25e6cecb1faf8626f",
-      "spv_sha256": "d15539b39245f5ab97827f169d6aa3c29e96f157d0575a51a498fb9e4b345aa6",
-      "inc_sha256": "5a485b4a7d94dc7c7120c3a6b818af39e80ae5fb7dfd58d9e1593d961d2b72f4"
+      "source_sha256": "50fcc9289da7de122a5261b629491739e2e1719c3654608a32f5bc74bdd37ec9",
+      "spv_sha256": "142bfc7e2a4ee78a28018670f2a606782442c476eee113718aeca8c679687661",
+      "inc_sha256": "d6ae9c425cebd10bc4425180c036161ceb71c80f9b9aa336773c5f7d642bcfa4"
     },
     {
       "source": "src/gfx/spirv/pt_composite.vert",
@@ -153,18 +153,18 @@
       "target_env": "vulkan1.2",
       "spv": "src/gfx/spirv/rt_debug.rchit.spv",
       "inc": "src/gfx/spirv/rt_debug.rchit.spv.inc",
-      "source_sha256": "92a9580b67c0d4bbfca49639fea18df2f37968e9a48d6b8d566523e550a0afa1",
-      "spv_sha256": "75e1a26321460dfd093583759986490f14b6ee8bfc09761f521878fa728a1d8a",
-      "inc_sha256": "47bd455167b7e06b358e2f5c27287ef285766fc1afc67f628941dca38891248f"
+      "source_sha256": "b2ed01d61ceb0a2a1ff7b3babbb51cf0e0e8320cdc0de8fecf5b6da7a6b389fc",
+      "spv_sha256": "df33443bf9bfd4418fb36387148de9e94742b2a36b48472316e325e1eae67178",
+      "inc_sha256": "b77e73e4beba0634fbd58b980c6ff9f1aa53d472241a3aef6ee2695f7f56a1d9"
     },
     {
       "source": "src/gfx/spirv/rt_debug.rgen",
       "target_env": "vulkan1.2",
       "spv": "src/gfx/spirv/rt_debug.rgen.spv",
       "inc": "src/gfx/spirv/rt_debug.rgen.spv.inc",
-      "source_sha256": "e4429dcf06f479f94502c9e9a0d0203ce50b7cb1d049e4d2d197f1db8807be08",
-      "spv_sha256": "21f45421300c5ea75f6cd7509b49e343696a29a174cddf0604510d8a292c3acd",
-      "inc_sha256": "cd4771a5314c52ffba0ab4109b393bf26f7dc3cccd5d350ec210b769ca6008bc"
+      "source_sha256": "83a215a647dbbdddeca85a942eddb7390bb18eb822fb51791b98cb47f42fcde9",
+      "spv_sha256": "215b6b96595bb6c164aef3ec4ae548b77770025b5f039c2138a78b5177070a62",
+      "inc_sha256": "68e322c311ef8870f2d1efca00e6a17a82430c04ca73ac17951952c216f1c014"
     },
     {
       "source": "src/gfx/spirv/rt_debug.rmiss",

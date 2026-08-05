@@ -31,6 +31,9 @@ struct PathTraceFrameParams {
   // progressively averaged preview. This does not invalidate its own history.
   bool temporal_reconstruction_input = false;
   bool ray_reconstruction_guides = false;
+  // Continuous material textures use this negative LOD offset while SR/RR
+  // reconstructs a lower-resolution input. Packed/discrete textures ignore it.
+  float reconstruction_mip_bias = 0.0f;
   // Optional AOV/RR/statistics writes. Color and depth remain mandatory.
   std::uint32_t output_write_mask = 0;
   float camera_jitter[2]{0.0f, 0.0f};
@@ -56,6 +59,7 @@ struct PathTraceFrameParams {
   PathTraceSettings settings{};
   LabPbrDebugView material_debug_view = LabPbrDebugView::Shaded;
   RtDebugView rt_debug_view = RtDebugView::Off;
+  RrAovDebugView rr_aov_debug_view = RrAovDebugView::Off;
   std::uint32_t material_feature_flags = 0;
   bool hdr_environment = false;
   // UNORM swapchain attachments require an explicit linear-to-sRGB encode;

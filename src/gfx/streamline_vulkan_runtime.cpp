@@ -2383,9 +2383,8 @@ StreamlineVulkanRuntime::queryDlssRayReconstructionOptimalSettings(
   } else {
     impl_->status =
         std::string(
-            "DLSS Ray Reconstruction optimal-settings query failed: ") +
+            "DLSS Ray Reconstruction optimal-settings query failed for the current request: " ) +
         sl::getResultAsStr(query_result);
-    impl_->dlss_rr_supported = false;
   }
 #endif
   return result;

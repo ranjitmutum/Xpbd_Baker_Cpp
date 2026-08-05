@@ -2,6 +2,7 @@
 
 #include "xpbd/gfx/frame_stats.hpp"
 #include "xpbd/gfx/labpbr_material.hpp"
+#include "xpbd/gfx/path_trace_aov.hpp"
 #include "xpbd/gfx/preview_scene.hpp"
 #include "xpbd/gfx/ray_tracing.hpp"
 #include "xpbd/gfx/rt_scene_generations.hpp"
@@ -55,22 +56,62 @@ struct ViewportRect {
 
 // Converts Nuklear/SDL logical coordinates to the physical framebuffer. This
 // is the single DPI boundary used by the renderer and keeps the offscreen
-// preview extent independent from UI pixel density.
+// preview extent independent from UI pixel density. Use shared half-open
+// framebuffer endpoints so adjacent logical rectangles cannot disagree by one
+// pixel at fractional DPI.
+[[nodiscard]] inline int logicalEdgeToFramebuffer(
+    float logical_edge, float scale, int framebuffer_limit) noexcept {
+  const double safe_scale =
+      std::isfinite(scale) && scale > 0.0f ? static_cast<double>(scale) : 1.0;
+  const double safe_edge =
+      std::isfinite(logical_edge) ? static_cast<double>(logical_edge) : 0.0;
+  long long pixel = std::llround(safe_edge * safe_scale);
+  if (framebuffer_limit > 0) {
+    pixel = std::clamp<long long>(
+        pixel, 0ll, static_cast<long long>(framebuffer_limit));
+  }
+  if (pixel < static_cast<long long>(std::numeric_limits<int>::min())) {
+    return std::numeric_limits<int>::min();
+  }
+  if (pixel > static_cast<long long>(std::numeric_limits<int>::max())) {
+    return std::numeric_limits<int>::max();
+  }
+  return static_cast<int>(pixel);
+}
+
+[[nodiscard]] inline ViewportRect logicalRectToFramebufferHalfOpen(
+    float x0, float y0, float x1, float y1, float scale_x, float scale_y,
+    int framebuffer_width, int framebuffer_height) noexcept {
+  const float safe_x0 = std::isfinite(x0) ? x0 : 0.0f;
+  const float safe_y0 = std::isfinite(y0) ? y0 : 0.0f;
+  const float safe_x1 = std::isfinite(x1) ? x1 : safe_x0;
+  const float safe_y1 = std::isfinite(y1) ? y1 : safe_y0;
+  const float ordered_x0 = (std::min)(safe_x0, safe_x1);
+  const float ordered_y0 = (std::min)(safe_y0, safe_y1);
+  const float ordered_x1 = (std::max)(safe_x0, safe_x1);
+  const float ordered_y1 = (std::max)(safe_y0, safe_y1);
+
+  ViewportRect result{};
+  result.x = logicalEdgeToFramebuffer(ordered_x0, scale_x, framebuffer_width);
+  result.y = logicalEdgeToFramebuffer(ordered_y0, scale_y, framebuffer_height);
+  const int pixel_x1 =
+      logicalEdgeToFramebuffer(ordered_x1, scale_x, framebuffer_width);
+  const int pixel_y1 =
+      logicalEdgeToFramebuffer(ordered_y1, scale_y, framebuffer_height);
+  result.w = (std::max)(0, pixel_x1 - result.x);
+  result.h = (std::max)(0, pixel_y1 - result.y);
+  return result;
+}
+
 [[nodiscard]] inline ViewportRect logicalViewportToFramebuffer(
     float x, float y, float w, float h, float scale_x, float scale_y,
     int framebuffer_width, int framebuffer_height) noexcept {
-  const float sx =
-      std::isfinite(scale_x) && scale_x > 0.0f ? scale_x : 1.0f;
-  const float sy =
-      std::isfinite(scale_y) && scale_y > 0.0f ? scale_y : 1.0f;
-  ViewportRect result{
-      static_cast<int>(std::lround(std::isfinite(x) ? x * sx : 0.0f)),
-      static_cast<int>(std::lround(std::isfinite(y) ? y * sy : 0.0f)),
-      std::max(1, static_cast<int>(
-                      std::lround(std::isfinite(w) ? w * sx : 1.0f))),
-      std::max(1, static_cast<int>(
-                      std::lround(std::isfinite(h) ? h * sy : 1.0f))),
-  };
+  const ViewportRect half_open = logicalRectToFramebufferHalfOpen(
+      x, y, x + (std::max)(w, 0.0f), y + (std::max)(h, 0.0f), scale_x,
+      scale_y, framebuffer_width, framebuffer_height);
+  ViewportRect result = half_open;
+  result.w = (std::max)(1, result.w);
+  result.h = (std::max)(1, result.h);
   if (framebuffer_width > 0) {
     result.x = std::clamp(result.x, 0, framebuffer_width - 1);
     result.w = std::clamp(result.w, 1, framebuffer_width - result.x);
@@ -177,6 +218,7 @@ struct FrameInput {
   std::uint64_t static_texture_generation = 0;
   LabPbrDebugView material_debug_view = LabPbrDebugView::Shaded;
   RtDebugView rt_debug_view = RtDebugView::Off;
+  RrAovDebugView rr_aov_debug_view = RrAovDebugView::Off;
   PathTraceSettings path_trace_settings{};
   const WorldEnvironmentState *world_environment = nullptr;
   const StillRenderFrameRequest *still_render = nullptr;

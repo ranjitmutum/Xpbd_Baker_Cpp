@@ -691,6 +691,7 @@ public:
       gfx::kLabPbrDefaultPeakBudgetBytes;
   gfx::LabPbrDebugView labpbr_debug_view = gfx::LabPbrDebugView::Shaded;
   gfx::RtDebugView rt_debug_view = gfx::RtDebugView::Off;
+  gfx::RrAovDebugView rr_aov_debug_view = gfx::RrAovDebugView::Off;
   gfx::PathTraceSettings path_trace_settings{};
   gfx::PathTracePostProcessCapabilities
       path_trace_post_process_capabilities{};

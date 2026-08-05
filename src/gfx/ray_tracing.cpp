@@ -1034,6 +1034,35 @@ float pathTraceRayConeTextureLod(
   return std::max(0.0f, std::log2(texels));
 }
 
+float reconstructionMipBias(
+    std::uint32_t render_width, std::uint32_t render_height,
+    std::uint32_t output_width, std::uint32_t output_height,
+    bool reconstruction_enabled) noexcept {
+  if (!reconstruction_enabled || render_width == 0u ||
+      render_height == 0u || output_width == 0u ||
+      output_height == 0u) {
+    return 0.0f;
+  }
+
+  const double ratio_x = static_cast<double>(render_width) /
+                         static_cast<double>(output_width);
+  const double ratio_y = static_cast<double>(render_height) /
+                         static_cast<double>(output_height);
+  // Integer-rounded optimal settings can differ by a fraction of a percent
+  // between axes. Prefer the less-negative bias to avoid oversharpening one
+  // axis while still correcting the reconstruction-scale footprint.
+  const double conservative_ratio = std::max(ratio_x, ratio_y);
+  if (!std::isfinite(conservative_ratio) ||
+      !(conservative_ratio > 0.0) || conservative_ratio >= 1.0) {
+    return 0.0f;
+  }
+  const double bias = std::log2(conservative_ratio);
+  if (!std::isfinite(bias)) {
+    return 0.0f;
+  }
+  return static_cast<float>(std::clamp(bias, -2.0, 0.0));
+}
+
 std::array<float, 2>
 pathTraceTemporalJitter(std::uint32_t frame_index,
                         std::uint32_t render_width,

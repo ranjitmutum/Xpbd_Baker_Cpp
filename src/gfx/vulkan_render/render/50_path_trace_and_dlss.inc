@@ -149,6 +149,8 @@
       }
       requested_output_mask |=
           pt_temporal_required_output_mask_for_frame;
+      requested_output_mask |=
+          rrAovDebugRequiredOutputMask(frame.rr_aov_debug_view);
       const PathTraceTargetResult target_result = path_tracer.ensureTarget(
           target_extent.width, target_extent.height,
           PathTraceTargetRequirements{requested_output_mask});
@@ -197,6 +199,9 @@
         pt_params.temporal_reconstruction_input = dlss_settings.valid;
         pt_params.ray_reconstruction_guides =
             dlss_settings.valid && pt_rr_requested;
+        pt_params.reconstruction_mip_bias = reconstructionMipBias(
+            ptw, pth, preview_output_width, preview_output_height,
+            pt_params.temporal_reconstruction_input);
         pt_params.output_write_mask = requested_output_mask;
         if (frame.raster_scene != nullptr) {
           pt_params.light_dir[0] = frame.raster_scene->lighting.direction[0];
@@ -243,6 +248,7 @@
         }
         pt_params.material_debug_view = frame.material_debug_view;
         pt_params.rt_debug_view = frame.rt_debug_view;
+        pt_params.rr_aov_debug_view = frame.rr_aov_debug_view;
         pt_params.material_feature_flags =
             labPbrFeatureFlags(frame.static_model_material);
         if (procedural_environment_ready) {
@@ -317,6 +323,8 @@
             static_cast<std::uint32_t>(pt_params.rt_debug_view));
         appendPathTraceHistoryValue(
             history_key, pt_params.material_feature_flags);
+        appendPathTraceHistoryValue(
+            history_key, pt_params.reconstruction_mip_bias);
         appendPathTraceHistoryValue(
             history_key, pt_params.output_write_mask);
         appendPathTraceHistoryValue(

@@ -3,6 +3,15 @@
 layout(set = 0, binding = 0) uniform sampler2D uPathTrace;
 layout(set = 0, binding = 1) uniform sampler2D uPathDepth;
 layout(set = 0, binding = 2) uniform sampler2D uReconstructed;
+layout(set = 0, binding = 3) uniform sampler2D uDiagnosticAov;
+layout(set = 0, binding = 4) uniform sampler2D uRrMotion;
+layout(set = 0, binding = 5) uniform sampler2D uRrDiffuseAlbedo;
+layout(set = 0, binding = 6) uniform sampler2D uRrSpecularAlbedo;
+layout(set = 0, binding = 7) uniform sampler2D uRrNormalRoughness;
+layout(set = 0, binding = 8) uniform sampler2D uRrSpecularHitDistance;
+layout(set = 0, binding = 9) uniform sampler2D uReactiveMask;
+layout(set = 0, binding = 10) uniform sampler2D uTransparencyComposition;
+layout(set = 0, binding = 11) uniform sampler2D uGuideValidity;
 layout(location = 0) in vec2 vUV;
 layout(location = 0) out vec4 FragColor;
 
@@ -34,22 +43,42 @@ bool reconstructedEnabled() {
   return (composite_push.flags.x & 2u) != 0u;
 }
 
+const uint kRrAovDebugOff = 0u;
+const uint kRrAovDebugRawColor = 1u;
+const uint kRrAovDebugReconstructedColor = 2u;
+const uint kRrAovDebugDeviceDepth = 3u;
+const uint kRrAovDebugLinearDepth = 4u;
+const uint kRrAovDebugMotion = 5u;
+const uint kRrAovDebugMotionMagnitude = 6u;
+const uint kRrAovDebugPreviousUvOutside = 7u;
+const uint kRrAovDebugDiffuseAlbedo = 8u;
+const uint kRrAovDebugSpecularAlbedo = 9u;
+const uint kRrAovDebugNormal = 10u;
+const uint kRrAovDebugRoughness = 11u;
+const uint kRrAovDebugSpecularHitDistance = 12u;
+const uint kRrAovDebugReactiveMask = 13u;
+const uint kRrAovDebugTransparencyComposition = 14u;
+const uint kRrAovDebugGuideValidity = 15u;
+const uint kRrAovDebugTemporalBoundaryOverlay = 16u;
+
+uint rrAovDebugMode() {
+  return composite_push.flags.w;
+}
+
 vec2 currentRawUv(vec2 outputUv) {
   if (!reconstructedEnabled()) {
     return outputUv;
   }
   // Temporal primary rays use pixelCenter-jitter. DLSS output is in
   // unjittered output space, so address the current raw frame at +jitter.
+  vec2 rawSize = vec2(textureSize(uPathTrace, 0));
   vec2 jitterPixels = uintBitsToFloat(composite_push.flags.yz);
-  return outputUv +
-         jitterPixels / vec2(textureSize(uPathTrace, 0));
+  vec2 rawUv = outputUv + jitterPixels / rawSize;
+  vec2 halfTexel = vec2(0.5) / rawSize;
+  return clamp(rawUv, halfTexel, vec2(1.0) - halfTexel);
 }
 
 float sampleCurrentCoverage(vec2 rawUv) {
-  if (any(lessThan(rawUv, vec2(0.0))) ||
-      any(greaterThanEqual(rawUv, vec2(1.0)))) {
-    return 0.0;
-  }
   // Spatially upscale this frame's coverage without temporal history. The
   // shared sampler remains nearest for pixel-art color/depth, so perform the
   // four-tap coverage filter explicitly.
@@ -71,26 +100,210 @@ float sampleCurrentCoverage(vec2 rawUv) {
                0.0, 1.0);
 }
 
-vec4 sampleDisplayColor(vec2 outputUv) {
+vec3 sampleDisplayRgb(vec2 outputUv, vec2 rawUv) {
   if (!reconstructedEnabled()) {
-    vec4 raw = texture(uPathTrace, outputUv);
-    raw.a = clamp(raw.a, 0.0, 1.0);
-    return raw;
+    return texture(uPathTrace, rawUv).rgb;
   }
-  vec4 reconstructed = texture(uReconstructed, outputUv);
-  // Never consume DLSS output alpha here. It is temporal and can trail across
-  // the independent raster sky while the camera rotates.
-  reconstructed.a = sampleCurrentCoverage(currentRawUv(outputUv));
-  return reconstructed;
+  return texture(uReconstructed, outputUv).rgb;
+}
+
+float sampleForegroundCoverage(vec2 outputUv, vec2 rawUv) {
+  if (!reconstructedEnabled()) {
+    return clamp(texture(uPathTrace, outputUv).a, 0.0, 1.0);
+  }
+  return sampleCurrentCoverage(rawUv);
+}
+
+vec4 sampleDisplayColor(vec2 outputUv) {
+  vec2 rawUv = currentRawUv(outputUv);
+  return vec4(sampleDisplayRgb(outputUv, rawUv),
+              sampleForegroundCoverage(outputUv, rawUv));
+}
+
+vec3 debugMotion(vec2 rawUv) {
+  vec2 motionPixels = texture(uRrMotion, rawUv).xy;
+  vec2 encoded = clamp(motionPixels / 32.0, vec2(-1.0), vec2(1.0));
+  return vec3(encoded * 0.5 + 0.5, 0.0);
+}
+
+bool previousUvOutsideAt(vec2 rawUv) {
+  vec2 motionPixels = texture(uRrMotion, rawUv).xy;
+  vec2 motionSize = vec2(textureSize(uRrMotion, 0));
+  vec2 previousUv = rawUv + motionPixels / max(motionSize, vec2(1.0));
+  return previousUv.x < 0.0 || previousUv.y < 0.0 ||
+         previousUv.x >= 1.0 || previousUv.y >= 1.0;
+}
+
+bool guideValidAt(vec2 rawUv) {
+  return texture(uGuideValidity, rawUv).r >= 0.5;
+}
+
+bool rawUvClampedAt(vec2 outputUv) {
+  if (!reconstructedEnabled()) {
+    return false;
+  }
+  vec2 rawSize = vec2(textureSize(uPathTrace, 0));
+  vec2 jitterPixels = uintBitsToFloat(composite_push.flags.yz);
+  vec2 requestedUv = outputUv + jitterPixels / rawSize;
+  vec2 halfTexel = vec2(0.5) / rawSize;
+  vec2 clampedUv = clamp(requestedUv, halfTexel, vec2(1.0) - halfTexel);
+  return any(greaterThan(abs(requestedUv - clampedUv), vec2(1.0e-7)));
+}
+
+bool booleanBoundaryPreviousUv(vec2 rawUv) {
+  vec2 size = vec2(textureSize(uRrMotion, 0));
+  vec2 texel = 1.0 / max(size, vec2(1.0));
+  bool center = previousUvOutsideAt(rawUv);
+  return previousUvOutsideAt(clamp(rawUv + vec2(texel.x, 0.0),
+                                   vec2(0.0), vec2(1.0))) != center ||
+         previousUvOutsideAt(clamp(rawUv - vec2(texel.x, 0.0),
+                                   vec2(0.0), vec2(1.0))) != center ||
+         previousUvOutsideAt(clamp(rawUv + vec2(0.0, texel.y),
+                                   vec2(0.0), vec2(1.0))) != center ||
+         previousUvOutsideAt(clamp(rawUv - vec2(0.0, texel.y),
+                                   vec2(0.0), vec2(1.0))) != center;
+}
+
+bool booleanBoundaryGuideValidity(vec2 rawUv) {
+  vec2 size = vec2(textureSize(uGuideValidity, 0));
+  vec2 texel = 1.0 / max(size, vec2(1.0));
+  bool center = guideValidAt(rawUv);
+  return guideValidAt(clamp(rawUv + vec2(texel.x, 0.0),
+                            vec2(0.0), vec2(1.0))) != center ||
+         guideValidAt(clamp(rawUv - vec2(texel.x, 0.0),
+                            vec2(0.0), vec2(1.0))) != center ||
+         guideValidAt(clamp(rawUv + vec2(0.0, texel.y),
+                            vec2(0.0), vec2(1.0))) != center ||
+         guideValidAt(clamp(rawUv - vec2(0.0, texel.y),
+                            vec2(0.0), vec2(1.0))) != center;
+}
+
+vec3 temporalBoundaryOverlayColor(vec2 outputUv, vec2 rawUv,
+                                  vec3 displayColor) {
+  bool previousBoundary = booleanBoundaryPreviousUv(rawUv);
+  bool guideBoundary = booleanBoundaryGuideValidity(rawUv);
+  bool clampBoundary = rawUvClampedAt(outputUv);
+
+  if (previousBoundary && guideBoundary) {
+    return vec3(1.0, 1.0, 0.0);
+  }
+  if (previousBoundary) {
+    return vec3(1.0, 0.0, 0.0);
+  }
+  if (guideBoundary) {
+    return vec3(0.0, 1.0, 1.0);
+  }
+  if (clampBoundary) {
+    return vec3(1.0, 0.0, 1.0);
+  }
+  return displayColor;
+}
+
+vec3 debugPreviousUvOutside(vec2 rawUv) {
+  bool reconstructedOutside = previousUvOutsideAt(rawUv);
+  // The MotionDisocclusion AOV preserves probe.motion.z/w that the actual
+  // RG32F Streamline motion image cannot store. White means both paths agree;
+  // red means only the shader-side flag rejected history; green means only
+  // the RG motion reconstruction falls outside.
+  vec4 diagnosticMotion = texture(uDiagnosticAov, rawUv);
+  bool shaderOutside = diagnosticMotion.z > 0.5 ||
+                       diagnosticMotion.w < 0.5;
+  if (shaderOutside && reconstructedOutside) {
+    return vec3(1.0);
+  }
+  if (shaderOutside) {
+    return vec3(1.0, 0.0, 0.0);
+  }
+  if (reconstructedOutside) {
+    return vec3(0.0, 1.0, 0.0);
+  }
+  return vec3(0.0);
+}
+
+vec3 sampleRrAovDebug(uint mode, vec2 outputUv, vec2 rawUv) {
+  if (mode == kRrAovDebugRawColor) {
+    return clamp(texture(uPathTrace, rawUv).rgb, vec3(0.0), vec3(1.0));
+  }
+  if (mode == kRrAovDebugReconstructedColor) {
+    return clamp(texture(uReconstructed, outputUv).rgb,
+                 vec3(0.0), vec3(1.0));
+  }
+  if (mode == kRrAovDebugDeviceDepth) {
+    return vec3(clamp(texture(uPathDepth, rawUv).r, 0.0, 1.0));
+  }
+  if (mode == kRrAovDebugLinearDepth) {
+    float linearDepth = max(texture(uDiagnosticAov, rawUv).a, 0.0);
+    float mapped = log2(1.0 + linearDepth) / log2(1001.0);
+    return vec3(clamp(mapped, 0.0, 1.0));
+  }
+  if (mode == kRrAovDebugMotion) {
+    return debugMotion(rawUv);
+  }
+  if (mode == kRrAovDebugMotionMagnitude) {
+    float magnitude = length(texture(uRrMotion, rawUv).xy);
+    return vec3(clamp(magnitude / 32.0, 0.0, 1.0));
+  }
+  if (mode == kRrAovDebugPreviousUvOutside) {
+    return debugPreviousUvOutside(rawUv);
+  }
+  if (mode == kRrAovDebugDiffuseAlbedo) {
+    return clamp(texture(uRrDiffuseAlbedo, rawUv).rgb,
+                 vec3(0.0), vec3(1.0));
+  }
+  if (mode == kRrAovDebugSpecularAlbedo) {
+    return clamp(texture(uRrSpecularAlbedo, rawUv).rgb,
+                 vec3(0.0), vec3(1.0));
+  }
+  if (mode == kRrAovDebugNormal) {
+    vec3 normal = texture(uRrNormalRoughness, rawUv).xyz;
+    float lengthSquared = dot(normal, normal);
+    normal = lengthSquared > 1.0e-8
+                 ? normal * inversesqrt(lengthSquared)
+                 : vec3(0.0, 0.0, 1.0);
+    return normal * 0.5 + 0.5;
+  }
+  if (mode == kRrAovDebugRoughness) {
+    return vec3(clamp(texture(uRrNormalRoughness, rawUv).a, 0.0, 1.0));
+  }
+  if (mode == kRrAovDebugSpecularHitDistance) {
+    float distance = max(texture(uRrSpecularHitDistance, rawUv).r, 0.0);
+    float mapped = log2(1.0 + distance) / log2(1001.0);
+    return vec3(clamp(mapped, 0.0, 1.0));
+  }
+  if (mode == kRrAovDebugReactiveMask) {
+    return vec3(clamp(texture(uReactiveMask, rawUv).r, 0.0, 1.0));
+  }
+  if (mode == kRrAovDebugTransparencyComposition) {
+    return vec3(clamp(texture(uTransparencyComposition, rawUv).r,
+                      0.0, 1.0));
+  }
+  if (mode == kRrAovDebugGuideValidity) {
+    return vec3(clamp(texture(uGuideValidity, rawUv).r, 0.0, 1.0));
+  }
+  return vec3(0.0);
 }
 
 void main() {
-  vec2 depthUv = currentRawUv(vUV);
-  vec4 color = sampleDisplayColor(vUV);
-  float depth = clamp(texture(uPathDepth, depthUv).r, 0.0, 1.0);
+  uint debugMode = rrAovDebugMode();
+  if (debugMode != kRrAovDebugOff &&
+      debugMode != kRrAovDebugTemporalBoundaryOverlay) {
+    vec2 rawUv = currentRawUv(vUV);
+    vec3 debugColor = sampleRrAovDebug(debugMode, vUV, rawUv);
+    if ((composite_push.flags.x & 4u) != 0u) {
+      debugColor = linearToSrgb(
+          clamp(debugColor, vec3(0.0), vec3(1.0)));
+    }
+    gl_FragDepth = 1.0;
+    FragColor = vec4(debugColor, 1.0);
+    return;
+  }
+  vec2 rawUv = currentRawUv(vUV);
+  vec3 rgb = sampleDisplayRgb(vUV, rawUv);
+  float coverage = sampleForegroundCoverage(vUV, rawUv);
+  float depth = clamp(texture(uPathDepth, rawUv).r, 0.0, 1.0);
   // Current-frame coverage is the single authority for foreground visibility.
   // Do not combine temporally reconstructed alpha with raw current depth.
-  if (color.a < 0.001) {
+  if (coverage < 0.001) {
     discard;
   }
 
@@ -98,6 +311,7 @@ void main() {
   // the nearest opaque RT surface, allowing
   // later raster grid/axis/skeleton passes to remain correctly occluded.
   gl_FragDepth = depth;
+  vec4 color = vec4(rgb, coverage);
   color.rgb *= max(composite_push.display.x, 0.0);
   vec3 whiteBalanceScale = whiteBalance(composite_push.display.y);
   color.rgb *= whiteBalanceScale;
@@ -105,9 +319,8 @@ void main() {
   float bloom = max(composite_push.display.z, 0.0);
   if (bloom > 0.0) {
     ivec2 sourceSize =
-        (composite_push.flags.x & 2u) != 0u
-            ? textureSize(uReconstructed, 0)
-            : textureSize(uPathTrace, 0);
+        reconstructedEnabled() ? textureSize(uReconstructed, 0)
+                               : textureSize(uPathTrace, 0);
     vec2 texel = 1.0 / vec2(sourceSize);
     vec3 glow = vec3(0.0);
     for (int y = -1; y <= 1; ++y) {
@@ -131,6 +344,9 @@ void main() {
   }
   if ((composite_push.flags.x & 4u) != 0u) {
     color.rgb = linearToSrgb(color.rgb);
+  }
+  if (debugMode == kRrAovDebugTemporalBoundaryOverlay) {
+    color.rgb = temporalBoundaryOverlayColor(vUV, rawUv, color.rgb);
   }
   // Path tracing and DLSS exchange straight RGBA. The Vulkan blend state
   // consumes premultiplied color, so associate RGB with coverage exactly once,

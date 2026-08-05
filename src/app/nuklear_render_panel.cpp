@@ -511,6 +511,36 @@ void drawRendererEditor(nk_context *ctx, const Geom &g, AppSession &session,
     toggle(tr("pt_force_compatibility"),
            settings.force_software_fallback,
            controls_disabled, false);
+
+    // Developer-only and deliberately not persisted: this selects only the
+    // final composite source and never changes the RR evaluation itself.
+    std::vector<const char *> rr_aov_debug_views{
+        "Off",
+        "Raw Color",
+        "RR Output",
+        "Device Depth",
+        "Linear Depth",
+        "Motion",
+        "Motion Magnitude",
+        "Previous UV Outside",
+        "Diffuse Albedo",
+        "Specular Albedo",
+        "Normal",
+        "Roughness",
+        "Specular Hit Distance",
+        "Reactive Mask",
+        "Transparency / Composition",
+        "Guide Validity",
+        "Temporal Boundary Overlay"};
+    int rr_aov_debug_view =
+        static_cast<int>(session.rr_aov_debug_view);
+    const int previous_rr_aov_debug_view = rr_aov_debug_view;
+    if (combo(ctx, g, "RR AOV Debug View", rr_aov_debug_views,
+              rr_aov_debug_view, controls_disabled) &&
+        rr_aov_debug_view != previous_rr_aov_debug_view) {
+      session.rr_aov_debug_view =
+          static_cast<gfx::RrAovDebugView>(rr_aov_debug_view);
+    }
   }
 
   nk_layout_row_dynamic(ctx, g.btn, 2);

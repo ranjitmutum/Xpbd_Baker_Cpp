@@ -181,6 +181,33 @@ void testPathTracePbrSourceContracts() {
               !ray_tracing_source.empty() && !rt_scene_header.empty() &&
               !rt_scene_source.empty(),
           "PBR source-contract fixtures are readable");
+  const std::string compact_composite = compactTestSource(composite);
+  const std::string compact_closest_hit = compactTestSource(closest_hit);
+  const std::string compact_any_hit = compactTestSource(any_hit);
+  const std::string compact_path_tracer = compactTestSource(path_tracer);
+  const std::string compact_stage50 = compactTestSource(stage50);
+  expect(
+      compact_composite.find(
+          "layout(set=0,binding=4)uniformsampler2DuRrMotion;") !=
+              std::string::npos &&
+          compact_composite.find("debugPreviousUvOutside") !=
+              std::string::npos &&
+          compact_composite.find("temporalBoundaryOverlayColor") !=
+              std::string::npos &&
+          compact_composite.find("vec2previousUv=rawUv+") !=
+              std::string::npos &&
+          compact_composite.find("rrAovDebugMode()") !=
+              std::string::npos &&
+          compact_path_tracer.find(
+              "std::array<VkDescriptorSetLayoutBinding,12>sbind{};") !=
+              std::string::npos &&
+          compact_path_tracer.find(
+              "composite_push.flags[3]=static_cast<std::uint32_t>("
+              "params.rr_aov_debug_view);") != std::string::npos &&
+          compact_stage50.find(
+              "rrAovDebugRequiredOutputMask(frame.rr_aov_debug_view)") !=
+              std::string::npos,
+      "RR AOV debug display samples tagged guides only in the final composite");
   expect(closest_hit.find("sampleAlbedoRayCone") != std::string::npos &&
              closest_hit.find("sampleNormalRayCone") != std::string::npos &&
              closest_hit.find("sampleSpecularRayCone") !=
@@ -189,7 +216,7 @@ void testPathTracePbrSourceContracts() {
              compute.find("sampleAlphaBaseLevel") != std::string::npos,
          "Full RT material shaders expose ray-cone LOD samplers while the "
          "compatibility compute path remains unchanged");
-  expect(countText(closest_hit, "textureLod(") == 3u &&
+  expect(countText(closest_hit, "textureLod(") == 4u &&
              countText(any_hit, "textureLod(") == 1u &&
              countText(compute, "textureLod(uAlbedo") == 2u &&
              countText(compute, "textureLod(uNormalTexture") == 1u &&
@@ -201,6 +228,32 @@ void testPathTracePbrSourceContracts() {
              compute.find(", uv, 0.0)") != std::string::npos,
          "Full RT material reads use explicit ray-cone LOD and compatibility "
          "material reads retain their frozen base level");
+  expect(compact_closest_hit.find("vec4reconstructionInfo;") !=
+                 std::string::npos &&
+             compact_closest_hit.find("continuousTextureLod") !=
+                 std::string::npos &&
+             compact_closest_hit.find("reconstructionInfo.x") !=
+                 std::string::npos &&
+             compact_closest_hit.find(
+                 "continuousTextureLod(normalTexture,uvFootprint)") !=
+                 std::string::npos &&
+             compact_closest_hit.find(
+                 "rayConeTextureLod(specularTexture,uvFootprint)") !=
+                 std::string::npos &&
+             compact_closest_hit.find("preserveCoverageLod") !=
+                 std::string::npos &&
+             compact_any_hit.find("reconstructionInfo") ==
+                 std::string::npos &&
+             compact_stage50.find("reconstructionMipBias(ptw,pth,") !=
+                 std::string::npos &&
+             compact_stage50.find(
+                 "history_key,pt_params.reconstruction_mip_bias") !=
+                 std::string::npos &&
+             compact_path_tracer.find(
+                 "static_assert(sizeof(PathTraceMotionFrameGpu)==96u);") !=
+                 std::string::npos,
+         "DLSS reconstruction Mip Bias sharpens continuous albedo/normal "
+         "LODs while preserving alpha coverage and packed-specular LOD");
   expect(closest_hit.find("PositionBuffer") != std::string::npos &&
              closest_hit.find("objectPosition0") != std::string::npos &&
              closest_hit.find("vec4(objectPosition1 - objectPosition0, 0.0)") !=
@@ -405,6 +458,22 @@ void testPathTracePbrSourceContracts() {
                  std::string::npos,
          "compute and Full RT preserve finite off-screen motion while "
          "marking history disoccluded");
+  expect(compact_raygen.find(
+             "boolprojectMotionUv(mat4viewProjection,vec3worldPosition,") !=
+                 std::string::npos &&
+             compact_raygen.find(
+             "projectMotionUv(pc.viewProj,currentWorld,currentUv)") !=
+                 std::string::npos &&
+             compact_raygen.find(
+             "projectMotionUv(previousViewProj,previousWorld,previousUv)") !=
+                 std::string::npos &&
+             compact_raygen.find(
+             "(previousUv-currentUv)*vec2(pc.sizeMode.xy)") !=
+                 std::string::npos &&
+             compact_raygen.find("previousUv-motionUv") ==
+                 std::string::npos,
+         "Full RT dense motion excludes temporal jitter when Streamline "
+         "declares motionVectorsJittered=false");
   expect(compact_closest_hit.find("floatggxAlpha;") != std::string::npos &&
              compact_closest_hit.find(
                  "returnperceptualRoughness*perceptualRoughness;") !=
@@ -439,6 +508,42 @@ void testPathTracePbrSourceContracts() {
         compact_forward.find(contract) != std::string::npos &&
         compact_forward_rt.find(contract) != std::string::npos;
   }
+  expect(compact_raygen.find(
+                 "result.specularHitDistance=10000.0;") !=
+                 std::string::npos &&
+             compact_raygen.find(
+                 "result.specularHitDistance=length("
+                 "reflectedHitPosition-guideHitPosition);") !=
+                 std::string::npos,
+         "RR environment reflection misses keep a far specular-hit distance "
+         "while finite reflected hits retain their measured world distance");
+  expect(compact_raygen.find(
+                 "boolspecularHitDistanceRequested=integratorFlag(31u)||") !=
+                 std::string::npos &&
+             compact_raygen.find(
+                 "outputEnabled(kOutputRrSpecularHitDistance)") !=
+                 std::string::npos &&
+             compact_raygen.find(
+                 "aovOutputEnabled(kAovSpecularHitDistance)") !=
+                 std::string::npos,
+         "specular-hit-distance AOV can be inspected without enabling RR");
+
+  expect(compact_raygen.find(
+                 "boolcurrentGuideInvalid="
+                 "coverageLayerCount>1u||guidePhysicalTransmission;") !=
+                 std::string::npos &&
+             compact_raygen.find(
+                 "boolhistoryOutside=result.motion.w<0.5;") !=
+                 std::string::npos &&
+             compact_raygen.find(
+                 "result.neutralizeRrGuides=currentGuideInvalid;") !=
+                 std::string::npos &&
+             compact_raygen.find(
+                 "coverageLayerCount>1u||guidePhysicalTransmission||"
+                 "result.motion.w<0.5") == std::string::npos,
+         "RR keeps valid current-frame guides when only history "
+         "reprojects outside the viewport");
+
   expect(forward_tint_matches &&
              compact_closest_hit.find(
                  "(predefinedMetal?2u:0u)") != std::string::npos &&
@@ -647,22 +752,31 @@ void testSelectionOutlineTemporalContract() {
       compact_composite.find("boolreconstructedEnabled()") !=
               std::string::npos &&
           compact_composite.find(
+              "vec2rawSize=vec2(textureSize(uPathTrace,0));") !=
+              std::string::npos &&
+          compact_composite.find(
               "vec2jitterPixels=uintBitsToFloat("
               "composite_push.flags.yz);") != std::string::npos &&
           compact_composite.find(
-              "returnoutputUv+jitterPixels/"
-              "vec2(textureSize(uPathTrace,0));") !=
+              "vec2halfTexel=vec2(0.5)/rawSize;") !=
+              std::string::npos &&
+          compact_composite.find(
+              "returnclamp(rawUv,halfTexel,vec2(1.0)-halfTexel);") !=
               std::string::npos &&
           compact_composite.find("floatsampleCurrentCoverage") !=
               std::string::npos &&
           compact_composite.find(
-              "reconstructed.a=sampleCurrentCoverage("
-              "currentRawUv(outputUv));") != std::string::npos &&
-          compact_composite.find("texture(uPathDepth,depthUv)") !=
+              "vec3sampleDisplayRgb(vec2outputUv,vec2rawUv)") !=
+              std::string::npos &&
+          compact_composite.find(
+              "floatcoverage=sampleForegroundCoverage(vUV,rawUv);") !=
+              std::string::npos &&
+          compact_composite.find(
+              "floatdepth=clamp(texture(uPathDepth,rawUv).r,0.0,1.0);") !=
               std::string::npos &&
           compact_composite.find("transparentBackground") ==
               std::string::npos,
-      "post-DLSS composite pairs current raw coverage/depth in jitter-corrected render space instead of consuming temporal alpha");
+      "post-DLSS composite clamps jittered raw UV to texel centers and samples current coverage/depth from one shared raw-space coordinate");
 
   expect(
       compact_backend_internal.find(
@@ -755,6 +869,8 @@ void testSelectionOutlineTemporalContract() {
 }
 
 void testLogicalFramebufferViewportContract() {
+  using xpbd::gfx::logicalEdgeToFramebuffer;
+  using xpbd::gfx::logicalRectToFramebufferHalfOpen;
   using xpbd::gfx::logicalViewportToFramebuffer;
   const auto mixed_dpi = logicalViewportToFramebuffer(
       10.0f, 20.0f, 300.0f, 200.0f, 1.5f, 2.0f, 1920, 1080);
@@ -775,6 +891,22 @@ void testLogicalFramebufferViewportContract() {
              minimum.w == 1 && minimum.h == 1,
          "invalid DPI and collapsed UI viewport retain a one-pixel target");
 
+  const auto left = logicalRectToFramebufferHalfOpen(
+      10.25f, 0.0f, 110.25f, 20.0f, 1.5f, 1.0f, 512, 128);
+  const auto right = logicalRectToFramebufferHalfOpen(
+      110.25f, 0.0f, 210.25f, 20.0f, 1.5f, 1.0f, 512, 128);
+  expect(left.x + left.w == right.x && left.w > 0 && right.w > 0,
+         "shared half-open edge conversion keeps adjacent UI rectangles pixel-tight at fractional DPI");
+
+  const int right_edge = logicalEdgeToFramebuffer(210.25f, 1.5f, 512);
+  expect(right.x + right.w == right_edge,
+         "half-open rectangles derive width from independently rounded endpoints");
+
+  RawUv raw_uv = mapOutputUvToCurrentRawUv(
+      {0.5f / 1280.0f, 0.5f / 720.0f}, {-0.5f, 0.0f}, 640, 360, true);
+  expectNear(raw_uv.x, 0.5f / 640.0f, 1e-6f,
+             "DLSS composite clamps negative jittered left-edge UV to the first raw texel center");
+
   using xpbd::gfx::choosePathTraceTargetExtent;
   expect(choosePathTraceTargetExtent(900u, 600u, 640u, 480u, true) ==
              xpbd::gfx::PathTraceTargetExtent{640u, 480u},
@@ -786,7 +918,6 @@ void testLogicalFramebufferViewportContract() {
              xpbd::gfx::PathTraceTargetExtent{900u, 600u},
          "released splitter adopts the final requested PT target");
 }
-
 void testVulkanQueueFamilySelection() {
   using xpbd::gfx::VulkanQueueFamilySupport;
   using xpbd::gfx::selectVulkanQueueFamilies;
@@ -3817,6 +3948,12 @@ void testPathTraceOptionalOutputMaskContract() {
   using xpbd::gfx::kPathTraceAllRrGuideOutputMask;
   using xpbd::gfx::kPathTraceRrMotionOutputMask;
   using xpbd::gfx::kPathTraceStatisticsOutputMask;
+  using xpbd::gfx::PathTraceAovLayer;
+  using xpbd::gfx::PathTraceOptionalOutput;
+  using xpbd::gfx::RrAovDebugView;
+  using xpbd::gfx::pathTraceAovOutputBit;
+  using xpbd::gfx::pathTraceOptionalOutputBit;
+  using xpbd::gfx::rrAovDebugRequiredOutputMask;
 
   expect(kPathTraceAllAovOutputMask == 0x03ffu,
          "path-trace AOV layers occupy bits 0 through 9");
@@ -3828,6 +3965,35 @@ void testPathTraceOptionalOutputMaskContract() {
          "path statistics occupy bit 15");
   expect(kPathTraceAllOptionalOutputMask == 0x7ffffu,
          "optional output ABI includes three standalone temporal transparency masks");
+  expect(rrAovDebugRequiredOutputMask(RrAovDebugView::LinearDepth) ==
+                 pathTraceAovOutputBit(
+                     PathTraceAovLayer::GeometryNormalLinearDepth) &&
+             rrAovDebugRequiredOutputMask(
+                 RrAovDebugView::PreviousUvOutside) ==
+                 (pathTraceAovOutputBit(
+                      PathTraceAovLayer::MotionDisocclusion) |
+                  pathTraceOptionalOutputBit(
+                      PathTraceOptionalOutput::RrMotion)) &&
+             rrAovDebugRequiredOutputMask(
+                 RrAovDebugView::SpecularHitDistance) ==
+                 pathTraceOptionalOutputBit(
+                     PathTraceOptionalOutput::RrSpecularHitDistance) &&
+             rrAovDebugRequiredOutputMask(
+                 RrAovDebugView::TemporalBoundaryOverlay) ==
+                 (pathTraceOptionalOutputBit(
+                      PathTraceOptionalOutput::RrMotion) |
+                  pathTraceOptionalOutputBit(
+                      PathTraceOptionalOutput::GuideValidity)),
+         "RR AOV debug modes request only the resources they display");
+  expect(xpbd::gfx::rrAovDebugViewFromName("previous-uv-outside") ==
+                 RrAovDebugView::PreviousUvOutside &&
+             std::string(xpbd::gfx::rrAovDebugViewName(
+                 RrAovDebugView::GuideValidity)) == "guide-validity" &&
+             xpbd::gfx::rrAovDebugViewFromName("edge-overlay") ==
+                 RrAovDebugView::TemporalBoundaryOverlay &&
+             xpbd::gfx::rrAovDebugViewFromName("unknown") ==
+                 RrAovDebugView::Off,
+         "RR AOV debug-view names are stable and unknown-safe");
 }
 
 void testRtNearestHitReference() {
@@ -3985,6 +4151,7 @@ void testPathTraceSamplingAndAccumulation() {
   using xpbd::gfx::pathTraceNextRandomBits;
   using xpbd::gfx::pathTraceNextRandom01;
   using xpbd::gfx::pathTraceRayConeTextureLod;
+  using xpbd::gfx::reconstructionMipBias;
   using xpbd::gfx::pathTraceTriangleGeometricNormal;
   using xpbd::gfx::initializePathTraceRayCone;
   using xpbd::gfx::propagatePathTraceRayCone;
@@ -4179,6 +4346,30 @@ void testPathTraceSamplingAndAccumulation() {
              diffuse_cone.spread_angle > mirror_cone.spread_angle,
          "ray cone initializes from pixel projection and propagates "
          "continuous distance/lobe/UV-area LOD");
+  const float quality_mip_bias =
+      reconstructionMipBias(1280u, 720u, 1920u, 1080u, true);
+  const float rounded_extent_mip_bias =
+      reconstructionMipBias(1241u, 790u, 1862u, 1185u, true);
+  const float expected_quality_mip_bias =
+      std::log2(2.0f / 3.0f);
+  expect(std::abs(quality_mip_bias - expected_quality_mip_bias) <
+                 1.0e-6f &&
+             std::abs(rounded_extent_mip_bias -
+                      expected_quality_mip_bias) < 1.0e-6f &&
+             reconstructionMipBias(960u, 540u, 1920u, 1080u, true) ==
+                 -1.0f &&
+             reconstructionMipBias(1920u, 1080u, 1920u, 1080u, true) ==
+                 0.0f &&
+             reconstructionMipBias(1920u, 1080u, 1280u, 720u, true) ==
+                 0.0f &&
+             reconstructionMipBias(1280u, 720u, 1920u, 1080u, false) ==
+                 0.0f &&
+             reconstructionMipBias(0u, 720u, 1920u, 1080u, true) ==
+                 0.0f &&
+             reconstructionMipBias(1u, 1u, 8192u, 8192u, true) ==
+                 -2.0f,
+         "DLSS reconstruction Mip Bias follows the conservative render-to-"
+         "output ratio and remains safe for native/invalid/extreme sizes");
   const auto temporal_jitter_0 =
       pathTraceTemporalJitter(0u, 393u, 590u);
   const auto temporal_jitter_1 =

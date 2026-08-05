@@ -603,6 +603,14 @@ int app_main(int argc, char **argv) {
     xpbd::log::infof("RT debug view: %s",
                      xpbd::gfx::rtDebugViewName(session.rt_debug_view));
   }
+  if (const char *rr_aov_debug = std::getenv("XPBD_RR_AOV_DEBUG");
+      rr_aov_debug != nullptr && rr_aov_debug[0] != '\0') {
+    session.rr_aov_debug_view =
+        xpbd::gfx::rrAovDebugViewFromName(rr_aov_debug);
+    xpbd::log::infof(
+        "RR AOV debug view: %s",
+        xpbd::gfx::rrAovDebugViewName(session.rr_aov_debug_view));
+  }
   if (const char *startup_rt = std::getenv("XPBD_RT")) {
     session.enable_ray_tracing =
         std::strcmp(startup_rt, "1") == 0 ||
@@ -2248,6 +2256,7 @@ int app_main(int argc, char **argv) {
     frame.diagnostics.texture_generation = session.textureGeneration();
     frame.material_debug_view = session.labpbr_debug_view;
     frame.rt_debug_view = session.rt_debug_view;
+    frame.rr_aov_debug_view = session.rr_aov_debug_view;
     frame.path_trace_settings = session.path_trace_settings;
     frame.world_environment =
         still_snapshot != nullptr ? &still_snapshot->world_environment

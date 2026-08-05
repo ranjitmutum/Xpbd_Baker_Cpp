@@ -60,6 +60,7 @@ layout(set = 0, binding = 19, std430) readonly buffer InstanceMotionBuffer {
 layout(set = 0, binding = 20, std430) readonly buffer MotionFrameBuffer {
   mat4 previousViewProj;
   uvec4 motionInfo;
+  vec4 reconstructionInfo;
 };
 layout(set = 0, binding = 21, rgba16f) uniform image2DArray outputAov;
 layout(set = 0, binding = 22, rgba32f) uniform image2D outputStatistics;
@@ -1483,45 +1484,66 @@ vec3 packedPosition(uint vertex, bool previous) {
                     positions[base + 2u]);
 }
 
-vec4 motionVector(vec2 motionUv, vec3 previousWorld, bool valid) {
+bool projectMotionUv(mat4 viewProjection, vec3 worldPosition,
+                     out vec2 projectedUv) {
+  vec4 clip = viewProjection * vec4(worldPosition, 1.0);
+  if (!finite4(clip) || !(clip.w > 1.0e-6)) {
+    projectedUv = vec2(0.0);
+    return false;
+  }
+  vec2 ndc = clip.xy / clip.w;
+  // Both matrices are pre-converted by glMvpToVulkan(), so NDC already maps
+  // directly to the top-left-origin storage-image UV convention.
+  projectedUv = ndc * 0.5 + 0.5;
+  return all(equal(projectedUv, projectedUv)) &&
+         all(lessThanEqual(abs(projectedUv), vec2(65504.0)));
+}
+
+vec4 motionVector(vec3 currentWorld, vec3 previousWorld, bool valid) {
   if (!valid || motionInfo.x == 0u) {
     return vec4(0.0, 0.0, 1.0, 0.0);
   }
-  vec4 previousClip = previousViewProj * vec4(previousWorld, 1.0);
-  if (!finite4(previousClip) || !(previousClip.w > 1.0e-6)) {
+  vec2 currentUv;
+  vec2 previousUv;
+  if (!projectMotionUv(pc.viewProj, currentWorld, currentUv) ||
+      !projectMotionUv(previousViewProj, previousWorld, previousUv)) {
     return vec4(0.0, 0.0, 1.0, 0.0);
   }
-  vec2 previousNdc = previousClip.xy / previousClip.w;
-  // previousViewProj is pre-converted by glMvpToVulkan(), so its NDC Y already
-  // maps directly to the top-left-origin storage-image UV convention.
-  vec2 previousUv = previousNdc * 0.5 + 0.5;
   bool inside = all(greaterThanEqual(previousUv, vec2(0.0))) &&
                 all(lessThan(previousUv, vec2(1.0)));
-  // Keep the real vector even when reprojection leaves the viewport. A zero
-  // vector would make Streamline sample stale history at the current pixel.
+  // Streamline receives jitter separately and motionVectorsJittered=false.
+  // Both motion endpoints must therefore come from the unjittered matrices.
+  // Subtracting the jittered primary sample UV injects a changing subpixel
+  // error into every static surface and RR amplifies it into swimming/ghosting.
   vec2 motionPixels =
-      (previousUv - motionUv) * vec2(pc.sizeMode.xy);
+      (previousUv - currentUv) * vec2(pc.sizeMode.xy);
   return vec4(motionPixels, inside ? 0.0 : 1.0, inside ? 1.0 : 0.0);
 }
 
-vec4 surfaceMotion(uint primitive, uint instanceId, vec2 barycentrics,
-                   vec2 motionUv) {
+vec4 surfaceMotion(uint primitive, uint instanceId, vec2 barycentrics) {
   uint i0 = indices[primitive * 3u + 0u];
   uint i1 = indices[primitive * 3u + 1u];
   uint i2 = indices[primitive * 3u + 2u];
   float w0 = 1.0 - barycentrics.x - barycentrics.y;
   bool sceneMotionValid =
       motionInfo.y != 0u && instanceMotion[instanceId].metadata.x != 0u;
+  vec3 currentLocal =
+      packedPosition(i0, false) * w0 +
+      packedPosition(i1, false) * barycentrics.x +
+      packedPosition(i2, false) * barycentrics.y;
   vec3 previousLocal =
       packedPosition(i0, sceneMotionValid) * w0 +
       packedPosition(i1, sceneMotionValid) * barycentrics.x +
       packedPosition(i2, sceneMotionValid) * barycentrics.y;
+  vec3 currentWorld =
+      (instanceMotion[instanceId].currentTransform *
+       vec4(currentLocal, 1.0)).xyz;
   vec3 previousWorld =
       ((sceneMotionValid
             ? instanceMotion[instanceId].previousTransform
             : instanceMotion[instanceId].currentTransform) *
        vec4(previousLocal, 1.0)).xyz;
-  return motionVector(motionUv, previousWorld, true);
+  return motionVector(currentWorld, previousWorld, true);
 }
 
 // NVIDIA DLSS-RR Programming Guide 4.2.1. Convert material F0 into the
@@ -1718,18 +1740,39 @@ PrimaryAovProbe probePrimaryAov(vec3 cameraOrigin, vec3 direction,
     uint primitive = payload.status.w - 1u;
     uint instanceId = floatBitsToUint(payload.hitData.z);
     result.motion =
-        surfaceMotion(primitive, instanceId, payload.hitData.xy, motionUv);
+        surfaceMotion(primitive, instanceId, payload.hitData.xy);
     result.guideValidity = 1.0;
-    if (coverageLayerCount > 1u || guidePhysicalTransmission ||
-        result.motion.w < 0.5) {
+    // A missing previous-frame sample is a history/disocclusion state,
+    // not evidence that the current primary-surface guides are invalid.
+    // Keep current-frame albedo/normal/roughness/hit-distance intact when
+    // motion reprojects outside the viewport; only genuinely ambiguous
+    // current surfaces may neutralize RR guides.
+    bool currentGuideInvalid =
+        coverageLayerCount > 1u || guidePhysicalTransmission;
+    bool historyOutside = result.motion.w < 0.5;
+    if (currentGuideInvalid) {
       result.guidePolicy = kTransparentGuidePolicyConservativeInvalid;
       result.guideValidity = 0.0;
       result.reactiveMask = 1.0;
       result.motion.z = 1.0;
     }
-    result.neutralizeRrGuides = result.guideValidity < 0.5;
-    if (integratorFlag(31u) && !guidePhysicalTransmission &&
+    if (historyOutside) {
+      result.reactiveMask = 1.0;
+      result.motion.z = 1.0;
+    }
+    result.neutralizeRrGuides = currentGuideInvalid;
+    bool specularHitDistanceRequested =
+        integratorFlag(31u) ||
+        outputEnabled(kOutputRrSpecularHitDistance) ||
+        aovOutputEnabled(kAovSpecularHitDistance);
+    if (specularHitDistanceRequested && !guidePhysicalTransmission &&
         !result.neutralizeRrGuides) {
+      // A reflected ray that reaches the environment has no finite surface
+      // hit. Zero is not a valid replacement: it describes a virtual hit at
+      // the primary surface and gives RR the wrong reflected reprojection,
+      // which becomes especially visible with bright HDRI/sky lighting.
+      // Approximate infinity with the same finite distance used by tracePrimary.
+      result.specularHitDistance = 10000.0;
       vec3 reflectedDirection =
           safeNormalize(reflect(direction, shadingNormal),
                          reflect(direction, geometricNormal));
@@ -1753,8 +1796,8 @@ PrimaryAovProbe probePrimaryAov(vec3 cameraOrigin, vec3 direction,
       result.specularHitDistance = 0.0;
     }
   } else {
-    result.motion =
-        motionVector(motionUv, cameraOrigin + direction * 10000.0, true);
+    vec3 skyWorld = cameraOrigin + direction * 10000.0;
+    result.motion = motionVector(skyWorld, skyWorld, true);
     if (result.motion.w < 0.5) {
       result.reactiveMask = 1.0;
       result.motion.z = 1.0;
@@ -1864,9 +1907,8 @@ void main() {
        (temporalReconstruction ? temporalPixelOffset : vec2(0.5))) /
       vec2(pc.sizeMode.xy);
   // Streamline receives jitter separately and motionVectorsJittered=false.
-  // Keep the ray-cone footprint stable at the unjittered pixel center, but
-  // compute motion from primaryUv: the AOV hit was traced through that
-  // sub-pixel sample using unjittered camera matrices.
+  // Keep the ray-cone footprint and motion reprojection in unjittered camera
+  // space. The primary ray itself may still use the temporal sample offset.
   vec2 footprintUv =
       (vec2(pixel) + vec2(0.5)) / vec2(pc.sizeMode.xy);
   vec2 footprintNdc =

@@ -3768,6 +3768,13 @@ int VulkanBackend::drawUi(FrameSync &frame, const UiDrawData &ui,
   const float sy =
       static_cast<float>(swap_extent_.height) / static_cast<float>(lh);
 
+  const auto swap_width = static_cast<int>(swap_extent_.width);
+  const auto swap_height = static_cast<int>(swap_extent_.height);
+  const auto convertRect = [&](float x0, float y0, float x1, float y1) {
+    return logicalRectToFramebufferHalfOpen(
+        x0, y0, x1, y1, sx, sy, swap_width, swap_height);
+  };
+
   const nk_draw_command *dcmd = nullptr;
   uint32_t index_offset = 0;
   int draw_commands = 0;
@@ -3775,33 +3782,34 @@ int VulkanBackend::drawUi(FrameSync &frame, const UiDrawData &ui,
     if (!dcmd || dcmd->elem_count == 0) {
       continue;
     }
-    int32_t x1 = static_cast<int32_t>(dcmd->clip_rect.x * sx);
-    int32_t y1 = static_cast<int32_t>(dcmd->clip_rect.y * sy);
-    int32_t x2 = static_cast<int32_t>(
-        (dcmd->clip_rect.x + dcmd->clip_rect.w) * sx);
-    int32_t y2 = static_cast<int32_t>(
-        (dcmd->clip_rect.y + dcmd->clip_rect.h) * sy);
+    ViewportRect rect = convertRect(
+        dcmd->clip_rect.x, dcmd->clip_rect.y,
+        dcmd->clip_rect.x + dcmd->clip_rect.w,
+        dcmd->clip_rect.y + dcmd->clip_rect.h);
     if (overlay_only) {
-      x1 = (std::max)(x1, static_cast<int32_t>(ui.overlay_x * sx));
-      y1 = (std::max)(y1, static_cast<int32_t>(ui.overlay_y * sy));
-      x2 = (std::min)(
-          x2, static_cast<int32_t>((ui.overlay_x + ui.overlay_w) * sx));
-      y2 = (std::min)(
-          y2, static_cast<int32_t>((ui.overlay_y + ui.overlay_h) * sy));
+      const ViewportRect overlay = convertRect(
+          ui.overlay_x, ui.overlay_y, ui.overlay_x + ui.overlay_w,
+          ui.overlay_y + ui.overlay_h);
+      const int clipped_x0 = (std::max)(rect.x, overlay.x);
+      const int clipped_y0 = (std::max)(rect.y, overlay.y);
+      const int clipped_x1 =
+          (std::min)(rect.x + rect.w, overlay.x + overlay.w);
+      const int clipped_y1 =
+          (std::min)(rect.y + rect.h, overlay.y + overlay.h);
+      rect.x = clipped_x0;
+      rect.y = clipped_y0;
+      rect.w = (std::max)(0, clipped_x1 - clipped_x0);
+      rect.h = (std::max)(0, clipped_y1 - clipped_y0);
     }
-    x1 = (std::max)(x1, 0);
-    y1 = (std::max)(y1, 0);
-    x2 = (std::min)(x2, static_cast<int32_t>(swap_extent_.width));
-    y2 = (std::min)(y2, static_cast<int32_t>(swap_extent_.height));
-    if (x2 <= x1 || y2 <= y1) {
+    if (rect.w <= 0 || rect.h <= 0) {
       index_offset += dcmd->elem_count;
       continue;
     }
     VkRect2D sc{};
-    sc.offset.x = x1;
-    sc.offset.y = y1;
-    sc.extent.width = static_cast<uint32_t>(x2 - x1);
-    sc.extent.height = static_cast<uint32_t>(y2 - y1);
+    sc.offset.x = rect.x;
+    sc.offset.y = rect.y;
+    sc.extent.width = static_cast<uint32_t>(rect.w);
+    sc.extent.height = static_cast<uint32_t>(rect.h);
     vkCmdSetScissor(cmd, 0, 1, &sc);
     vkCmdDrawIndexed(cmd, dcmd->elem_count, 1, index_offset, 0, 0);
     index_offset += dcmd->elem_count;

@@ -56,8 +56,10 @@ struct alignas(16) PathTraceMotionFrameGpu {
   float previous_view_projection[16]{};
   // x previous camera valid, y scene motion valid, z/w reserved.
   std::uint32_t info[4]{};
+  // x reconstruction Mip Bias; y/z/w reserved for frame-wide RT sampling data.
+  float reconstruction[4]{};
 };
-static_assert(sizeof(PathTraceMotionFrameGpu) == 80u);
+static_assert(sizeof(PathTraceMotionFrameGpu) == 96u);
 
 bool invertMatrix4(const float *m, float *out) {
   float inv[16];
@@ -1825,7 +1827,7 @@ bool VulkanPathTracer::createPipelines(VkRenderPass render_pass) {
 
   // Composite graphics pipeline
   cli.pNext = nullptr;
-  std::array<VkDescriptorSetLayoutBinding, 3> sbind{};
+  std::array<VkDescriptorSetLayoutBinding, 12> sbind{};
   for (std::uint32_t binding = 0; binding < sbind.size(); ++binding) {
     sbind[binding].binding = binding;
     sbind[binding].descriptorType =
@@ -1884,7 +1886,7 @@ bool VulkanPathTracer::createPipelines(VkRenderPass render_pass) {
     return false;
   }
 
-  VkDescriptorPoolSize sps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3};
+  VkDescriptorPoolSize sps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 12};
   dpi.poolSizeCount = 1;
   dpi.pPoolSizes = &sps;
   dpi.maxSets = 1;
@@ -2459,15 +2461,36 @@ PathTraceTargetResult VulkanPathTracer::ensureTarget(
   compute_descriptor_key_valid_ = false;
   rt_pipeline_.invalidateDescriptorCache();
 
-  std::array<VkDescriptorImageInfo, 3> descriptor_images{};
+  const auto sampled_view_or_fallback = [&](VkImageView view) {
+    return view != VK_NULL_HANDLE ? view : fallback_albedo_view_;
+  };
+  std::array<VkDescriptorImageInfo, 12> descriptor_images{};
   descriptor_images[0].imageView = image_view_;
   descriptor_images[1].imageView = depth_image_view_;
   descriptor_images[2].imageView = image_view_;
+  descriptor_images[3].imageView = sampled_view_or_fallback(
+      aovView(PathTraceAovLayer::GeometryNormalLinearDepth));
+  descriptor_images[4].imageView =
+      sampled_view_or_fallback(rr_motion_image_view_);
+  descriptor_images[5].imageView =
+      sampled_view_or_fallback(rr_diffuse_albedo_image_view_);
+  descriptor_images[6].imageView =
+      sampled_view_or_fallback(rr_specular_albedo_image_view_);
+  descriptor_images[7].imageView =
+      sampled_view_or_fallback(rr_normal_roughness_image_view_);
+  descriptor_images[8].imageView =
+      sampled_view_or_fallback(rr_specular_hit_distance_image_view_);
+  descriptor_images[9].imageView =
+      sampled_view_or_fallback(reactive_mask_image_view_);
+  descriptor_images[10].imageView = sampled_view_or_fallback(
+      transparency_and_composition_image_view_);
+  descriptor_images[11].imageView =
+      sampled_view_or_fallback(guide_validity_image_view_);
   for (auto &descriptor_image : descriptor_images) {
     descriptor_image.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     descriptor_image.sampler = sampler_;
   }
-  std::array<VkWriteDescriptorSet, 3> writes{};
+  std::array<VkWriteDescriptorSet, 12> writes{};
   static_assert(writes.size() == descriptor_images.size(),
                 "composite descriptor writes must match image bindings");
   for (std::uint32_t binding = 0; binding < writes.size(); ++binding) {
@@ -3182,6 +3205,10 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
   }
   motion_frame->info[0] = camera_motion_valid ? 1u : 0u;
   motion_frame->info[1] = scene.motionHistoryValid() ? 1u : 0u;
+  motion_frame->reconstruction[0] =
+      std::isfinite(params.reconstruction_mip_bias)
+          ? std::clamp(params.reconstruction_mip_bias, -2.0f, 0.0f)
+          : 0.0f;
 
   bool traced_with_rt_pipeline = false;
   if (try_rt_pipeline) {
@@ -3567,15 +3594,47 @@ void VulkanPathTracer::recordComposite(
   reconstructed_image.sampler = sampler_;
   reconstructed_image.imageLayout =
       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  VkWriteDescriptorSet reconstructed_write{
-      VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-  reconstructed_write.dstSet = composite_set_;
-  reconstructed_write.dstBinding = 2u;
-  reconstructed_write.descriptorType =
+
+  VkImageView diagnostic_aov_view = fallback_albedo_view_;
+  switch (params.rr_aov_debug_view) {
+  case RrAovDebugView::LinearDepth:
+    diagnostic_aov_view =
+        aovView(PathTraceAovLayer::GeometryNormalLinearDepth);
+    break;
+  case RrAovDebugView::PreviousUvOutside:
+    diagnostic_aov_view =
+        aovView(PathTraceAovLayer::MotionDisocclusion);
+    break;
+  default:
+    break;
+  }
+  if (diagnostic_aov_view == VK_NULL_HANDLE) {
+    diagnostic_aov_view = fallback_albedo_view_;
+  }
+  VkDescriptorImageInfo diagnostic_aov_image{};
+  diagnostic_aov_image.imageView = diagnostic_aov_view;
+  diagnostic_aov_image.sampler = sampler_;
+  diagnostic_aov_image.imageLayout =
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+  std::array<VkWriteDescriptorSet, 2> composite_writes{};
+  composite_writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  composite_writes[0].dstSet = composite_set_;
+  composite_writes[0].dstBinding = 2u;
+  composite_writes[0].descriptorType =
       VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-  reconstructed_write.descriptorCount = 1;
-  reconstructed_write.pImageInfo = &reconstructed_image;
-  vkUpdateDescriptorSets(device_, 1u, &reconstructed_write, 0, nullptr);
+  composite_writes[0].descriptorCount = 1u;
+  composite_writes[0].pImageInfo = &reconstructed_image;
+  composite_writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  composite_writes[1].dstSet = composite_set_;
+  composite_writes[1].dstBinding = 3u;
+  composite_writes[1].descriptorType =
+      VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  composite_writes[1].descriptorCount = 1u;
+  composite_writes[1].pImageInfo = &diagnostic_aov_image;
+  vkUpdateDescriptorSets(
+      device_, static_cast<std::uint32_t>(composite_writes.size()),
+      composite_writes.data(), 0u, nullptr);
   VkViewport vp{};
   vp.x = static_cast<float>(params.viewport_x);
   vp.y = static_cast<float>(params.viewport_y);
@@ -3612,6 +3671,8 @@ void VulkanPathTracer::recordComposite(
       use_reconstructed ? params.camera_jitter[0] : 0.0f);
   composite_push.flags[2] = std::bit_cast<std::uint32_t>(
       use_reconstructed ? params.camera_jitter[1] : 0.0f);
+  composite_push.flags[3] =
+      static_cast<std::uint32_t>(params.rr_aov_debug_view);
   vkCmdPushConstants(cmd, composite_pipe_layout_,
                      VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                      sizeof(composite_push), &composite_push);

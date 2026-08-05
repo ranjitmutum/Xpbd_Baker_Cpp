@@ -162,3 +162,7 @@ xpbd_gfx_log.txt
 out/
 build/
 build-app/
+/src*.zip
+
+
+

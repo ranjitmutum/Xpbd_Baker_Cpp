@@ -31,6 +31,11 @@ layout(set = 0, binding = 13) uniform sampler2D specularTexture;
 layout(set = 0, binding = 17, std430) readonly buffer PositionBuffer {
   float positions[];
 };
+layout(set = 0, binding = 20, std430) readonly buffer MotionFrameBuffer {
+  mat4 previousViewProj;
+  uvec4 motionInfo;
+  vec4 reconstructionInfo;
+};
 struct SurfaceOpticsGpu {
   vec4 parameters;
   vec4 attenuationColor;
@@ -72,6 +77,8 @@ layout(location = 0) rayPayloadInEXT PrimaryPayload payload;
 hitAttributeEXT vec2 hitBarycentrics;
 
 const uint kMaterialTextured = 1u << 0u;
+const uint kMaterialCutout = 1u << 1u;
+const uint kMaterialBlend = 1u << 2u;
 
 bool finiteFloat(float value) {
   return !isnan(value) && !isinf(value);
@@ -96,19 +103,35 @@ float rayConeTextureLod(sampler2D sampledTexture, float uvFootprint) {
   return texels > 1.0 ? max(log2(texels), 0.0) : 0.0;
 }
 
-vec4 sampleAlbedoRayCone(vec2 uv, float uvFootprint) {
-  vec4 packed = textureLod(
-      albedoTexture, uv, rayConeTextureLod(albedoTexture, uvFootprint));
+float continuousTextureLod(sampler2D sampledTexture, float uvFootprint) {
+  float baseLod = rayConeTextureLod(sampledTexture, uvFootprint);
+  float mipBias = clamp(reconstructionInfo.x, -2.0, 0.0);
+  // The role-specific Vulkan sampler supplies the semantic safeMaxLod. Keep
+  // the explicit lower bound here so negative reconstruction bias never asks
+  // for a non-existent sharper-than-base level.
+  return max(baseLod + mipBias, 0.0);
+}
+
+vec4 sampleAlbedoRayCone(vec2 uv, float uvFootprint,
+                         bool preserveCoverageLod) {
+  float baseLod = rayConeTextureLod(albedoTexture, uvFootprint);
+  float biasedLod = continuousTextureLod(albedoTexture, uvFootprint);
+  vec4 packed = textureLod(albedoTexture, uv, biasedLod);
+  // DLSS Mip Bias is a color-detail correction, not an alpha-test policy.
+  // Keep cutout/blend coverage on the unbiased ray-cone LOD used by any-hit.
+  if (preserveCoverageLod && abs(biasedLod - baseLod) > 1.0e-6) {
+    packed.a = textureLod(albedoTexture, uv, baseLod).a;
+  }
   if (any(isnan(packed)) || any(isinf(packed))) {
     return vec4(1.0);
   }
-  packed = clamp(packed, vec4(0.0), vec4(1.0));
-  return packed;
+  return clamp(packed, vec4(0.0), vec4(1.0));
 }
 
 vec3 sampleNormalRayCone(vec2 uv, float uvFootprint) {
   vec3 packed = textureLod(
-      normalTexture, uv, rayConeTextureLod(normalTexture, uvFootprint)).rgb;
+      normalTexture, uv,
+      continuousTextureLod(normalTexture, uvFootprint)).rgb;
   return finite3(packed) ? clamp(packed, vec3(0.0), vec3(1.0))
                          : vec3(0.5, 0.5, 1.0);
 }
@@ -341,7 +364,10 @@ void main() {
   vec4 baseColor = vertexColor;
   bool textured = (flags & kMaterialTextured) != 0u;
   if (textured) {
-    vec4 sampledAlbedo = sampleAlbedoRayCone(uv, uvFootprint);
+    bool preserveCoverageLod =
+        (flags & (kMaterialCutout | kMaterialBlend)) != 0u;
+    vec4 sampledAlbedo =
+        sampleAlbedoRayCone(uv, uvFootprint, preserveCoverageLod);
     baseColor = vec4(sampledAlbedo.rgb * vertexColor.rgb,
                      sampledAlbedo.a * vertexColor.a);
   }

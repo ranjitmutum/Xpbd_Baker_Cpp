@@ -627,6 +627,15 @@ enum class PathTraceLobe : std::uint8_t;
     float triangle_world_double_area, float triangle_uv_double_area,
     std::uint32_t texture_width, std::uint32_t texture_height) noexcept;
 
+// Negative continuous-texture LOD offset used while SR/RR reconstructs a
+// lower-resolution render into a larger display target. The less-downscaled
+// axis is chosen when integer-rounded X/Y ratios differ, avoiding excess
+// sharpening. Invalid, native-resolution, and downscale requests return zero.
+[[nodiscard]] float reconstructionMipBias(
+    std::uint32_t render_width, std::uint32_t render_height,
+    std::uint32_t output_width, std::uint32_t output_height,
+    bool reconstruction_enabled) noexcept;
+
 // NVIDIA-style Halton(2,3) camera jitter for temporal reconstruction. Values
 // are pixel offsets from the pixel center in [-0.5, 0.5]. The sequence period
 // follows round(8 * (output_width / render_width)^2).
