@@ -11,7 +11,7 @@ struct NativeDialogHooks {
   // Platform window handle (HWND on Windows); may be null.
   void *owner_window = nullptr;
   // Called on the UI thread immediately before the modal dialog runs.
-  void (*prepare)() = nullptr;
+  bool (*prepare)() = nullptr;
   // Called after the modal dialog returns (success or cancel).
   void (*finish)() = nullptr;
 };
@@ -29,6 +29,11 @@ public:
   ~NativeDialogScope();
   NativeDialogScope(const NativeDialogScope &) = delete;
   NativeDialogScope &operator=(const NativeDialogScope &) = delete;
+
+  [[nodiscard]] bool ready() const noexcept { return ready_; }
+
+private:
+  bool ready_ = false;
 };
 
 } // namespace xpbd::app

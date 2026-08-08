@@ -8,6 +8,8 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <memory>
+#include <new>
 #include <numeric>
 
 namespace xpbd::gfx {
@@ -268,6 +270,14 @@ void appendKeyProfile(std::string &out,
     appendKeyDouble(out, layer.constant_term);
   }
 }
+
+bool checkedAdd(std::uint64_t &total, std::uint64_t value) noexcept;
+bool checkedMultiply(std::uint64_t left, std::uint64_t right,
+                     std::uint64_t &out) noexcept;
+bool estimateHdriRuntimeBudget(
+    const FloatEnvironmentImage &source, std::uint32_t requested_width,
+    std::uint32_t resolved_width, const HdriRuntimeBudgetLimits &limits,
+    HdriRuntimeBudget &out) noexcept;
 
 } // namespace
 
@@ -778,9 +788,12 @@ bool decodeRadianceHdr(std::span<const std::uint8_t> encoded,
     return false;
   }
 
-  float *decoded = stbi_loadf_from_memory(encoded.data(), encoded_size, &width,
-                                          &height, &source_channels, 4);
-  if (decoded == nullptr) {
+  using StbiFloatImage = std::unique_ptr<float, decltype(&stbi_image_free)>;
+  StbiFloatImage decoded(
+      stbi_loadf_from_memory(encoded.data(), encoded_size, &width, &height,
+                             &source_channels, 4),
+      &stbi_image_free);
+  if (!decoded) {
     const char *reason = stbi_failure_reason();
     setError(error, reason != nullptr ? reason : "HDR decode failed");
     return false;
@@ -789,8 +802,17 @@ bool decodeRadianceHdr(std::span<const std::uint8_t> encoded,
   FloatEnvironmentImage candidate;
   candidate.width = static_cast<std::uint32_t>(width);
   candidate.height = static_cast<std::uint32_t>(height);
-  candidate.rgba.assign(decoded, decoded + pixels * std::size_t{4});
-  stbi_image_free(decoded);
+  try {
+    candidate.rgba.assign(decoded.get(),
+                          decoded.get() + pixels * std::size_t{4});
+  } catch (const std::bad_alloc &) {
+    setError(error, "HDR decoded-image allocation failed");
+    return false;
+  } catch (...) {
+    setError(error, "HDR decoded-image construction raised an exception");
+    return false;
+  }
+  decoded.reset();
 
   bool nonempty_radiance = false;
   for (std::size_t pixel = 0; pixel < pixels; ++pixel) {
@@ -1058,8 +1080,253 @@ bool buildHdrEnvironmentAsset(
   if (!decodeRadianceHdr(encoded, candidate.radiance, error, limits)) {
     return false;
   }
-  if (!candidate.distribution.build(candidate.radiance)) {
-    setError(error, "HDR environment distribution is empty");
+  const std::uint64_t pixels =
+      static_cast<std::uint64_t>(candidate.radiance.width) *
+      candidate.radiance.height;
+  // Peak while Alias construction is live: retained RGBA32F (16 B/texel),
+  // persistent accept/pmf/alias data (20 B/texel), temporary weights/scaled
+  // arrays (16 B/texel), and the two reserved partition lists (8 B/texel).
+  std::uint64_t asset_peak_bytes = 0u;
+  if (!checkedMultiply(pixels, 60u, asset_peak_bytes) ||
+      !checkedAdd(asset_peak_bytes, limits.asset_safety_margin_bytes) ||
+      asset_peak_bytes > limits.maximum_asset_peak_bytes) {
+    setError(error, "HDR asset exceeds the distribution-build peak budget");
+    return false;
+  }
+  try {
+    if (!candidate.distribution.build(candidate.radiance)) {
+      setError(error, "HDR environment distribution is empty");
+      return false;
+    }
+  } catch (const std::bad_alloc &) {
+    setError(error, "HDR environment distribution allocation failed");
+    return false;
+  } catch (...) {
+    setError(error, "HDR environment distribution raised an exception");
+    return false;
+  }
+  out = std::move(candidate);
+  return true;
+}
+
+bool resolveHdriRuntimeBudget(
+    const FloatEnvironmentImage &source, std::uint32_t requested_width,
+    HdriRuntimeBudget &out, std::string *error,
+    HdriRuntimeBudgetLimits limits) {
+  if (error != nullptr) {
+    error->clear();
+  }
+  if (!source.valid() || source.width != source.height * 2u) {
+    setError(error, "HDR runtime source must be a valid 2:1 image");
+    return false;
+  }
+  if (requested_width < 2u || limits.maximum_runtime_width < 2u ||
+      limits.maximum_total_bytes == 0u || limits.maximum_gpu_bytes == 0u) {
+    setError(error, "HDR runtime limits or requested width are invalid");
+    return false;
+  }
+
+  std::uint32_t resolved_width =
+      std::min({requested_width, source.width,
+                limits.maximum_runtime_width});
+  resolved_width &= ~std::uint32_t{1};
+  if (resolved_width < 2u) {
+    setError(error, "HDR runtime width cannot preserve a 2:1 extent");
+    return false;
+  }
+  const std::uint32_t requested_floor = resolved_width;
+  std::uint32_t budget_floor = std::min(
+      requested_floor,
+      std::max(std::min(limits.minimum_runtime_width, source.width), 2u));
+  budget_floor &= ~std::uint32_t{1};
+  budget_floor = std::max(budget_floor, 2u);
+
+  HdriRuntimeBudget last_estimate;
+  for (;;) {
+    HdriRuntimeBudget candidate;
+    if (!estimateHdriRuntimeBudget(source, requested_width, resolved_width,
+                                   limits, candidate)) {
+      setError(error, "HDR runtime budget arithmetic overflow");
+      return false;
+    }
+    last_estimate = candidate;
+    const bool gpu_resources_fit =
+        candidate.gpu_image_bytes <= limits.maximum_gpu_bytes &&
+        candidate.gpu_distribution_bytes <=
+            limits.maximum_gpu_bytes - candidate.gpu_image_bytes;
+    if (gpu_resources_fit &&
+        candidate.total_bytes <= limits.maximum_total_bytes) {
+      out = candidate;
+      return true;
+    }
+    if (resolved_width <= budget_floor) {
+      break;
+    }
+    std::uint32_t next_width = (resolved_width >> 1u) & ~std::uint32_t{1};
+    if (next_width < budget_floor) {
+      next_width = budget_floor & ~std::uint32_t{1};
+    }
+    if (next_width < 2u || next_width >= resolved_width) {
+      break;
+    }
+    resolved_width = next_width;
+  }
+
+  setError(error,
+           "HDR runtime transaction exceeds the unified memory budget: " +
+               std::to_string(last_estimate.total_bytes) + " > " +
+               std::to_string(limits.maximum_total_bytes));
+  return false;
+}
+
+bool resampleHdriLatLong(const FloatEnvironmentImage &source,
+                         std::uint32_t resolved_width,
+                         FloatEnvironmentImage &out, std::string *error) {
+  if (error != nullptr) {
+    error->clear();
+  }
+  if (!source.valid() || source.width != source.height * 2u ||
+      resolved_width < 2u || (resolved_width & 1u) != 0u ||
+      resolved_width > source.width) {
+    setError(error,
+             "HDR resample requires a valid, non-upscaled 2:1 extent");
+    return false;
+  }
+  const std::uint32_t resolved_height = resolved_width / 2u;
+  std::uint64_t texels64 = 0u;
+  std::uint64_t values64 = 0u;
+  if (!checkedMultiply(resolved_width, resolved_height, texels64) ||
+      !checkedMultiply(texels64, 4u, values64) ||
+      values64 > (std::numeric_limits<std::size_t>::max)()) {
+    setError(error, "HDR resample extent overflows host addressing");
+    return false;
+  }
+
+  for (std::size_t value = 0u; value < source.rgba.size(); value += 4u) {
+    for (std::size_t channel = 0u; channel < 3u; ++channel) {
+      const float radiance = source.rgba[value + channel];
+      if (!std::isfinite(radiance) || radiance < 0.0f) {
+        setError(error, "HDR resample source contains invalid radiance");
+        return false;
+      }
+    }
+  }
+
+  FloatEnvironmentImage candidate;
+  candidate.width = resolved_width;
+  candidate.height = resolved_height;
+  try {
+    candidate.rgba.resize(static_cast<std::size_t>(values64));
+  } catch (const std::bad_alloc &) {
+    setError(error, "HDR resample allocation failed");
+    return false;
+  } catch (...) {
+    setError(error, "HDR resample allocation raised an exception");
+    return false;
+  }
+
+  const auto wrapped_x = [&](std::int64_t x) {
+    const std::int64_t width = static_cast<std::int64_t>(source.width);
+    x %= width;
+    return static_cast<std::uint32_t>(x < 0 ? x + width : x);
+  };
+  const auto clamped_y = [&](std::int64_t y) {
+    return static_cast<std::uint32_t>(std::clamp<std::int64_t>(
+        y, 0, static_cast<std::int64_t>(source.height) - 1));
+  };
+  for (std::uint32_t y = 0u; y < resolved_height; ++y) {
+    const double source_y =
+        (static_cast<double>(y) + 0.5) * source.height /
+            resolved_height -
+        0.5;
+    const std::int64_t y0i =
+        static_cast<std::int64_t>(std::floor(source_y));
+    const std::uint32_t y0 = clamped_y(y0i);
+    const std::uint32_t y1 = clamped_y(y0i + 1);
+    const double ty = source_y - std::floor(source_y);
+    for (std::uint32_t x = 0u; x < resolved_width; ++x) {
+      const double source_x =
+          (static_cast<double>(x) + 0.5) * source.width /
+              resolved_width -
+          0.5;
+      const std::int64_t x0i =
+          static_cast<std::int64_t>(std::floor(source_x));
+      const std::uint32_t x0 = wrapped_x(x0i);
+      const std::uint32_t x1 = wrapped_x(x0i + 1);
+      const double tx = source_x - std::floor(source_x);
+      const std::size_t destination =
+          (static_cast<std::size_t>(y) * resolved_width + x) * 4u;
+      for (std::uint32_t channel = 0u; channel < 3u; ++channel) {
+        const auto read = [&](std::uint32_t sx, std::uint32_t sy) {
+          return source.rgba[
+              (static_cast<std::size_t>(sy) * source.width + sx) * 4u +
+              channel];
+        };
+        const float p00 = read(x0, y0);
+        const float p10 = read(x1, y0);
+        const float p01 = read(x0, y1);
+        const float p11 = read(x1, y1);
+        if (!std::isfinite(p00) || p00 < 0.0f || !std::isfinite(p10) ||
+            p10 < 0.0f || !std::isfinite(p01) || p01 < 0.0f ||
+            !std::isfinite(p11) || p11 < 0.0f) {
+          setError(error, "HDR resample source contains invalid radiance");
+          return false;
+        }
+        const double top = static_cast<double>(p00) +
+                           (static_cast<double>(p10) - p00) * tx;
+        const double bottom = static_cast<double>(p01) +
+                              (static_cast<double>(p11) - p01) * tx;
+        const double value = top + (bottom - top) * ty;
+        if (!std::isfinite(value) || value < 0.0 ||
+            value > (std::numeric_limits<float>::max)()) {
+          setError(error, "HDR resample produced invalid radiance");
+          return false;
+        }
+        candidate.rgba[destination + channel] = static_cast<float>(value);
+      }
+      candidate.rgba[destination + 3u] = 1.0f;
+    }
+  }
+  out = std::move(candidate);
+  return true;
+}
+
+bool buildHdrEnvironmentRuntimeCandidate(
+    const HdrEnvironmentAsset &source, std::uint32_t requested_width,
+    std::uint64_t runtime_settings_generation,
+    HdrEnvironmentRuntimeCandidate &out, std::string *error,
+    HdriRuntimeBudgetLimits limits) {
+  if (error != nullptr) {
+    error->clear();
+  }
+  if (!source.valid()) {
+    setError(error, "HDR runtime source asset is incomplete");
+    return false;
+  }
+  HdrEnvironmentRuntimeCandidate candidate;
+  candidate.content_generation = source.generation;
+  candidate.runtime_settings_generation = runtime_settings_generation;
+  if (!resolveHdriRuntimeBudget(source.radiance, requested_width,
+                                candidate.budget, error, limits) ||
+      !resampleHdriLatLong(source.radiance,
+                           candidate.budget.resolved_width,
+                           candidate.radiance, error)) {
+    return false;
+  }
+  try {
+    if (!candidate.distribution.build(candidate.radiance)) {
+      setError(error, "HDR runtime distribution is empty");
+      return false;
+    }
+  } catch (const std::bad_alloc &) {
+    setError(error, "HDR runtime distribution allocation failed");
+    return false;
+  } catch (...) {
+    setError(error, "HDR runtime distribution raised an exception");
+    return false;
+  }
+  if (!candidate.valid()) {
+    setError(error, "HDR runtime candidate is internally inconsistent");
     return false;
   }
   out = std::move(candidate);
@@ -1075,6 +1342,8 @@ resolveWorldEnvironment(const WorldEnvironmentState &state) {
   resolved.cloud_generation = state.cloud_generation;
   resolved.display_generation = state.display_generation;
   resolved.target_generation = state.target_generation;
+  resolved.hdri_runtime_generation = state.hdri_runtime_generation;
+  resolved.requested_hdri_runtime_width = state.hdri_runtime_resolution;
   resolved.debug_view = state.debug_view;
   resolved.background_exposure =
       std::isfinite(state.background_exposure)
@@ -1113,6 +1382,19 @@ resolveWorldEnvironment(const WorldEnvironmentState &state) {
          state.selected_hdr_identity == state.hdr.source_identity)) {
       resolved.sky_rendering = SkyRendering::UserHdri;
       resolved.hdr = &state.hdr;
+      std::string budget_error;
+      if (resolveHdriRuntimeBudget(
+              state.hdr.radiance, state.hdri_runtime_resolution,
+              resolved.hdri_runtime_budget, &budget_error)) {
+        resolved.resolved_hdri_runtime_width =
+            resolved.hdri_runtime_budget.resolved_width;
+        resolved.resolved_hdri_runtime_height =
+            resolved.hdri_runtime_budget.resolved_height;
+      } else {
+        resolved.warning = budget_error.empty()
+                               ? "HDR runtime extent is unavailable"
+                               : budget_error;
+      }
     } else {
       resolved.warning = "selected HDR environment is unavailable";
     }
@@ -1533,6 +1815,141 @@ EnvironmentSample sampleEnvironment(
 std::uint64_t environmentGeneration(
     const ResolvedEnvironmentView &environment) noexcept {
   return environment.generation;
+}
+
+namespace {
+
+bool checkedAdd(std::uint64_t &total, std::uint64_t value) noexcept {
+  if (value > (std::numeric_limits<std::uint64_t>::max)() - total) {
+    return false;
+  }
+  total += value;
+  return true;
+}
+
+bool checkedMultiply(std::uint64_t left, std::uint64_t right,
+                     std::uint64_t &out) noexcept {
+  if (left != 0u &&
+      right > (std::numeric_limits<std::uint64_t>::max)() / left) {
+    return false;
+  }
+  out = left * right;
+  return true;
+}
+
+bool estimateHdriRuntimeBudget(
+    const FloatEnvironmentImage &source, std::uint32_t requested_width,
+    std::uint32_t resolved_width, const HdriRuntimeBudgetLimits &limits,
+    HdriRuntimeBudget &out) noexcept {
+  if (!source.valid() || source.width != source.height * 2u ||
+      requested_width == 0u || resolved_width < 2u ||
+      (resolved_width & 1u) != 0u || resolved_width > source.width) {
+    return false;
+  }
+
+  HdriRuntimeBudget candidate;
+  candidate.source_width = source.width;
+  candidate.source_height = source.height;
+  candidate.requested_width = requested_width;
+  candidate.resolved_width = resolved_width;
+  candidate.resolved_height = resolved_width / 2u;
+  candidate.distribution_width = candidate.resolved_width;
+  candidate.distribution_height = candidate.resolved_height;
+
+  std::uint64_t source_texels = 0u;
+  std::uint64_t runtime_texels = 0u;
+  if (!checkedMultiply(source.width, source.height, source_texels) ||
+      !checkedMultiply(candidate.resolved_width,
+                       candidate.resolved_height, runtime_texels) ||
+      !checkedMultiply(source_texels, 4u * sizeof(float),
+                       candidate.source_radiance_bytes) ||
+      // AliasTable retains two doubles and one uint32 per texel.
+      !checkedMultiply(source_texels,
+                       2u * sizeof(double) + sizeof(std::uint32_t),
+                       candidate.source_distribution_bytes) ||
+      !checkedMultiply(runtime_texels, 4u * sizeof(float),
+                       candidate.runtime_radiance_bytes) ||
+      !checkedMultiply(runtime_texels,
+                       2u * sizeof(double) + sizeof(std::uint32_t),
+                       candidate.runtime_distribution_bytes) ||
+      // Distribution construction temporarily owns weights, scaled weights,
+      // and the small/large work lists.
+      !checkedMultiply(runtime_texels,
+                       2u * sizeof(double) + 2u * sizeof(std::uint32_t),
+                       candidate.distribution_scratch_bytes)) {
+    return false;
+  }
+
+  std::uint64_t mip_texels = runtime_texels;
+  std::uint32_t mip_width = candidate.resolved_width;
+  std::uint32_t mip_height = candidate.resolved_height;
+  while (mip_width > 1u || mip_height > 1u) {
+    mip_width = std::max(mip_width >> 1u, 1u);
+    mip_height = std::max(mip_height >> 1u, 1u);
+    std::uint64_t level_texels = 0u;
+    if (!checkedMultiply(mip_width, mip_height, level_texels) ||
+        !checkedAdd(mip_texels, level_texels)) {
+      return false;
+    }
+  }
+  if (!checkedMultiply(mip_texels, 4u * sizeof(float),
+                       candidate.gpu_image_bytes)) {
+    return false;
+  }
+  constexpr std::uint64_t kGpuHeaderBytes = 112u;
+  constexpr std::uint64_t kGpuAliasBytes = 16u;
+  if (!checkedMultiply(runtime_texels, kGpuAliasBytes,
+                       candidate.gpu_distribution_bytes) ||
+      !checkedAdd(candidate.gpu_distribution_bytes, kGpuHeaderBytes)) {
+    return false;
+  }
+  candidate.staging_bytes = candidate.runtime_radiance_bytes;
+  candidate.safety_margin_bytes = limits.safety_margin_bytes;
+
+  std::uint64_t total = 0u;
+  if (!checkedAdd(total, candidate.source_radiance_bytes) ||
+      !checkedAdd(total, candidate.source_distribution_bytes) ||
+      !checkedAdd(total, candidate.runtime_radiance_bytes) ||
+      !checkedAdd(total, candidate.runtime_distribution_bytes) ||
+      !checkedAdd(total, candidate.distribution_scratch_bytes) ||
+      !checkedAdd(total, candidate.gpu_image_bytes) ||
+      !checkedAdd(total, candidate.gpu_distribution_bytes) ||
+      !checkedAdd(total, candidate.staging_bytes) ||
+      !checkedAdd(total, candidate.safety_margin_bytes)) {
+    return false;
+  }
+  candidate.total_bytes = total;
+  out = candidate;
+  return true;
+}
+
+} // namespace
+
+std::array<double, 3> sampleUniformTriangleBarycentrics(
+    double sample_u, double sample_v) noexcept {
+  const double u = std::isfinite(sample_u)
+                       ? std::clamp(sample_u, 0.0,
+                                    std::nextafter(1.0, 0.0))
+                       : 0.0;
+  const double v = std::isfinite(sample_v)
+                       ? std::clamp(sample_v, 0.0,
+                                    std::nextafter(1.0, 0.0))
+                       : 0.0;
+  const double root = std::sqrt(u);
+  return {1.0 - root, root * (1.0 - v), root * v};
+}
+
+double emissiveTriangleSolidAnglePdf(
+    double triangle_selection_probability, double world_area,
+    double distance_squared, double absolute_light_cosine) noexcept {
+  if (!std::isfinite(triangle_selection_probability) ||
+      !std::isfinite(world_area) ||
+      triangle_selection_probability <= 0.0 || world_area <= 0.0) {
+    return 0.0;
+  }
+  return areaPdfToSolidAngle(
+      triangle_selection_probability / world_area, distance_squared,
+      absolute_light_cosine);
 }
 
 bool EmissivePatchDistribution::build(

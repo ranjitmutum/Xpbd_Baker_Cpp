@@ -92,15 +92,25 @@
 
     VkDeviceSize ui_vertex_bytes = 0;
     VkDeviceSize ui_index_bytes = 0;
-    bool draw_ui = frame.ui && font_ready_ && frame.ui->ctx && frame.ui->cmds &&
-                   frame.ui->vertices && frame.ui->indices;
+    const bool owned_ui =
+        frame.ui != nullptr && frame.ui->vertex_data != nullptr &&
+        frame.ui->index_data != nullptr && frame.ui->draw_commands != nullptr;
+    const bool legacy_ui =
+        frame.ui != nullptr && frame.ui->ctx != nullptr &&
+        frame.ui->cmds != nullptr && frame.ui->vertices != nullptr &&
+        frame.ui->indices != nullptr;
+    bool draw_ui = frame.ui && font_ready_ && (owned_ui || legacy_ui);
     if (draw_ui) {
-      ui_vertex_bytes = frame.ui->vertices->allocated > 0
-                            ? frame.ui->vertices->allocated
-                            : nk_buffer_total(frame.ui->vertices);
-      ui_index_bytes = frame.ui->indices->allocated > 0
-                           ? frame.ui->indices->allocated
-                           : nk_buffer_total(frame.ui->indices);
+      ui_vertex_bytes = owned_ui
+                            ? static_cast<VkDeviceSize>(frame.ui->vertex_bytes)
+                            : (frame.ui->vertices->allocated > 0
+                                   ? frame.ui->vertices->allocated
+                                   : nk_buffer_total(frame.ui->vertices));
+      ui_index_bytes = owned_ui
+                           ? static_cast<VkDeviceSize>(frame.ui->index_bytes)
+                           : (frame.ui->indices->allocated > 0
+                                  ? frame.ui->indices->allocated
+                                  : nk_buffer_total(frame.ui->indices));
       draw_ui = ui_vertex_bytes > 0 && ui_index_bytes > 0;
     }
 
@@ -126,16 +136,20 @@
       // queued graphics work and waits only for that submission's fence. Once
       // it signals, the old static resources are no longer referenced and can
       // be replaced without a device-wide idle.
-      std::uint64_t resource_upload_bytes = 0;
       if (!rebuildStaticModelResources(
               *frame.static_model, frame.static_model_texture,
               frame.static_model_material,
               frame.static_model_generation, frame.static_texture_generation,
-              resource_upload_bytes)) {
+              static_resource_upload_bytes_frame)) {
         writeLog("Vulkan static model resource rebuild failed");
         return;
       }
-      stats_.static_resource_upload_bytes = resource_upload_bytes;
+      static_refresh_pending = false;
+      static_resource_rebuilt_this_frame = true;
+    }
+    if (static_resource_rebuilt_this_frame) {
+      stats_.static_resource_upload_bytes =
+          static_resource_upload_bytes_frame;
       stats_.static_resource_rebuilds = static_resource_rebuilds_;
       stats_.static_model_vertex_bytes = static_vertex_bytes_;
       stats_.static_model_index_bytes = static_index_bytes_;
@@ -160,6 +174,9 @@
 
     VkDeviceSize requested_bone_bytes = 0;
     if (draw_static) {
+      // Stage 10 proved this frame slot idle. Refresh only its descriptor sets
+      // so another in-flight slot may continue referencing the retired owner.
+      updateStaticTextureDescriptors(fs);
       const VkDeviceSize bone_bytes =
           static_cast<VkDeviceSize>(frame.static_model_frame->bones.size() *
                                     sizeof(StaticModelBoneState));
@@ -175,10 +192,13 @@
       stats_.static_bone_upload_bytes = bone_bytes;
       stats_.mesh_upload_bytes += bone_bytes;
     }
-    if (draw_skybox && !uploadSkyboxCubemap(raster->skybox)) {
+    const bool skybox_upload_ready =
+        !draw_skybox || uploadSkyboxCubemap(raster->skybox);
+    if (!skybox_upload_ready) {
       writeLog("Vulkan skybox cubemap upload failed");
     }
-    const bool skybox_draw = draw_skybox && skybox_ready_;
+    const bool skybox_draw =
+        draw_skybox && skybox_upload_ready && skybox_ready_;
 
     const bool draw_viewport =
         valid_viewport &&
@@ -197,9 +217,13 @@
           !ensure_owned_buffer(fs.ui_ibo, ui_index_bytes,
                                VK_BUFFER_USAGE_INDEX_BUFFER_BIT) ||
           !uploadBuffer(fs.ui_vbo, 0, ui_vertex_bytes,
-                        nk_buffer_memory_const(frame.ui->vertices)) ||
+                        owned_ui
+                            ? frame.ui->vertex_data
+                            : nk_buffer_memory_const(frame.ui->vertices)) ||
           !uploadBuffer(fs.ui_ibo, 0, ui_index_bytes,
-                        nk_buffer_memory_const(frame.ui->indices))) {
+                        owned_ui
+                            ? frame.ui->index_data
+                            : nk_buffer_memory_const(frame.ui->indices))) {
         writeLog("Vulkan UI dynamic upload failed");
         return;
       }
@@ -280,4 +304,3 @@
         ui_index_bytes,
         stats_.buffer_reallocations > 0 ||
             stats_.static_resource_upload_bytes > 0);
-

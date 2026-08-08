@@ -124,7 +124,7 @@ void drawSkyEditor(nk_context *ctx, const Geom &g, AppSession &session) {
                   256, 8192, 256, busy)) {
     world.hdri_runtime_resolution =
         static_cast<std::uint32_t>(hdri_resolution);
-    session.touchWorldEnvironmentTargets();
+    session.touchWorldEnvironmentHdriRuntime();
   }
   if (world.hdr.valid()) {
     const std::string line = std::string(tr("sky_hdri_active")) +

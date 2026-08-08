@@ -3,11 +3,28 @@
     diagnostic_context_ = frame.diagnostics;
     diagnostic_trace_frame_ =
         perf_diagnostics_enabled_ && frame.diagnostics.active;
+    const std::uint64_t temporal_render_serial =
+        render_thread_frame_context_active_
+            ? render_thread_render_serial_
+            : frame.diagnostics.render_frame;
+    streamline_temporal_commit_candidate_valid_ = false;
     if (fatal_error_ || !device_) {
       failActiveStillRender(
           frame, fatal_error_detail_.empty()
                      ? "Vulkan backend is unavailable after a fatal error"
                      : fatal_error_detail_);
+      return;
+    }
+    bool static_retirement_complete = false;
+    if (!pollStaticAssetRetirement(false,
+                                   static_retirement_complete)) {
+      failActiveStillRender(frame, fatal_error_detail_);
+      return;
+    }
+    bool environment_retirement_complete = false;
+    if (!pollWorldEnvironmentRetirement(
+            false, environment_retirement_complete)) {
+      failActiveStillRender(frame, fatal_error_detail_);
       return;
     }
     // While a native file dialog is open, do not submit GPU work (avoids hang).
@@ -93,7 +110,7 @@
     bool rt_shadows_active = false;
 
     FrameSync &fs = frames_[frame_index_];
-    VulkanRtScene &rt_scene = rt_scenes_[frame_index_];
+    VulkanRtScene *rt_scene = rt_scenes_[frame_index_].get();
     VulkanPathTracer &path_tracer = path_tracers_[frame_index_];
     bool &rt_scene_built = rt_scene_built_[frame_index_];
     std::uint64_t &last_rt_scene_hash = last_rt_scene_hash_[frame_index_];
@@ -101,9 +118,8 @@
         mesh_rt_desc_sets_[frame_index_];
     const bool static_input =
         frame.static_model != nullptr && frame.static_model_frame != nullptr;
-    const bool static_refresh_pending =
+    bool static_refresh_pending =
         static_input &&
         static_generations_.needsRefresh(frame.static_model_generation,
                                          frame.static_texture_generation);
     logDiagnosticFrame(frame, fs);
-

@@ -1544,6 +1544,37 @@ rtBsdfLobeProbabilities(const RtBsdfMaterial &input) noexcept {
                    interface_probability - reflection_probability)};
 }
 
+RtSubsurfaceLobeSplit rtSubsurfaceLobeSplit(
+    float legacy_diffuse_probability, float subsurface,
+    bool eligible) noexcept {
+  const float diffuse = std::isfinite(legacy_diffuse_probability)
+                            ? std::clamp(legacy_diffuse_probability, 0.0f, 1.0f)
+                            : 0.0f;
+  if (!eligible || !std::isfinite(subsurface) || !(subsurface > 0.0f)) {
+    return {diffuse, 0.0f};
+  }
+  const float split = std::clamp(subsurface, 0.0f, 1.0f);
+  return {diffuse * (1.0f - split), diffuse * split};
+}
+
+float rtSubsurfaceOpticalDepth(float subsurface) noexcept {
+  const float split = std::isfinite(subsurface)
+                          ? std::clamp(subsurface, 0.0f, 1.0f)
+                          : 0.0f;
+  return 0.35f + 1.65f * split;
+}
+
+float rtSubsurfaceFreeFlightFraction(float subsurface,
+                                     float sample_u) noexcept {
+  constexpr float kLargestRandomBelowOne = 0.99999994f;
+  const float sample = std::isfinite(sample_u)
+                           ? std::clamp(sample_u, 0.0f,
+                                        kLargestRandomBelowOne)
+                           : 0.0f;
+  const float survival = std::max(1.0f - sample, 1.0e-7f);
+  return -std::log(survival) / rtSubsurfaceOpticalDepth(subsurface);
+}
+
 namespace {
 
 [[nodiscard]] float thinWalledCombinedFresnel(float fresnel) noexcept {

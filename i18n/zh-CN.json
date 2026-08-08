@@ -342,6 +342,7 @@
   "labpbr_view_f0": "F0 / 金属",
   "labpbr_view_emission": "发光",
   "labpbr_view_opacity": "不透明度",
+  "labpbr_view_height": "高度（仅数据）",
   "labpbr_select_group": "请在层级或视口中选择一个模型组。",
   "labpbr_selected_group": "所选组：",
   "labpbr_coverage_texels": "所选 UV 覆盖：%zu 个像素",

@@ -24,6 +24,22 @@
 #include <windows.h>
 #endif
 
+#ifndef XPBD_STREAMLINE_HAS_DLSS_SR
+#define XPBD_STREAMLINE_HAS_DLSS_SR 0
+#endif
+#ifndef XPBD_STREAMLINE_HAS_DLSS_RR
+#define XPBD_STREAMLINE_HAS_DLSS_RR 0
+#endif
+#ifndef XPBD_STREAMLINE_HAS_DLSS_G
+#define XPBD_STREAMLINE_HAS_DLSS_G 0
+#endif
+#ifndef XPBD_STREAMLINE_HAS_REFLEX
+#define XPBD_STREAMLINE_HAS_REFLEX 0
+#endif
+#ifndef XPBD_STREAMLINE_HAS_PCL
+#define XPBD_STREAMLINE_HAS_PCL 0
+#endif
+
 #if XPBD_WITH_STREAMLINE && defined(_WIN32)
 #include <sl.h>
 #include <sl_dlss.h>
@@ -286,6 +302,20 @@ struct StreamlineVulkanRuntime::Impl {
 #endif
   bool initialized = false;
   bool shutdown = false;
+  bool dlss_plugin_available = false;
+  bool dlss_rr_plugin_available = false;
+  bool frame_generation_plugin_available = false;
+  bool reflex_plugin_available = false;
+  bool pcl_plugin_available = false;
+  bool dlss_feature_loaded = false;
+  bool dlss_rr_feature_loaded = false;
+  bool reflex_feature_loaded = false;
+  bool pcl_feature_loaded = false;
+  // Last request/submission result, deliberately separate from packaged,
+  // loaded, and adapter-supported state so a transient fault cannot poison
+  // an independent feature's capability.
+  bool dlss_runtime_faulted = false;
+  bool dlss_rr_runtime_faulted = false;
   bool dlss_supported = false;
   bool dlss_rr_supported = false;
   bool dlss_g_vulkan_supported = false;
@@ -319,6 +349,9 @@ struct StreamlineVulkanRuntime::Impl {
   std::uint32_t frame_generation_injected_disable_failures_remaining = 0u;
   std::uint64_t frame_generation_present_thread_id = 0u;
   std::uint32_t frame_generation_present_frame_index = 0u;
+  bool frame_generation_state_poll_pending = false;
+  bool frame_generation_state_poll_inputs_ready = false;
+  std::uint32_t frame_generation_state_poll_frame_index = 0u;
   std::uint32_t frame_generation_tag_frame_index = 0u;
   std::uint64_t frame_generation_generation = 0u;
   bool force_history_reset = true;
@@ -1159,38 +1192,111 @@ bool StreamlineVulkanRuntime::initializeBeforeVulkan() {
     xpbd::log::warn(impl_->status);
     return false;
   }
-  constexpr std::array<const wchar_t *, 8> kStreamlinePluginFiles{{
-      L"sl.interposer.dll", L"sl.common.dll", L"sl.dlss.dll",
-      L"sl.dlss_d.dll", L"sl.dlss_g.dll", L"sl.reflex.dll",
-      L"sl.pcl.dll", L"NvLowLatencyVk.dll",
-  }};
-  for (const wchar_t *name : kStreamlinePluginFiles) {
+  auto signed_streamline_file =
+      [&](const wchar_t *name, const char *feature) {
     const std::filesystem::path path = directory / name;
     const std::wstring native_path = path.native();
     if (!std::filesystem::is_regular_file(path) ||
         !sl::security::verifyEmbeddedSignature(native_path.c_str())) {
-      impl_->status =
-          "Required Streamline plugin is missing or unsigned: " +
-          path.filename().string();
-      xpbd::log::error(impl_->status);
+      xpbd::log::errorf(
+          "Streamline %s runtime is missing or unsigned: %s", feature,
+          path.filename().string().c_str());
       return false;
     }
-  }
-  constexpr std::array<const wchar_t *, 3> kNgxRuntimeFiles{{
-      L"nvngx_dlss.dll", L"nvngx_dlssd.dll", L"nvngx_dlssg.dll",
-  }};
-  for (const wchar_t *name : kNgxRuntimeFiles) {
+    return true;
+  };
+  auto signed_ngx_file = [&](const wchar_t *name, const char *feature) {
     const std::filesystem::path path = directory / name;
     const std::wstring native_path = path.native();
     if (!std::filesystem::is_regular_file(path) ||
         !verifyAuthenticodeSignature(native_path.c_str())) {
-      impl_->status =
-          "Required NVIDIA NGX runtime is missing or has an invalid "
-          "Authenticode signature: " +
-          path.filename().string();
-      xpbd::log::error(impl_->status);
+      xpbd::log::errorf(
+          "NVIDIA NGX %s runtime is missing or has an invalid "
+          "Authenticode signature: %s",
+          feature, path.filename().string().c_str());
       return false;
     }
+    return true;
+  };
+
+  const bool interposer_signed =
+      signed_streamline_file(L"sl.interposer.dll", "core");
+  const bool common_signed =
+      signed_streamline_file(L"sl.common.dll", "core");
+  const bool core_signed = interposer_signed && common_signed;
+  if (!core_signed) {
+    impl_->status = "Signed Streamline core runtime is incomplete";
+    return false;
+  }
+#if XPBD_STREAMLINE_HAS_DLSS_SR
+  {
+    const bool plugin =
+        signed_streamline_file(L"sl.dlss.dll", "DLSS SR");
+    const bool ngx = signed_ngx_file(L"nvngx_dlss.dll", "DLSS SR");
+    impl_->dlss_plugin_available = plugin && ngx;
+  }
+#endif
+#if XPBD_STREAMLINE_HAS_DLSS_RR
+  {
+    const bool plugin =
+        signed_streamline_file(L"sl.dlss_d.dll", "DLSS RR");
+    const bool ngx = signed_ngx_file(L"nvngx_dlssd.dll", "DLSS RR");
+    impl_->dlss_rr_plugin_available =
+        impl_->dlss_plugin_available && plugin && ngx;
+  }
+#endif
+#if XPBD_STREAMLINE_HAS_REFLEX
+  {
+    const bool plugin =
+        signed_streamline_file(L"sl.reflex.dll", "Reflex");
+    const bool low_latency =
+        signed_streamline_file(L"NvLowLatencyVk.dll", "Reflex Vulkan");
+    impl_->reflex_plugin_available = plugin && low_latency;
+  }
+#endif
+  bool frame_generation_files_available = false;
+#if XPBD_STREAMLINE_HAS_DLSS_G
+  {
+    const bool plugin =
+        signed_streamline_file(L"sl.dlss_g.dll", "DLSS FG");
+    const bool ngx = signed_ngx_file(L"nvngx_dlssg.dll", "DLSS FG");
+    frame_generation_files_available = plugin && ngx;
+  }
+#endif
+  impl_->frame_generation_plugin_available =
+      frame_generation_files_available && impl_->reflex_plugin_available;
+  if (frame_generation_files_available &&
+      !impl_->frame_generation_plugin_available) {
+    xpbd::log::warn(
+        "DLSS Frame Generation runtime is present but Reflex is unavailable; "
+        "only Frame Generation is disabled");
+  }
+#if XPBD_STREAMLINE_HAS_PCL
+  {
+    impl_->pcl_plugin_available =
+        signed_streamline_file(L"sl.pcl.dll", "PCL");
+  }
+#endif
+
+  std::array<sl::Feature, 5> requested_features{};
+  std::uint32_t requested_feature_count = 0u;
+  auto request_feature = [&](bool available, sl::Feature feature) {
+    if (available) {
+      requested_features[requested_feature_count++] = feature;
+    }
+  };
+  request_feature(impl_->dlss_plugin_available, sl::kFeatureDLSS);
+  request_feature(impl_->dlss_rr_plugin_available, sl::kFeatureDLSS_RR);
+  request_feature(impl_->frame_generation_plugin_available,
+                  sl::kFeatureDLSS_G);
+  request_feature(impl_->reflex_plugin_available, sl::kFeatureReflex);
+  request_feature(impl_->pcl_plugin_available, sl::kFeaturePCL);
+  if (requested_feature_count == 0u) {
+    impl_->status =
+        "No signed Streamline feature runtime is available; using native "
+        "Vulkan";
+    xpbd::log::warn(impl_->status);
+    return false;
   }
   const std::wstring interposer_path = interposer.native();
   impl_->module = LoadLibraryExW(
@@ -1260,9 +1366,6 @@ bool StreamlineVulkanRuntime::initializeBeforeVulkan() {
     return false;
   }
 
-  const sl::Feature requested_features[] = {
-      sl::kFeatureDLSS, sl::kFeatureDLSS_RR, sl::kFeatureDLSS_G,
-      sl::kFeatureReflex, sl::kFeaturePCL};
   const std::wstring plugin_directory = directory.native();
   const wchar_t *plugin_paths[] = {plugin_directory.c_str()};
   sl::Preferences preferences{};
@@ -1277,9 +1380,8 @@ bool StreamlineVulkanRuntime::initializeBeforeVulkan() {
       sl::PreferenceFlags::eDisableDebugText |
       sl::PreferenceFlags::eUseManualHooking |
       sl::PreferenceFlags::eUseFrameBasedResourceTagging;
-  preferences.featuresToLoad = requested_features;
-  preferences.numFeaturesToLoad =
-      static_cast<std::uint32_t>(std::size(requested_features));
+  preferences.featuresToLoad = requested_features.data();
+  preferences.numFeaturesToLoad = requested_feature_count;
   preferences.engine = sl::EngineType::eCustom;
   preferences.engineVersion = "1.0";
   // NGX accepts custom-engine GUIDs but rejects identifiers containing long
@@ -1299,30 +1401,38 @@ bool StreamlineVulkanRuntime::initializeBeforeVulkan() {
   }
   impl_->initialized = true;
   impl_->shutdown = false;
-  // Every feature named in featuresToLoad starts loaded. DLSS-G is unloaded
-  // after device/support discovery and before the first swapchain is created,
-  // so the user-facing default remains genuinely Off.
-  impl_->frame_generation_feature_loaded = true;
+  // Every requested feature starts loaded. DLSS-G is unloaded after
+  // device/support discovery and before the first swapchain is created, so
+  // the user-facing default remains genuinely Off.
+  impl_->frame_generation_feature_loaded =
+      impl_->frame_generation_plugin_available;
   impl_->frame_generation_state_ok = false;
-  sl::FeatureRequirements frame_generation_requirements{};
-  const sl::Result requirements_result =
-      impl_->sl_get_feature_requirements(
-          sl::kFeatureDLSS_G, frame_generation_requirements);
-  impl_->dlss_g_vulkan_supported =
-      requirements_result == sl::Result::eOk &&
-      (static_cast<std::uint32_t>(
-           frame_generation_requirements.flags) &
-       static_cast<std::uint32_t>(
-           sl::FeatureRequirementFlags::eVulkanSupported)) != 0u;
-  if (!impl_->dlss_g_vulkan_supported) {
-    impl_->frame_generation_status =
-        requirements_result == sl::Result::eOk
-            ? "DLSS Frame Generation plugin does not advertise Vulkan support"
-            : std::string("DLSS Frame Generation requirements query failed: ") +
-                  sl::getResultAsStr(requirements_result);
+  if (impl_->frame_generation_plugin_available) {
+    sl::FeatureRequirements frame_generation_requirements{};
+    const sl::Result requirements_result =
+        impl_->sl_get_feature_requirements(
+            sl::kFeatureDLSS_G, frame_generation_requirements);
+    impl_->dlss_g_vulkan_supported =
+        requirements_result == sl::Result::eOk &&
+        (static_cast<std::uint32_t>(
+             frame_generation_requirements.flags) &
+         static_cast<std::uint32_t>(
+             sl::FeatureRequirementFlags::eVulkanSupported)) != 0u;
+    if (!impl_->dlss_g_vulkan_supported) {
+      impl_->frame_generation_status =
+          requirements_result == sl::Result::eOk
+              ? "DLSS Frame Generation plugin does not advertise Vulkan support"
+              : std::string(
+                    "DLSS Frame Generation requirements query failed: ") +
+                    sl::getResultAsStr(requirements_result);
+    } else {
+      impl_->frame_generation_status =
+          "DLSS Frame Generation loaded; waiting for Vulkan adapter";
+    }
   } else {
+    impl_->dlss_g_vulkan_supported = false;
     impl_->frame_generation_status =
-        "DLSS Frame Generation loaded; waiting for Vulkan adapter";
+        "DLSS Frame Generation runtime is not packaged or signed";
   }
   impl_->create_instance =
       reinterpret_cast<PFN_vkCreateInstance>(
@@ -1336,7 +1446,15 @@ bool StreamlineVulkanRuntime::initializeBeforeVulkan() {
     return false;
   }
   impl_->status =
-      "Streamline 2.12.0 initialized; waiting for Vulkan adapter";
+      "Streamline 2.12.0 initialized; packaged features "
+      "SR=" + std::to_string(impl_->dlss_plugin_available ? 1 : 0) +
+      " RR=" + std::to_string(impl_->dlss_rr_plugin_available ? 1 : 0) +
+      " FG=" +
+      std::to_string(impl_->frame_generation_plugin_available ? 1 : 0) +
+      " Reflex=" +
+      std::to_string(impl_->reflex_plugin_available ? 1 : 0) +
+      " PCL=" + std::to_string(impl_->pcl_plugin_available ? 1 : 0) +
+      "; waiting for Vulkan adapter";
   xpbd::log::info(impl_->status);
   return true;
 #else
@@ -1354,8 +1472,38 @@ void StreamlineVulkanRuntime::inspectPhysicalDevice(
   sl::AdapterInfo adapter{};
   adapter.vkPhysicalDevice =
       reinterpret_cast<void *>(physical_device);
+  auto feature_loaded = [&](bool plugin_available, sl::Feature feature,
+                            const char *name) {
+    if (!plugin_available || impl_->sl_is_feature_loaded == nullptr) {
+      return false;
+    }
+    bool loaded = false;
+    const sl::Result result =
+        impl_->sl_is_feature_loaded(feature, loaded);
+    if (result != sl::Result::eOk || !loaded) {
+      xpbd::log::warnf(
+          "Streamline %s plugin was packaged but did not initialize: %s",
+          name, sl::getResultAsStr(result));
+      return false;
+    }
+    return true;
+  };
+  impl_->dlss_feature_loaded = feature_loaded(
+      impl_->dlss_plugin_available, sl::kFeatureDLSS, "DLSS SR");
+  impl_->dlss_rr_feature_loaded = feature_loaded(
+      impl_->dlss_rr_plugin_available, sl::kFeatureDLSS_RR, "DLSS RR");
+  impl_->reflex_feature_loaded = feature_loaded(
+      impl_->reflex_plugin_available, sl::kFeatureReflex, "Reflex");
+  impl_->pcl_feature_loaded = feature_loaded(
+      impl_->pcl_plugin_available, sl::kFeaturePCL, "PCL");
+  impl_->frame_generation_feature_loaded = feature_loaded(
+      impl_->frame_generation_plugin_available, sl::kFeatureDLSS_G,
+      "DLSS FG");
+
   const sl::Result dlss_result =
-      impl_->sl_is_feature_supported(sl::kFeatureDLSS, adapter);
+      impl_->dlss_feature_loaded
+          ? impl_->sl_is_feature_supported(sl::kFeatureDLSS, adapter)
+          : sl::Result::eErrorFeatureMissing;
   impl_->dlss_supported = dlss_result == sl::Result::eOk;
   if (impl_->dlss_supported) {
     void *optimal = nullptr;
@@ -1377,7 +1525,9 @@ void StreamlineVulkanRuntime::inspectPhysicalDevice(
     }
   }
   const sl::Result rr_result =
-      impl_->sl_is_feature_supported(sl::kFeatureDLSS_RR, adapter);
+      impl_->dlss_rr_feature_loaded
+          ? impl_->sl_is_feature_supported(sl::kFeatureDLSS_RR, adapter)
+          : sl::Result::eErrorFeatureMissing;
   impl_->dlss_rr_supported =
       impl_->dlss_supported && rr_result == sl::Result::eOk;
   if (impl_->dlss_rr_supported) {
@@ -1406,7 +1556,9 @@ void StreamlineVulkanRuntime::inspectPhysicalDevice(
   }
 
   const sl::Result pcl_result =
-      impl_->sl_is_feature_supported(sl::kFeaturePCL, adapter);
+      impl_->pcl_feature_loaded
+          ? impl_->sl_is_feature_supported(sl::kFeaturePCL, adapter)
+          : sl::Result::eErrorFeatureMissing;
   impl_->pcl_supported = pcl_result == sl::Result::eOk;
   if (impl_->pcl_supported) {
     void *get_state = nullptr;
@@ -1459,7 +1611,9 @@ void StreamlineVulkanRuntime::inspectPhysicalDevice(
   }
 
   const sl::Result reflex_result =
-      impl_->sl_is_feature_supported(sl::kFeatureReflex, adapter);
+      impl_->reflex_feature_loaded
+          ? impl_->sl_is_feature_supported(sl::kFeatureReflex, adapter)
+          : sl::Result::eErrorFeatureMissing;
   impl_->reflex_supported = reflex_result == sl::Result::eOk;
   if (impl_->reflex_supported) {
     void *get_state = nullptr;
@@ -1502,7 +1656,9 @@ void StreamlineVulkanRuntime::inspectPhysicalDevice(
   }
 
   const sl::Result frame_generation_result =
-      impl_->sl_is_feature_supported(sl::kFeatureDLSS_G, adapter);
+      impl_->frame_generation_feature_loaded
+          ? impl_->sl_is_feature_supported(sl::kFeatureDLSS_G, adapter)
+          : sl::Result::eErrorFeatureMissing;
   // Streamline returns eErrorNoSupportedAdapterFound and does not create a
   // DLSS-G feature context on pre-supported adapters (for example RTX 3060
   // with a current driver). Never call slIsFeatureLoaded/slSetFeatureLoaded
@@ -1560,15 +1716,20 @@ void StreamlineVulkanRuntime::inspectPhysicalDevice(
   } else if (impl_->dlss_supported) {
     if (impl_->status.rfind(
             "DLSS Ray Reconstruction entry points unavailable:", 0u) != 0u) {
-      impl_->status =
-          std::string("DLSS Super Resolution supported; Ray Reconstruction "
-                      "unavailable: ") +
-          sl::getResultAsStr(rr_result);
+      impl_->status = impl_->dlss_rr_plugin_available
+                          ? std::string(
+                                "DLSS Super Resolution supported; Ray "
+                                "Reconstruction unavailable: ") +
+                                sl::getResultAsStr(rr_result)
+                          : "DLSS Super Resolution supported; Ray "
+                            "Reconstruction runtime not packaged";
     }
   } else {
-    impl_->status =
-        std::string("DLSS Super Resolution unavailable: ") +
-        sl::getResultAsStr(dlss_result);
+    impl_->status = impl_->dlss_plugin_available
+                        ? std::string("DLSS Super Resolution unavailable: ") +
+                              sl::getResultAsStr(dlss_result)
+                        : "DLSS Super Resolution runtime not packaged; "
+                          "independent Streamline features remain available";
   }
   if (impl_->dlss_supported) {
     xpbd::log::info(impl_->status);
@@ -1580,9 +1741,11 @@ void StreamlineVulkanRuntime::inspectPhysicalDevice(
   } else {
     xpbd::log::warn(impl_->frame_generation_status);
   }
-  if (!impl_->pcl_supported) {
+  if (impl_->pcl_plugin_available && !impl_->pcl_supported) {
     xpbd::log::warnf("Streamline PCL unavailable: %s",
                      sl::getResultAsStr(pcl_result));
+  } else if (!impl_->pcl_plugin_available) {
+    xpbd::log::info("Streamline PCL runtime not packaged");
   }
   // featuresToLoad makes DLSS-G loaded immediately after slInit only when a
   // usable feature context exists. The UI contract is opt-in, so unhook it
@@ -1667,6 +1830,12 @@ void StreamlineVulkanRuntime::shutdownBeforeVulkan() noexcept {
     }
     impl_->shutdown = true;
     impl_->initialized = false;
+    impl_->dlss_feature_loaded = false;
+    impl_->dlss_rr_feature_loaded = false;
+    impl_->reflex_feature_loaded = false;
+    impl_->pcl_feature_loaded = false;
+    impl_->dlss_runtime_faulted = false;
+    impl_->dlss_rr_runtime_faulted = false;
     impl_->dlss_supported = false;
     impl_->dlss_rr_supported = false;
     impl_->frame_generation_supported = false;
@@ -1761,6 +1930,17 @@ void StreamlineVulkanRuntime::releaseAfterVulkan() noexcept {
   impl_->frame_generation_feature_loaded = false;
   impl_->frame_generation_context_available = false;
   impl_->frame_generation_state_ok = false;
+  impl_->dlss_feature_loaded = false;
+  impl_->dlss_rr_feature_loaded = false;
+  impl_->reflex_feature_loaded = false;
+  impl_->pcl_feature_loaded = false;
+  impl_->dlss_runtime_faulted = false;
+  impl_->dlss_rr_runtime_faulted = false;
+  impl_->dlss_plugin_available = false;
+  impl_->dlss_rr_plugin_available = false;
+  impl_->frame_generation_plugin_available = false;
+  impl_->reflex_plugin_available = false;
+  impl_->pcl_plugin_available = false;
   impl_->swapchain_ownership = SwapchainOwnership::Native;
   impl_->swapchain_present = false;
   if (impl_->exception_diagnostic != nullptr) {
@@ -2107,6 +2287,8 @@ void StreamlineVulkanRuntime::requestFrameGenerationNativeRecovery(
     const char *reason, bool latch_failure) noexcept {
   impl_->frame_generation_recovery_required = true;
   impl_->frame_generation_failure_latched |= latch_failure;
+  impl_->frame_generation_state_poll_pending = false;
+  impl_->frame_generation_state_poll_inputs_ready = false;
   impl_->frame_generation_status =
       reason != nullptr ? reason : "DLSS-G requested Native recovery";
   impl_->frame_generation_state_ok = false;
@@ -2341,10 +2523,12 @@ StreamlineVulkanRuntime::queryDlssOptimalSettings(
   if (query_result == sl::Result::eOk &&
       settings.optimalRenderWidth > 0u &&
       settings.optimalRenderHeight > 0u) {
+    impl_->dlss_runtime_faulted = false;
     result.valid = true;
     result.render_width = settings.optimalRenderWidth;
     result.render_height = settings.optimalRenderHeight;
   } else {
+    impl_->dlss_runtime_faulted = true;
     impl_->status =
         std::string("DLSS optimal-settings query failed: ") +
         sl::getResultAsStr(query_result);
@@ -2377,10 +2561,12 @@ StreamlineVulkanRuntime::queryDlssRayReconstructionOptimalSettings(
   if (query_result == sl::Result::eOk &&
       settings.optimalRenderWidth > 0u &&
       settings.optimalRenderHeight > 0u) {
+    impl_->dlss_rr_runtime_faulted = false;
     result.valid = true;
     result.render_width = settings.optimalRenderWidth;
     result.render_height = settings.optimalRenderHeight;
   } else {
+    impl_->dlss_rr_runtime_faulted = true;
     impl_->status =
         std::string(
             "DLSS Ray Reconstruction optimal-settings query failed for the current request: " ) +
@@ -2393,6 +2579,7 @@ StreamlineVulkanRuntime::queryDlssRayReconstructionOptimalSettings(
 bool StreamlineVulkanRuntime::recordDlss(
     const StreamlineDlssFrame &frame) {
 #if XPBD_WITH_STREAMLINE && defined(_WIN32)
+  impl_->dlss_runtime_faulted = true;
   const bool valid =
       impl_->initialized && impl_->dlss_supported &&
       impl_->sl_dlss_set_options != nullptr &&
@@ -2624,6 +2811,7 @@ bool StreamlineVulkanRuntime::recordDlss(
   impl_->configured_mode = frame.mode;
   impl_->configured_ray_reconstruction = false;
   impl_->force_history_reset = false;
+  impl_->dlss_runtime_faulted = false;
   impl_->status = "DLSS Super Resolution active";
   return true;
 #else
@@ -2635,6 +2823,7 @@ bool StreamlineVulkanRuntime::recordDlss(
 bool StreamlineVulkanRuntime::recordDlssRayReconstruction(
     const StreamlineDlssRayReconstructionFrame &frame) {
 #if XPBD_WITH_STREAMLINE && defined(_WIN32)
+  impl_->dlss_rr_runtime_faulted = true;
   const bool valid =
       impl_->initialized && impl_->dlss_supported &&
       impl_->dlss_rr_supported &&
@@ -2939,6 +3128,7 @@ bool StreamlineVulkanRuntime::recordDlssRayReconstruction(
   impl_->configured_mode = frame.mode;
   impl_->configured_ray_reconstruction = true;
   impl_->force_history_reset = false;
+  impl_->dlss_rr_runtime_faulted = false;
   impl_->status = "DLSS Ray Reconstruction active";
   return true;
 #else
@@ -3559,6 +3749,8 @@ bool StreamlineVulkanRuntime::disableFrameGeneration() noexcept {
   impl_->frame_generation_state_ok = false;
   impl_->frame_generation_active = false;
   impl_->frames_actually_presented = 1u;
+  impl_->frame_generation_state_poll_pending = false;
+  impl_->frame_generation_state_poll_inputs_ready = false;
   xpbd::log::infof(
       "DLSSG Options-Off confirmed: attempt=%u/%u result=%d",
       impl_->frame_generation_disable.attempts,
@@ -3568,43 +3760,24 @@ bool StreamlineVulkanRuntime::disableFrameGeneration() noexcept {
 }
 
 FrameGenerationTransitionResult StreamlineVulkanRuntime::
-updateFrameGenerationStateAfterPresent(
-    VkResult present_result) noexcept {
+pollFrameGenerationStateBeforePresent() noexcept {
 #if XPBD_WITH_STREAMLINE && defined(_WIN32)
+  if (!impl_->frame_generation_state_poll_pending) {
+    return FrameGenerationTransitionResult::NoAction;
+  }
   if (!bindFrameGenerationPresentThread()) {
     return FrameGenerationTransitionResult::RecoverNative;
   }
-  const FrameGenerationTransitionResult api_result =
-      classifyFrameGenerationVkResult(present_result, "Present");
-  if (api_result != FrameGenerationTransitionResult::NoAction) {
-    return api_result;
-  }
-  const bool current_frame_inputs_ready =
-      frameGenerationCurrentFrameInputsReady(
-          impl_->frame_generation_options_enabled,
-          impl_->frame_generation_options_key.valid,
-          impl_->frame_generation.tag_generation != 0u,
-          impl_->current_frame_index, impl_->constants_frame_index,
-          impl_->frame_generation_tag_frame_index);
-  if (!current_frame_inputs_ready ||
-       !impl_->frame_generation_supported ||
-       impl_->sl_dlss_g_get_state == nullptr) {
+  const bool inputs_ready = impl_->frame_generation_state_poll_inputs_ready;
+  const std::uint32_t presented_frame_index =
+      impl_->frame_generation_state_poll_frame_index;
+  impl_->frame_generation_state_poll_pending = false;
+  impl_->frame_generation_state_poll_inputs_ready = false;
+  if (!impl_->frame_generation_supported ||
+      impl_->sl_dlss_g_get_state == nullptr) {
     impl_->frame_generation_active = false;
     impl_->frame_generation_state_ok = false;
     impl_->frames_actually_presented = 1u;
-    if (!current_frame_inputs_ready) {
-      impl_->frame_generation_status =
-          "DLSS Frame Generation paused; current-frame options, constants, "
-          "or tags are incomplete";
-      if (impl_->frame_generation_feature_loaded &&
-          impl_->swapchain_ownership ==
-              SwapchainOwnership::StreamlineFrameGenerationProxy) {
-        setFrameGenerationState(
-            *impl_, FrameGenerationRuntimeState::ProxyArmed,
-            impl_->current_frame_index,
-            "current-frame inputs are incomplete after present");
-      }
-    }
     return FrameGenerationTransitionResult::NoAction;
   }
   const sl::ViewportHandle viewport{0u};
@@ -3625,6 +3798,23 @@ updateFrameGenerationStateAfterPresent(
     requestFrameGenerationNativeRecovery(
         impl_->frame_generation_status.c_str(), true);
     return FrameGenerationTransitionResult::RecoverNative;
+  }
+  if (!inputs_ready) {
+    impl_->frame_generation_active = false;
+    impl_->frame_generation_state_ok = true;
+    impl_->frames_actually_presented = 1u;
+    impl_->frame_generation_status =
+        "DLSS Frame Generation paused; presented-frame options, constants, "
+        "or tags were incomplete";
+    if (impl_->frame_generation_feature_loaded &&
+        impl_->swapchain_ownership ==
+            SwapchainOwnership::StreamlineFrameGenerationProxy) {
+      setFrameGenerationState(
+          *impl_, FrameGenerationRuntimeState::ProxyArmed,
+          presented_frame_index,
+          "presented-frame inputs were incomplete");
+    }
+    return FrameGenerationTransitionResult::NoAction;
   }
   const bool was_active = impl_->frame_generation_active;
   const std::uint32_t previous_presented =
@@ -3647,15 +3837,70 @@ updateFrameGenerationStateAfterPresent(
           : "DLSS Frame Generation enabled; waiting for generated presents";
   impl_->frame_generation_state_ok = true;
   impl_->frame_generation_present_frame_index =
-      impl_->current_frame_index;
+      presented_frame_index;
   setFrameGenerationState(
       *impl_, impl_->frame_generation_active
                   ? FrameGenerationRuntimeState::Active
                   : FrameGenerationRuntimeState::ProxyArmed,
-      impl_->current_frame_index,
+      presented_frame_index,
       impl_->frame_generation_active
           ? "generated present confirmed"
           : "waiting for generated present");
+  return FrameGenerationTransitionResult::NoAction;
+#else
+  impl_->frame_generation_active = false;
+  impl_->frames_actually_presented = 1u;
+  return FrameGenerationTransitionResult::NoAction;
+#endif
+}
+
+FrameGenerationTransitionResult StreamlineVulkanRuntime::
+updateFrameGenerationStateAfterPresent(
+    VkResult present_result) noexcept {
+#if XPBD_WITH_STREAMLINE && defined(_WIN32)
+  if (!bindFrameGenerationPresentThread()) {
+    return FrameGenerationTransitionResult::RecoverNative;
+  }
+  const FrameGenerationTransitionResult api_result =
+      classifyFrameGenerationVkResult(present_result, "Present");
+  if (api_result != FrameGenerationTransitionResult::NoAction) {
+    impl_->frame_generation_state_poll_pending = false;
+    impl_->frame_generation_state_poll_inputs_ready = false;
+    return api_result;
+  }
+
+  const bool current_frame_inputs_ready =
+      frameGenerationCurrentFrameInputsReady(
+          impl_->frame_generation_options_enabled,
+          impl_->frame_generation_options_key.valid,
+          impl_->frame_generation.tag_generation != 0u,
+          impl_->current_frame_index, impl_->constants_frame_index,
+          impl_->frame_generation_tag_frame_index);
+  impl_->frame_generation_present_frame_index = impl_->current_frame_index;
+  impl_->frame_generation_state_poll_frame_index = impl_->current_frame_index;
+  impl_->frame_generation_state_poll_inputs_ready = current_frame_inputs_ready;
+  impl_->frame_generation_state_poll_pending =
+      impl_->frame_generation_feature_loaded &&
+      impl_->frame_generation_supported &&
+      impl_->swapchain_ownership ==
+          SwapchainOwnership::StreamlineFrameGenerationProxy &&
+      impl_->sl_dlss_g_get_state != nullptr;
+  if (!current_frame_inputs_ready) {
+    impl_->frame_generation_active = false;
+    impl_->frame_generation_state_ok = false;
+    impl_->frames_actually_presented = 1u;
+    impl_->frame_generation_status =
+        "DLSS Frame Generation paused; current-frame options, constants, "
+        "or tags are incomplete";
+    if (impl_->frame_generation_feature_loaded &&
+        impl_->swapchain_ownership ==
+            SwapchainOwnership::StreamlineFrameGenerationProxy) {
+      setFrameGenerationState(
+          *impl_, FrameGenerationRuntimeState::ProxyArmed,
+          impl_->current_frame_index,
+          "current-frame inputs are incomplete after present");
+    }
+  }
   return FrameGenerationTransitionResult::NoAction;
 #else
   impl_->frame_generation_active = false;
@@ -3784,6 +4029,15 @@ VkResult StreamlineVulkanRuntime::createWin32Surface(
     create_info.hwnd = static_cast<HWND>(window_handle);
     return impl_->create_win32_surface(instance, &create_info, allocator,
                                        surface);
+  }
+#endif
+#if defined(_WIN32)
+  if (window_handle != nullptr && surface != nullptr) {
+    VkWin32SurfaceCreateInfoKHR create_info{
+        VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
+    create_info.hinstance = GetModuleHandleW(nullptr);
+    create_info.hwnd = static_cast<HWND>(window_handle);
+    return vkCreateWin32SurfaceKHR(instance, &create_info, allocator, surface);
   }
 #else
   (void)instance;

@@ -13,12 +13,16 @@
 #include <cstdint>
 #include <filesystem>
 #include <limits>
+#include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <vulkan/vulkan.h>
 
 namespace xpbd::gfx {
+
+struct PathTraceCaptureSaveState;
 
 struct PathTraceFrameParams {
   // Column-major OpenGL-style matrices (same as FrameInput).
@@ -27,8 +31,9 @@ struct PathTraceFrameParams {
   const float *previous_view = nullptr;
   const float *previous_proj = nullptr;
   bool motion_history_valid = false;
-  // Temporal reconstruction consumes a fresh noisy frame rather than the
-  // progressively averaged preview. This does not invalidate its own history.
+  // Temporal consumers (SR/RR and Frame Generation) consume a fresh noisy
+  // frame rather than a preview that stops at its progressive sample limit.
+  // This does not invalidate their own history.
   bool temporal_reconstruction_input = false;
   bool ray_reconstruction_guides = false;
   // Continuous material textures use this negative LOD offset while SR/RR
@@ -79,6 +84,7 @@ enum class PathTraceCaptureState : std::uint8_t {
   Idle = 0,
   Requested,
   PendingGpuReadback,
+  Saving,
   Completed,
   Failed,
   Cancelled,
@@ -310,6 +316,7 @@ public:
   [[nodiscard]] std::uint64_t historyGeneration() const noexcept {
     return history_generation_;
   }
+  void invalidateTemporalHistory() noexcept;
   [[nodiscard]] DescriptorStats descriptorStats() const noexcept {
     const RtPipelineStats pipeline_stats = rt_pipeline_.stats();
     return {descriptor_write_calls_ + pipeline_stats.descriptor_write_calls,
@@ -586,6 +593,8 @@ private:
   void destroyCaptureBuffer();
   [[nodiscard]] bool ensureCaptureBuffer(VkDeviceSize size);
   void flushPendingCapture();
+  void pollRuntimeCaptureSave() noexcept;
+  void stopRuntimeCaptureSave() noexcept;
   [[nodiscard]] bool ensureFallbackAlbedo();
   [[nodiscard]] bool ensureDummyStorageImages();
   void destroyDummyStorageImages();
@@ -771,6 +780,9 @@ private:
   VkDeviceSize pending_depth_offset_ = 0;
   bool capture_pending_ = false;
   bool capture_completed_ = false;
+
+  std::shared_ptr<PathTraceCaptureSaveState> runtime_capture_save_state_;
+  std::thread runtime_capture_save_thread_;
 
   std::string runtime_capture_path_;
   std::string runtime_capture_error_;

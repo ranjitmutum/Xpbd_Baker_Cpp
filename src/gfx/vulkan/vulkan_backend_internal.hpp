@@ -9,11 +9,13 @@
 #include "xpbd/gfx/labpbr_material.hpp"
 #include "xpbd/gfx/preview_scene.hpp"
 #include "xpbd/gfx/ray_tracing.hpp"
+#include "xpbd/gfx/render_thread_runtime.hpp"
 #include "xpbd/gfx/static_model_draw_plan.hpp"
 #include "xpbd/gfx/streamline_vulkan_runtime.hpp"
 #include "xpbd/gfx/vulkan_path_tracer.hpp"
 #include "xpbd/gfx/vulkan_queue_selection.hpp"
 #include "xpbd/gfx/vulkan_rt_scene.hpp"
+#include "xpbd/gfx/vulkan_window_bootstrap.hpp"
 
 #include <SDL3/SDL.h>
 #include <vulkan/vulkan.h>
@@ -26,12 +28,15 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
 #include <vector>
 
 namespace xpbd::gfx::detail {
+
+class VulkanRenderThreadBackend;
 
 enum class GpuTimestampQuery : std::uint32_t {
   FrameBegin,
@@ -63,6 +68,7 @@ struct SwapchainSupport {
 class VulkanBackend final : public IGpuBackend {
 public:
   bool init(SDL_Window *window) override;
+  bool init(const VulkanWindowBootstrap &bootstrap) override;
   void shutdown() override;
   void resize(int, int) override;
   bool uploadFontAtlas(const void *pixels, int width, int height,
@@ -88,17 +94,68 @@ public:
   RayTracingCapability rayTracingCapability() const override;
   bool supportsRayTracing() const override;
   RenderPath activeRenderPath() const override;
-  void prepareForSystemDialog() override;
-  void resumeAfterSystemDialog() override;
+  bool prepareForSystemDialog() override;
+  bool resumeAfterSystemDialog() override;
   bool presentationSuspended() const override;
 
 private:
+  friend class VulkanRenderThreadBackend;
   using Clock = std::chrono::steady_clock;
+
+  void setRenderThreadFrameContext(
+      std::uint64_t render_serial,
+      const HistoryCommitSnapshot *previous_history) noexcept;
+
+  enum class ControlledWaitState : std::uint8_t {
+    Completed,
+    StopRequested,
+    Failed,
+  };
+
+  struct ControlledWaitResult {
+    VkResult result = VK_SUCCESS;
+    ControlledWaitState state = ControlledWaitState::Completed;
+
+    [[nodiscard]] bool completed() const noexcept {
+      return state == ControlledWaitState::Completed && result == VK_SUCCESS;
+    }
+  };
 
   struct ImageResource;
   struct FrameSync;
   struct DynamicSkyCpuInput;
   struct DynamicSkyCpuResult;
+
+  struct RtSceneSynchronousUpdate {
+    const float *bone_transforms = nullptr;
+    std::size_t bone_count = 0u;
+    const float *bone_tints = nullptr;
+    std::size_t tint_count = 0u;
+    std::span<const RtColoredGeometryView> colored_geometry{};
+    bool include_rest_model = true;
+    std::span<const float> previous_packed_positions{};
+    const float *previous_bone_transforms = nullptr;
+    std::size_t previous_bone_count = 0u;
+    bool explicit_motion_history_valid = false;
+    RtSceneGenerations generations{};
+    bool generations_valid = false;
+    std::uint64_t scene_hash = 0u;
+    std::uint64_t topology_hash = 0u;
+  };
+
+  struct RtSceneSynchronousAssembly {
+    std::vector<float> packed_bones;
+    std::vector<float> packed_tints;
+    std::array<RtColoredGeometryView, 4> geometry_views{};
+    std::size_t geometry_view_count = 0u;
+    RtSceneGenerations effective_generations{};
+    RtSceneSynchronousUpdate update{};
+    std::uint64_t streamline_topology_hash = 14695981039346656037ull;
+    std::uint64_t streamline_material_hash = 14695981039346656037ull;
+    std::uint64_t emissive_generation = 0u;
+    float scene_hash_ms = 0.0f;
+    bool have_rt_geometry = false;
+  };
 
   static const char *vkResultName(VkResult result);
   static void writeLog(const char *msg);
@@ -114,7 +171,8 @@ private:
 
   [[nodiscard]] static DynamicSkyCpuResult buildDynamicSkyDistribution(
       const DynamicSkyCpuInput &input, VkDevice device, VkFence fence,
-      Clock::time_point submitted_at);
+      Clock::time_point submitted_at,
+      std::shared_ptr<RenderThreadControl> control);
   bool pollDynamicSkyEnvironmentCache(bool wait_for_completion = false);
   void discardDynamicSkyPending();
   void clearDynamicSkyEnvironmentCache();
@@ -135,12 +193,25 @@ private:
       const ResolvedWorldEnvironment &resolved);
   void clearWorldEnvironmentResources();
   void destroyWorldEnvironmentGpu();
+  bool submitGraphicsTransactionAndWait(VkCommandBuffer command,
+                                        const char *resource);
   std::uint64_t worldEnvironmentResourceKey(
       const ResolvedWorldEnvironment &resolved) const;
   bool ensureWorldEnvironmentSampler();
-  bool uploadWorldEnvironment(const ResolvedWorldEnvironment &resolved);
+  bool uploadWorldEnvironment(ResolvedWorldEnvironment &resolved,
+                              bool defer_commit = false);
   bool ensureWorldEnvironmentResources(
-      const ResolvedWorldEnvironment &resolved);
+      ResolvedWorldEnvironment &resolved,
+      bool defer_commit = false);
+  bool pollWorldEnvironmentPending(bool wait_for_completion,
+                                   bool &ready,
+                                   bool &superseded);
+  void discardWorldEnvironmentPending(const char *reason) noexcept;
+  bool beginWorldEnvironmentRetirement();
+  bool commitWorldEnvironmentPending(std::uint64_t &uploaded_bytes);
+  bool pollWorldEnvironmentRetirement(bool wait_for_completion,
+                                      bool &complete);
+  void destroyWorldEnvironmentRetired() noexcept;
 
   void destroySkyboxGpu();
   bool uploadSkyboxCubemap(const PreviewSkybox &sky);
@@ -152,18 +223,67 @@ private:
   bool createStaticMaterialSampler(VkSamplerMipmapMode mipmap_mode,
                                    float max_lod, VkSampler &out);
   void destroyStaticMaterialSamplers();
-  void updateStaticTextureDescriptors();
+  void updateStaticTextureDescriptors(FrameSync &frame);
   void updateStaticBoneDescriptor(FrameSync &frame);
+  bool prepareRtSceneCandidate(std::size_t slot,
+                               const RtSceneSynchronousUpdate &update,
+                               RtRestGeometry *replacement_rest = nullptr,
+                               bool wait_for_completion = true,
+                               std::uint64_t additional_resident_bytes = 0u);
+  bool assembleRtSceneSynchronousUpdate(
+      const FrameInput &frame, bool static_input,
+      RtSceneSynchronousAssembly &assembly);
+  bool uploadStaticAssetPacket(const RenderFramePacket &packet,
+                               std::uint64_t &uploaded_bytes,
+                               bool defer_commit = false);
+  bool pollStaticAssetPacket(std::uint64_t &uploaded_bytes,
+                             bool wait_for_completion,
+                             bool &complete, bool &superseded);
+  void discardStaticAssetPending(const char *reason) noexcept;
+  bool commitStaticAssetPending(std::uint64_t &uploaded_bytes);
+  bool prepareStaticPendingRtCandidates();
+  bool beginStaticAssetRetirement();
+  bool pollStaticAssetRetirement(bool wait_for_completion,
+                                 bool &complete);
+  void destroyStaticAssetRetired() noexcept;
+  bool uploadEnvironmentPacket(const RenderFramePacket &packet,
+                               std::uint64_t &uploaded_bytes,
+                               bool defer_commit = false);
+  bool pollEnvironmentPacket(const RenderFramePacket &packet,
+                             std::uint64_t &uploaded_bytes,
+                             bool wait_for_completion,
+                             bool &complete, bool &superseded);
+  bool resetRtSceneCandidate(std::size_t slot,
+                             const char *reason) noexcept;
+  void publishRtSceneCandidate(std::size_t slot,
+                               std::uint64_t scene_hash) noexcept;
   bool rebuildStaticModelResources(
       const StaticIndexedModelMesh &mesh, const TextureImage *texture,
       const ResolvedMaterialTable *material, std::uint64_t model_generation,
-      std::uint64_t texture_generation, std::uint64_t &uploaded_bytes);
+      std::uint64_t texture_generation, std::uint64_t &uploaded_bytes,
+      const RtSceneSynchronousUpdate *rt_update = nullptr,
+      bool defer_commit = false);
 
   void failActiveStillRender(const FrameInput &frame,
                              const std::string &detail);
   void enterFatalVulkanError(const FrameInput &frame, const char *api,
                              VkResult result);
   void recordFatalVulkanError(const char *api, VkResult result);
+  void recordFatalError(const char *api, std::string detail,
+                        std::int64_t result_code = 0);
+  void markGpuCompletionUnproven(const char *api);
+  [[nodiscard]] bool renderThreadStopRequested() const noexcept;
+  [[nodiscard]] bool interruptibleRetryDelay(
+      Clock::time_point retry_at) const;
+  [[nodiscard]] ControlledWaitResult waitForFenceControlled(
+      VkFence fence, const char *stage,
+      std::uint32_t image_index = UINT32_MAX,
+      VkFence image_fence = VK_NULL_HANDLE,
+      VkCommandBuffer command = VK_NULL_HANDLE,
+      bool force_diagnostics = false,
+      bool allow_shutdown_drain = false);
+  [[nodiscard]] ControlledWaitResult waitForDeviceIdleControlled(
+      const char *stage, std::chrono::milliseconds timeout);
   [[nodiscard]] bool presentFenceLifecycleEnabled() const noexcept;
   [[nodiscard]] bool
   frameGenerationPlatformSupported() const noexcept;
@@ -311,6 +431,97 @@ private:
       return fence != VK_NULL_HANDLE;
     }
   };
+  struct WorldEnvironmentPending {
+    Buffer staging{};
+    Buffer distribution{};
+    ImageResource texture{};
+    VkCommandBuffer upload_command = VK_NULL_HANDLE;
+    VkFence upload_fence = VK_NULL_HANDLE;
+    // Created immediately before atomic publication. Until commit this fence
+    // orders old consumers but owns no published resources, so failure can
+    // still retain the complete old environment.
+    VkFence retirement_fence = VK_NULL_HANDLE;
+    HdrEnvironmentAsset runtime_asset{};
+    ResolvedWorldEnvironment published{};
+    HdriRuntimeBudget budget{};
+    VkDeviceSize distribution_bytes = 0u;
+    float power_estimate = 0.0f;
+    std::uint64_t resource_key = 0u;
+    std::uint64_t uploaded_bytes = 0u;
+    std::uint64_t gpu_image_bytes = 0u;
+    std::uint64_t generation = 0u;
+    std::uint32_t source_width = 0u;
+    std::uint32_t source_height = 0u;
+    std::uint32_t runtime_width = 0u;
+    std::uint32_t runtime_height = 0u;
+    std::uint32_t mip_levels = 0u;
+    bool active = false;
+    bool superseded = false;
+    Clock::time_point submitted_at{};
+  };
+  struct WorldEnvironmentRetired {
+    Buffer distribution{};
+    ImageResource texture{};
+    VkFence completion_fence = VK_NULL_HANDLE;
+    HdrEnvironmentAsset runtime_asset{};
+    ResolvedWorldEnvironment published{};
+    std::uint64_t resource_key = 0u;
+    std::uint64_t generation = 0u;
+    Clock::time_point submitted_at{};
+
+    [[nodiscard]] bool active() const noexcept {
+      return completion_fence != VK_NULL_HANDLE;
+    }
+  };
+  struct StaticAssetPending {
+    Buffer staging{};
+    Buffer vertex{};
+    Buffer index{};
+    ImageResource albedo{};
+    ImageResource normal{};
+    ImageResource specular{};
+    VkSampler albedo_sampler = VK_NULL_HANDLE;
+    VkSampler normal_sampler = VK_NULL_HANDLE;
+    VkSampler specular_sampler = VK_NULL_HANDLE;
+    VkCommandBuffer upload_command = VK_NULL_HANDLE;
+    VkFence upload_fence = VK_NULL_HANDLE;
+    StaticModelDrawPlan draw_plan{};
+    std::vector<RtRestGeometry> rt_rest_candidates;
+    std::uint64_t model_generation = 0u;
+    std::uint64_t texture_generation = 0u;
+    std::uint64_t uploaded_bytes = 0u;
+    std::uint64_t vertex_bytes = 0u;
+    std::uint64_t index_bytes = 0u;
+    std::uint64_t texture_logical_bytes = 0u;
+    std::uint64_t scene_hash = 0u;
+    std::size_t bone_count = 0u;
+    bool active = false;
+    std::array<bool, 2> rt_candidate_submitted{};
+    std::array<std::unique_ptr<VulkanRtScene>, 2> rt_candidates{};
+    bool rt_candidates_submitted = false;
+    bool fail_before_commit = false;
+    bool superseded = false;
+    Clock::time_point submitted_at{};
+  };
+  struct StaticAssetRetired {
+    Buffer vertex{};
+    Buffer index{};
+    ImageResource albedo{};
+    ImageResource normal{};
+    ImageResource specular{};
+    VkSampler albedo_sampler = VK_NULL_HANDLE;
+    VkSampler normal_sampler = VK_NULL_HANDLE;
+    VkSampler specular_sampler = VK_NULL_HANDLE;
+    VkFence completion_fence = VK_NULL_HANDLE;
+    std::array<std::unique_ptr<VulkanRtScene>, 2> rt_scenes{};
+    std::uint64_t model_generation = 0u;
+    std::uint64_t texture_generation = 0u;
+    Clock::time_point submitted_at{};
+
+    [[nodiscard]] bool active() const noexcept {
+      return completion_fence != VK_NULL_HANDLE;
+    }
+  };
   struct SwapchainImageResource {
     VkImage depth_image = VK_NULL_HANDLE;
     VkDeviceMemory depth_memory = VK_NULL_HANDLE;
@@ -335,6 +546,7 @@ private:
     Buffer mesh_vbo;
     Buffer bone_ssbo;
     VkDescriptorSet static_descriptor_set = VK_NULL_HANDLE;
+    std::uint64_t static_descriptor_revision = 0u;
     VkQueryPool timestamp_pool = VK_NULL_HANDLE;
     bool timestamps_pending = false;
     FrameStats perf_snapshot{};
@@ -342,7 +554,11 @@ private:
     bool perf_pending = false;
   };
 
-  SDL_Window *window_ = nullptr;
+  SDL_Window *legacy_sdl_window_ = nullptr;
+  void *native_window_handle_ = nullptr;
+  int window_pixel_width_ = 0;
+  int window_pixel_height_ = 0;
+  bool window_presentation_available_ = false;
   VkInstance instance_ = VK_NULL_HANDLE;
   VkDebugUtilsMessengerEXT debug_messenger_ = VK_NULL_HANDLE;
   VkSurfaceKHR surface_ = VK_NULL_HANDLE;
@@ -381,6 +597,9 @@ private:
   Clock::time_point next_swapchain_recreate_attempt_{};
   bool fatal_error_ = false;
   std::string fatal_error_detail_;
+  std::shared_ptr<RenderThreadControl> render_thread_control_;
+  bool gpu_completion_unproven_ = false;
+  bool quarantine_required_ = false;
   bool surface_maintenance1_khr_enabled_ = false;
   bool surface_maintenance1_ext_enabled_ = false;
   bool swapchain_maintenance1_enabled_ = false;
@@ -429,6 +648,7 @@ private:
   ImageResource skybox_cubemap_{};
   std::uint32_t skybox_face_size_ = 0;
   std::uint64_t skybox_generation_ = 0;
+  std::string skybox_source_identity_;
   bool skybox_ready_ = false;
 
   // Shared linear-float User HDRI + alias/PDF table for both RT frame slots.
@@ -440,6 +660,10 @@ private:
   std::uint64_t world_environment_resource_key_ = 0;
   std::uint64_t world_environment_failed_key_ = 0;
   bool world_environment_ready_ = false;
+  HdrEnvironmentAsset world_environment_runtime_asset_{};
+  ResolvedWorldEnvironment world_environment_published_{};
+  WorldEnvironmentPending world_environment_pending_{};
+  WorldEnvironmentRetired world_environment_retired_{};
 
   // Shared, lazy Bruneton procedural-atmosphere precomputation.
   VkDescriptorSetLayout atmosphere_desc_layout_ = VK_NULL_HANDLE;
@@ -487,7 +711,13 @@ private:
   RenderPath active_render_path_ = RenderPath::Raster;
   bool rt_fallback_logged_ = false;
   bool unified_rt_logged_ = false;
-  std::array<VulkanRtScene, 2> rt_scenes_{};
+  // Published and scratch Candidate scene objects are pointer-swapped only
+  // after the Candidate's BLAS/TLAS submission fence succeeds.  Keeping the
+  // complete owning objects separate makes allocation/build failure unable to
+  // corrupt the currently rendered CPU/GPU/RT set.
+  std::array<std::unique_ptr<VulkanRtScene>, 2> rt_scenes_{};
+  std::array<std::unique_ptr<VulkanRtScene>, 2> rt_scene_candidates_{};
+  bool rt_candidate_failure_injected_ = false;
   std::array<VulkanPathTracer, 2> path_tracers_{};
   VulkanPathTracer still_path_tracer_{};
   StreamlineVulkanRuntime streamline_vulkan_runtime_{};
@@ -524,11 +754,25 @@ private:
   std::vector<float> rt_motion_previous_bones_;
   std::uint64_t rt_motion_topology_hash_ = 0u;
   bool rt_motion_history_valid_ = false;
+  std::uint64_t rt_motion_history_render_serial_ = 0u;
   std::array<float, 16> rt_motion_previous_view_{};
   std::array<float, 16> rt_motion_previous_proj_{};
   bool rt_motion_camera_history_valid_ = false;
+  bool render_thread_frame_context_active_ = false;
+  std::uint64_t render_thread_render_serial_ = 0u;
   std::uint64_t streamline_temporal_history_key_ = 0u;
   bool streamline_temporal_history_valid_ = false;
+  std::uint64_t streamline_temporal_history_render_serial_ = 0u;
+  bool streamline_temporal_commit_candidate_valid_ = false;
+  std::uint64_t streamline_temporal_commit_candidate_key_ = 0u;
+  std::uint32_t streamline_temporal_commit_candidate_render_width_ = 0u;
+  std::uint32_t streamline_temporal_commit_candidate_render_height_ = 0u;
+  std::uint32_t streamline_temporal_commit_candidate_output_width_ = 0u;
+  std::uint32_t streamline_temporal_commit_candidate_output_height_ = 0u;
+  std::uint64_t streamline_temporal_commit_candidate_reset_generation_ = 0u;
+  PathTraceUpscale streamline_temporal_commit_candidate_mode_ =
+      PathTraceUpscale::Off;
+  bool streamline_temporal_commit_candidate_ray_reconstruction_ = false;
   std::uint32_t streamline_temporal_render_width_ = 0u;
   std::uint32_t streamline_temporal_render_height_ = 0u;
   std::uint32_t streamline_temporal_output_width_ = 0u;
@@ -563,6 +807,7 @@ private:
   VkSampler font_sampler_ = VK_NULL_HANDLE;
   int font_w_ = 0, font_h_ = 0;
   bool font_ready_ = false;
+  std::optional<std::uint64_t> rejected_ui_texture_id_;
 
   Buffer static_model_vbo_{};
   Buffer static_model_ibo_{};
@@ -571,10 +816,14 @@ private:
   ImageResource static_specular_texture_{};
   StaticModelDrawPlan static_draw_plan_{};
   StaticModelGenerationCache static_generations_{};
+  StaticAssetPending static_asset_pending_{};
+  StaticAssetRetired static_asset_retired_{};
+  std::uint64_t static_descriptor_revision_ = 0u;
   std::size_t static_bone_count_ = 0;
   std::uint64_t static_resource_rebuilds_ = 0;
   std::uint64_t static_vertex_bytes_ = 0;
   std::uint64_t static_index_bytes_ = 0;
+  std::uint64_t static_texture_logical_bytes_ = 0;
   bool static_model_ready_ = false;
   bool static_mismatch_logged_ = false;
 
@@ -672,6 +921,8 @@ private:
   void createTimestampQueryPools();
 
 
+  [[nodiscard]] VkDescriptorSet
+  resolveUiLogicalTexture(std::uint64_t logical_texture_id) const noexcept;
   int drawUi(FrameSync &frame, const UiDrawData &ui, bool overlay_only);
 };
 

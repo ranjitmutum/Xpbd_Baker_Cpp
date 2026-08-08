@@ -205,10 +205,8 @@ LabPbrExportResult exportLabPbrBundle(
           stage_directory / result.specular_path.filename();
       std::vector<std::uint8_t> encoded_specular;
       std::string png_error;
-      if (!encodePngRgba8(effective_specular->width,
-                          effective_specular->height,
-                          effective_specular->rgba, encoded_specular,
-                          &png_error)) {
+      if (!encodePngTextureImage(*effective_specular, encoded_specular,
+                                 &png_error)) {
         throw std::runtime_error(
             png_error.empty() ? "failed to encode LabPBR specular PNG"
                               : png_error);
@@ -243,7 +241,8 @@ LabPbrExportResult exportLabPbrBundle(
                             &validation_error) ||
           verified_specular.width != effective_specular->width ||
           verified_specular.height != effective_specular->height ||
-          verified_specular.source_channels != 4 ||
+          verified_specular.source_channels !=
+              effective_specular->source_channels ||
           verified_specular.rgba != effective_specular->rgba) {
         throw std::runtime_error(
             validation_error.empty()

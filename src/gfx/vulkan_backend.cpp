@@ -40,6 +40,7 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
@@ -48,6 +49,7 @@
 #include <functional>
 #include <future>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -74,9 +76,41 @@ namespace {
     }                                                                          \
   } while (0)
 
+template <typename Callback> class ScopeExit final {
+public:
+  explicit ScopeExit(Callback callback) noexcept(
+      std::is_nothrow_move_constructible_v<Callback>)
+      : callback_(std::move(callback)) {}
+  ScopeExit(const ScopeExit &) = delete;
+  ScopeExit &operator=(const ScopeExit &) = delete;
+  ScopeExit(ScopeExit &&other) noexcept(
+      std::is_nothrow_move_constructible_v<Callback>)
+      : callback_(std::move(other.callback_)), active_(other.active_) {
+    other.active_ = false;
+  }
+  ~ScopeExit() {
+    if (active_) {
+      callback_();
+    }
+  }
+
+  void release() noexcept { active_ = false; }
+
+private:
+  Callback callback_;
+  bool active_ = true;
+};
+
+template <typename Callback>
+ScopeExit(Callback) -> ScopeExit<Callback>;
+
 
 
 constexpr std::uint64_t kDiagnosticWaitSliceNs = 250'000'000ull;
+constexpr std::uint64_t kControlledWaitSliceNs = 25'000'000ull;
+constexpr auto kControlledWaitDiagnosticThreshold = std::chrono::seconds(1);
+constexpr auto kControlledWaitDiagnosticInterval = std::chrono::seconds(2);
+constexpr auto kControlledDeviceIdleBudget = std::chrono::seconds(2);
 constexpr auto kSwapchainRecreateRetryDelay = std::chrono::milliseconds(100);
 
 bool environmentFlagEnabled(const char *name) {
@@ -308,7 +342,26 @@ void VulkanBackend::appendPathTraceHistoryBytes(
 
 
 bool VulkanBackend::init(SDL_Window *window) {
-    window_ = window;
+    VulkanWindowBootstrap bootstrap;
+    std::string bootstrap_error;
+    if (!captureVulkanWindowBootstrap(window, bootstrap, &bootstrap_error)) {
+      xpbd::log::errorf("Vulkan window bootstrap failed: %s",
+                        bootstrap_error.c_str());
+      return false;
+    }
+    return init(bootstrap);
+}
+
+bool VulkanBackend::init(const VulkanWindowBootstrap &bootstrap) {
+    if (!bootstrap.valid()) {
+      xpbd::log::error("Vulkan window bootstrap is invalid");
+      return false;
+    }
+    legacy_sdl_window_ = bootstrap.legacy_sdl_window;
+    native_window_handle_ = bootstrap.native_window_handle;
+    window_pixel_width_ = bootstrap.pixel_width;
+    window_pixel_height_ = bootstrap.pixel_height;
+    window_presentation_available_ = bootstrap.presentation_available;
     diagnostics_enabled_ =
         environmentFlagEnabled("XPBD_VULKAN_DIAGNOSTICS");
     perf_diagnostics_enabled_ =
@@ -316,17 +369,35 @@ bool VulkanBackend::init(SDL_Window *window) {
         environmentFlagEnabled("XPBD_PERF_DIAGNOSTICS");
     validation_requested_ =
         environmentFlagEnabled("XPBD_VULKAN_VALIDATION");
+#if defined(XPBD_STRICT_RT_GATE) && XPBD_STRICT_RT_GATE
+    validation_requested_ = true;
+#endif
     validation_enabled_ = false;
     writeLog("VulkanBackend::init");
-    (void)streamline_vulkan_runtime_.initializeBeforeVulkan();
-
-    uint32_t ext_count = 0;
-    const char *const *exts = SDL_Vulkan_GetInstanceExtensions(&ext_count);
-    if (!exts || ext_count == 0) {
-      writeLog("No SDL Vulkan instance extensions");
+    const bool streamline_initialized =
+        streamline_vulkan_runtime_.initializeBeforeVulkan();
+#if defined(XPBD_STRICT_RT_GATE) && XPBD_STRICT_RT_GATE
+    if (!streamline_initialized) {
+      xpbd::log::errorf(
+          "STRICT_RT_GATE_FAIL stage=streamline_init status=%s",
+          streamline_vulkan_runtime_.status().c_str());
+      xpbd::log::flush();
       return false;
     }
-    std::vector<const char *> instance_exts(exts, exts + ext_count);
+#else
+    (void)streamline_initialized;
+#endif
+
+    std::vector<const char *> instance_exts;
+    instance_exts.reserve(bootstrap.required_instance_extensions.size() + 4u);
+    for (const std::string &extension :
+         bootstrap.required_instance_extensions) {
+      if (extension.empty()) {
+        writeLog("Vulkan bootstrap contains an empty instance extension");
+        return false;
+      }
+      instance_exts.push_back(extension.c_str());
+    }
 
     std::uint32_t available_extension_count = 0;
     VkResult available_extension_result =
@@ -412,11 +483,21 @@ bool VulkanBackend::init(SDL_Window *window) {
             "Vulkan validation requested: enabled layer=%s debug_utils=%d",
             kValidationLayer, validation_enabled_ ? 1 : 0);
       } else {
+#if defined(XPBD_STRICT_RT_GATE) && XPBD_STRICT_RT_GATE
+        xpbd::log::errorf(
+            "STRICT_RT_GATE_FAIL stage=validation_availability layer=%d "
+            "debug_utils=%d",
+            validation_layer_available ? 1 : 0,
+            debug_utils_available ? 1 : 0);
+        xpbd::log::flush();
+        return false;
+#else
         xpbd::log::warnf(
             "Vulkan validation requested but unavailable: layer=%d "
             "debug_utils=%d; continuing without validation",
             validation_layer_available ? 1 : 0,
             debug_utils_available ? 1 : 0);
+#endif
       }
     }
 
@@ -479,30 +560,45 @@ bool VulkanBackend::init(SDL_Window *window) {
               vkGetInstanceProcAddr(instance_,
                                     "vkCreateDebugUtilsMessengerEXT"));
       if (create_debug_messenger == nullptr) {
+#if defined(XPBD_STRICT_RT_GATE) && XPBD_STRICT_RT_GATE
+        xpbd::log::error(
+            "STRICT_RT_GATE_FAIL stage=validation_messenger "
+            "entry_point=missing");
+        xpbd::log::flush();
+        return false;
+#else
         xpbd::log::warnf(
             "Vulkan validation layer enabled but debug messenger entry point "
             "is unavailable");
+#endif
       } else {
         const VkResult messenger_result = create_debug_messenger(
             instance_, &validation_info, nullptr, &debug_messenger_);
         if (messenger_result != VK_SUCCESS) {
+#if defined(XPBD_STRICT_RT_GATE) && XPBD_STRICT_RT_GATE
+          xpbd::log::errorf(
+              "STRICT_RT_GATE_FAIL stage=validation_messenger result=%s(%d)",
+              vkResultName(messenger_result),
+              static_cast<int>(messenger_result));
+          xpbd::log::flush();
+          return false;
+#else
           xpbd::log::warnf(
               "Vulkan debug messenger creation failed: %s(%d)",
               vkResultName(messenger_result),
               static_cast<int>(messenger_result));
+#endif
         }
       }
     }
 
     bool surface_created = false;
 #if defined(_WIN32)
-    void *native_window = SDL_GetPointerProperty(
-        SDL_GetWindowProperties(window_),
-        SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
-    if (streamline_vulkan_runtime_.initialized()) {
+    if (native_window_handle_ != nullptr &&
+        streamline_vulkan_runtime_.initialized()) {
       const VkResult surface_result =
           streamline_vulkan_runtime_.createWin32Surface(
-              instance_, native_window, nullptr, &surface_);
+              instance_, native_window_handle_, nullptr, &surface_);
       surface_created = surface_result == VK_SUCCESS;
       if (!surface_created) {
         xpbd::log::warnf(
@@ -513,13 +609,33 @@ bool VulkanBackend::init(SDL_Window *window) {
         streamline_vulkan_runtime_.shutdownBeforeVulkan();
       }
     }
+    if (!surface_created && native_window_handle_ != nullptr) {
+      const VkResult surface_result =
+          streamline_vulkan_runtime_.createWin32Surface(
+              instance_, native_window_handle_, nullptr, &surface_);
+      surface_created = surface_result == VK_SUCCESS;
+      if (!surface_created) {
+        xpbd::log::errorf("Native Win32 Vulkan surface creation failed: %s(%d)",
+                          vkResultName(surface_result),
+                          static_cast<int>(surface_result));
+      }
+    }
+#endif
+#if !defined(_WIN32)
+    if (!surface_created && legacy_sdl_window_ != nullptr) {
+      surface_created =
+          SDL_Vulkan_CreateSurface(legacy_sdl_window_, instance_, nullptr,
+                                   &surface_);
+      if (!surface_created) {
+        const char *sdl_error = SDL_GetError();
+        writeLog(sdl_error != nullptr && sdl_error[0] != '\0'
+                     ? sdl_error
+                     : "SDL Vulkan surface creation failed");
+      }
+    }
 #endif
     if (!surface_created) {
-      surface_created =
-          SDL_Vulkan_CreateSurface(window_, instance_, nullptr, &surface_);
-    }
-    if (!surface_created) {
-      writeLog(SDL_GetError());
+      writeLog("Vulkan surface creation failed");
       return false;
     }
 
@@ -530,18 +646,35 @@ bool VulkanBackend::init(SDL_Window *window) {
     if (!createDevice()) {
       return false;
     }
+    try {
+      for (std::size_t i = 0u; i < rt_scenes_.size(); ++i) {
+        rt_scenes_[i] = std::make_unique<VulkanRtScene>();
+        rt_scene_candidates_[i] = std::make_unique<VulkanRtScene>();
+      }
+    } catch (const std::bad_alloc &) {
+      writeLog("Vulkan RT: scene Candidate allocation failed");
+      return false;
+    }
     streamline_vulkan_runtime_.inspectPhysicalDevice(phys_);
     if (rt_capability_.supported && rt_capability_.device_extensions_enabled) {
       bool rt_scenes_ready = true;
-      for (auto &scene : rt_scenes_) {
-        if (!scene.init(phys_, device_, graphics_family_, graphics_queue_)) {
+      for (std::size_t i = 0u; i < rt_scenes_.size(); ++i) {
+        rt_scenes_[i]->setWaitControl(render_thread_control_);
+        rt_scene_candidates_[i]->setWaitControl(render_thread_control_);
+        if (!rt_scenes_[i]->init(phys_, device_, graphics_family_,
+                                 graphics_queue_) ||
+            !rt_scene_candidates_[i]->init(
+                phys_, device_, graphics_family_, graphics_queue_)) {
           rt_scenes_ready = false;
           break;
         }
       }
       if (!rt_scenes_ready) {
         for (auto &scene : rt_scenes_) {
-          scene.shutdown();
+          scene->shutdown();
+        }
+        for (auto &scene : rt_scene_candidates_) {
+          scene->shutdown();
         }
         xpbd::log::warn(
             "Vulkan RT: scene helper init failed; RT shadows disabled");
@@ -624,6 +757,28 @@ bool VulkanBackend::init(SDL_Window *window) {
                       return path_tracer.rtPipelineReady();
                     });
     setVulkanPathTraceAvailability(path_tracer_ready, rt_pipeline_ready);
+#if defined(XPBD_STRICT_RT_GATE) && XPBD_STRICT_RT_GATE
+    const bool still_path_tracer_ready = still_path_tracer_.ready();
+    const bool still_rt_pipeline_ready =
+        still_path_tracer_ready && still_path_tracer_.rtPipelineReady();
+    if (!rt_capability_.supported ||
+        !rt_capability_.device_extensions_enabled || !path_tracer_ready ||
+        !rt_pipeline_ready || !still_path_tracer_ready ||
+        !still_rt_pipeline_ready) {
+      xpbd::log::errorf(
+          "STRICT_RT_GATE_FAIL stage=rt_runtime capability=%d extensions=%d "
+          "viewport_path_tracer=%d viewport_rt_pipeline=%d "
+          "still_path_tracer=%d still_rt_pipeline=%d reason=%s",
+          rt_capability_.supported ? 1 : 0,
+          rt_capability_.device_extensions_enabled ? 1 : 0,
+          path_tracer_ready ? 1 : 0, rt_pipeline_ready ? 1 : 0,
+          still_path_tracer_ready ? 1 : 0,
+          still_rt_pipeline_ready ? 1 : 0,
+          rt_capability_.unsupported_reason.c_str());
+      xpbd::log::flush();
+      return false;
+    }
+#endif
     if (!createBuffers()) {
       return false;
     }
@@ -635,11 +790,35 @@ bool VulkanBackend::init(SDL_Window *window) {
     }
     createTimestampQueryPools();
 
+#if defined(XPBD_STRICT_RT_GATE) && XPBD_STRICT_RT_GATE
+    if (!streamline_vulkan_runtime_.initialized() || !validation_enabled_ ||
+        debug_messenger_ == VK_NULL_HANDLE) {
+      xpbd::log::errorf(
+          "STRICT_RT_GATE_FAIL stage=final_contract streamline=%d "
+          "validation=%d messenger=%d",
+          streamline_vulkan_runtime_.initialized() ? 1 : 0,
+          validation_enabled_ ? 1 : 0,
+          debug_messenger_ != VK_NULL_HANDLE ? 1 : 0);
+      xpbd::log::flush();
+      return false;
+    }
+    xpbd::log::info(
+        "STRICT_RT_GATE_RUNTIME_READY backend=Vulkan streamline=1 "
+        "validation_active=1 rt_capability=1 viewport_path_tracer=1 "
+        "viewport_rt_pipeline=1 still_path_tracer=1 still_rt_pipeline=1");
+    xpbd::log::flush();
+#endif
     writeLog("VulkanBackend init OK");
     return true;
   }
 
 void VulkanBackend::shutdown() {
+    if (quarantine_required_) {
+      xpbd::log::error(
+          "Vulkan shutdown retained the complete backend because ownership "
+          "is quarantined");
+      return;
+    }
     if (device_) {
       // Turn interpolation off before draining or destroying any presentation
       // object. The feature itself is unloaded after the swapchain is gone.
@@ -659,27 +838,9 @@ void VulkanBackend::shutdown() {
            !frame_generation_disable_ready &&
            drain_cycle <= kFrameGenerationDisableMaxAttempts;
            ++drain_cycle) {
-        const FrameSync &sync = frames_[frame_index_];
-        const auto idle_start = Clock::now();
-        logDiagnosticApi("vkDeviceWaitIdle.shutdown", "before", std::nullopt,
-                         0.0, UINT32_MAX, sync.fence, VK_NULL_HANDLE, sync.cmd,
-                         true, true);
-        const VkResult idle_result =
-            streamline_vulkan_runtime_.deviceWaitIdle(device_);
-        logDiagnosticApi(
-            "vkDeviceWaitIdle.shutdown", "after", idle_result,
-            std::chrono::duration<double, std::milli>(Clock::now() -
-                                                      idle_start)
-                .count(),
-            UINT32_MAX, sync.fence, VK_NULL_HANDLE, sync.cmd, true, false);
-        if (idle_result != VK_SUCCESS) {
-          SDL_Log("Vulkan device idle wait during shutdown failed: %d",
-                  static_cast<int>(idle_result));
-          if (idle_result == VK_ERROR_DEVICE_LOST) {
-            fatal_error_ = true;
-            fatal_error_detail_ =
-                "VK_ERROR_DEVICE_LOST while draining DLSS-G shutdown";
-          }
+        const ControlledWaitResult idle = waitForDeviceIdleControlled(
+            "vkDeviceWaitIdle.shutdown", kControlledDeviceIdleBudget);
+        if (!idle.completed()) {
           xpbd::log::error(
               "shutdown blocked by FG disable failure");
           return;
@@ -704,9 +865,10 @@ void VulkanBackend::shutdown() {
         const FrameGenerationDiagnostic diagnostic =
             streamline_vulkan_runtime_.frameGenerationDiagnostic();
         fg_recovery_reason_ = diagnostic.status;
-        xpbd::log::errorf(
-            "shutdown blocked by FG disable failure: %s",
-            diagnostic.status.c_str());
+        recordFatalError(
+            "Streamline.frame_generation_shutdown",
+            std::string("shutdown blocked by FG disable failure: ") +
+                diagnostic.status);
         return;
       }
     }
@@ -746,11 +908,25 @@ void VulkanBackend::shutdown() {
     still_last_logged_samples_ = 0;
     still_last_progress_time_ = {};
     destroyProceduralAtmosphereGpu();
+    if (quarantine_required_) {
+      return;
+    }
     destroyWorldEnvironmentGpu();
+    if (quarantine_required_) {
+      return;
+    }
     setVulkanPathTraceAvailability(false, false);
     for (auto &scene : rt_scenes_) {
-      scene.shutdown();
+      if (scene) {
+        scene->shutdown();
+      }
     }
+    for (auto &scene : rt_scene_candidates_) {
+      if (scene) {
+        scene->shutdown();
+      }
+    }
+    rt_candidate_failure_injected_ = false;
     rt_scene_built_.fill(false);
     last_rt_scene_hash_.fill(0);
     rt_fallback_generation_serial_ = 0;
@@ -850,10 +1026,18 @@ void VulkanBackend::shutdown() {
     streamline_vulkan_runtime_.releaseAfterVulkan();
     instance_ = VK_NULL_HANDLE;
     device_ = VK_NULL_HANDLE;
+    legacy_sdl_window_ = nullptr;
+    native_window_handle_ = nullptr;
+    window_pixel_width_ = 0;
+    window_pixel_height_ = 0;
+    window_presentation_available_ = false;
     descriptor_binding_partially_bound_enabled_ = false;
   }
 
-void VulkanBackend::resize(int, int) {
+void VulkanBackend::resize(int fb_w, int fb_h) {
+    window_pixel_width_ = std::max(0, fb_w);
+    window_pixel_height_ = std::max(0, fb_h);
+    window_presentation_available_ = fb_w > 0 && fb_h > 0;
     // A resize is a mandatory Native transition.  Keep the user's FG request
     // intact so the next stable frame can opt back in through a fresh proxy
     // swapchain.
@@ -868,30 +1052,65 @@ void VulkanBackend::resize(int, int) {
   }
 
 bool VulkanBackend::uploadFontAtlas(const void *pixels, int width, int height,
-                       bool is_rgba) {
+                        bool is_rgba) {
     if (!pixels || width <= 0 || height <= 0 || !device_) {
       return false;
     }
-    font_w_ = width;
-    font_h_ = height;
 
     std::vector<uint8_t> rgba;
     const uint8_t *src = static_cast<const uint8_t *>(pixels);
-    VkDeviceSize size = 0;
+    const std::uint64_t texel_count =
+        static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height);
+    if (texel_count == 0u ||
+        texel_count >
+            static_cast<std::uint64_t>((std::numeric_limits<std::size_t>::max)()) /
+                4u ||
+        texel_count >
+            static_cast<std::uint64_t>((std::numeric_limits<VkDeviceSize>::max)()) /
+                4u) {
+      writeLog("Vulkan font atlas dimensions overflow the upload size");
+      return false;
+    }
+    const VkDeviceSize size = static_cast<VkDeviceSize>(texel_count * 4u);
     if (is_rgba) {
-      size = static_cast<VkDeviceSize>(width) * height * 4;
+      // The caller already supplied tightly packed RGBA8 texels.
     } else {
-      rgba.resize(static_cast<size_t>(width) * height * 4);
-      for (int i = 0, n = width * height; i < n; ++i) {
-        rgba[static_cast<size_t>(i) * 4 + 0] = 255;
-        rgba[static_cast<size_t>(i) * 4 + 1] = 255;
-        rgba[static_cast<size_t>(i) * 4 + 2] = 255;
-        rgba[static_cast<size_t>(i) * 4 + 3] = src[i];
+      rgba.resize(static_cast<std::size_t>(size));
+      for (std::uint64_t i = 0; i < texel_count; ++i) {
+        rgba[static_cast<std::size_t>(i) * 4 + 0] = 255;
+        rgba[static_cast<std::size_t>(i) * 4 + 1] = 255;
+        rgba[static_cast<std::size_t>(i) * 4 + 2] = 255;
+        rgba[static_cast<std::size_t>(i) * 4 + 3] =
+            src[static_cast<std::size_t>(i)];
       }
       src = rgba.data();
-      size = static_cast<VkDeviceSize>(rgba.size());
     }
+
     Buffer staging{};
+    VkImage new_image = VK_NULL_HANDLE;
+    VkDeviceMemory new_memory = VK_NULL_HANDLE;
+    VkImageView new_view = VK_NULL_HANDLE;
+    VkSampler new_sampler = VK_NULL_HANDLE;
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    ScopeExit cleanup([&] {
+      if (command != VK_NULL_HANDLE) {
+        vkFreeCommandBuffers(device_, cmd_pool_, 1, &command);
+      }
+      if (new_view != VK_NULL_HANDLE) {
+        vkDestroyImageView(device_, new_view, nullptr);
+      }
+      if (new_image != VK_NULL_HANDLE) {
+        vkDestroyImage(device_, new_image, nullptr);
+      }
+      if (new_memory != VK_NULL_HANDLE) {
+        vkFreeMemory(device_, new_memory, nullptr);
+      }
+      if (new_sampler != VK_NULL_HANDLE) {
+        vkDestroySampler(device_, new_sampler, nullptr);
+      }
+      destroyBuffer(staging);
+    });
+
     if (!createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
@@ -899,20 +1118,9 @@ bool VulkanBackend::uploadFontAtlas(const void *pixels, int width, int height,
       return false;
     }
     if (!staging.mapped) {
-      destroyBuffer(staging);
       return false;
     }
     std::memcpy(staging.mapped, src, static_cast<size_t>(size));
-
-    if (font_image_) {
-      vkDestroyImageView(device_, font_view_, nullptr);
-      vkDestroyImage(device_, font_image_, nullptr);
-      vkFreeMemory(device_, font_mem_, nullptr);
-      font_view_ = VK_NULL_HANDLE;
-      font_image_ = VK_NULL_HANDLE;
-      font_mem_ = VK_NULL_HANDLE;
-      font_ready_ = false;
-    }
 
     VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ii.imageType = VK_IMAGE_TYPE_2D;
@@ -925,60 +1133,57 @@ bool VulkanBackend::uploadFontAtlas(const void *pixels, int width, int height,
     ii.tiling = VK_IMAGE_TILING_OPTIMAL;
     ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VK_CHECK(vkCreateImage(device_, &ii, nullptr, &font_image_));
+    const VkResult image_result =
+        vkCreateImage(device_, &ii, nullptr, &new_image);
+    if (image_result != VK_SUCCESS) {
+      SDL_Log("Vulkan font image creation failed: %d",
+              static_cast<int>(image_result));
+      return false;
+    }
     VkMemoryRequirements req{};
-    vkGetImageMemoryRequirements(device_, font_image_, &req);
+    vkGetImageMemoryRequirements(device_, new_image, &req);
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = req.size;
     const auto memory_type = findMemoryType(
         req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (!memory_type) {
       writeLog("Vulkan font image has no compatible memory type");
-      vkDestroyImage(device_, font_image_, nullptr);
-      font_image_ = VK_NULL_HANDLE;
-      destroyBuffer(staging);
       return false;
     }
     ai.memoryTypeIndex = *memory_type;
     const VkResult allocation_result =
-        vkAllocateMemory(device_, &ai, nullptr, &font_mem_);
+        vkAllocateMemory(device_, &ai, nullptr, &new_memory);
     if (allocation_result != VK_SUCCESS) {
       SDL_Log("Vulkan font image allocation failed: %d",
               static_cast<int>(allocation_result));
-      vkDestroyImage(device_, font_image_, nullptr);
-      font_image_ = VK_NULL_HANDLE;
-      destroyBuffer(staging);
       return false;
     }
     const VkResult bind_result =
-        vkBindImageMemory(device_, font_image_, font_mem_, 0);
+        vkBindImageMemory(device_, new_image, new_memory, 0);
     if (bind_result != VK_SUCCESS) {
       SDL_Log("Vulkan font image memory bind failed: %d",
               static_cast<int>(bind_result));
-      vkDestroyImage(device_, font_image_, nullptr);
-      vkFreeMemory(device_, font_mem_, nullptr);
-      font_image_ = VK_NULL_HANDLE;
-      font_mem_ = VK_NULL_HANDLE;
-      destroyBuffer(staging);
       return false;
     }
-
 
     VkCommandBufferAllocateInfo cai{
         VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     cai.commandPool = cmd_pool_;
     cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cai.commandBufferCount = 1;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    VK_CHECK(vkAllocateCommandBuffers(device_, &cai, &cmd));
+    const VkResult allocate_command_result =
+        vkAllocateCommandBuffers(device_, &cai, &command);
+    if (allocate_command_result != VK_SUCCESS) {
+      SDL_Log("Vulkan font upload command allocation failed: %d",
+              static_cast<int>(allocate_command_result));
+      return false;
+    }
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    const VkResult begin_result = vkBeginCommandBuffer(cmd, &bi);
+    const VkResult begin_result = vkBeginCommandBuffer(command, &bi);
     if (begin_result != VK_SUCCESS) {
       SDL_Log("Vulkan font upload command begin failed: %d",
               static_cast<int>(begin_result));
-      vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
-      destroyBuffer(staging);
       return false;
     }
 
@@ -987,11 +1192,11 @@ bool VulkanBackend::uploadFontAtlas(const void *pixels, int width, int height,
     barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = font_image_;
+    barrier.image = new_image;
     barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     barrier.srcAccessMask = 0;
     barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
                          nullptr, 1, &barrier);
 
@@ -999,86 +1204,68 @@ bool VulkanBackend::uploadFontAtlas(const void *pixels, int width, int height,
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.imageExtent = {static_cast<uint32_t>(width),
                           static_cast<uint32_t>(height), 1};
-    vkCmdCopyBufferToImage(cmd, staging.buffer, font_image_,
+    vkCmdCopyBufferToImage(command, staging.buffer, new_image,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
     barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr,
                          0, nullptr, 1, &barrier);
-    const VkResult end_result = vkEndCommandBuffer(cmd);
+    const VkResult end_result = vkEndCommandBuffer(command);
     if (end_result != VK_SUCCESS) {
       SDL_Log("Vulkan font upload command end failed: %d",
               static_cast<int>(end_result));
-      vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
-      destroyBuffer(staging);
       return false;
     }
-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
-    const FrameSync &sync = frames_[frame_index_];
-    const auto submit_start = Clock::now();
-    logDiagnosticApi("vkQueueSubmit.font_upload", "before", std::nullopt, 0.0,
-                     UINT32_MAX, sync.fence, VK_NULL_HANDLE, cmd, true, true);
-    const VkResult submit_result =
-        vkQueueSubmit(graphics_queue_, 1, &si, VK_NULL_HANDLE);
-    logDiagnosticApi(
-        "vkQueueSubmit.font_upload", "after", submit_result,
-        std::chrono::duration<double, std::milli>(Clock::now() - submit_start)
-            .count(),
-        UINT32_MAX, sync.fence, VK_NULL_HANDLE, cmd, true, false);
-    if (submit_result != VK_SUCCESS) {
-      SDL_Log("Vulkan font upload submit failed: %d",
-              static_cast<int>(submit_result));
-      vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
-      destroyBuffer(staging);
+    if (!submitGraphicsTransactionAndWait(command, "font-upload")) {
+      SDL_Log("Vulkan font upload transaction failed");
+      if (gpu_completion_unproven_) {
+        cleanup.release();
+      }
       return false;
     }
-    const auto idle_start = Clock::now();
-    logDiagnosticApi("vkQueueWaitIdle.font_upload", "before", std::nullopt,
-                     0.0, UINT32_MAX, sync.fence, VK_NULL_HANDLE, cmd, true,
-                     true);
-    const VkResult idle_result = vkQueueWaitIdle(graphics_queue_);
-    logDiagnosticApi(
-        "vkQueueWaitIdle.font_upload", "after", idle_result,
-        std::chrono::duration<double, std::milli>(Clock::now() - idle_start)
-            .count(),
-        UINT32_MAX, sync.fence, VK_NULL_HANDLE, cmd, true, false);
-    if (idle_result != VK_SUCCESS) {
-      SDL_Log("Vulkan font upload queue wait failed: %d",
-              static_cast<int>(idle_result));
-      vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
-      destroyBuffer(staging);
-      return false;
-    }
-    vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
+    vkFreeCommandBuffers(device_, cmd_pool_, 1, &command);
+    command = VK_NULL_HANDLE;
     destroyBuffer(staging);
 
     VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    vi.image = font_image_;
+    vi.image = new_image;
     vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
     vi.format = VK_FORMAT_R8G8B8A8_UNORM;
     vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    VK_CHECK(vkCreateImageView(device_, &vi, nullptr, &font_view_));
+    const VkResult view_result =
+        vkCreateImageView(device_, &vi, nullptr, &new_view);
+    if (view_result != VK_SUCCESS) {
+      SDL_Log("Vulkan font image view creation failed: %d",
+              static_cast<int>(view_result));
+      return false;
+    }
 
-    if (!font_sampler_) {
+    VkSampler published_sampler = font_sampler_;
+    if (published_sampler == VK_NULL_HANDLE) {
       VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
       sci.magFilter = VK_FILTER_LINEAR;
       sci.minFilter = VK_FILTER_LINEAR;
       sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
       sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
       sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-      VK_CHECK(vkCreateSampler(device_, &sci, nullptr, &font_sampler_));
+      const VkResult sampler_result =
+          vkCreateSampler(device_, &sci, nullptr, &new_sampler);
+      if (sampler_result != VK_SUCCESS) {
+        SDL_Log("Vulkan font sampler creation failed: %d",
+                static_cast<int>(sampler_result));
+        return false;
+      }
+      published_sampler = new_sampler;
     }
 
     VkDescriptorImageInfo di{};
     di.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    di.imageView = font_view_;
-    di.sampler = font_sampler_;
+    di.imageView = new_view;
+    di.sampler = published_sampler;
     VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     w.dstSet = desc_set_;
     w.dstBinding = 0;
@@ -1086,14 +1273,37 @@ bool VulkanBackend::uploadFontAtlas(const void *pixels, int width, int height,
     w.descriptorCount = 1;
     w.pImageInfo = &di;
     vkUpdateDescriptorSets(device_, 1, &w, 0, nullptr);
+
+    if (font_view_ != VK_NULL_HANDLE) {
+      vkDestroyImageView(device_, font_view_, nullptr);
+    }
+    if (font_image_ != VK_NULL_HANDLE) {
+      vkDestroyImage(device_, font_image_, nullptr);
+    }
+    if (font_mem_ != VK_NULL_HANDLE) {
+      vkFreeMemory(device_, font_mem_, nullptr);
+    }
+    font_image_ = new_image;
+    new_image = VK_NULL_HANDLE;
+    font_mem_ = new_memory;
+    new_memory = VK_NULL_HANDLE;
+    font_view_ = new_view;
+    new_view = VK_NULL_HANDLE;
+    if (font_sampler_ == VK_NULL_HANDLE) {
+      font_sampler_ = new_sampler;
+      new_sampler = VK_NULL_HANDLE;
+    }
+    font_w_ = width;
+    font_h_ = height;
     font_ready_ = true;
+    cleanup.release();
     writeLog("Vulkan font atlas uploaded");
     return true;
   }
 
 unsigned int VulkanBackend::fontTextureId() const {
-
-    return 1;
+    return static_cast<unsigned int>(
+        uiLogicalTextureId(UiLogicalTexture::FontAtlas));
   }
 
 bool VulkanBackend::supportsStaticModel() const { return true; }
@@ -1222,7 +1432,38 @@ bool VulkanBackend::supportsRayTracing() const {
 
 RenderPath VulkanBackend::activeRenderPath() const { return active_render_path_; }
 
-void VulkanBackend::prepareForSystemDialog() {
+void VulkanBackend::setRenderThreadFrameContext(
+    std::uint64_t render_serial,
+    const HistoryCommitSnapshot *previous_history) noexcept {
+    render_thread_frame_context_active_ = true;
+    render_thread_render_serial_ = render_serial;
+    if (previous_history == nullptr || previous_history->render_serial == 0u) {
+      rt_motion_camera_history_valid_ = false;
+      rt_motion_history_valid_ = false;
+      streamline_temporal_history_valid_ = false;
+      return;
+    }
+
+    rt_motion_previous_view_ = previous_history->view_matrix;
+    rt_motion_previous_proj_ = previous_history->proj_matrix;
+    rt_motion_camera_history_valid_ = true;
+    if (rt_motion_history_render_serial_ !=
+        previous_history->render_serial) {
+      rt_motion_history_valid_ = false;
+    }
+    if (streamline_temporal_history_render_serial_ !=
+        previous_history->render_serial) {
+      streamline_temporal_history_valid_ = false;
+    }
+  }
+
+bool VulkanBackend::prepareForSystemDialog() {
+    if (fatal_error_ || quarantine_required_) {
+      return false;
+    }
+    if (presentation_suspended_) {
+      return true;
+    }
     swapchain_recreate_target_ = SwapchainOwnership::Native;
     fg_force_native_recovery_ = true;
     recreate_swapchain_ = true;
@@ -1232,17 +1473,27 @@ void VulkanBackend::prepareForSystemDialog() {
     if (device_ && swapchain_ &&
         streamline_vulkan_runtime_.swapchainOwnership() ==
             SwapchainOwnership::StreamlineFrameGenerationProxy) {
-      (void)recreateSwapchain();
+      if (!recreateSwapchain()) {
+        return false;
+      }
+    }
+    if (device_) {
+      // ACK is published only after this bounded safe boundary completes.
+      const ControlledWaitResult idle = waitForDeviceIdleControlled(
+          "vkDeviceWaitIdle.suspend", kControlledDeviceIdleBudget);
+      if (!idle.completed()) {
+        return false;
+      }
     }
     presentation_suspended_ = true;
     streamline_temporal_history_valid_ = false;
-    if (device_) {
-      // Drain all queues so the modal shell dialog cannot race RT builds.
-      (void)streamline_vulkan_runtime_.deviceWaitIdle(device_);
-    }
+    return true;
   }
 
-void VulkanBackend::resumeAfterSystemDialog() {
+bool VulkanBackend::resumeAfterSystemDialog() {
+    if (fatal_error_ || quarantine_required_) {
+      return false;
+    }
     presentation_suspended_ = false;
     // Dialog may have resized/minimized the window or stolen the GPU.
     recreate_swapchain_ = true;
@@ -1251,6 +1502,7 @@ void VulkanBackend::resumeAfterSystemDialog() {
     rt_scene_built_.fill(false);
     last_rt_scene_hash_.fill(0);
     streamline_temporal_history_valid_ = false;
+    return true;
   }
 
 bool VulkanBackend::presentationSuspended() const {
@@ -1286,11 +1538,222 @@ void VulkanBackend::enterFatalVulkanError(const FrameInput &frame, const char *a
   }
 
 void VulkanBackend::recordFatalVulkanError(const char *api, VkResult result) {
+    recordFatalError(
+        api,
+        std::string(api != nullptr ? api : "Vulkan") + " failed: " +
+            vkResultName(result) + " (" +
+            std::to_string(static_cast<int>(result)) + ")",
+        static_cast<std::int64_t>(result));
+  }
+
+void VulkanBackend::recordFatalError(const char *api, std::string detail,
+                                     std::int64_t result_code) {
+    const bool first = !fatal_error_;
     fatal_error_ = true;
-    fatal_error_detail_ = std::string(api) + " failed: " +
-                          vkResultName(result) + " (" +
-                          std::to_string(static_cast<int>(result)) + ")";
-    xpbd::log::error(fatal_error_detail_);
+    quarantine_required_ = true;
+    if (first) {
+      fatal_error_detail_ = std::move(detail);
+      xpbd::log::errorf("Vulkan fatal quarantine: API=%s result=%lld %s",
+                       api != nullptr ? api : "<unknown>",
+                       static_cast<long long>(result_code),
+                       fatal_error_detail_.c_str());
+    }
+    if (render_thread_control_) {
+      render_thread_control_->requestFatalQuarantine();
+    }
+  }
+
+void VulkanBackend::markGpuCompletionUnproven(const char *api) {
+    gpu_completion_unproven_ = true;
+    recordFatalError(
+        api,
+        std::string(api != nullptr ? api : "Vulkan wait") +
+            " was cancelled or timed out before GPU completion could be "
+            "proven; retaining the complete backend in quarantine",
+        static_cast<std::int64_t>(VK_TIMEOUT));
+  }
+
+bool VulkanBackend::renderThreadStopRequested() const noexcept {
+    return render_thread_control_ &&
+           render_thread_control_->stopRequested();
+  }
+
+bool VulkanBackend::interruptibleRetryDelay(
+    Clock::time_point retry_at) const {
+    for (;;) {
+      const Clock::time_point now = Clock::now();
+      if (now >= retry_at) {
+        return true;
+      }
+      if (renderThreadStopRequested()) {
+        return false;
+      }
+      const auto remaining = retry_at - now;
+      const auto slice = (std::min)(
+          remaining,
+          std::chrono::duration_cast<Clock::duration>(
+              std::chrono::milliseconds(10)));
+      std::this_thread::sleep_for(slice);
+    }
+  }
+
+VulkanBackend::ControlledWaitResult VulkanBackend::waitForFenceControlled(
+    VkFence fence, const char *stage, std::uint32_t image_index,
+    VkFence image_fence, VkCommandBuffer command,
+    bool force_diagnostics, bool allow_shutdown_drain) {
+    if (device_ == VK_NULL_HANDLE || fence == VK_NULL_HANDLE) {
+      recordFatalError(stage, "Vulkan fence wait received an invalid handle",
+                       static_cast<std::int64_t>(VK_ERROR_UNKNOWN));
+      return {VK_ERROR_UNKNOWN, ControlledWaitState::Failed};
+    }
+
+    const auto wait_start = Clock::now();
+    auto next_diagnostic = wait_start + kControlledWaitDiagnosticThreshold;
+    bool timed_out = false;
+    logDiagnosticApi(stage, "before", std::nullopt, 0.0, image_index, fence,
+                     image_fence, command, force_diagnostics, true);
+    for (;;) {
+      const RenderThreadStopReason stop_reason =
+          render_thread_control_ ? render_thread_control_->reason()
+                                 : RenderThreadStopReason::None;
+      const bool stop_wait =
+          stop_reason == RenderThreadStopReason::FatalQuarantine ||
+          (stop_reason == RenderThreadStopReason::ShutdownRequested &&
+           !allow_shutdown_drain);
+      if (stop_wait) {
+        const VkResult status = vkGetFenceStatus(device_, fence);
+        if (status == VK_SUCCESS) {
+          logDiagnosticApi(
+              stage, "after", status,
+              std::chrono::duration<double, std::milli>(Clock::now() -
+                                                        wait_start)
+                  .count(),
+              image_index, fence, image_fence, command, timed_out, false);
+          return {status, ControlledWaitState::Completed};
+        }
+        if (status != VK_NOT_READY) {
+          gpu_completion_unproven_ = true;
+          recordFatalVulkanError(stage, status);
+          return {status, ControlledWaitState::Failed};
+        }
+        markGpuCompletionUnproven(stage);
+        return {VK_TIMEOUT, ControlledWaitState::StopRequested};
+      }
+
+      const VkResult result = vkWaitForFences(
+          device_, 1u, &fence, VK_TRUE,
+          render_thread_control_ ? kControlledWaitSliceNs : UINT64_MAX);
+      if (result == VK_SUCCESS) {
+        logDiagnosticApi(
+            stage, "after", result,
+            std::chrono::duration<double, std::milli>(Clock::now() -
+                                                      wait_start)
+                .count(),
+            image_index, fence, image_fence, command, timed_out, false);
+        return {result, ControlledWaitState::Completed};
+      }
+      if (result != VK_TIMEOUT) {
+        logDiagnosticApi(
+            stage, "after", result,
+            std::chrono::duration<double, std::milli>(Clock::now() -
+                                                      wait_start)
+                .count(),
+            image_index, fence, image_fence, command, true, true);
+        gpu_completion_unproven_ = true;
+        recordFatalVulkanError(stage, result);
+        return {result, ControlledWaitState::Failed};
+      }
+
+      timed_out = true;
+      const Clock::time_point now = Clock::now();
+      if (diagnostics_enabled_ || now >= next_diagnostic) {
+        logDiagnosticApi(
+            stage, "timeout", result,
+            std::chrono::duration<double, std::milli>(now - wait_start)
+                .count(),
+            image_index, fence, image_fence, command, true, true);
+        if (now >= next_diagnostic) {
+          next_diagnostic = now + kControlledWaitDiagnosticInterval;
+        }
+      }
+    }
+  }
+
+VulkanBackend::ControlledWaitResult
+VulkanBackend::waitForDeviceIdleControlled(
+    const char *stage, std::chrono::milliseconds timeout) {
+    if (device_ == VK_NULL_HANDLE) {
+      return {VK_SUCCESS, ControlledWaitState::Completed};
+    }
+    const auto wait_start = Clock::now();
+    const FrameSync &sync = frames_[frame_index_];
+    logDiagnosticApi(stage, "before", std::nullopt, 0.0, UINT32_MAX,
+                     sync.fence, VK_NULL_HANDLE, sync.cmd, true, true);
+
+    VkResult idle_result = VK_SUCCESS;
+    if (!render_thread_control_) {
+      idle_result = streamline_vulkan_runtime_.deviceWaitIdle(device_);
+    } else {
+      struct IdleWaitState {
+        std::mutex mutex;
+        std::condition_variable changed;
+        VkResult result = VK_SUCCESS;
+        bool finished = false;
+      };
+      auto state = std::make_shared<IdleWaitState>();
+      std::thread waiter;
+      try {
+        waiter = std::thread([this, state]() {
+          const VkResult result =
+              streamline_vulkan_runtime_.deviceWaitIdle(device_);
+          {
+            std::lock_guard lock(state->mutex);
+            state->result = result;
+            state->finished = true;
+          }
+          state->changed.notify_all();
+        });
+      } catch (...) {
+        markGpuCompletionUnproven(stage);
+        return {VK_ERROR_UNKNOWN, ControlledWaitState::StopRequested};
+      }
+
+      const Clock::time_point deadline = Clock::now() + timeout;
+      bool finished = false;
+      {
+        std::unique_lock lock(state->mutex);
+        while (!(finished = state->finished)) {
+          const Clock::time_point now = Clock::now();
+          if (now >= deadline ||
+              (render_thread_control_->fatalQuarantineRequested() &&
+               quarantine_required_)) {
+            break;
+          }
+          (void)state->changed.wait_until(
+              lock, (std::min)(deadline, now + std::chrono::milliseconds(25)));
+        }
+        if (finished) {
+          idle_result = state->result;
+        }
+      }
+      if (!finished) {
+        waiter.detach();
+        markGpuCompletionUnproven(stage);
+        return {VK_TIMEOUT, ControlledWaitState::StopRequested};
+      }
+      waiter.join();
+    }
+
+    logDiagnosticApi(
+        stage, "after", idle_result,
+        std::chrono::duration<double, std::milli>(Clock::now() - wait_start)
+            .count(),
+        UINT32_MAX, sync.fence, VK_NULL_HANDLE, sync.cmd, true, false);
+    if (idle_result != VK_SUCCESS) {
+      recordFatalVulkanError(stage, idle_result);
+      return {idle_result, ControlledWaitState::Failed};
+    }
+    return {idle_result, ControlledWaitState::Completed};
   }
 
 [[nodiscard]] bool VulkanBackend::presentFenceLifecycleEnabled() const noexcept {
@@ -2196,6 +2659,35 @@ bool VulkanBackend::createDevice() {
     synchronization2_features.synchronization2 =
         synchronization2_enabled ? VK_TRUE : VK_FALSE;
 
+    VkPhysicalDeviceProperties device_properties{};
+    vkGetPhysicalDeviceProperties(phys_, &device_properties);
+    const bool private_data_core =
+        device_properties.apiVersion >= VK_API_VERSION_1_3;
+    const bool private_data_extension_supported = supportsDeviceExtension(
+        phys_, VK_EXT_PRIVATE_DATA_EXTENSION_NAME);
+    VkPhysicalDevicePrivateDataFeatures supported_private_data_features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIVATE_DATA_FEATURES};
+    if (private_data_core || private_data_extension_supported) {
+      VkPhysicalDeviceFeatures2 private_data_query{
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+      private_data_query.pNext = &supported_private_data_features;
+      vkGetPhysicalDeviceFeatures2(phys_, &private_data_query);
+    }
+    const bool private_data_enabled =
+        supported_private_data_features.privateData == VK_TRUE &&
+        (private_data_core || private_data_extension_supported);
+    VkPhysicalDevicePrivateDataFeatures private_data_features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIVATE_DATA_FEATURES};
+    private_data_features.privateData =
+        private_data_enabled ? VK_TRUE : VK_FALSE;
+    const auto append_private_data_extension =
+        [&](std::vector<const char *> &extensions) {
+          if (private_data_enabled && !private_data_core) {
+            extensions.push_back(VK_EXT_PRIVATE_DATA_EXTENSION_NAME);
+          }
+        };
+    append_private_data_extension(device_extensions);
+
     // Always need swapchain. Optionally enable NVIDIA RT extension stack when
     // the selected device is NVIDIA and supports hardware ray tracing.
     VkPhysicalDeviceBufferDeviceAddressFeatures bda_features{
@@ -2232,6 +2724,10 @@ bool VulkanBackend::createDevice() {
     if (swapchain_maintenance1_enabled_) {
       maintenance_features.pNext = optional_feature_chain;
       optional_feature_chain = &maintenance_features;
+    }
+    if (private_data_enabled) {
+      private_data_features.pNext = optional_feature_chain;
+      optional_feature_chain = &private_data_features;
     }
     const bool enable_rt = rt_capability_.supported;
     descriptor_binding_partially_bound_enabled_ =
@@ -2331,6 +2827,7 @@ bool VulkanBackend::createDevice() {
       if (memory_budget_supported_) {
         raster_exts.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
       }
+      append_private_data_extension(raster_exts);
       void *raster_features = nullptr;
       if (synchronization2_enabled) {
         raster_exts.push_back(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
@@ -2341,6 +2838,10 @@ bool VulkanBackend::createDevice() {
         raster_exts.push_back(maintenance_extension);
         maintenance_features.pNext = raster_features;
         raster_features = &maintenance_features;
+      }
+      if (private_data_enabled) {
+        private_data_features.pNext = raster_features;
+        raster_features = &private_data_features;
       }
       created = try_create(raster_exts, raster_features);
       rt_armed = false;
@@ -2355,11 +2856,16 @@ bool VulkanBackend::createDevice() {
       if (memory_budget_supported_) {
         core_exts.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
       }
+      append_private_data_extension(core_exts);
       void *core_features = nullptr;
       if (synchronization2_enabled) {
         core_exts.push_back(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
         synchronization2_features.pNext = nullptr;
         core_features = &synchronization2_features;
+      }
+      if (private_data_enabled) {
+        private_data_features.pNext = core_features;
+        core_features = &private_data_features;
       }
       created = try_create(core_exts, core_features);
       rt_armed = false;
@@ -2371,6 +2877,15 @@ bool VulkanBackend::createDevice() {
 
     vkGetDeviceQueue(device_, graphics_family_, 0, &graphics_queue_);
     vkGetDeviceQueue(device_, present_family_, 0, &present_queue_);
+    if (private_data_enabled) {
+      xpbd::log::infof("Vulkan private-data feature enabled via %s",
+                       private_data_core ? "Vulkan 1.3 core"
+                                         : VK_EXT_PRIVATE_DATA_EXTENSION_NAME);
+    } else {
+      xpbd::log::warn(
+          "Vulkan private-data feature unavailable; SDK private data slots "
+          "must remain disabled");
+    }
     if (swapchain_maintenance1_enabled_) {
       xpbd::log::infof("Vulkan present-fence lifecycle enabled via %s",
                        swapchain_maintenance1_extension_.c_str());
@@ -2507,8 +3022,8 @@ bool VulkanBackend::createSwapchain(
     if (support.caps.currentExtent.width != UINT32_MAX) {
       swap_extent_ = support.caps.currentExtent;
     } else {
-      int w = 0, h = 0;
-      SDL_GetWindowSizeInPixels(window_, &w, &h);
+      const int w = window_pixel_width_;
+      const int h = window_pixel_height_;
       if (w <= 0 || h <= 0) {
         return false;
       }
@@ -2812,39 +3327,13 @@ bool VulkanBackend::waitForPendingPresentFences(const char *reason) {
         return false;
       }
 
-      const auto wait_start = Clock::now();
-      logDiagnosticApi(stage.c_str(), "before", std::nullopt, 0.0,
-                       image_index, resource.present_fence,
-                       resource.last_in_flight, VK_NULL_HANDLE, true, true);
-      VkResult result = VK_SUCCESS;
-      if (!diagnostics_enabled_) {
-        result = vkWaitForFences(device_, 1, &resource.present_fence, VK_TRUE,
-                                 UINT64_MAX);
-      } else {
-        do {
-          result =
-              vkWaitForFences(device_, 1, &resource.present_fence, VK_TRUE,
-                              kDiagnosticWaitSliceNs);
-          if (result == VK_TIMEOUT) {
-            logDiagnosticApi(
-                stage.c_str(), "timeout", result,
-                std::chrono::duration<double, std::milli>(Clock::now() -
-                                                          wait_start)
-                    .count(),
-                image_index, resource.present_fence,
-                resource.last_in_flight, VK_NULL_HANDLE, true, true);
-          }
-        } while (result == VK_TIMEOUT);
-      }
-      logDiagnosticApi(
-          stage.c_str(), "after", result,
-          std::chrono::duration<double, std::milli>(Clock::now() - wait_start)
-              .count(),
-          image_index, resource.present_fence, resource.last_in_flight,
-          VK_NULL_HANDLE, true, false);
-      if (result != VK_SUCCESS) {
+      const ControlledWaitResult wait = waitForFenceControlled(
+          resource.present_fence, stage.c_str(), image_index,
+          resource.last_in_flight, VK_NULL_HANDLE, true,
+          reason != nullptr && std::string_view(reason) == "shutdown");
+      if (!wait.completed()) {
         SDL_Log("Vulkan present fence wait during %s failed: %d", reason,
-                static_cast<int>(result));
+                static_cast<int>(wait.result));
         return false;
       }
       resource.present_pending = false;
@@ -2917,22 +3406,17 @@ bool VulkanBackend::destroySwapchainObjects() {
   }
 
 bool VulkanBackend::recreateSwapchain() {
-    if (!window_) {
-      return false;
-    }
     SwapchainOwnership target_ownership = swapchain_recreate_target_;
     if (target_ownership == SwapchainOwnership::StreamlineFrameGenerationProxy &&
         (!streamline_vulkan_runtime_.frameGenerationActivationAllowed() ||
          !frameGenerationPlatformSupported() || vsync_)) {
       target_ownership = SwapchainOwnership::Native;
     }
-    const SDL_WindowFlags window_flags = SDL_GetWindowFlags(window_);
-    if ((window_flags & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN)) != 0) {
+    if (!window_presentation_available_) {
       return false;
     }
-    int drawable_width = 0;
-    int drawable_height = 0;
-    SDL_GetWindowSizeInPixels(window_, &drawable_width, &drawable_height);
+    const int drawable_width = window_pixel_width_;
+    const int drawable_height = window_pixel_height_;
     if (drawable_width <= 0 || drawable_height <= 0) {
       return false;
     }
@@ -2946,7 +3430,9 @@ bool VulkanBackend::recreateSwapchain() {
               "failed: %d",
               static_cast<int>(capabilities_result));
       if (capabilities_result == VK_ERROR_DEVICE_LOST) {
-        fatal_error_ = true;
+        recordFatalVulkanError(
+            "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
+            capabilities_result);
       }
       return false;
     }
@@ -2981,26 +3467,12 @@ bool VulkanBackend::recreateSwapchain() {
          !frame_generation_disable_ready &&
          drain_cycle <= kFrameGenerationDisableMaxAttempts;
          ++drain_cycle) {
-      const FrameSync &sync = frames_[frame_index_];
-      const auto idle_start = Clock::now();
-      logDiagnosticApi("vkDeviceWaitIdle.swapchain_recreate", "before",
-                       std::nullopt, 0.0, UINT32_MAX, sync.fence,
-                       VK_NULL_HANDLE, sync.cmd, true, true);
-      const VkResult idle_result =
-          streamline_vulkan_runtime_.deviceWaitIdle(device_);
-      logDiagnosticApi(
-          "vkDeviceWaitIdle.swapchain_recreate", "after", idle_result,
-          std::chrono::duration<double, std::milli>(Clock::now() - idle_start)
-              .count(),
-          UINT32_MAX, sync.fence, VK_NULL_HANDLE, sync.cmd, true, false);
-      if (idle_result != VK_SUCCESS) {
+      const ControlledWaitResult idle = waitForDeviceIdleControlled(
+          "vkDeviceWaitIdle.swapchain_recreate",
+          kControlledDeviceIdleBudget);
+      if (!idle.completed()) {
         SDL_Log("Vulkan device idle wait before swapchain recreate failed: %d",
-                static_cast<int>(idle_result));
-        if (idle_result == VK_ERROR_DEVICE_LOST) {
-          fatal_error_ = true;
-          fatal_error_detail_ =
-              "VK_ERROR_DEVICE_LOST while draining DLSS-G transition";
-        }
+                static_cast<int>(idle.result));
         return false;
       }
       // Proxy presents do not expose an application maintenance1 fence.
@@ -3719,16 +4191,37 @@ void VulkanBackend::createTimestampQueryPools() {
   }
 
 
+VkDescriptorSet VulkanBackend::resolveUiLogicalTexture(
+    std::uint64_t logical_texture_id) const noexcept {
+  if (!font_ready_ ||
+      logical_texture_id !=
+          uiLogicalTextureId(UiLogicalTexture::FontAtlas)) {
+    return VK_NULL_HANDLE;
+  }
+  return desc_set_;
+}
+
 int VulkanBackend::drawUi(FrameSync &frame, const UiDrawData &ui,
                           bool overlay_only) {
-  if (!ui.ctx || !ui.cmds || !ui.vertices || !ui.indices) {
+  const bool owned_ui = ui.vertex_data != nullptr && ui.index_data != nullptr &&
+                        ui.draw_commands != nullptr;
+  const bool legacy_ui = ui.ctx != nullptr && ui.cmds != nullptr &&
+                         ui.vertices != nullptr && ui.indices != nullptr;
+  if (!owned_ui && !legacy_ui) {
     return 0;
   }
-  const nk_size vsize = ui.vertices->allocated > 0
-                            ? ui.vertices->allocated
-                            : nk_buffer_total(ui.vertices);
-  const nk_size esize = ui.indices->allocated > 0 ? ui.indices->allocated
-                                                  : nk_buffer_total(ui.indices);
+  const std::size_t vsize =
+      owned_ui ? ui.vertex_bytes
+               : static_cast<std::size_t>(
+                     ui.vertices->allocated > 0
+                         ? ui.vertices->allocated
+                         : nk_buffer_total(ui.vertices));
+  const std::size_t esize =
+      owned_ui ? ui.index_bytes
+               : static_cast<std::size_t>(
+                     ui.indices->allocated > 0
+                         ? ui.indices->allocated
+                         : nk_buffer_total(ui.indices));
   if (vsize == 0 || esize == 0 || !frame.ui_vbo.buffer ||
       !frame.ui_ibo.buffer) {
     return 0;
@@ -3755,8 +4248,6 @@ int VulkanBackend::drawUi(FrameSync &frame, const UiDrawData &ui,
   vkCmdSetScissor(cmd, 0, 1, &full);
 
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ui_pipeline_);
-  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ui_layout_, 0,
-                          1, &desc_set_, 0, nullptr);
   vkCmdPushConstants(cmd, ui_layout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc),
                      pc);
   VkDeviceSize off = 0;
@@ -3775,17 +4266,30 @@ int VulkanBackend::drawUi(FrameSync &frame, const UiDrawData &ui,
         x0, y0, x1, y1, sx, sy, swap_width, swap_height);
   };
 
-  const nk_draw_command *dcmd = nullptr;
-  uint32_t index_offset = 0;
   int draw_commands = 0;
-  nk_draw_foreach(dcmd, ui.ctx, ui.cmds) {
-    if (!dcmd || dcmd->elem_count == 0) {
-      continue;
+  const auto draw_command = [&](std::uint32_t element_count,
+                                 std::uint32_t index_offset,
+                                 std::uint64_t logical_texture_id, float clip_x,
+                                 float clip_y, float clip_w, float clip_h) {
+    if (element_count == 0u) {
+      return;
+    }
+    const VkDescriptorSet descriptor =
+        resolveUiLogicalTexture(logical_texture_id);
+    if (descriptor == VK_NULL_HANDLE) {
+      if (!isKnownUiLogicalTextureId(logical_texture_id) &&
+          (!rejected_ui_texture_id_ ||
+           *rejected_ui_texture_id_ != logical_texture_id)) {
+        const std::string message =
+            "Vulkan UI rejected unknown logical texture ID " +
+            std::to_string(logical_texture_id);
+        writeLog(message.c_str());
+        rejected_ui_texture_id_ = logical_texture_id;
+      }
+      return;
     }
     ViewportRect rect = convertRect(
-        dcmd->clip_rect.x, dcmd->clip_rect.y,
-        dcmd->clip_rect.x + dcmd->clip_rect.w,
-        dcmd->clip_rect.y + dcmd->clip_rect.h);
+        clip_x, clip_y, clip_x + clip_w, clip_y + clip_h);
     if (overlay_only) {
       const ViewportRect overlay = convertRect(
           ui.overlay_x, ui.overlay_y, ui.overlay_x + ui.overlay_w,
@@ -3802,26 +4306,46 @@ int VulkanBackend::drawUi(FrameSync &frame, const UiDrawData &ui,
       rect.h = (std::max)(0, clipped_y1 - clipped_y0);
     }
     if (rect.w <= 0 || rect.h <= 0) {
-      index_offset += dcmd->elem_count;
-      continue;
+      return;
     }
     VkRect2D sc{};
     sc.offset.x = rect.x;
     sc.offset.y = rect.y;
     sc.extent.width = static_cast<uint32_t>(rect.w);
     sc.extent.height = static_cast<uint32_t>(rect.h);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ui_layout_, 0,
+                            1, &descriptor, 0, nullptr);
     vkCmdSetScissor(cmd, 0, 1, &sc);
-    vkCmdDrawIndexed(cmd, dcmd->elem_count, 1, index_offset, 0, 0);
-    index_offset += dcmd->elem_count;
+    vkCmdDrawIndexed(cmd, element_count, 1, index_offset, 0, 0);
     ++draw_commands;
+  };
+
+  if (owned_ui) {
+    for (std::size_t index = 0; index < ui.draw_command_count; ++index) {
+      const UiDrawCommand &command = ui.draw_commands[index];
+      draw_command(command.element_count, command.index_offset,
+                    command.logical_texture_id, command.clip_x, command.clip_y,
+                    command.clip_w, command.clip_h);
+    }
+  } else {
+    const nk_draw_command *command = nullptr;
+    std::uint32_t index_offset = 0u;
+    nk_draw_foreach(command, ui.ctx, ui.cmds) {
+      if (command == nullptr || command->elem_count == 0u) {
+        continue;
+      }
+      draw_command(
+          command->elem_count, index_offset,
+          static_cast<std::uint64_t>(
+              static_cast<std::uint32_t>(command->texture.id)),
+          command->clip_rect.x, command->clip_rect.y, command->clip_rect.w,
+          command->clip_rect.h);
+      index_offset += command->elem_count;
+    }
   }
   return draw_commands;
 }
 
-}
-
-std::unique_ptr<IGpuBackend> createVulkanBackend() {
-  return std::make_unique<detail::VulkanBackend>();
 }
 
 }

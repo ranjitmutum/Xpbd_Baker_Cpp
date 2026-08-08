@@ -1,12 +1,26 @@
 #version 460
 #extension GL_EXT_ray_tracing : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "src/gfx/spirv/labpbr_emission.glsl"
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT topLevelAS;
 layout(set = 0, binding = 1, rgba16f) uniform image2D outputImage;
 layout(set = 0, binding = 3, std430) readonly buffer IndexBuffer {
   uint indices[];
 };
+layout(set = 0, binding = 4, std430) readonly buffer UvBuffer {
+  vec2 uvs[];
+};
+layout(set = 0, binding = 5) uniform sampler2D albedoTexture;
+layout(set = 0, binding = 6, std430) readonly buffer ColorBuffer {
+  vec4 colors[];
+};
+layout(set = 0, binding = 7, std430) readonly buffer PrimitiveFlagBuffer {
+  uint primitiveFlags[];
+};
 layout(set = 0, binding = 10, r32f) uniform image2D outputDepth;
+layout(set = 0, binding = 13) uniform sampler2D specularTexture;
 layout(set = 0, binding = 14) uniform sampler2D environmentTexture;
 
 struct EnvironmentAliasEntry {
@@ -145,18 +159,14 @@ struct PrimaryPayload {
   float opacity;
   vec4 attenuation;
   uvec4 status;
-  // xy barycentrics, z uintBitsToFloat(instance id), w reserved.
+  // xy barycentrics, z uintBitsToFloat(instance id), w LabPBR SSS [0,1].
   vec4 hitData;
   // x = cone width at the ray origin, y = angular spread.
   vec2 rayCone;
 };
 
-struct ShadowPayload {
-  float visibility;
-  float reserved;
-  vec2 rayCone;
-};
-
+const uint kMaterialTextured = 1u << 0u;
+const uint kMaterialCutout = 1u << 1u;
 const uint kMaterialBlend = 1u << 2u;
 const uint kSunBackgroundVisible = 1u << 4u;
 const uint kMoonBackgroundVisible = 1u << 5u;
@@ -179,9 +189,9 @@ const uint kRngDomainLightRegistry = 0x4c524547u;
 const uint kRngDomainRussianRoulette = 0x52524f55u;
 const uint kRngDomainVolume = 0x564f4c55u;
 const uint kRngDomainRestir = 0x52535452u;
+const uint kRngDomainSubsurface = 0x53535320u;
 
 layout(location = 0) rayPayloadEXT PrimaryPayload payload;
-layout(location = 1) rayPayloadEXT ShadowPayload shadowPayload;
 
 struct EnvironmentSample {
   vec3 direction;
@@ -361,7 +371,7 @@ RayCone propagateRayCone(RayCone cone, float distance, uint lobe,
   cone.width = rayConeWidthAtDistance(cone, distance);
   float alpha = clamp(ggxAlpha, 0.0, 1.0);
   float lobeSpread = 0.0;
-  if (lobe == 0u) {
+  if (lobe == 0u || lobe == 3u) {
     lobeSpread = 0.5;
   } else if (lobe == 1u) {
     lobeSpread = 0.5 * sqrt(alpha);
@@ -421,6 +431,16 @@ vec3 sampleUniformSphere(float sampleU, float sampleV) {
   float radius = sqrt(max(0.0, 1.0 - y * y));
   float angle = 6.28318530718 * clamp(sampleV, 0.0, 0.99999994);
   return vec3(radius * cos(angle), y, radius * sin(angle));
+}
+
+float subsurfaceOpticalDepth(float subsurface) {
+  return mix(0.35, 2.0, clamp(subsurface, 0.0, 1.0));
+}
+
+float subsurfaceFreeFlightFraction(float subsurface, float sampleValue) {
+  float survival = max(1.0 - clamp(sampleValue, 0.0, 0.99999994),
+                       1.0e-7);
+  return -log(survival) / subsurfaceOpticalDepth(subsurface);
 }
 
 vec3 cosineHemisphere(vec3 normal, float sampleU, float sampleV) {
@@ -654,6 +674,41 @@ vec3 evaluateBsdf(vec3 baseColor, vec3 f0, vec3 reflectionTint,
       baseColor, f0, reflectionTint, ggxAlpha, transmission, ior,
       metal, thinWalled, frontFace, normal, view,
       light, diffuse, specular, pdf);
+  return diffuse + specular;
+}
+
+void evaluateBsdfComponentsSubsurface(
+    vec3 baseColor, vec3 f0, vec3 reflectionTint, float ggxAlpha,
+    float transmission, float ior, bool metal, bool thinWalled,
+    bool frontFace, vec3 normal, vec3 view, vec3 light, float subsurface,
+    out vec3 diffuse, out vec3 specular, out float pdf) {
+  evaluateBsdfComponents(
+      baseColor, f0, reflectionTint, ggxAlpha, transmission, ior, metal,
+      thinWalled, frontFace, normal, view, light, diffuse, specular, pdf);
+  float split = clamp(subsurface, 0.0, 1.0);
+  if (!(split > 0.0)) {
+    return;
+  }
+  vec3 probabilities;
+  lobeProbabilities(baseColor, f0, metal, transmission, ior,
+                    probabilities);
+  float diffusePdf = max(dot(normal, light), 0.0) *
+                     (1.0 / 3.14159265358979323846);
+  diffuse *= 1.0 - split;
+  pdf = max(pdf - probabilities.x * split * diffusePdf, 0.0);
+}
+
+vec3 evaluateBsdfSubsurface(
+    vec3 baseColor, vec3 f0, vec3 reflectionTint, float ggxAlpha,
+    float transmission, float ior, bool metal, bool thinWalled,
+    bool frontFace, vec3 normal, vec3 view, vec3 light, float subsurface,
+    out float pdf) {
+  vec3 diffuse;
+  vec3 specular;
+  evaluateBsdfComponentsSubsurface(
+      baseColor, f0, reflectionTint, ggxAlpha, transmission, ior, metal,
+      thinWalled, frontFace, normal, view, light, subsurface, diffuse,
+      specular, pdf);
   return diffuse + specular;
 }
 
@@ -1192,6 +1247,39 @@ float meshLightPdf(uint primitive, vec3 source, vec3 lightPoint) {
              : 0.0;
 }
 
+vec3 evaluateMeshLightRadiance(uint primitive, float b0, float b1,
+                               float b2) {
+  if (primitive >= emissiveInfo.x) {
+    return vec3(0.0);
+  }
+  uint flags = primitiveFlags[primitive];
+  uint materialFeatures = (pc.sampling.w >> 8u) & 0xffu;
+  if ((flags & kMaterialTextured) == 0u ||
+      (materialFeatures & 2u) == 0u) {
+    return vec3(0.0);
+  }
+  uint i0 = indices[primitive * 3u + 0u];
+  uint i1 = indices[primitive * 3u + 1u];
+  uint i2 = indices[primitive * 3u + 2u];
+  vec2 uv = uvs[i0] * b0 + uvs[i1] * b1 + uvs[i2] * b2;
+  vec4 vertexColor = colors[i0] * b0 + colors[i1] * b1 + colors[i2] * b2;
+  vec4 sampledAlbedo = textureLod(albedoTexture, uv, 0.0);
+  vec4 sampledSpecular = textureLod(specularTexture, uv, 0.0);
+  if (any(isnan(vertexColor)) || any(isinf(vertexColor)) ||
+      any(isnan(sampledAlbedo)) || any(isinf(sampledAlbedo)) ||
+      any(isnan(sampledSpecular)) || any(isinf(sampledSpecular))) {
+    return vec3(0.0);
+  }
+  vec4 baseColor = clamp(sampledAlbedo * vertexColor,
+                         vec4(0.0), vec4(1.0));
+  vec3 radiance = evaluateLabPbrEmission(
+      baseColor.rgb, clamp(sampledSpecular.a, 0.0, 1.0));
+  float coverageWeight = labPbrEmissionCoverageWeight(
+      baseColor.a, (flags & kMaterialCutout) != 0u,
+      (flags & kMaterialBlend) != 0u);
+  return max(radiance * coverageWeight, vec3(0.0));
+}
+
 MeshLightSample sampleMeshLight(
     vec3 source, float columnSample, float coinSample,
     float triangleSampleU, float triangleSampleV) {
@@ -1238,7 +1326,8 @@ MeshLightSample sampleMeshLight(
           ? entry.p0Probability.w * distanceSquared /
                 (entry.p2Area.w * lightCosine)
           : 0.0;
-  result.radiance = max(entry.emissionLuminance.rgb, vec3(0.0));
+  result.radiance = evaluateMeshLightRadiance(
+      entry.metadata.z, b0, b1, b2);
   result.valid = result.pdf > 0.0 && max3(result.radiance) > 0.0 &&
                  finite3(result.direction) && finite3(result.radiance);
   return result;
@@ -1717,6 +1806,9 @@ PrimaryAovProbe probePrimaryAov(vec3 cameraOrigin, vec3 direction,
     bool metal = (payload.status.y & 1u) != 0u;
     bool predefinedMetal = (payload.status.y & 2u) != 0u;
     bool physicalTransmission = payload.transmission > 0.0;
+    // Positive LabPBR SSS remains a closed dielectric primary surface.
+    // Unlike physical transmission or coverage Blend, it does not make the
+    // surface a Transparency/Reactive guide event.
     vec3 reflectionTint =
         predefinedMetal
             ? clamp(payload.baseColor, vec3(0.0), vec3(1.0))
@@ -2048,10 +2140,85 @@ void main() {
     bool insideSolidMedium = false;
     vec3 mediumAttenuationColor = vec3(1.0);
     float mediumAttenuationDistance = 0.0;
+    bool insideSubsurfaceMedium = false;
+    float subsurfaceStrength = 0.0;
+    float subsurfaceIor = 1.3;
+    uint subsurfaceInstanceId = 0u;
+    uint subsurfaceScatters = 0u;
 
     uint bounce = 0u;
     while (bounce < maxBounces) {
       tracePrimary(origin, direction, rayCone);
+      if (insideSubsurfaceMedium) {
+        if (payload.status.x == 0u || !(payload.t > 0.0) ||
+            floatBitsToUint(payload.hitData.z) != subsurfaceInstanceId) {
+          // An SSS random walk requires a closed boundary in the same RT
+          // instance. Fail dark rather than leaking energy through open or
+          // overlapping geometry.
+          break;
+        }
+        samplePathLength += 1.0;
+        PathRngState subsurfaceRng = makePathRng(
+            pixel, sampleIndex, bounce, kRngDomainSubsurface,
+            subsurfaceScatters, pc.sampling.z);
+        float freeFlightSample = nextRandom(subsurfaceRng);
+        float phaseSampleU = nextRandom(subsurfaceRng);
+        float phaseSampleV = nextRandom(subsurfaceRng);
+        float boundarySample = nextRandom(subsurfaceRng);
+        float freeFlightFraction = subsurfaceFreeFlightFraction(
+            subsurfaceStrength, freeFlightSample);
+        if (freeFlightFraction < 1.0) {
+          float traveledDistance = payload.t * freeFlightFraction;
+          origin += direction * traveledDistance;
+          direction = sampleUniformSphere(phaseSampleU, phaseSampleV);
+          rayCone = propagateRayCone(
+              rayCone, traveledDistance, 0u, 1.0, 1.0);
+          previousBsdfPdf = 0.0;
+          previousWasDelta = true;
+          ++subsurfaceScatters;
+          ++bounce;
+          continue;
+        }
+
+        vec3 boundaryPosition = origin + direction * payload.t;
+        vec3 authoredBoundaryNormal = safeNormalize(
+            payload.geometricNormal, vec3(0.0, 1.0, 0.0));
+        vec3 outwardNormal =
+            dot(direction, authoredBoundaryNormal) >= 0.0
+                ? authoredBoundaryNormal
+                : -authoredBoundaryNormal;
+        float boundaryCosine =
+            clamp(abs(dot(direction, outwardNormal)), 0.0, 1.0);
+        float boundaryFresnel = dielectricFresnel(
+            boundaryCosine, subsurfaceIor, 1.0);
+        vec3 refracted = refract(
+            direction, -outwardNormal, subsurfaceIor);
+        bool totalInternalReflection = dot(refracted, refracted) <= 1.0e-12;
+        bool reflectAtBoundary =
+            totalInternalReflection || boundarySample < boundaryFresnel;
+        if (reflectAtBoundary) {
+          direction = safeNormalize(
+              reflect(direction, outwardNormal), -outwardNormal);
+          origin = offsetRayOrigin(
+              boundaryPosition, outwardNormal, direction);
+          rayCone = propagateRayCone(
+              rayCone, payload.t, 1u, 0.0, 1.0);
+        } else {
+          direction = safeNormalize(refracted, outwardNormal);
+          origin = offsetRayOrigin(
+              boundaryPosition, outwardNormal, direction);
+          rayCone = propagateRayCone(
+              rayCone, payload.t, 2u, 0.0, subsurfaceIor);
+          insideSubsurfaceMedium = false;
+          subsurfaceStrength = 0.0;
+          subsurfaceIor = 1.3;
+        }
+        previousBsdfPdf = 0.0;
+        previousWasDelta = true;
+        ++subsurfaceScatters;
+        ++bounce;
+        continue;
+      }
       if (payload.status.x == 0u || !(payload.t >= 0.0)) {
         float environmentLod = rayConeEnvironmentLod(rayCone);
         vec3 missRadiance = backgroundEnvironment(direction, environmentLod);
@@ -2165,6 +2332,14 @@ void main() {
       bool metal = (payload.status.y & 1u) != 0u;
       bool predefinedMetal = (payload.status.y & 2u) != 0u;
       bool thinWalled = (payload.status.y & 4u) != 0u;
+      bool cutoutMaterial = (payload.status.z & kMaterialCutout) != 0u;
+      float subsurface =
+          !isnan(payload.hitData.w) && !isinf(payload.hitData.w)
+              ? clamp(payload.hitData.w, 0.0, 1.0)
+              : 0.0;
+      bool subsurfaceActive =
+          subsurface > 0.0 && !metal && !thinWalled && !cutoutMaterial &&
+          !blendMaterial && frontFace;
       vec3 attenuationColor =
           finite3(payload.attenuation.rgb)
               ? clamp(payload.attenuation.rgb, vec3(1.0e-6), vec3(1.0))
@@ -2236,11 +2411,7 @@ void main() {
             !(registryNoL > 0.0)) {
           continue;
         }
-        shadowPayload.visibility = 1.0;
-        shadowPayload.reserved = 0.0;
-        shadowPayload.rayCone = vec2(
-            rayConeWidthAtDistance(rayCone, payload.t),
-            max(rayCone.spreadAngle, 0.0));
+        float shadowVisibility = 1.0;
         if (registrySample.castsShadow) {
           vec3 shadowOrigin = offsetRayOrigin(
               hitPosition, geometricNormal, registrySample.direction);
@@ -2251,21 +2422,36 @@ void main() {
           if (!(shadowDistance > 0.0)) {
             continue;
           }
+          PrimaryPayload savedPayload = payload;
+          payload.transmission = 1.0;
+          payload.rayCone = vec2(
+              rayConeWidthAtDistance(rayCone, savedPayload.t),
+              max(rayCone.spreadAngle, 0.0));
           traceRayEXT(
               topLevelAS,
               gl_RayFlagsTerminateOnFirstHitEXT |
                   gl_RayFlagsSkipClosestHitShaderEXT,
               0xff, 0, 1, 1, shadowOrigin, 0.0,
-              registrySample.direction, shadowDistance, 1);
+              registrySample.direction, shadowDistance, 0);
+          shadowVisibility = payload.transmission;
+          payload = savedPayload;
         }
         float registryBsdfPdf = 0.0;
         vec3 registryDiffuseBsdf;
         vec3 registrySpecularBsdf;
-        evaluateBsdfComponents(
-            baseColor, f0, reflectionTint, ggxAlpha, transmission, ior,
-            metal, thinWalled, frontFace, normal, view,
-            registrySample.direction, registryDiffuseBsdf,
-            registrySpecularBsdf, registryBsdfPdf);
+        if (subsurfaceActive) {
+          evaluateBsdfComponentsSubsurface(
+              baseColor, f0, reflectionTint, ggxAlpha, transmission, ior,
+              metal, thinWalled, frontFace, normal, view,
+              registrySample.direction, subsurface, registryDiffuseBsdf,
+              registrySpecularBsdf, registryBsdfPdf);
+        } else {
+          evaluateBsdfComponents(
+              baseColor, f0, reflectionTint, ggxAlpha, transmission, ior,
+              metal, thinWalled, frontFace, normal, view,
+              registrySample.direction, registryDiffuseBsdf,
+              registrySpecularBsdf, registryBsdfPdf);
+        }
         float correction = shadingNormalCorrection(
             geometricNormal, normal, view, registrySample.direction);
         float misWeight =
@@ -2274,7 +2460,7 @@ void main() {
                 : 1.0;
         vec3 registryScale =
             throughput * registrySample.radiance *
-            (registryNoL * clamp(shadowPayload.visibility, 0.0, 1.0) *
+            (registryNoL * clamp(shadowVisibility, 0.0, 1.0) *
              correction * misWeight / registrySample.pdf);
         registryDiffuseSum += registryScale * registryDiffuseBsdf;
         registrySpecularSum += registryScale * registrySpecularBsdf;
@@ -2312,6 +2498,7 @@ void main() {
       float nextBsdfPdf = 0.0;
       bool nextWasDelta = false;
       uint nextLobe = 0u;
+      bool startSubsurface = false;
 
       float etaIncident = frontFace ? 1.0 : ior;
       float etaTransmitted = frontFace ? ior : 1.0;
@@ -2324,18 +2511,50 @@ void main() {
         if (bounce == 0u) {
           primaryPathClass = 1u;
         }
-        nextDirection = cosineHemisphere(normal, sampleU, sampleV);
-        float pdf = 0.0;
-        vec3 value = evaluateBsdf(
-            baseColor, f0, reflectionTint, ggxAlpha, transmission, ior,
-            metal, thinWalled, frontFace, normal, view, nextDirection, pdf);
-        if (!(pdf > 0.0)) {
-          break;
+        float localDiffuseProbability =
+            probabilities.x * (subsurfaceActive ? 1.0 - subsurface : 1.0);
+        if (subsurfaceActive && lobeSample >= localDiffuseProbability) {
+          float subsurfaceProbability = probabilities.x * subsurface;
+          if (!(subsurfaceProbability > 0.0)) {
+            break;
+          }
+          // Geometry, rather than a potentially aggressive normal map,
+          // defines the closed-volume entry hemisphere.
+          nextDirection = cosineHemisphere(
+              -geometricNormal, sampleU, sampleV);
+          float entryFresnel = dielectricFresnel(
+              max(dot(normal, view), 0.0), 1.0, ior);
+          sampleWeight =
+              baseColor * (1.0 - transmission) *
+              (1.0 - entryFresnel) * subsurface /
+              subsurfaceProbability;
+          nextBsdfPdf = subsurfaceProbability *
+                        max(dot(-geometricNormal, nextDirection), 0.0) *
+                        (1.0 / 3.14159265358979323846);
+          nextWasDelta = true;
+          nextLobe = 3u;
+          startSubsurface = true;
+        } else {
+          nextDirection = cosineHemisphere(normal, sampleU, sampleV);
+          float pdf = 0.0;
+          vec3 value =
+              subsurfaceActive
+                  ? evaluateBsdfSubsurface(
+                        baseColor, f0, reflectionTint, ggxAlpha,
+                        transmission, ior, metal, thinWalled, frontFace,
+                        normal, view, nextDirection, subsurface, pdf)
+                  : evaluateBsdf(
+                        baseColor, f0, reflectionTint, ggxAlpha,
+                        transmission, ior, metal, thinWalled, frontFace,
+                        normal, view, nextDirection, pdf);
+          if (!(pdf > 0.0)) {
+            break;
+          }
+          nextBsdfPdf = pdf;
+          sampleWeight =
+              value * max(dot(normal, nextDirection), 0.0) / pdf;
+          nextLobe = 0u;
         }
-        nextBsdfPdf = pdf;
-        sampleWeight =
-            value * max(dot(normal, nextDirection), 0.0) / pdf;
-        nextLobe = 0u;
       } else {
         float interfaceProbability = probabilities.y + probabilities.z;
         if (!(interfaceProbability > 0.0)) {
@@ -2467,10 +2686,16 @@ void main() {
             nextWasDelta = true;
           } else if (reflectEvent) {
             float pdf = 0.0;
-            vec3 value = evaluateBsdf(
-                baseColor, f0, reflectionTint, ggxAlpha, transmission, ior,
-                metal, thinWalled, frontFace, normal, view, nextDirection,
-                pdf);
+            vec3 value =
+                subsurfaceActive
+                    ? evaluateBsdfSubsurface(
+                          baseColor, f0, reflectionTint, ggxAlpha,
+                          transmission, ior, metal, thinWalled, frontFace,
+                          normal, view, nextDirection, subsurface, pdf)
+                    : evaluateBsdf(
+                          baseColor, f0, reflectionTint, ggxAlpha,
+                          transmission, ior, metal, thinWalled, frontFace,
+                          normal, view, nextDirection, pdf);
             if (!(pdf > 0.0)) {
               break;
             }
@@ -2492,8 +2717,11 @@ void main() {
         }
       }
 
-      float correction = shadingNormalCorrection(
-          geometricNormal, normal, view, nextDirection);
+      float correction =
+          startSubsurface
+              ? 1.0
+              : shadingNormalCorrection(
+                    geometricNormal, normal, view, nextDirection);
       throughput *= sampleWeight * correction;
       if (!finite3(throughput) || !finite3(nextDirection) ||
           max3(throughput) <= 1.0e-5) {
@@ -2509,6 +2737,13 @@ void main() {
           mediumAttenuationColor = vec3(1.0);
           mediumAttenuationDistance = 0.0;
         }
+      }
+      if (startSubsurface) {
+        insideSubsurfaceMedium = true;
+        subsurfaceStrength = subsurface;
+        subsurfaceIor = ior;
+        subsurfaceInstanceId = floatBitsToUint(payload.hitData.z);
+        subsurfaceScatters = 0u;
       }
       previousBsdfPdf = nextBsdfPdf;
       previousWasDelta = nextWasDelta;

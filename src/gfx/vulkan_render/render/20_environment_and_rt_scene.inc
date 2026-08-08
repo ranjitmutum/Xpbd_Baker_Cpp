@@ -155,12 +155,19 @@
     bool rt_as_needs_record = false;
     std::uint64_t rt_upload_bytes_frame = 0;
     float rt_emitter_distribution_frame_ms = 0.0f;
+    std::uint64_t static_resource_upload_bytes_frame = 0u;
+    bool static_resource_rebuilt_this_frame = false;
     std::uint64_t rt_streamline_topology_hash =
         14695981039346656037ull;
     std::uint64_t rt_streamline_material_hash =
         14695981039346656037ull;
     std::uint64_t rt_emissive_generation =
         frame.rt_scene_generations.emission;
+    std::vector<float> rt_motion_commit_positions;
+    std::vector<float> rt_motion_commit_bones;
+    std::uint64_t rt_motion_commit_topology_hash = 0u;
+    bool rt_motion_commit_candidate_valid = false;
+    bool rt_motion_clear_on_commit = false;
     if (active_render_path_ == RenderPath::RayTracing &&
         rt_capability_.device_extensions_enabled && !presentation_suspended_) {
       std::vector<float> packed_bones;
@@ -306,40 +313,95 @@
               .count();
 
       const bool have_rt_geometry = static_input || geometry_view_count != 0u;
+      const bool explicit_motion_history_valid =
+          rt_motion_history_valid_ &&
+          topology_hash == rt_motion_topology_hash_;
+      RtSceneSynchronousUpdate rt_update{};
+      rt_update.bone_transforms =
+          packed_bones.empty() ? nullptr : packed_bones.data();
+      rt_update.bone_count = packed_bones.size() / 16u;
+      rt_update.bone_tints =
+          packed_tints.empty() ? nullptr : packed_tints.data();
+      rt_update.tint_count = packed_tints.size() / 4u;
+      rt_update.colored_geometry = std::span<const RtColoredGeometryView>(
+          geometry_views.data(), geometry_view_count);
+      rt_update.include_rest_model = static_input;
+      rt_update.previous_packed_positions =
+          explicit_motion_history_valid
+              ? std::span<const float>(rt_motion_previous_positions_)
+              : std::span<const float>{};
+      rt_update.previous_bone_transforms =
+          explicit_motion_history_valid &&
+                  !rt_motion_previous_bones_.empty()
+              ? rt_motion_previous_bones_.data()
+              : nullptr;
+      rt_update.previous_bone_count =
+          explicit_motion_history_valid
+              ? rt_motion_previous_bones_.size() / 16u
+              : 0u;
+      rt_update.explicit_motion_history_valid =
+          explicit_motion_history_valid;
+      rt_update.generations = effective_generations;
+      rt_update.generations_valid = frame.rt_scene_generations_valid;
+      rt_update.scene_hash = scene_hash;
+      rt_update.topology_hash = topology_hash;
+
+      bool scene_committed = false;
+      if (static_refresh_pending) {
+        const auto total_rt_upload_bytes = [&] {
+          std::uint64_t total = 0u;
+          const auto append_scenes = [&](const auto &scenes) {
+            for (const auto &scene : scenes) {
+              if (scene) {
+                const std::uint64_t bytes = scene->stats().upload_bytes;
+                total = bytes >
+                                (std::numeric_limits<std::uint64_t>::max)() -
+                                    total
+                            ? (std::numeric_limits<std::uint64_t>::max)()
+                            : total + bytes;
+              }
+            }
+          };
+          append_scenes(rt_scenes_);
+          append_scenes(rt_scene_candidates_);
+          return total;
+        };
+        const std::uint64_t rt_upload_before = total_rt_upload_bytes();
+        if (!rebuildStaticModelResources(
+                *frame.static_model, frame.static_model_texture,
+                frame.static_model_material,
+                frame.static_model_generation,
+                frame.static_texture_generation,
+                static_resource_upload_bytes_frame, &rt_update)) {
+          writeLog("Vulkan static CPU/GPU/RT Candidate transaction failed");
+          return;
+        }
+        const std::uint64_t rt_upload_after = total_rt_upload_bytes();
+        if (rt_upload_after >= rt_upload_before) {
+          rt_upload_bytes_frame += rt_upload_after - rt_upload_before;
+        }
+        static_refresh_pending = false;
+        static_resource_rebuilt_this_frame = true;
+        scene_committed = true;
+        rt_scene = rt_scenes_[frame_index_].get();
+      }
+
       bool as_ok = !static_refresh_pending && rt_scene_built &&
-                   rt_scene.ready() && scene_hash == last_rt_scene_hash;
-      if (as_ok) {
-        rt_scene.markMotionStable();
+                   rt_scene->ready() && scene_hash == last_rt_scene_hash;
+      if (as_ok && !scene_committed) {
+        rt_scene->markMotionStable();
       }
       // Empty-scene transition frames are valid: there is no BLAS/TLAS input
       // to build yet, so keep the raster path quiet until geometry arrives.
       if (!as_ok && !static_refresh_pending && have_rt_geometry) {
-        // CPU skin + append all scene triangles, then mark BLAS build/refit.
-        const bool explicit_motion_history_valid =
-            rt_motion_history_valid_ &&
-            topology_hash == rt_motion_topology_hash_;
-        const RtSceneStats before_scene_update = rt_scene.stats();
-        const bool scene_updated = rt_scene.updateGeometry(
-            packed_bones.empty() ? nullptr : packed_bones.data(),
-            packed_bones.size() / 16u,
-            packed_tints.empty() ? nullptr : packed_tints.data(),
-            packed_tints.size() / 4u,
-            std::span<const RtColoredGeometryView>(
-                geometry_views.data(), geometry_view_count),
-            static_input,
-            explicit_motion_history_valid
-                ? std::span<const float>(rt_motion_previous_positions_)
-                : std::span<const float>{},
-            explicit_motion_history_valid &&
-                    !rt_motion_previous_bones_.empty()
-                ? rt_motion_previous_bones_.data()
-                : nullptr,
-            explicit_motion_history_valid
-                ? rt_motion_previous_bones_.size() / 16u
-                : 0u,
-            explicit_motion_history_valid, effective_generations,
-            frame.rt_scene_generations_valid);
-        const RtSceneStats after_scene_update = rt_scene.stats();
+        // Prepare and build on the unpublished scratch scene. The published
+        // CPU/GPU/RT set is not mutated unless the Candidate fence succeeds.
+        VulkanRtScene &candidate =
+            *rt_scene_candidates_[frame_index_];
+        const RtSceneStats before_scene_update = candidate.stats();
+        const bool scene_updated =
+            prepareRtSceneCandidate(frame_index_, rt_update);
+        const RtSceneStats after_scene_update = candidate.stats();
         if (after_scene_update.upload_bytes >=
             before_scene_update.upload_bytes) {
           rt_upload_bytes_frame += after_scene_update.upload_bytes -
@@ -348,29 +410,34 @@
         rt_emitter_distribution_frame_ms +=
             after_scene_update.emitter_distribution_ms;
         if (scene_updated) {
-          rt_scene_built = true;
-          last_rt_scene_hash = scene_hash;
+          publishRtSceneCandidate(frame_index_, scene_hash);
+          rt_scene = rt_scenes_[frame_index_].get();
           as_ok = true;
-          rt_as_needs_record = true;
-          const std::span<const float> current_positions =
-              rt_scene.packedPositionSnapshot();
-          rt_motion_previous_positions_.assign(
-              current_positions.begin(), current_positions.end());
-          rt_motion_previous_bones_ = packed_bones;
-          rt_motion_topology_hash_ = topology_hash;
-          rt_motion_history_valid_ = true;
+          scene_committed = true;
         } else if (!rt_fallback_logged_) {
           xpbd::log::warnf(
               "Vulkan RT: acceleration rebuild failed; using raster path (%s)",
-              rt_scene.lastUpdateFailureReason());
+              candidate.lastUpdateFailureReason());
           rt_fallback_logged_ = true;
         }
       }
+      if (scene_committed || (as_ok && !rt_motion_history_valid_)) {
+        const std::span<const float> current_positions =
+            rt_scene->packedPositionSnapshot();
+        try {
+          rt_motion_commit_positions.assign(current_positions.begin(),
+                                            current_positions.end());
+          rt_motion_commit_bones = packed_bones;
+          rt_motion_commit_topology_hash = topology_hash;
+          rt_motion_commit_candidate_valid = true;
+        } catch (const std::bad_alloc &) {
+          rt_motion_clear_on_commit = true;
+          xpbd::log::warn(
+              "Vulkan RT: temporal motion snapshot allocation failed");
+        }
+      }
       if (!have_rt_geometry) {
-        rt_motion_previous_positions_.clear();
-        rt_motion_previous_bones_.clear();
-        rt_motion_topology_hash_ = 0u;
-        rt_motion_history_valid_ = false;
+        rt_motion_clear_on_commit = true;
       }
       if (have_rt_geometry && as_ok) {
         // Allow a later, genuine rebuild failure to be reported once without
@@ -378,15 +445,15 @@
         rt_fallback_logged_ = false;
       }
       if (as_ok) {
-        rt_shadows_active = rt_scene.ready() && rt_pipelines_ready_;
+        rt_shadows_active = rt_scene->ready() && rt_pipelines_ready_;
         if (rt_shadows_active) {
-          const VkAccelerationStructureKHR active_tlas = rt_scene.tlas();
+          const VkAccelerationStructureKHR active_tlas = rt_scene->tlas();
           const auto descriptor_update_begin = Clock::now();
           if (mesh_rt_desc_set) {
             if (last_mesh_rt_descriptor_sets_[frame_index_] !=
                     mesh_rt_desc_set ||
                 last_mesh_rt_tlas_[frame_index_] != active_tlas) {
-              rt_scene.writeTlasDescriptor(mesh_rt_desc_set, 0);
+              rt_scene->writeTlasDescriptor(mesh_rt_desc_set, 0);
               last_mesh_rt_descriptor_sets_[frame_index_] = mesh_rt_desc_set;
               last_mesh_rt_tlas_[frame_index_] = active_tlas;
               ++rt_descriptor_write_calls_frame_;
@@ -407,7 +474,7 @@
             if (last_static_rt_descriptor_sets_[frame_index_] !=
                     static_rt_set ||
                 last_static_rt_tlas_[frame_index_] != active_tlas) {
-              rt_scene.writeTlasDescriptor(static_rt_set, 2);
+              rt_scene->writeTlasDescriptor(static_rt_set, 2);
               last_static_rt_descriptor_sets_[frame_index_] = static_rt_set;
               last_static_rt_tlas_[frame_index_] = active_tlas;
               ++rt_descriptor_write_calls_frame_;
@@ -424,14 +491,14 @@
                                                        descriptor_update_begin)
                   .count();
         }
-        path_trace_active = rt_scene.ready() && path_tracer.ready();
+        path_trace_active = rt_scene->ready() && path_tracer.ready();
         if (path_trace_active && !unified_rt_logged_) {
-          const RtSceneStats rt_stats = rt_scene.stats();
+          const RtSceneStats rt_stats = rt_scene->stats();
           xpbd::log::infof(
               "Vulkan RT: unified alpha-aware primary path active "
               "(vertices=%u triangles=%u BLAS=%u TLAS=%u instances=%u)",
-              rt_scene.pathTraceVertexCount(),
-              rt_scene.pathTraceIndexCount() / 3u, rt_stats.blas_count,
+              rt_scene->pathTraceVertexCount(),
+              rt_scene->pathTraceIndexCount() / 3u, rt_stats.blas_count,
               rt_stats.tlas_count, rt_stats.instance_count);
           unified_rt_logged_ = true;
         }
@@ -451,9 +518,9 @@
     const RtLightRegistry rt_light_registry = buildRtLightRegistry(
         resolved_environment_view, environment_sampling_available,
         registry_sun_light, rt_emissive_generation,
-        rt_scene.emissivePowerEstimate() *
+        rt_scene->emissivePowerEstimate() *
             std::max(resolved_environment_settings.emissive_multiplier, 0.0f),
         resolved_environment_settings.emissive_surfaces &&
             resolved_environment_settings.emissive_mesh_sampling &&
-            rt_scene.ready() && rt_scene.emissiveTriangleCount() > 0u);
+            rt_scene->ready() && rt_scene->emissiveTriangleCount() > 0u);
 

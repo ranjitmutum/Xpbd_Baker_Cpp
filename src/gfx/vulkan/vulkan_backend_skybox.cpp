@@ -49,18 +49,28 @@ void VulkanBackend::destroySkyboxGpu() {
     }
     skybox_face_size_ = 0;
     skybox_generation_ = 0;
+    skybox_source_identity_.clear();
     skybox_ready_ = false;
   }
 
 bool VulkanBackend::uploadSkyboxCubemap(const PreviewSkybox &sky) {
     if (!sky.valid() || !device_ || !cmd_pool_ || !graphics_queue_) {
-      skybox_ready_ = false;
       return false;
     }
     if (skybox_ready_ && skybox_generation_ == sky.generation &&
         skybox_face_size_ == static_cast<std::uint32_t>(sky.face_size) &&
+        skybox_source_identity_ == sky.source_identity &&
         skybox_cubemap_.view) {
       return true;
+    }
+
+    std::string candidate_source_identity;
+    try {
+      candidate_source_identity = sky.source_identity;
+    } catch (...) {
+      xpbd::log::warn(
+          "Preview skybox identity Candidate allocation failed");
+      return false;
     }
 
     const std::uint32_t face = static_cast<std::uint32_t>(sky.face_size);
@@ -68,8 +78,8 @@ bool VulkanBackend::uploadSkyboxCubemap(const PreviewSkybox &sky) {
         static_cast<VkDeviceSize>(face) * face * 4u;
     const VkDeviceSize total_bytes = face_bytes * 6u;
 
-    // Create cubemap image with correct memory type.
-    destroyImage(skybox_cubemap_);
+    // Build a complete replacement without disturbing the published cubemap.
+    ImageResource new_cubemap{};
     VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     image_info.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     image_info.imageType = VK_IMAGE_TYPE_2D;
@@ -83,7 +93,7 @@ bool VulkanBackend::uploadSkyboxCubemap(const PreviewSkybox &sky) {
         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     const VkResult create_result =
-        vkCreateImage(device_, &image_info, nullptr, &skybox_cubemap_.image);
+        vkCreateImage(device_, &image_info, nullptr, &new_cubemap.image);
     if (create_result != VK_SUCCESS) {
       logImageResourceError(
           "vkCreateImage", create_result, "preview-skybox-cubemap",
@@ -92,60 +102,60 @@ bool VulkanBackend::uploadSkyboxCubemap(const PreviewSkybox &sky) {
       return false;
     }
     VkMemoryRequirements requirements{};
-    vkGetImageMemoryRequirements(device_, skybox_cubemap_.image, &requirements);
+    vkGetImageMemoryRequirements(device_, new_cubemap.image, &requirements);
     VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     allocation.allocationSize = requirements.size;
     const auto memory_type = findMemoryType(
         requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (!memory_type) {
-      destroyImage(skybox_cubemap_);
+      destroyImage(new_cubemap);
       return false;
     }
     allocation.memoryTypeIndex = *memory_type;
     const VkResult allocation_result = vkAllocateMemory(
-        device_, &allocation, nullptr, &skybox_cubemap_.memory);
+        device_, &allocation, nullptr, &new_cubemap.memory);
     if (allocation_result != VK_SUCCESS) {
       logImageResourceError(
           "vkAllocateMemory", allocation_result, "preview-skybox-cubemap",
           image_info.format, face, face, 1u, image_info.usage,
           requirements.size, *memory_type);
-      destroyImage(skybox_cubemap_);
+      destroyImage(new_cubemap);
       return false;
     }
     const VkResult bind_result = vkBindImageMemory(
-        device_, skybox_cubemap_.image, skybox_cubemap_.memory, 0);
+        device_, new_cubemap.image, new_cubemap.memory, 0);
     if (bind_result != VK_SUCCESS) {
       logImageResourceError(
           "vkBindImageMemory", bind_result, "preview-skybox-cubemap",
           image_info.format, face, face, 1u, image_info.usage,
           requirements.size, *memory_type);
-      destroyImage(skybox_cubemap_);
+      destroyImage(new_cubemap);
       return false;
     }
     VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    view_info.image = skybox_cubemap_.image;
+    view_info.image = new_cubemap.image;
     view_info.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
     view_info.format = VK_FORMAT_R8G8B8A8_UNORM;
     view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6};
     const VkResult view_result = vkCreateImageView(
-        device_, &view_info, nullptr, &skybox_cubemap_.view);
+        device_, &view_info, nullptr, &new_cubemap.view);
     if (view_result != VK_SUCCESS) {
       logImageResourceError(
           "vkCreateImageView", view_result, "preview-skybox-cubemap",
           image_info.format, face, face, 1u, image_info.usage,
           requirements.size, *memory_type);
-      destroyImage(skybox_cubemap_);
+      destroyImage(new_cubemap);
       return false;
     }
-    skybox_cubemap_.width = face;
-    skybox_cubemap_.height = face;
+    new_cubemap.width = face;
+    new_cubemap.height = face;
 
     Buffer staging{};
     if (!createBuffer(total_bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                      staging, "preview-skybox-staging")) {
-      destroyImage(skybox_cubemap_);
+                       staging, "preview-skybox-staging")) {
+      destroyImage(new_cubemap);
       return false;
     }
     std::memcpy(staging.mapped, sky.rgba.data(),
@@ -160,7 +170,7 @@ bool VulkanBackend::uploadSkyboxCubemap(const PreviewSkybox &sky) {
           !uploadBuffer(skybox_vbo_, 0, sizeof(kSkyboxCubePositions),
                         kSkyboxCubePositions)) {
         destroyBuffer(staging);
-        destroyImage(skybox_cubemap_);
+        destroyImage(new_cubemap);
         return false;
       }
     }
@@ -173,7 +183,7 @@ bool VulkanBackend::uploadSkyboxCubemap(const PreviewSkybox &sky) {
     ai.commandBufferCount = 1;
     if (vkAllocateCommandBuffers(device_, &ai, &cmd) != VK_SUCCESS) {
       destroyBuffer(staging);
-      destroyImage(skybox_cubemap_);
+      destroyImage(new_cubemap);
       return false;
     }
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -188,7 +198,7 @@ bool VulkanBackend::uploadSkyboxCubemap(const PreviewSkybox &sky) {
           static_cast<unsigned long long>(still_active_job_id_));
       vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
       destroyBuffer(staging);
-      destroyImage(skybox_cubemap_);
+      destroyImage(new_cubemap);
       return false;
     }
 
@@ -197,7 +207,7 @@ bool VulkanBackend::uploadSkyboxCubemap(const PreviewSkybox &sky) {
     barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = skybox_cubemap_.image;
+    barrier.image = new_cubemap.image;
     barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6};
     barrier.srcAccessMask = 0;
     barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -212,7 +222,7 @@ bool VulkanBackend::uploadSkyboxCubemap(const PreviewSkybox &sky) {
                                          1};
       regions[layer].imageExtent = {face, face, 1};
     }
-    vkCmdCopyBufferToImage(cmd, staging.buffer, skybox_cubemap_.image,
+    vkCmdCopyBufferToImage(cmd, staging.buffer, new_cubemap.image,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 6,
                            regions.data());
 
@@ -233,50 +243,25 @@ bool VulkanBackend::uploadSkyboxCubemap(const PreviewSkybox &sky) {
           static_cast<unsigned long long>(still_active_job_id_));
       vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
       destroyBuffer(staging);
-      destroyImage(skybox_cubemap_);
+      destroyImage(new_cubemap);
       return false;
     }
 
-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
-    const VkResult submit_result =
-        vkQueueSubmit(graphics_queue_, 1, &si, VK_NULL_HANDLE);
-    if (submit_result != VK_SUCCESS) {
-      xpbd::log::errorf(
-          "Preview skybox submit failed: API=vkQueueSubmit "
-          "VkResult=%s(%d) extent=%ux%u frame_slot=%u still_job_id=%llu",
-          vkResultName(submit_result), static_cast<int>(submit_result), face,
-          face, frame_index_,
-          static_cast<unsigned long long>(still_active_job_id_));
-      if (submit_result == VK_ERROR_DEVICE_LOST) {
-        recordFatalVulkanError("vkQueueSubmit(preview_skybox)",
-                               submit_result);
+    if (!submitGraphicsTransactionAndWait(cmd, "preview-skybox")) {
+      if (gpu_completion_unproven_) {
+        return false;
       }
       vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
       destroyBuffer(staging);
-      destroyImage(skybox_cubemap_);
-      return false;
-    }
-    const VkResult wait_result = vkQueueWaitIdle(graphics_queue_);
-    if (wait_result != VK_SUCCESS) {
-      xpbd::log::errorf(
-          "Preview skybox wait failed: API=vkQueueWaitIdle "
-          "VkResult=%s(%d) extent=%ux%u frame_slot=%u still_job_id=%llu",
-          vkResultName(wait_result), static_cast<int>(wait_result), face,
-          face, frame_index_,
-          static_cast<unsigned long long>(still_active_job_id_));
-      if (wait_result == VK_ERROR_DEVICE_LOST) {
-        recordFatalVulkanError("vkQueueWaitIdle(preview_skybox)",
-                               wait_result);
-      }
-      vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
-      destroyBuffer(staging);
-      destroyImage(skybox_cubemap_);
+      destroyImage(new_cubemap);
       return false;
     }
     vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
     destroyBuffer(staging);
+
+    destroyImage(skybox_cubemap_);
+    skybox_cubemap_ = new_cubemap;
+    new_cubemap = {};
 
     VkDescriptorImageInfo desc_image{};
     desc_image.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -292,6 +277,7 @@ bool VulkanBackend::uploadSkyboxCubemap(const PreviewSkybox &sky) {
 
     skybox_face_size_ = face;
     skybox_generation_ = sky.generation;
+    skybox_source_identity_ = std::move(candidate_source_identity);
     skybox_ready_ = true;
     return true;
   }

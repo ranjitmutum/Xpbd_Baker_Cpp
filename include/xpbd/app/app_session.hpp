@@ -36,6 +36,10 @@
 #include <utility>
 #include <vector>
 
+namespace xpbd::gfx {
+struct LastPresentedSnapshot;
+}
+
 namespace xpbd::app {
 
 enum class PresentationMode { SourcePreview, LiveSimulation, FinalBakedPreview };
@@ -501,6 +505,7 @@ struct StillRenderSnapshot {
   std::array<float, 16> proj_matrix{};
   std::uint64_t model_generation = 0;
   std::uint64_t material_generation = 0;
+  std::uint64_t emission_generation = 0;
   double preview_time = 0.0;
   float raster_scene_time_seconds = 0.0f;
   gfx::PreviewSceneId preview_scene_id = gfx::PreviewSceneId::None;
@@ -761,6 +766,10 @@ public:
     return material_generation_;
   }
 
+  [[nodiscard]] std::uint64_t emissionGeneration() const noexcept {
+    return emission_generation_;
+  }
+
   [[nodiscard]] std::uint64_t viewportAppearanceGeneration() const noexcept {
     return viewport_appearance_generation_;
   }
@@ -785,6 +794,7 @@ public:
   void touchWorldEnvironmentDisplay() noexcept;
   void touchWorldEnvironmentCelestial() noexcept;
   void touchWorldEnvironmentTargets() noexcept;
+  void touchWorldEnvironmentHdriRuntime() noexcept;
   void resetWorldSkyPhysicalDefaults();
   bool advanceWorldSkyTime(double elapsed_seconds);
   bool saveWorldSkySettings(const std::filesystem::path &path);
@@ -910,6 +920,9 @@ public:
   void setBoneVisible(const std::string &name, bool visible);
   [[nodiscard]] std::string pickBoneAt(float viewport_x, float viewport_y,
                                        float view_w, float view_h);
+  [[nodiscard]] std::string
+  pickBoneAt(const gfx::LastPresentedSnapshot *presented, float viewport_x,
+             float viewport_y, float view_w, float view_h);
   [[nodiscard]] std::uint64_t viewportPickStateToken(float view_w,
                                                      float view_h) const;
   [[nodiscard]] const ViewportPickDiagnostics &
@@ -989,6 +1002,7 @@ private:
   std::uint64_t model_generation_ = 0;
   std::uint64_t animation_generation_ = 0;
   std::uint64_t material_generation_ = 0;
+  std::uint64_t emission_generation_ = 0;
   std::uint64_t physics_generation_ = 0;
   std::uint64_t viewport_appearance_generation_ = 0;
   std::uint64_t viewport_visibility_generation_ = 0;
@@ -1004,6 +1018,9 @@ private:
   bool viewport_pick_cache_valid_ = false;
   std::uint64_t viewport_pick_cache_token_ = 0;
   render::BonePickIndex viewport_pick_cache_;
+  bool presented_viewport_pick_cache_valid_ = false;
+  std::uint64_t presented_viewport_pick_serial_ = 0;
+  render::BonePickIndex presented_viewport_pick_cache_;
   ViewportPickDiagnostics last_viewport_pick_diagnostics_{};
   SessionFingerprint active_job_fingerprint_{};
   std::optional<std::jthread> bake_thread;

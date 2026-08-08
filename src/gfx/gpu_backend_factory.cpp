@@ -1,5 +1,6 @@
 #include "xpbd/gfx/backend_select.hpp"
 #include "xpbd/gfx/gpu_backend.hpp"
+#include "xpbd/gfx/vulkan_window_bootstrap.hpp"
 #include "xpbd/log.hpp"
 
 #include <SDL3/SDL.h>
@@ -97,9 +98,12 @@ bool initWithWindow(SDL_Window *&window, const char *title, int w, int h,
     prepareVulkanEnvironment();
   }
 
-  window = SDL_CreateWindow(
-      title, w, h,
-      flags | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+  SDL_WindowFlags window_flags =
+      flags | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+  if (environmentFlagEnabled("XPBD_STRICT_RT_GATE_PROBE")) {
+    window_flags |= SDL_WINDOW_HIDDEN;
+  }
+  window = SDL_CreateWindow(title, w, h, window_flags);
   if (window == nullptr) {
     logFailure(std::string("CreateWindow(") + preferenceName(pref) + "): " +
                (SDL_GetError() ? SDL_GetError() : "failed"));
@@ -114,7 +118,23 @@ bool initWithWindow(SDL_Window *&window, const char *title, int w, int h,
     return false;
   }
 
-  if (!candidate->init(window)) {
+  bool initialized = false;
+  if (pref == BackendPreference::Vulkan) {
+    VulkanWindowBootstrap bootstrap;
+    std::string bootstrap_error;
+    if (!captureVulkanWindowBootstrap(window, bootstrap, &bootstrap_error)) {
+      logFailure(std::string("Vulkan window bootstrap failed: ") +
+                 bootstrap_error);
+      candidate->shutdown();
+      destroyWindow(window);
+      return false;
+    }
+    initialized = candidate->init(bootstrap);
+  } else {
+    initialized = candidate->init(window);
+  }
+
+  if (!initialized) {
     logFailure(std::string(preferenceName(pref)) + " init failed" +
                (SDL_GetError() && SDL_GetError()[0]
                     ? std::string(": ") + SDL_GetError()
@@ -144,10 +164,14 @@ bool createWindowAndBackend(const BackendRequest &req, const char *title, int w,
     xpbd::log::error(err);
     return false;
   }
+  if (req.pref == BackendPreference::OpenGL) {
+    err = "OpenGL renderer is deprecated; Vulkan RenderThread is required";
+    xpbd::log::error(err);
+    return false;
+  }
 
   constexpr Attempt auto_order[] = {
       {BackendPreference::Vulkan, SDL_WINDOW_VULKAN, false},
-      {BackendPreference::OpenGL, SDL_WINDOW_OPENGL, true},
   };
 
   auto tryOne = [&](BackendPreference pref) {
@@ -181,7 +205,7 @@ bool createWindowAndBackend(const BackendRequest &req, const char *title, int w,
 
   destroyWindow(window);
   if (err.empty()) {
-    err = "No graphics backend available (OpenGL/Vulkan)";
+    err = "Vulkan RenderThread backend is unavailable";
   }
   return false;
 }

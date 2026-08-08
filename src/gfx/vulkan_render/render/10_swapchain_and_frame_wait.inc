@@ -1,6 +1,8 @@
     if (recreate_swapchain_ || !swapchain_) {
       if (Clock::now() < next_swapchain_recreate_attempt_) {
-        SDL_Delay(16);
+        (void)interruptibleRetryDelay((std::min)(
+            next_swapchain_recreate_attempt_,
+            Clock::now() + std::chrono::milliseconds(16)));
         return;
       }
       if (!recreateSwapchain()) {
@@ -8,7 +10,8 @@
         if (!fatal_error_) {
           next_swapchain_recreate_attempt_ =
               Clock::now() + kSwapchainRecreateRetryDelay;
-          SDL_Delay(16);
+          (void)interruptibleRetryDelay(
+              Clock::now() + std::chrono::milliseconds(16));
         }
         return;
       }
@@ -19,44 +22,19 @@
     auto wait_for_fence = [&](VkFence fence, const char *stage,
                               std::uint32_t image_index,
                               VkFence image_fence) {
-      const auto wait_start = Clock::now();
-      logDiagnosticApi(stage, "before", std::nullopt, 0.0, image_index,
-                       fence, image_fence, fs.cmd, false, true);
-      VkResult result = VK_SUCCESS;
-      bool timed_out = false;
-      if (!diagnostics_enabled_) {
-        result =
-            vkWaitForFences(device_, 1, &fence, VK_TRUE, UINT64_MAX);
-      } else {
-        do {
-          result = vkWaitForFences(device_, 1, &fence, VK_TRUE,
-                                   kDiagnosticWaitSliceNs);
-          if (result == VK_TIMEOUT) {
-            timed_out = true;
-            const double elapsed_ms =
-                std::chrono::duration<double, std::milli>(Clock::now() -
-                                                          wait_start)
-                    .count();
-            logDiagnosticApi(stage, "timeout", result, elapsed_ms,
-                             image_index, fence, image_fence, fs.cmd, true,
-                             true);
-          }
-        } while (result == VK_TIMEOUT);
-      }
-      const double elapsed_ms =
-          std::chrono::duration<double, std::milli>(Clock::now() - wait_start)
-              .count();
-      logDiagnosticApi(stage, "after", result, elapsed_ms, image_index,
-                       fence, image_fence, fs.cmd, timed_out, false);
-      return result;
+      // Once a preview submission owns this fence, ordinary shutdown must let
+      // it reach a proven completion before teardown. The outer worker join
+      // deadline escalates to FatalQuarantine, which still interrupts this
+      // sliced wait and preserves bounded shutdown.
+      return waitForFenceControlled(fence, stage, image_index, image_fence,
+                                    fs.cmd, false, true);
     };
 
-    const VkResult wait_result =
+    const ControlledWaitResult wait_result =
         wait_for_fence(fs.fence, "vkWaitForFences.frame", UINT32_MAX,
                        VK_NULL_HANDLE);
-    if (wait_result != VK_SUCCESS) {
-      SDL_Log("Vulkan fence wait failed: %d", static_cast<int>(wait_result));
-      enterFatalVulkanError(frame, "vkWaitForFences(frame)", wait_result);
+    if (!wait_result.completed()) {
+      failActiveStillRender(frame, fatal_error_detail_);
       return;
     }
 

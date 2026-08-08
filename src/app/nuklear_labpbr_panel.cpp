@@ -98,7 +98,8 @@ void drawLabPbrEditor(nk_context *ctx, const Geom &g, AppSession &session) {
       tr("labpbr_view_shaded"),    tr("labpbr_view_base_color"),
       tr("labpbr_view_normal"),    tr("labpbr_view_ao"),
       tr("labpbr_view_roughness"), tr("labpbr_view_f0"),
-      tr("labpbr_view_emission"),  tr("labpbr_view_opacity")};
+      tr("labpbr_view_emission"),  tr("labpbr_view_opacity"),
+      tr("labpbr_view_height")};
   int debug_view = static_cast<int>(session.labpbr_debug_view);
   const int previous_debug_view = debug_view;
   if (combo(ctx, g, tr("labpbr_preview_mode"), debug_views, debug_view,

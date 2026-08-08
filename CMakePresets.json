@@ -61,6 +61,29 @@
         "lhs": "${hostSystemName}",
         "rhs": "Windows"
       }
+    },
+    {
+      "name": "render-v5-strict",
+      "displayName": "Render V5 strict Vulkan RT gate",
+      "description": "Fail-closed Vulkan RT, Streamline, SPIR-V and Validation gate",
+      "inherits": "base",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/out/build/render-v5-strict",
+      "cacheVariables": {
+        "XPBD_BUILD_APP": "ON",
+        "XPBD_BUILD_TESTS": "ON",
+        "XPBD_CHECK_SPIRV": "ON",
+        "XPBD_GFX_VULKAN": "ON",
+        "XPBD_GFX_OPENGL": "OFF",
+        "XPBD_STRICT_RT_GATE": "ON",
+        "XPBD_STREAMLINE_SDK_ROOT": "${sourceDir}/.tmp/streamline-sdk"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     }
   ],
   "buildPresets": [
@@ -86,6 +109,20 @@
         "xpbd_app_session_regression_tests",
         "xpbd_check_spirv"
       ]
+    },
+    {
+      "name": "render-v5-strict-release",
+      "displayName": "Render V5 strict Vulkan RT gate (Release)",
+      "configurePreset": "render-v5-strict",
+      "configuration": "Release",
+      "targets": [
+        "xpbd_baker_app",
+        "xpbd_cli",
+        "xpbd_viewport_regression_tests",
+        "xpbd_nuklear_focus_regression_tests",
+        "xpbd_app_session_regression_tests",
+        "xpbd_check_spirv"
+      ]
     }
   ],
   "testPresets": [
@@ -93,6 +130,20 @@
       "name": "s00-gate-release",
       "displayName": "S00 clean regression tests (Release)",
       "configurePreset": "s00-gate",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error",
+        "stopOnFailure": false,
+        "timeout": 120
+      }
+    },
+    {
+      "name": "render-v5-strict-release",
+      "displayName": "Render V5 strict Vulkan RT tests (Release)",
+      "configurePreset": "render-v5-strict",
       "configuration": "Release",
       "output": {
         "outputOnFailure": true

@@ -13,8 +13,42 @@ option(XPBD_BUILD_TESTS "Build focused viewport/render regression tests" OFF)
 option(XPBD_CHECK_SPIRV "Verify embedded Vulkan SPIR-V during the default build" OFF)
 option(XPBD_GFX_OPENGL "Enable OpenGL 3.3 backend in app" ON)
 option(XPBD_GFX_VULKAN "Enable Vulkan backend in app" ON)
+option(XPBD_STRICT_RT_GATE
+    "Require the formal Vulkan RT/Streamline/SPIR-V/Validation gate contract"
+    OFF)
 
 include("${CMAKE_CURRENT_LIST_DIR}/cmake/Streamline.cmake")
+
+if(XPBD_STRICT_RT_GATE)
+    if(NOT WIN32)
+        message(FATAL_ERROR
+            "XPBD_STRICT_RT_GATE is the formal Windows Vulkan RT gate")
+    endif()
+    foreach(_xpbd_strict_required_option IN ITEMS
+            XPBD_BUILD_APP
+            XPBD_BUILD_TESTS
+            XPBD_CHECK_SPIRV
+            XPBD_GFX_VULKAN)
+        if(NOT ${_xpbd_strict_required_option})
+            message(FATAL_ERROR
+                "XPBD_STRICT_RT_GATE requires ${_xpbd_strict_required_option}=ON")
+        endif()
+    endforeach()
+    if(XPBD_GFX_OPENGL)
+        message(FATAL_ERROR
+            "XPBD_STRICT_RT_GATE requires XPBD_GFX_OPENGL=OFF; "
+            "the formal gate cannot fall back to OpenGL")
+    endif()
+    if(NOT XPBD_STREAMLINE_COMPLETE_FOUND)
+        message(FATAL_ERROR
+            "XPBD_STRICT_RT_GATE requires the complete Streamline core and "
+            "target feature runtime set (SR/RR/FG/Reflex/PCL); "
+            "XPBD_STREAMLINE_COMPLETE_FOUND is false")
+    endif()
+    message(STATUS
+        "xpbd_baker: strict RT gate configure contract enabled "
+        "(app/tests/SPIR-V/Vulkan=ON, OpenGL=OFF, Streamline=required)")
+endif()
 
 set(XPBD_SPIRV_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/src/gfx/spirv/mesh.vert"
@@ -383,6 +417,9 @@ endif()
 
 if(XPBD_BUILD_TESTS)
     enable_testing()
+    add_test(NAME xpbd_streamline_manifest
+        COMMAND "${CMAKE_COMMAND}" -P
+            "${CMAKE_CURRENT_SOURCE_DIR}/cmake/tests/StreamlineManifestTests.cmake")
     if(Python3_Interpreter_FOUND)
         add_test(NAME xpbd_spirv_stale_detection
             COMMAND "${Python3_EXECUTABLE}" "${XPBD_SPIRV_TOOL}" self-test)
@@ -412,6 +449,9 @@ if(XPBD_BUILD_TESTS)
         src/gfx/labpbr_export.cpp
         src/gfx/rt_scene_records.cpp
         src/gfx/ray_tracing.cpp
+        src/gfx/render_thread_contract.cpp
+        src/gfx/render_thread_runtime.cpp
+        src/gfx/dedicated_render_thread.cpp
         src/gfx/world_environment.cpp
         src/gfx/preview_scene.cpp
         src/gfx/preview_surfaces.cpp
@@ -517,6 +557,9 @@ if(XPBD_BUILD_APP)
         src/gfx/backend_select.cpp
         src/gfx/gpu_backend_factory.cpp
         src/gfx/ray_tracing.cpp
+        src/gfx/render_thread_contract.cpp
+        src/gfx/render_thread_runtime.cpp
+        src/gfx/dedicated_render_thread.cpp
         src/gfx/world_environment.cpp
         src/gfx/uv_domain.cpp
         src/gfx/viewport_mesh.cpp
@@ -578,9 +621,13 @@ if(XPBD_BUILD_APP)
         if(Vulkan_FOUND)
             target_sources(xpbd_baker_app PRIVATE
                 src/gfx/vulkan_backend.cpp
+                src/gfx/threaded_vulkan_backend.cpp
+                src/gfx/vulkan_render_thread_backend.cpp
+                src/gfx/vulkan_window_bootstrap.cpp
                 src/gfx/vulkan/vulkan_backend_internal.hpp
                 src/gfx/vulkan/vulkan_backend_skybox.cpp
                 src/gfx/vulkan/vulkan_backend_pipelines.cpp
+                src/gfx/vulkan/vulkan_backend_rt_assembly.cpp
                 src/gfx/vulkan/vulkan_backend_static_resources.cpp
                 src/gfx/vulkan/vulkan_backend_environment.cpp
                 src/gfx/streamline_vulkan_runtime.cpp
@@ -589,25 +636,24 @@ if(XPBD_BUILD_APP)
                 src/gfx/vulkan_rt_pipeline.cpp
             )
             target_compile_definitions(xpbd_baker_app PRIVATE XPBD_GFX_VULKAN=1)
+            if(XPBD_STRICT_RT_GATE)
+                target_compile_definitions(xpbd_baker_app PRIVATE
+                    XPBD_STRICT_RT_GATE=1)
+            endif()
             target_link_libraries(xpbd_baker_app PRIVATE Vulkan::Vulkan)
             if(XPBD_STREAMLINE_FOUND)
                 target_compile_definitions(xpbd_baker_app PRIVATE
-                    XPBD_WITH_STREAMLINE=1)
+                    XPBD_WITH_STREAMLINE=1
+                    "XPBD_STREAMLINE_HAS_DLSS_SR=$<BOOL:${XPBD_STREAMLINE_SR_FOUND}>"
+                    "XPBD_STREAMLINE_HAS_DLSS_RR=$<BOOL:${XPBD_STREAMLINE_RR_FOUND}>"
+                    "XPBD_STREAMLINE_HAS_DLSS_G=$<BOOL:${XPBD_STREAMLINE_FG_FOUND}>"
+                    "XPBD_STREAMLINE_HAS_REFLEX=$<BOOL:${XPBD_STREAMLINE_REFLEX_FOUND}>"
+                    "XPBD_STREAMLINE_HAS_PCL=$<BOOL:${XPBD_STREAMLINE_PCL_FOUND}>")
                 target_include_directories(xpbd_baker_app PRIVATE
                     "${XPBD_STREAMLINE_SDK_ROOT}/include")
                 add_custom_command(TARGET xpbd_baker_app POST_BUILD
                     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                        "${XPBD_STREAMLINE_SDK_ROOT}/bin/x64/sl.interposer.dll"
-                        "${XPBD_STREAMLINE_SDK_ROOT}/bin/x64/sl.common.dll"
-                        "${XPBD_STREAMLINE_SDK_ROOT}/bin/x64/sl.dlss.dll"
-                        "${XPBD_STREAMLINE_SDK_ROOT}/bin/x64/sl.dlss_d.dll"
-                        "${XPBD_STREAMLINE_SDK_ROOT}/bin/x64/sl.dlss_g.dll"
-                        "${XPBD_STREAMLINE_SDK_ROOT}/bin/x64/sl.reflex.dll"
-                        "${XPBD_STREAMLINE_SDK_ROOT}/bin/x64/sl.pcl.dll"
-                        "${XPBD_STREAMLINE_SDK_ROOT}/bin/x64/NvLowLatencyVk.dll"
-                        "${XPBD_STREAMLINE_SDK_ROOT}/bin/x64/nvngx_dlss.dll"
-                        "${XPBD_STREAMLINE_SDK_ROOT}/bin/x64/nvngx_dlssd.dll"
-                        "${XPBD_STREAMLINE_SDK_ROOT}/bin/x64/nvngx_dlssg.dll"
+                        ${XPBD_STREAMLINE_RUNTIME_FILES}
                         "$<TARGET_FILE_DIR:xpbd_baker_app>"
                     COMMAND ${CMAKE_COMMAND} -E make_directory
                         "$<TARGET_FILE_DIR:xpbd_baker_app>/notices"
@@ -617,22 +663,40 @@ if(XPBD_BUILD_APP)
                     COMMAND ${CMAKE_COMMAND} -E copy_if_different
                         "${XPBD_STREAMLINE_SDK_ROOT}/3rd-party-licenses.md"
                         "$<TARGET_FILE_DIR:xpbd_baker_app>/notices/STREAMLINE-3RD-PARTY-LICENSES.md"
-                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                        "${XPBD_STREAMLINE_SDK_ROOT}/bin/x64/nvngx_dlss.license.txt"
-                        "$<TARGET_FILE_DIR:xpbd_baker_app>/notices/NVNGX-DLSS-LICENSE.txt"
-                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                        "${XPBD_STREAMLINE_SDK_ROOT}/bin/x64/reflex.license.txt"
-                        "$<TARGET_FILE_DIR:xpbd_baker_app>/notices/NVIDIA-REFLEX-LICENSE.txt"
-                    COMMENT "Copy signed NVIDIA Streamline/DLSS runtime and licenses")
+                    COMMENT "Copy available signed NVIDIA Streamline feature runtimes and core licenses")
+                if(XPBD_STREAMLINE_SR_FOUND OR XPBD_STREAMLINE_RR_FOUND OR
+                   XPBD_STREAMLINE_FG_FOUND)
+                    add_custom_command(TARGET xpbd_baker_app POST_BUILD
+                        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                            "${XPBD_STREAMLINE_SDK_ROOT}/bin/x64/nvngx_dlss.license.txt"
+                            "$<TARGET_FILE_DIR:xpbd_baker_app>/notices/NVNGX-DLSS-LICENSE.txt")
+                endif()
+                if(XPBD_STREAMLINE_REFLEX_FOUND)
+                    add_custom_command(TARGET xpbd_baker_app POST_BUILD
+                        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                            "${XPBD_STREAMLINE_SDK_ROOT}/bin/x64/reflex.license.txt"
+                            "$<TARGET_FILE_DIR:xpbd_baker_app>/notices/NVIDIA-REFLEX-LICENSE.txt")
+                endif()
             else()
                 target_compile_definitions(xpbd_baker_app PRIVATE
-                    XPBD_WITH_STREAMLINE=0)
+                    XPBD_WITH_STREAMLINE=0
+                    XPBD_STREAMLINE_HAS_DLSS_SR=0
+                    XPBD_STREAMLINE_HAS_DLSS_RR=0
+                    XPBD_STREAMLINE_HAS_DLSS_G=0
+                    XPBD_STREAMLINE_HAS_REFLEX=0
+                    XPBD_STREAMLINE_HAS_PCL=0)
             endif()
             message(STATUS "xpbd_baker: Vulkan package found")
         else()
-            message(WARNING
-                "xpbd_baker: Vulkan package not found; Vulkan is disabled "
-                "and the app will use OpenGL when available")
+            if(XPBD_STRICT_RT_GATE)
+                message(FATAL_ERROR
+                    "XPBD_STRICT_RT_GATE requires the Vulkan package; "
+                    "fallback is forbidden")
+            else()
+                message(WARNING
+                    "xpbd_baker: Vulkan package not found; Vulkan is disabled "
+                    "and the app will use OpenGL when available")
+            endif()
         endif()
     endif()
     if(MSVC)
@@ -643,6 +707,15 @@ if(XPBD_BUILD_APP)
             "/INCLUDE:AmdPowerXpressRequestHighPerformance")
     else()
         target_compile_options(xpbd_baker_app PRIVATE -Wall -Wextra)
+    endif()
+
+    if(XPBD_STRICT_RT_GATE)
+        add_test(NAME xpbd_strict_rt_runtime
+            COMMAND $<TARGET_FILE:xpbd_baker_app>)
+        set_tests_properties(xpbd_strict_rt_runtime PROPERTIES
+            ENVIRONMENT
+                "XPBD_STRICT_RT_GATE_PROBE=1;XPBD_GFX=vulkan"
+            TIMEOUT 60)
     endif()
 
     if(XPBD_BUILD_TESTS)
@@ -660,6 +733,7 @@ if(XPBD_BUILD_APP)
             src/gfx/labpbr_authoring.cpp
             src/gfx/labpbr_export.cpp
             src/gfx/ray_tracing.cpp
+            src/gfx/render_thread_contract.cpp
             src/gfx/still_image_export.cpp
             src/gfx/world_environment.cpp
         )

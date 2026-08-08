@@ -164,10 +164,12 @@
       fg_frame.swapchain_image_count =
           static_cast<std::uint32_t>(swap_images_.size());
       fg_frame.frame_index = static_cast<std::uint32_t>(
-          frame.diagnostics.render_frame);
+          temporal_render_serial);
       fg_frame.jitter_x = pt_params.camera_jitter[0];
       fg_frame.jitter_y = pt_params.camera_jitter[1];
-      fg_frame.reset_history = pt_streamline_history_reset;
+      fg_frame.reset_history = frameGenerationHistoryReset(
+          pt_temporal_reconstruction_requested_for_frame,
+          pt_streamline_history_reset, pt_history_reset);
       fg_inputs_recorded =
           streamline_vulkan_runtime_.recordFrameGenerationInputs(
               fg_frame);
@@ -190,7 +192,7 @@
       const bool inputs_cleared =
           streamline_vulkan_runtime_.clearFrameGenerationInputs(
               fs.cmd, static_cast<std::uint32_t>(
-                          frame.diagnostics.render_frame),
+                          temporal_render_serial),
               swap_extent_.width, swap_extent_.height,
               static_cast<std::uint32_t>(safe_viewport.x),
               static_cast<std::uint32_t>(safe_viewport.y),

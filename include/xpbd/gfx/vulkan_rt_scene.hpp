@@ -1,6 +1,7 @@
 #pragma once
 
 #include "xpbd/gfx/frame_stats.hpp"
+#include "xpbd/gfx/render_thread_runtime.hpp"
 #include "xpbd/gfx/rt_scene_records.hpp"
 #include "xpbd/gfx/rt_scene_generations.hpp"
 
@@ -11,8 +12,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <array>
+#include <memory>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <vulkan/vulkan.h>
@@ -41,12 +44,93 @@ struct RtRestGeometry {
   // uvec4 per triangle: cube, face, material, original source primitive.
   std::vector<std::array<std::uint32_t, 4>> primitive_metadata;
   std::vector<RtSurfaceOptics> primitive_optics;
-  // Average premultiplied emitted radiance per packed triangle. This is used
-  // to build the world-space GPU mesh-light alias table after rigid instance
-  // transforms/tints have been applied.
+  // Deterministic bounded estimate of premultiplied emitted radiance per
+  // packed triangle. This builds the world-space mesh-light Alias table only;
+  // the GPU evaluates actual radiance at each sampled barycentric UV.
   std::vector<std::array<float, 3>> primitive_emission;
   std::vector<RtRestGeometryRange> geometry_ranges;
 };
+
+enum class RtRestGeometryChange : std::uint8_t {
+  Unchanged,
+  MaterialOnly,
+  AlphaClassification,
+  Topology,
+};
+
+// Classifies a static-asset replacement without consulting Vulkan state.
+// Material/texture records can update shader buffers in place; only a change
+// to a range's opaque-vs-any-hit contract or true geometry topology permits a
+// BLAS rebuild.
+[[nodiscard]] inline RtRestGeometryChange classifyRtRestGeometryChange(
+    const RtRestGeometry &current, const RtRestGeometry &next) noexcept {
+  const auto ranges_equal = [](const RtRestGeometryRange &left,
+                               const RtRestGeometryRange &right) {
+    return left.kind == right.kind &&
+           left.blas_policy == right.blas_policy &&
+           left.instance_custom_index == right.instance_custom_index &&
+           left.source_bone_index == right.source_bone_index &&
+           left.first_index == right.first_index &&
+           left.index_count == right.index_count;
+  };
+  if (current.positions != next.positions ||
+      current.normals != next.normals || current.uvs != next.uvs ||
+      current.tangents != next.tangents ||
+      current.indices != next.indices ||
+      current.bone_indices != next.bone_indices ||
+      current.geometry_ranges.size() != next.geometry_ranges.size()) {
+    return RtRestGeometryChange::Topology;
+  }
+  for (std::size_t index = 0u; index < current.geometry_ranges.size();
+       ++index) {
+    if (!ranges_equal(current.geometry_ranges[index],
+                      next.geometry_ranges[index])) {
+      return RtRestGeometryChange::Topology;
+    }
+  }
+
+  constexpr std::uint32_t kAlphaFlags =
+      kRtPrimitiveCutout | kRtPrimitiveBlend;
+  bool alpha_changed =
+      current.primitive_flags.size() != next.primitive_flags.size();
+  if (!alpha_changed) {
+    for (std::size_t primitive = 0u;
+         primitive < current.primitive_flags.size(); ++primitive) {
+      if ((current.primitive_flags[primitive] & kAlphaFlags) !=
+          (next.primitive_flags[primitive] & kAlphaFlags)) {
+        alpha_changed = true;
+        break;
+      }
+    }
+  }
+  if (alpha_changed) {
+    return RtRestGeometryChange::AlphaClassification;
+  }
+
+  const auto optics_equal = [](const RtSurfaceOptics &left,
+                               const RtSurfaceOptics &right) {
+    return left.transmission == right.transmission &&
+           left.ior == right.ior &&
+           left.attenuation_color == right.attenuation_color &&
+           left.attenuation_distance == right.attenuation_distance &&
+           left.thin_walled == right.thin_walled;
+  };
+  bool optics_match =
+      current.primitive_optics.size() == next.primitive_optics.size();
+  for (std::size_t primitive = 0u;
+       optics_match && primitive < current.primitive_optics.size();
+       ++primitive) {
+    optics_match = optics_equal(current.primitive_optics[primitive],
+                                next.primitive_optics[primitive]);
+  }
+  if (current.primitive_flags == next.primitive_flags &&
+      current.primitive_metadata == next.primitive_metadata &&
+      current.primitive_emission == next.primitive_emission &&
+      optics_match) {
+    return RtRestGeometryChange::Unchanged;
+  }
+  return RtRestGeometryChange::MaterialOnly;
+}
 
 // std430 mesh-light record cached on the CPU.  Keeping this typed cache alive
 // across frames avoids reallocating and rebuilding the dense alias table when
@@ -55,6 +139,8 @@ struct alignas(16) RtEmissiveTriangleGpu {
   std::array<float, 4> p0_probability{};
   std::array<float, 4> p1_acceptance{};
   std::array<float, 4> p2_area{};
+  // xyz = Alias-weight radiance estimate, w = its luminance. Never use xyz as
+  // the actual radiance of a sampled texture point.
   std::array<float, 4> emission_luminance{};
   std::array<std::uint32_t, 4> metadata{};
   // xy: stable 64-bit light ID, z: sidedness flags, w: source primitive.
@@ -102,6 +188,9 @@ struct RtSceneStats {
   std::uint64_t scratch_bytes = 0;
   std::uint64_t attribute_bytes = 0;
   std::uint64_t allocated_bytes = 0;
+  std::uint64_t cpu_rest_bytes = 0;
+  std::uint64_t cpu_workspace_bytes = 0;
+  std::uint64_t cpu_allocated_bytes = 0;
   std::uint64_t full_builds = 0;
   std::uint64_t refits = 0;
   std::uint64_t tlas_full_builds = 0;
@@ -117,6 +206,14 @@ struct RtSceneStats {
       RtAccelerationBuildReason::None;
 };
 
+enum class RtScenePendingBuildState : std::uint8_t {
+  Idle,
+  PendingFence,
+  ReadyToCommit,
+  Failed,
+  CompletionUnproven,
+};
+
 class VulkanRtScene {
 public:
   VulkanRtScene() = default;
@@ -129,6 +226,14 @@ public:
                           std::uint32_t queue_family, VkQueue queue);
   void shutdown();
 
+  void setWaitControl(
+      std::shared_ptr<RenderThreadControl> control) noexcept {
+    wait_control_ = std::move(control);
+  }
+  [[nodiscard]] bool completionUnproven() const noexcept {
+    return completion_unproven_;
+  }
+
   // True once TLAS objects exist and at least one build has been prepared.
   // GPU build may still be pending in the current frame command buffer.
   [[nodiscard]] bool ready() const noexcept {
@@ -137,7 +242,7 @@ public:
   }
 
   // Replace rest-pose geometry (called when the static model rebuilds).
-  void setRestGeometry(RtRestGeometry geometry);
+  void setRestGeometry(RtRestGeometry geometry) noexcept;
 
   // Update rigid TLAS transforms and dynamic world-space geometry, preparing
   // only the BLAS builds/refits required by each range's declared policy.
@@ -160,6 +265,22 @@ public:
   // ray-query draws). No-op when nothing is pending. Inserts barriers so
   // subsequent compute/fragment ray queries and RT shaders see the new AS.
   void recordBuilds(VkCommandBuffer cmd);
+
+  // Submit the prepared Candidate build without waiting. The scene owns the
+  // one-shot command/fence until pollPendingBuild proves completion.
+  [[nodiscard]] bool submitPendingBuild();
+  [[nodiscard]] RtScenePendingBuildState
+  pollPendingBuild(bool wait_for_completion = false);
+  [[nodiscard]] bool pendingBuildSubmitted() const noexcept {
+    return submitted_build_fence_ != VK_NULL_HANDLE;
+  }
+
+  // Complete the currently prepared BLAS/TLAS transaction on this scene's
+  // private one-shot command pool and wait only for that submission.  This is
+  // used by the synchronous A3 Candidate path: callers keep the published
+  // VulkanRtScene untouched until this returns true, then exchange ownership
+  // of the complete scene object atomically.
+  [[nodiscard]] bool buildPendingAndWait();
 
   // Compatibility: CPU update + one-shot GPU build (blocks). Prefer
   // updateGeometry + recordBuilds on the frame command buffer.
@@ -344,7 +465,8 @@ private:
   void destroyAs(AccelerationStructure &as);
   [[nodiscard]] VkDeviceAddress bufferDeviceAddress(VkBuffer buffer) const;
   [[nodiscard]] VkCommandBuffer beginOneShot();
-  [[nodiscard]] bool submitOneShot(VkCommandBuffer cmd);
+  [[nodiscard]] bool submitOneShotPending(VkCommandBuffer cmd);
+  void releaseSubmittedBuild() noexcept;
   [[nodiscard]] bool ensureScratch(VkDeviceSize size);
 
   void fillTriangleGeometry(
@@ -368,8 +490,13 @@ private:
   std::uint32_t queue_family_ = 0;
   VkQueue queue_ = VK_NULL_HANDLE;
   VkCommandPool cmd_pool_ = VK_NULL_HANDLE;
+  VkCommandBuffer submitted_build_command_ = VK_NULL_HANDLE;
+  VkFence submitted_build_fence_ = VK_NULL_HANDLE;
   bool initialized_ = false;
   bool procs_ok_ = false;
+  std::shared_ptr<RenderThreadControl> wait_control_;
+  bool completion_unproven_ = false;
+  bool submitted_build_ready_ = false;
   bool geometry_prepared_ = false;
   PendingBuild pending_ = PendingBuild::None;
 

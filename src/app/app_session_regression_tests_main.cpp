@@ -1,6 +1,7 @@
 // Focused AppSession regression tests for transactional LabPBR suite import.
 
 #include "xpbd/app/app_session.hpp"
+#include "xpbd/app/native_dialog.hpp"
 #include "xpbd/gfx/labpbr_authoring.hpp"
 #include "xpbd/gfx/labpbr_material.hpp"
 #include "xpbd/gfx/still_image_export.hpp"
@@ -20,6 +21,16 @@
 namespace {
 
 int g_failures = 0;
+bool g_dialog_prepare_result = true;
+int g_dialog_prepare_calls = 0;
+int g_dialog_finish_calls = 0;
+
+bool testDialogPrepare() {
+  ++g_dialog_prepare_calls;
+  return g_dialog_prepare_result;
+}
+
+void testDialogFinish() { ++g_dialog_finish_calls; }
 
 void expect(bool condition, const char *label) {
   if (condition) {
@@ -34,6 +45,34 @@ bool sameTexture(const xpbd::gfx::TextureImage &lhs,
                  const xpbd::gfx::TextureImage &rhs) {
   return lhs.width == rhs.width && lhs.height == rhs.height &&
          lhs.source_channels == rhs.source_channels && lhs.rgba == rhs.rgba;
+}
+
+void testNativeDialogSuspendGate() {
+  xpbd::app::NativeDialogHooks hooks;
+  hooks.prepare = testDialogPrepare;
+  hooks.finish = testDialogFinish;
+  xpbd::app::setNativeDialogHooks(hooks);
+
+  g_dialog_prepare_result = false;
+  g_dialog_prepare_calls = 0;
+  g_dialog_finish_calls = 0;
+  {
+    xpbd::app::NativeDialogScope rejected;
+    expect(!rejected.ready() && !xpbd::app::nativeDialogOpen(),
+           "native dialog is rejected when RenderThread Suspend ACK fails");
+  }
+  expect(g_dialog_prepare_calls == 1 && g_dialog_finish_calls == 0,
+         "rejected native dialog does not run Resume without Suspend ACK");
+
+  g_dialog_prepare_result = true;
+  {
+    xpbd::app::NativeDialogScope accepted;
+    expect(accepted.ready() && xpbd::app::nativeDialogOpen(),
+           "native dialog enters only after successful Suspend ACK");
+  }
+  expect(!xpbd::app::nativeDialogOpen() && g_dialog_finish_calls == 1,
+         "accepted native dialog runs one matching Resume");
+  xpbd::app::setNativeDialogHooks({});
 }
 
 bool sameTexture(const xpbd::gfx::SharedTextureImage &lhs,
@@ -94,6 +133,7 @@ struct MaterialSessionSnapshot {
   xpbd::gfx::LabPbrSuiteSource source;
   std::string texture_path;
   std::uint64_t generation = 0;
+  std::uint64_t emission_generation = 0;
   bool source_change_pending = false;
   bool last_import_cache_hit = false;
 };
@@ -111,6 +151,7 @@ MaterialSessionSnapshot snapshot(const xpbd::app::AppSession &session) {
       session.labpbr_suite_source,
       session.texture_path,
       session.materialGeneration(),
+      session.emissionGeneration(),
       session.labpbr_source_change_pending,
       session.labpbr_last_import_cache_hit,
   };
@@ -144,6 +185,7 @@ bool unchanged(const xpbd::app::AppSession &session,
          sameSuiteSource(session.labpbr_suite_source, before.source) &&
          session.texture_path == before.texture_path &&
          session.materialGeneration() == before.generation &&
+         session.emissionGeneration() == before.emission_generation &&
          session.labpbr_source_change_pending ==
              before.source_change_pending &&
          session.labpbr_last_import_cache_hit ==
@@ -434,6 +476,16 @@ void testIndependentSkyRenderingState() {
              session.world_environment.cloud_generation >
                  classified_cloud_generation,
          "cloud edits advance classified cloud generations without scene changes");
+  const auto hdri_runtime_generation =
+      session.world_environment.hdri_runtime_generation;
+  const auto cloud_target_generation =
+      session.world_environment.target_generation;
+  session.touchWorldEnvironmentHdriRuntime();
+  expect(session.world_environment.hdri_runtime_generation >
+                 hdri_runtime_generation &&
+             session.world_environment.target_generation ==
+                 cloud_target_generation,
+         "HDR runtime edits advance an independent resource generation");
   session.world_environment.time.playing = true;
   session.world_environment.time.time_speed = 3600.0f;
   const auto playback_utc = session.world_environment.celestial.utc;
@@ -1241,7 +1293,11 @@ void testLargeUvModelMaterialTransactions() {
   session.labpbr_draft.roughness_enabled = true;
   session.labpbr_draft.roughness = 0.25f;
   session.markLabPbrDraftDirty();
-  expect(session.applySelectedLabPbrDraft(),
+  const auto emission_generation_before_roughness =
+      session.emissionGeneration();
+  expect(session.applySelectedLabPbrDraft() &&
+             session.emissionGeneration() ==
+                 emission_generation_before_roughness,
          "real AppSession Override materializes large-UV authoring state");
   const auto *left_coverage = session.labpbr_uv_coverage.find("eye_left");
   const auto *right_coverage = session.labpbr_uv_coverage.find("eye_right");
@@ -1266,6 +1322,15 @@ void testLargeUvModelMaterialTransactions() {
   session.markLabPbrDraftDirty();
   expect(session.applySelectedLabPbrDraft(),
          "large-UV Override can be reapplied after COW release");
+  const auto emission_generation_before_emission =
+      session.emissionGeneration();
+  session.labpbr_draft.emission_enabled = true;
+  session.labpbr_draft.emission = 0.5f;
+  session.markLabPbrDraftDirty();
+  expect(session.applySelectedLabPbrDraft() &&
+             session.emissionGeneration() >
+                 emission_generation_before_emission,
+         "real AppSession emission edit advances its independent render generation");
 
   std::vector<std::uint8_t> small_rgba(16u * 16u * 4u, 255u);
   std::vector<std::uint8_t> small_png;
@@ -1752,6 +1817,7 @@ void testStillRenderSnapshotAndOutput() {
 } // namespace
 
 int main(int argc, char **argv) {
+  testNativeDialogSuspendGate();
   testDefaultEmptyScene();
   testStillRenderSceneSelectionContentMatrix();
   testBoneSubtreeVisibilityGeneration();

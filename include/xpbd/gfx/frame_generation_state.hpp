@@ -145,6 +145,28 @@ makeFrameGenerationTagExtent(std::uint32_t viewport_x,
          temporal_reconstruction_active;
 }
 
+// A generated presentation needs a newly rendered color/depth/motion tuple on
+// every application frame.  Progressive preview convergence must therefore
+// not stop path-trace dispatches while the FG proxy is being driven.  Resize
+// transactions deliberately pause the tuple until the final extent is known.
+[[nodiscard]] constexpr bool frameGenerationRequiresLivePathTraceInput(
+    bool frame_generation_requested,
+    bool interactive_preview_resize) noexcept {
+  return frame_generation_requested && !interactive_preview_resize;
+}
+
+// SR/RR history is authoritative only when one of those reconstruction passes
+// actually feeds FG.  Native-resolution FG must instead reset from the raw RT
+// history; otherwise the inactive reconstruction history reports FirstFrame on
+// every present and prevents interpolation history from ever becoming stable.
+[[nodiscard]] constexpr bool frameGenerationHistoryReset(
+    bool temporal_reconstruction_requested,
+    bool temporal_reconstruction_reset,
+    bool path_trace_history_reset) noexcept {
+  return temporal_reconstruction_requested ? temporal_reconstruction_reset
+                                           : path_trace_history_reset;
+}
+
 // A native acquire semaphore only protects the swapchain image, so work that
 // does not touch it may run before COLOR_ATTACHMENT_OUTPUT. Streamline's
 // Vulkan DLSS-G acquire semaphore is also the frame-start handoff: its wait

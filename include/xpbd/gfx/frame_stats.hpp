@@ -12,6 +12,7 @@ enum class RtAccelerationBuildReason : std::uint32_t {
   MissingTopLevel,
   InstanceTransformsChanged,
   StableGeometryRefit,
+  AlphaClassificationChanged,
   OtherFullBuild,
 };
 
@@ -32,6 +33,8 @@ rtAccelerationBuildReasonName(RtAccelerationBuildReason reason) noexcept {
     return "instance transforms";
   case RtAccelerationBuildReason::StableGeometryRefit:
     return "stable refit";
+  case RtAccelerationBuildReason::AlphaClassificationChanged:
+    return "alpha classification";
   case RtAccelerationBuildReason::OtherFullBuild:
     return "full build";
   }

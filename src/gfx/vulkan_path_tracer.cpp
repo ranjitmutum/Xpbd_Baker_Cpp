@@ -4,15 +4,20 @@
 #include "xpbd/log.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <mutex>
+#include <system_error>
+#include <thread>
 #include <vector>
 
 namespace xpbd::gfx {
@@ -318,7 +323,37 @@ supportsMemoryBudget(VkPhysicalDevice physical_device) {
   return "unknown";
 }
 
+struct RuntimeCaptureSaveSnapshot {
+  std::filesystem::path output_path;
+  StillImageFormat format = StillImageFormat::Png;
+  std::uint32_t width = 0u;
+  std::uint32_t height = 0u;
+  std::vector<std::uint16_t> rgba16f;
+  StillImageDisplayTransform display{};
+  bool transparent_background = false;
+  std::vector<float> device_depth;
+  std::uint32_t background_face_size = 0u;
+  std::vector<std::uint8_t> background_rgba8;
+  std::array<float, 16> background_inverse_view_projection{};
+  std::array<float, 3> background_camera_position{};
+  std::uint64_t job_id = 0u;
+};
+
 } // namespace
+
+struct PathTraceCaptureSaveState {
+  std::atomic_bool cancel_requested{false};
+  std::mutex mutex;
+  std::condition_variable completed_condition;
+  bool completed = false;
+  bool wrote = false;
+  bool cancelled = false;
+  std::uint64_t output_bytes = 0u;
+  std::string error;
+  std::filesystem::path output_path;
+  std::uint64_t job_id = 0u;
+  std::chrono::steady_clock::time_point started_at{};
+};
 
 std::uint32_t VulkanPathTracer::findMemoryType(std::uint32_t bits,
                                                VkMemoryPropertyFlags props) const {
@@ -529,14 +564,135 @@ bool VulkanPathTracer::init(VkPhysicalDevice phys, VkDevice device,
   return true;
 }
 
+void VulkanPathTracer::pollRuntimeCaptureSave() noexcept {
+  const std::shared_ptr<PathTraceCaptureSaveState> state =
+      runtime_capture_save_state_;
+  if (!state) {
+    return;
+  }
+
+  bool completed = false;
+  bool wrote = false;
+  bool cancelled = false;
+  std::uint64_t output_bytes = 0u;
+  std::string error;
+  {
+    const std::scoped_lock lock(state->mutex);
+    completed = state->completed;
+    if (completed) {
+      wrote = state->wrote;
+      cancelled = state->cancelled;
+      output_bytes = state->output_bytes;
+      error = state->error;
+    }
+  }
+  if (!completed) {
+    return;
+  }
+
+  if (runtime_capture_save_thread_.joinable()) {
+    try {
+      runtime_capture_save_thread_.join();
+    } catch (const std::system_error &exception) {
+      xpbd::log::errorf("Still save worker join failed: %s",
+                        exception.what());
+      try {
+        if (runtime_capture_save_thread_.joinable()) {
+          runtime_capture_save_thread_.detach();
+        }
+      } catch (...) {
+      }
+    }
+  }
+
+  const auto elapsed = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - state->started_at);
+  const std::string output_path = state->output_path.string();
+  const char *result = cancelled ? "cancelled" : (wrote ? "passed" : "failed");
+  xpbd::log::infof(
+      "STILL_JOB save_async_complete job_id=%llu path=%s result=%s "
+      "bytes=%llu elapsed_ms=%.4f",
+      static_cast<unsigned long long>(state->job_id), output_path.c_str(),
+      result, static_cast<unsigned long long>(output_bytes), elapsed.count());
+  xpbd::log::infof("STILL_JOB save job_id=%llu path=%s result=%s async=1",
+                   static_cast<unsigned long long>(state->job_id),
+                   output_path.c_str(), wrote && !cancelled ? "passed" : "failed");
+  if (wrote && !cancelled) {
+    xpbd::log::infof(
+        "STILL path_trace_capture path=%s bytes=%llu format=%s",
+        output_path.c_str(), static_cast<unsigned long long>(output_bytes),
+        runtime_capture_format_ == StillImageFormat::Exr ? "exr" : "png");
+  } else if (!cancelled) {
+    xpbd::log::warnf("Still path-trace capture failed for '%s': %s",
+                     output_path.c_str(),
+                     error.empty() ? "filesystem write failed" : error.c_str());
+  }
+
+  if (runtime_capture_state_ == PathTraceCaptureState::Saving) {
+    capture_completed_ = wrote && !cancelled;
+    runtime_capture_error_ =
+        !cancelled && !wrote ? std::move(error) : std::string{};
+    runtime_capture_state_ =
+        cancelled ? PathTraceCaptureState::Cancelled
+                  : (wrote ? PathTraceCaptureState::Completed
+                           : PathTraceCaptureState::Failed);
+    runtime_capture_path_.clear();
+    runtime_capture_job_id_ = 0u;
+    runtime_capture_background_face_size_ = 0u;
+    runtime_capture_background_rgba8_.clear();
+    runtime_capture_background_inverse_view_projection_ = {};
+    runtime_capture_background_camera_position_ = {};
+  }
+  runtime_capture_save_state_.reset();
+}
+
+void VulkanPathTracer::stopRuntimeCaptureSave() noexcept {
+  pollRuntimeCaptureSave();
+  const std::shared_ptr<PathTraceCaptureSaveState> state =
+      runtime_capture_save_state_;
+  if (!state) {
+    return;
+  }
+
+  state->cancel_requested.store(true, std::memory_order_release);
+  bool completed = false;
+  {
+    std::unique_lock lock(state->mutex);
+    completed = state->completed_condition.wait_for(
+        lock, std::chrono::seconds(2), [&]() { return state->completed; });
+  }
+  if (completed) {
+    pollRuntimeCaptureSave();
+    return;
+  }
+
+  xpbd::log::warnf(
+      "Still save worker exceeded bounded shutdown wait; detaching cancelled "
+      "filesystem-only task job_id=%llu path=%s",
+      static_cast<unsigned long long>(state->job_id),
+      state->output_path.string().c_str());
+  try {
+    if (runtime_capture_save_thread_.joinable()) {
+      runtime_capture_save_thread_.detach();
+    }
+  } catch (const std::system_error &exception) {
+    xpbd::log::errorf("Still save worker detach failed: %s",
+                      exception.what());
+  }
+  runtime_capture_save_state_.reset();
+}
+
 bool VulkanPathTracer::requestStillCapture(
     const std::filesystem::path &path, StillImageFormat format,
     bool transparent_background, std::uint64_t job_id,
     const PathTraceStillBackgroundInput *background) {
+  pollRuntimeCaptureSave();
   if (path.empty() || !ready() ||
+      runtime_capture_save_state_ ||
       runtime_capture_state_ == PathTraceCaptureState::Requested ||
       runtime_capture_state_ ==
-          PathTraceCaptureState::PendingGpuReadback) {
+          PathTraceCaptureState::PendingGpuReadback ||
+      runtime_capture_state_ == PathTraceCaptureState::Saving) {
     return false;
   }
   runtime_capture_background_face_size_ = 0u;
@@ -580,6 +736,26 @@ bool VulkanPathTracer::requestStillCapture(
 }
 
 void VulkanPathTracer::cancelStillCapture() noexcept {
+  pollRuntimeCaptureSave();
+  if (runtime_capture_state_ == PathTraceCaptureState::Saving) {
+    const std::shared_ptr<PathTraceCaptureSaveState> state =
+        runtime_capture_save_state_;
+    bool newly_requested = false;
+    if (state) {
+      const std::scoped_lock lock(state->mutex);
+      if (!state->completed) {
+        newly_requested = !state->cancel_requested.exchange(
+            true, std::memory_order_acq_rel);
+      }
+    }
+    if (newly_requested) {
+      xpbd::log::infof(
+          "STILL_JOB save_cancel_requested job_id=%llu path=%s",
+          static_cast<unsigned long long>(state->job_id),
+          state->output_path.string().c_str());
+    }
+    return;
+  }
   const bool active =
       runtime_capture_state_ == PathTraceCaptureState::Requested ||
       runtime_capture_state_ == PathTraceCaptureState::PendingGpuReadback;
@@ -987,6 +1163,7 @@ bool VulkanPathTracer::ensureCaptureBuffer(VkDeviceSize size) {
 }
 
 void VulkanPathTracer::flushPendingCapture() {
+  pollRuntimeCaptureSave();
   if (!capture_pending_ || capture_mapped_ == nullptr ||
       pending_capture_width_ == 0u ||
       pending_capture_height_ == 0u ||
@@ -1005,6 +1182,194 @@ void VulkanPathTracer::flushPendingCapture() {
                 static_cast<const std::byte *>(capture_mapped_) +
                 pending_depth_offset_)
           : nullptr;
+
+  if (pending_capture_is_runtime_) {
+    std::string launch_error;
+    try {
+      RuntimeCaptureSaveSnapshot snapshot;
+      snapshot.output_path = std::filesystem::path(pending_capture_path_);
+      snapshot.format = pending_capture_format_;
+      snapshot.width = pending_capture_width_;
+      snapshot.height = pending_capture_height_;
+      snapshot.rgba16f.assign(half_pixels,
+                              half_pixels + pixel_count * 4u);
+      snapshot.display = pending_capture_display_;
+      snapshot.transparent_background =
+          pending_capture_transparent_background_;
+      if (device_depth != nullptr) {
+        snapshot.device_depth.assign(device_depth, device_depth + pixel_count);
+      }
+      snapshot.background_face_size =
+          pending_capture_background_face_size_;
+      snapshot.background_rgba8 =
+          std::move(pending_capture_background_rgba8_);
+      snapshot.background_inverse_view_projection =
+          pending_capture_background_inverse_view_projection_;
+      snapshot.background_camera_position =
+          pending_capture_background_camera_position_;
+      snapshot.job_id = pending_capture_job_id_;
+
+      const auto state = std::make_shared<PathTraceCaptureSaveState>();
+      state->output_path = snapshot.output_path;
+      state->job_id = snapshot.job_id;
+      state->started_at = std::chrono::steady_clock::now();
+      const std::uint64_t snapshot_bytes =
+          static_cast<std::uint64_t>(snapshot.rgba16f.size()) *
+              sizeof(std::uint16_t) +
+          static_cast<std::uint64_t>(snapshot.device_depth.size()) *
+              sizeof(float) +
+          static_cast<std::uint64_t>(snapshot.background_rgba8.size());
+
+      std::thread worker(
+          [snapshot = std::move(snapshot), state]() mutable noexcept {
+            bool wrote = false;
+            bool cancelled = false;
+            bool output_committed = false;
+            std::uint64_t output_bytes = 0u;
+            std::string error;
+            std::filesystem::path temporary_path = snapshot.output_path;
+            temporary_path +=
+                ".xpbd-part-" + std::to_string(snapshot.job_id);
+            try {
+              std::error_code filesystem_error;
+              std::filesystem::remove(temporary_path, filesystem_error);
+              cancelled = state->cancel_requested.load(
+                  std::memory_order_acquire);
+              if (!cancelled) {
+                StillImageCubemapBackground background{};
+                const StillImageCubemapBackground *background_ptr = nullptr;
+                if (snapshot.background_face_size > 0u &&
+                    !snapshot.background_rgba8.empty()) {
+                  background.face_size = snapshot.background_face_size;
+                  background.rgba8 = snapshot.background_rgba8.data();
+                  background.rgba8_size =
+                      snapshot.background_rgba8.size();
+                  background.inverse_view_projection =
+                      snapshot.background_inverse_view_projection;
+                  background.camera_position =
+                      snapshot.background_camera_position;
+                  if (background.valid()) {
+                    background_ptr = &background;
+                  }
+                }
+                wrote = writeStillImageRgba16f(
+                    temporary_path, snapshot.format, snapshot.width,
+                    snapshot.height, snapshot.rgba16f.data(),
+                    snapshot.rgba16f.size(), snapshot.display,
+                    snapshot.transparent_background,
+                    snapshot.device_depth.empty()
+                        ? nullptr
+                        : snapshot.device_depth.data(),
+                    snapshot.device_depth.size(), &error, background_ptr);
+              }
+
+              cancelled = cancelled || state->cancel_requested.load(
+                                             std::memory_order_acquire);
+              if (wrote && !cancelled) {
+                filesystem_error.clear();
+                std::filesystem::rename(temporary_path, snapshot.output_path,
+                                        filesystem_error);
+                if (filesystem_error) {
+                  filesystem_error.clear();
+                  std::filesystem::copy_file(
+                      temporary_path, snapshot.output_path,
+                      std::filesystem::copy_options::overwrite_existing,
+                      filesystem_error);
+                  if (!filesystem_error) {
+                    std::error_code remove_error;
+                    std::filesystem::remove(temporary_path, remove_error);
+                  }
+                }
+                if (filesystem_error) {
+                  wrote = false;
+                  error = "cannot publish still image output: " +
+                          filesystem_error.message();
+                } else {
+                  output_committed = true;
+                  std::error_code size_error;
+                  output_bytes = static_cast<std::uint64_t>(
+                      std::filesystem::file_size(snapshot.output_path,
+                                                 size_error));
+                  if (size_error) {
+                    output_bytes = 0u;
+                  }
+                }
+              }
+            } catch (const std::exception &exception) {
+              wrote = false;
+              error = std::string("still save worker exception: ") +
+                      exception.what();
+            } catch (...) {
+              wrote = false;
+              error = "still save worker failed with unknown exception";
+            }
+
+            {
+              const std::scoped_lock lock(state->mutex);
+              cancelled = cancelled || state->cancel_requested.load(
+                                             std::memory_order_acquire);
+              if (cancelled && output_committed) {
+                std::error_code remove_error;
+                std::filesystem::remove(snapshot.output_path, remove_error);
+                output_committed = false;
+                output_bytes = 0u;
+              }
+              if (!output_committed) {
+                std::error_code remove_error;
+                std::filesystem::remove(temporary_path, remove_error);
+              }
+              state->wrote = wrote && output_committed && !cancelled;
+              state->cancelled = cancelled;
+              state->output_bytes = output_bytes;
+              state->error = cancelled ? std::string{} : std::move(error);
+              state->completed = true;
+            }
+            state->completed_condition.notify_all();
+          });
+
+      runtime_capture_save_state_ = state;
+      runtime_capture_save_thread_ = std::move(worker);
+      runtime_capture_state_ = PathTraceCaptureState::Saving;
+      xpbd::log::infof(
+          "STILL_JOB save_async_begin job_id=%llu path=%s width=%u "
+          "height=%u snapshot_bytes=%llu",
+          static_cast<unsigned long long>(pending_capture_job_id_),
+          pending_capture_path_.c_str(), pending_capture_width_,
+          pending_capture_height_,
+          static_cast<unsigned long long>(snapshot_bytes));
+    } catch (const std::exception &exception) {
+      launch_error = std::string("cannot launch still save worker: ") +
+                     exception.what();
+    } catch (...) {
+      launch_error = "cannot launch still save worker";
+    }
+
+    capture_pending_ = false;
+    pending_capture_path_.clear();
+    pending_aov_summary_path_.clear();
+    pending_capture_is_runtime_ = false;
+    pending_capture_job_id_ = 0u;
+    pending_capture_background_face_size_ = 0u;
+    pending_capture_background_rgba8_.clear();
+    pending_capture_background_inverse_view_projection_ = {};
+    pending_capture_background_camera_position_ = {};
+    pending_capture_width_ = 0u;
+    pending_capture_height_ = 0u;
+    pending_aov_offset_ = 0u;
+    pending_statistics_offset_ = 0u;
+    pending_depth_offset_ = 0u;
+    if (!launch_error.empty()) {
+      runtime_capture_save_state_.reset();
+      runtime_capture_error_ = std::move(launch_error);
+      runtime_capture_state_ = PathTraceCaptureState::Failed;
+      runtime_capture_path_.clear();
+      runtime_capture_job_id_ = 0u;
+      xpbd::log::errorf("STILL_JOB save_async_launch_failed error=%s",
+                        runtime_capture_error_.c_str());
+    }
+    return;
+  }
+
   bool capture_wrote = pending_capture_path_.empty();
   std::string capture_error;
   if (!pending_capture_path_.empty()) {
@@ -1571,6 +1936,7 @@ bool VulkanPathTracer::ensureDummyStorageImages() {
 }
 
 void VulkanPathTracer::shutdown() {
+  stopRuntimeCaptureSave();
   if (device_ != VK_NULL_HANDLE) {
     rt_pipeline_.shutdown();
     destroyImage();
@@ -1680,6 +2046,13 @@ void VulkanPathTracer::shutdown() {
   runtime_capture_background_rgba8_.clear();
   runtime_capture_background_inverse_view_projection_ = {};
   runtime_capture_background_camera_position_ = {};
+}
+
+void VulkanPathTracer::invalidateTemporalHistory() noexcept {
+  history_key_ = 0u;
+  accumulated_samples_ = 0u;
+  history_valid_ = false;
+  ++history_generation_;
 }
 
 bool VulkanPathTracer::createPipelines(VkRenderPass render_pass) {
@@ -2560,6 +2933,12 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
   // This slot's frame fence has been waited before the backend records its
   // next frame, so a copy queued on the prior use is now host-visible.
   flushPendingCapture();
+  if (runtime_capture_state_ == PathTraceCaptureState::Saving ||
+      runtime_capture_state_ == PathTraceCaptureState::Completed ||
+      runtime_capture_state_ == PathTraceCaptureState::Failed ||
+      runtime_capture_state_ == PathTraceCaptureState::Cancelled) {
+    return;
+  }
   target_requirement_hint_mask_ = last_output_write_mask_;
   const PathTraceTargetResult target_result = ensureTarget(
       params.width, params.height,
@@ -2622,8 +3001,9 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
   PathTraceAccumulationStep accumulation_step{};
   if (!debug_requested) {
     if (params.temporal_reconstruction_input) {
-      // DLSS SR/RR own temporal history. Feed them a newly sampled noisy
-      // frame without presenting that overwrite as a camera/scene cut.
+      // Streamline SR/RR/FG own their temporal history. Feed them a newly
+      // sampled noisy frame without presenting that overwrite as a
+      // camera/scene cut or stopping at the progressive-preview sample cap.
       accumulation_step.history_key = params.history_key;
       accumulation_step.history_reset =
           !history_valid_ || params.history_key != history_key_;
@@ -2684,8 +3064,10 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
     }
     rt_fallback_logged_ = true;
   }
-  if (use_fallback && !fallback_albedo_cleared_) {
-    // One-shot clear of 1x1 white fallback albedo.
+  if (!fallback_albedo_cleared_) {
+    // One-shot clear of the 1x1 white fallback. The composite pass also uses
+    // this image when an optional diagnostic AOV is absent, even when the
+    // material textures themselves do not need the fallback.
     VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -2715,7 +3097,8 @@ void VulkanPathTracer::recordDispatch(VkCommandBuffer cmd,
     to_sample.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     to_sample.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         dispatch_stages, 0, 0, nullptr, 0,
+                         dispatch_stages | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         0, 0, nullptr, 0,
                          nullptr, 1, &to_sample);
     fallback_albedo_cleared_ = true;
   }

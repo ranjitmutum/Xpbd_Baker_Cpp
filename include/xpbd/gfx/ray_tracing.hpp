@@ -54,6 +54,9 @@ struct RtTransparentGuideProbeInputV1 {
   RtTransparencyClass classification = RtTransparencyClass::Opaque;
   float coverage = 1.0f;
   float physical_transmission = 0.0f;
+  // LabPBR SSS is closed dielectric diffuse transport, not a transparency
+  // class. It is retained here to pin that guide classification ignores it.
+  float subsurface = 0.0f;
   std::uint32_t coverage_layer_count = 0u;
   bool front_surface_available = true;
   bool opaque_behind_available = false;
@@ -729,6 +732,14 @@ struct RtBsdfLobeProbabilities {
   float transmission = 0.0f;
 };
 
+// LabPBR SSS conditionally divides only the legacy dielectric diffuse
+// probability. Ineligible materials and a zero SSS value preserve the legacy
+// probability exactly.
+struct RtSubsurfaceLobeSplit {
+  float local_diffuse = 0.0f;
+  float subsurface = 0.0f;
+};
+
 struct RtBsdfEval {
   std::array<float, 3> value{};
   float pdf = 0.0f;
@@ -773,6 +784,12 @@ struct RtGgxVisibleNormalSample {
     float sample_u, float sample_v) noexcept;
 [[nodiscard]] RtBsdfLobeProbabilities
 rtBsdfLobeProbabilities(const RtBsdfMaterial &material) noexcept;
+[[nodiscard]] RtSubsurfaceLobeSplit rtSubsurfaceLobeSplit(
+    float legacy_diffuse_probability, float subsurface,
+    bool eligible) noexcept;
+[[nodiscard]] float rtSubsurfaceOpticalDepth(float subsurface) noexcept;
+[[nodiscard]] float rtSubsurfaceFreeFlightFraction(
+    float subsurface, float sample_u) noexcept;
 
 // All directions point away from the surface. Finite-alpha reflection eval is
 // continuous; ideal reflection/refraction is returned as a delta sample by

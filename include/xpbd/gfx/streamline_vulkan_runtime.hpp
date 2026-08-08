@@ -252,8 +252,14 @@ public:
       std::uint32_t viewport_x, std::uint32_t viewport_y,
       std::uint32_t viewport_width,
       std::uint32_t viewport_height) noexcept;
-  // Query after each intercepted present; numFramesActuallyPresented then
-  // represents this application's most recent present interval.
+  // Poll the preceding asynchronous present interval immediately before the
+  // next intercepted Present. This remains on the Present thread and keeps
+  // numFramesActuallyPresented scoped to one application-present interval,
+  // while avoiding a state query in Streamline's just-returned Present path.
+  [[nodiscard]] FrameGenerationTransitionResult
+  pollFrameGenerationStateBeforePresent() noexcept;
+  // Classify the current intercepted Present result immediately and arm the
+  // next pre-Present state poll with this frame's input-readiness snapshot.
   [[nodiscard]] FrameGenerationTransitionResult
   updateFrameGenerationStateAfterPresent(
       VkResult present_result = VK_SUCCESS) noexcept;

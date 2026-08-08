@@ -342,6 +342,7 @@
   "labpbr_view_f0": "F0 / metal",
   "labpbr_view_emission": "Emission",
   "labpbr_view_opacity": "Opacity",
+  "labpbr_view_height": "Height (data only)",
   "labpbr_select_group": "Select a model group in the hierarchy or viewport.",
   "labpbr_selected_group": "Selected group: ",
   "labpbr_coverage_texels": "Selected UV coverage: %zu texels",

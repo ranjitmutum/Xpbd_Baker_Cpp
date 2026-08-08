@@ -14,6 +14,7 @@ struct PrimaryPayload {
   float opacity;
   vec4 attenuation;
   uvec4 status;
+  // xy barycentrics, z uintBitsToFloat(instance id), w LabPBR SSS [0,1].
   vec4 hitData;
   vec2 rayCone;
 };

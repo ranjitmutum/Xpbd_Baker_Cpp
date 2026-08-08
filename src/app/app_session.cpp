@@ -6,6 +6,7 @@
 #include "xpbd/export/animation_exporter.hpp"
 #include "xpbd/export/velocity_cache_exporter.hpp"
 #include "xpbd/gfx/labpbr_export.hpp"
+#include "xpbd/gfx/render_thread_contract.hpp"
 #include "xpbd/log.hpp"
 
 #include <algorithm>
@@ -111,13 +112,17 @@ bool sameTextureResource(const gfx::SharedTextureImage &lhs,
     return true;
   }
   return lhs != nullptr && rhs != nullptr && lhs->width == rhs->width &&
-         lhs->height == rhs->height && lhs->rgba == rhs->rgba;
+         lhs->height == rhs->height &&
+         lhs->source_channels == rhs->source_channels &&
+         lhs->rgba == rhs->rgba;
 }
 
 bool sameTextureResource(const gfx::SharedTextureImage &lhs,
                          const gfx::TextureImage &rhs) noexcept {
   return lhs != nullptr && lhs->width == rhs.width &&
-         lhs->height == rhs.height && lhs->rgba == rhs.rgba;
+         lhs->height == rhs.height &&
+         lhs->source_channels == rhs.source_channels &&
+         lhs->rgba == rhs.rgba;
 }
 
 bool hasTextureResourceState(
@@ -2326,6 +2331,9 @@ void AppSession::loadModel(const std::filesystem::path &path) {
         !labpbr_group_overrides.empty() ||
         !gfx::sameResolvedMaterialResource(resolved_material,
                                            loaded_resolved);
+    const bool emission_changed =
+        gfx::labPbrEmissionContentKey(&resolved_material) !=
+        gfx::labPbrEmissionContentKey(&loaded_resolved);
     const std::string loaded_model_path = path.string();
     std::string loaded_status =
         "Model: " + path.filename().string() + " (" +
@@ -2373,6 +2381,9 @@ void AppSession::loadModel(const std::filesystem::path &path) {
     advanceGeneration(model_generation_);
     if (material_changed) {
       advanceGeneration(material_generation_);
+    }
+    if (emission_changed) {
+      advanceGeneration(emission_generation_);
     }
     advanceGeneration(viewport_appearance_generation_);
     advanceGeneration(viewport_visibility_generation_);
@@ -2648,6 +2659,9 @@ bool AppSession::importLabPbrSuiteInternal(
       !gfx::sameResolvedMaterialResource(resolved_material,
                                          loaded_resolved) ||
       labpbr_imported_normal.sha256 != imported_normal.sha256;
+  const bool emission_changed =
+      gfx::labPbrEmissionContentKey(&resolved_material) !=
+      gfx::labPbrEmissionContentKey(&loaded_resolved);
 
   (void)labpbr_import_cache_.store(imported.suite);
 
@@ -2671,6 +2685,9 @@ bool AppSession::importLabPbrSuiteInternal(
   loadSelectedLabPbrDraft();
   if (material_changed) {
     advanceGeneration(material_generation_);
+  }
+  if (emission_changed) {
+    advanceGeneration(emission_generation_);
   }
 
   last_error.clear();
@@ -2889,6 +2906,9 @@ bool AppSession::loadTexture(const std::filesystem::path &path) {
       (labpbr_imported_normal.valid() && !keep_imported_normal) ||
       (labpbr_source_material_.specular_map_active &&
        !keep_imported_specular);
+  const bool emission_changed =
+      gfx::labPbrEmissionContentKey(&resolved_material) !=
+      gfx::labPbrEmissionContentKey(&loaded_resolved);
   model_texture = std::move(loaded_texture_asset);
   model_uv_domain = loaded_domain;
   labpbr_source_material_ = std::move(loaded_material);
@@ -2909,6 +2929,9 @@ bool AppSession::loadTexture(const std::filesystem::path &path) {
   loadSelectedLabPbrDraft();
   if (texture_changed) {
     advanceGeneration(material_generation_);
+  }
+  if (emission_changed) {
+    advanceGeneration(emission_generation_);
   }
   last_error.clear();
   status = "Texture: " + gfx::pathUtf8String(path.filename()) + " (" +
@@ -3127,6 +3150,12 @@ void AppSession::touchWorldEnvironmentTargets() noexcept {
   advanceGeneration(world_environment.cloud_generation);
   advanceGeneration(world_environment.target_generation);
   advanceGeneration(world_environment.clouds.generation);
+  resetPathTraceAccumulation();
+}
+
+void AppSession::touchWorldEnvironmentHdriRuntime() noexcept {
+  advanceGeneration(world_environment.generation);
+  advanceGeneration(world_environment.hdri_runtime_generation);
   resetPathTraceAccumulation();
 }
 
@@ -3364,6 +3393,7 @@ bool AppSession::queueStillRender() {
   snapshot.rt_debug_view = rt_debug_view;
   snapshot.model_generation = modelGeneration();
   snapshot.material_generation = materialGeneration();
+  snapshot.emission_generation = emissionGeneration();
   snapshot.preview_time = preview_time;
   snapshot.preview_scene_id = preview_scene_id;
   snapshot.show_preview_grid = show_preview_grid;
@@ -4296,6 +4326,7 @@ bool AppSession::loadWorldSkySettings(
     advanceGeneration(candidate.celestial_generation);
     advanceGeneration(candidate.cloud_generation);
     advanceGeneration(candidate.display_generation);
+    advanceGeneration(candidate.hdri_runtime_generation);
     world_environment = std::move(candidate);
     resetPathTraceAccumulation();
 
@@ -4331,6 +4362,8 @@ void AppSession::clearTexture() {
   }
   const bool texture_changed = hasTextureResourceState(model_texture) ||
                                resolved_material.valid();
+  const bool emission_changed =
+      gfx::labPbrEmissionContentKey(&resolved_material) != 0u;
   model_texture.reset();
   model_uv_domain = {};
   resolved_material.clear();
@@ -4355,6 +4388,9 @@ void AppSession::clearTexture() {
   texture_path.clear();
   if (texture_changed) {
     advanceGeneration(material_generation_);
+  }
+  if (emission_changed) {
+    advanceGeneration(emission_generation_);
   }
   status = "Texture cleared";
 }
@@ -4488,6 +4524,9 @@ bool AppSession::applySelectedLabPbrDraft() {
   const bool changed =
       overrides != labpbr_group_overrides ||
       !gfx::sameResolvedMaterialResource(resolved_material, resolved);
+  const bool emission_changed =
+      gfx::labPbrEmissionContentKey(&resolved_material) !=
+      gfx::labPbrEmissionContentKey(&resolved);
   labpbr_group_overrides = std::move(overrides);
   model_uv_domain = domain;
   labpbr_uv_coverage = std::move(coverage);
@@ -4497,6 +4536,9 @@ bool AppSession::applySelectedLabPbrDraft() {
   labpbr_draft_dirty = false;
   if (changed) {
     advanceGeneration(material_generation_);
+  }
+  if (emission_changed) {
+    advanceGeneration(emission_generation_);
   }
   last_error.clear();
   status = "Applied LabPBR values to group: " + selected_bone_name;
@@ -4544,6 +4586,9 @@ bool AppSession::restoreSelectedLabPbrFromTexture() {
   const bool changed =
       removed ||
       !gfx::sameResolvedMaterialResource(resolved_material, resolved);
+  const bool emission_changed =
+      gfx::labPbrEmissionContentKey(&resolved_material) !=
+      gfx::labPbrEmissionContentKey(&resolved);
   labpbr_group_overrides = std::move(overrides);
   model_uv_domain = domain;
   labpbr_uv_coverage = std::move(coverage);
@@ -4552,6 +4597,9 @@ bool AppSession::restoreSelectedLabPbrFromTexture() {
   loadSelectedLabPbrDraft();
   if (changed) {
     advanceGeneration(material_generation_);
+  }
+  if (emission_changed) {
+    advanceGeneration(emission_generation_);
   }
   last_error.clear();
   status = "Restored texture values for group: " + selected_bone_name;
@@ -4638,6 +4686,9 @@ bool AppSession::importLabPbrSpecular(const std::filesystem::path &path) {
       !sameTextureResource(labpbr_source_material_.specularImageAsset(),
                            imported_asset) ||
       !gfx::sameResolvedMaterialResource(resolved_material, resolved);
+  const bool emission_changed =
+      gfx::labPbrEmissionContentKey(&resolved_material) !=
+      gfx::labPbrEmissionContentKey(&resolved);
   labpbr_source_material_ = std::move(source);
   model_uv_domain = domain;
   labpbr_uv_coverage = std::move(coverage);
@@ -4650,6 +4701,9 @@ bool AppSession::importLabPbrSpecular(const std::filesystem::path &path) {
   loadSelectedLabPbrDraft();
   if (changed) {
     advanceGeneration(material_generation_);
+  }
+  if (emission_changed) {
+    advanceGeneration(emission_generation_);
   }
   last_error.clear();
   status = "Imported LabPBR specular image: " +
@@ -4692,6 +4746,9 @@ void AppSession::removeLabPbrSpecular() {
     return;
   }
 
+  const bool emission_changed =
+      gfx::labPbrEmissionContentKey(&resolved_material) !=
+      gfx::labPbrEmissionContentKey(&resolved);
   labpbr_source_material_ = std::move(source);
   model_uv_domain = domain;
   labpbr_uv_coverage = std::move(coverage);
@@ -4699,6 +4756,9 @@ void AppSession::removeLabPbrSpecular() {
   resolved_material = std::move(resolved);
   loadSelectedLabPbrDraft();
   advanceGeneration(material_generation_);
+  if (emission_changed) {
+    advanceGeneration(emission_generation_);
+  }
   last_error.clear();
   status = "Removed imported LabPBR specular image";
 }
@@ -4745,6 +4805,9 @@ bool AppSession::importLabPbrNormal(const std::filesystem::path &path) {
   const bool changed =
       imported.sha256 != labpbr_imported_normal.sha256 ||
       !gfx::sameResolvedMaterialResource(resolved_material, resolved);
+  const bool emission_changed =
+      gfx::labPbrEmissionContentKey(&resolved_material) !=
+      gfx::labPbrEmissionContentKey(&resolved);
   labpbr_imported_normal = std::move(imported);
   model_uv_domain = domain;
   labpbr_uv_coverage = std::move(coverage);
@@ -4756,6 +4819,9 @@ bool AppSession::importLabPbrNormal(const std::filesystem::path &path) {
   labpbr_last_import_cache_hit = false;
   if (changed) {
     advanceGeneration(material_generation_);
+  }
+  if (emission_changed) {
+    advanceGeneration(emission_generation_);
   }
   last_error.clear();
   status = "Imported LabPBR / Iris normal image: " +
@@ -4788,6 +4854,9 @@ void AppSession::removeLabPbrNormal() {
     status = "Iris normal removal failed: " + error;
     return;
   }
+  const bool emission_changed =
+      gfx::labPbrEmissionContentKey(&resolved_material) !=
+      gfx::labPbrEmissionContentKey(&resolved);
   labpbr_imported_normal.clear();
   labpbr_source_material_ = std::move(source_without_normal);
   model_uv_domain = domain;
@@ -4795,6 +4864,9 @@ void AppSession::removeLabPbrNormal() {
   labpbr_composition = std::move(composition);
   resolved_material = std::move(resolved);
   advanceGeneration(material_generation_);
+  if (emission_changed) {
+    advanceGeneration(emission_generation_);
+  }
   last_error.clear();
   status = "Removed imported Iris normal";
 }
@@ -5111,6 +5183,46 @@ std::string AppSession::pickBoneAt(float viewport_x, float viewport_y,
   std::string result =
       render::pickBone(viewport_pick_cache_, viewport_x, viewport_y, 6.0f,
                        &diagnostics);
+  last_viewport_pick_diagnostics_.candidate_face_count =
+      diagnostics.candidate_face_count;
+  last_viewport_pick_diagnostics_.total_face_count =
+      diagnostics.total_face_count;
+  return result;
+}
+
+std::string AppSession::pickBoneAt(
+    const gfx::LastPresentedSnapshot *presented, float viewport_x,
+    float viewport_y, float view_w, float view_h) {
+  last_viewport_pick_diagnostics_ = {};
+  if (presented == nullptr || presented->present_serial == 0u ||
+      viewport_x < 0.0f || viewport_y < 0.0f || view_w < 1.0f ||
+      view_h < 1.0f || viewport_x > view_w || viewport_y > view_h ||
+      presented->history.viewport.w < 1 ||
+      presented->history.viewport.h < 1) {
+    return {};
+  }
+
+  if (!presented_viewport_pick_cache_valid_ ||
+      presented_viewport_pick_serial_ != presented->present_serial) {
+    presented_viewport_pick_cache_ =
+        gfx::buildLastPresentedBonePickIndex(*presented);
+    presented_viewport_pick_serial_ = presented->present_serial;
+    presented_viewport_pick_cache_valid_ = true;
+    last_viewport_pick_diagnostics_.cache_rebuilt = true;
+  }
+
+  const float snapshot_w =
+      static_cast<float>(presented->history.viewport.w);
+  const float snapshot_h =
+      static_cast<float>(presented->history.viewport.h);
+  const float snapshot_x = viewport_x * snapshot_w / view_w;
+  const float snapshot_y = viewport_y * snapshot_h / view_h;
+  const float tolerance_scale =
+      std::max(snapshot_w / view_w, snapshot_h / view_h);
+  render::BonePickDiagnostics diagnostics;
+  std::string result = render::pickBone(
+      presented_viewport_pick_cache_, snapshot_x, snapshot_y,
+      std::min(32.0f, 6.0f * tolerance_scale), &diagnostics);
   last_viewport_pick_diagnostics_.candidate_face_count =
       diagnostics.candidate_face_count;
   last_viewport_pick_diagnostics_.total_face_count =
@@ -7089,6 +7201,9 @@ std::optional<std::filesystem::path> runFileSystemDialog(
   // Pause GPU / RT before the modal shell dialog so the picker is not
   // contending with in-flight command buffers (fixes hang after close).
   NativeDialogScope modal_scope;
+  if (!modal_scope.ready()) {
+    return std::nullopt;
+  }
   ComApartmentScope apartment;
   if (!apartment.ready()) {
     return std::nullopt;

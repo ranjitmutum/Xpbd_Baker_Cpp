@@ -78,8 +78,8 @@ vec3 decodeLabPbrF0(float packed, vec3 baseColor, out bool metal,
 }
 
 vec3 labPbrDebugColor(uint view, vec3 baseColor, vec3 tangentNormal,
-                      float ao, float ggx_alpha, vec3 f0, vec3 emission,
-                      float opacity) {
+                       float ao, float stored_height, float ggx_alpha, vec3 f0,
+                       vec3 emission, float opacity) {
   if (view == 2u) {
     return tangentNormal * 0.5 + 0.5;
   }
@@ -97,6 +97,9 @@ vec3 labPbrDebugColor(uint view, vec3 baseColor, vec3 tangentNormal,
   }
   if (view == 7u) {
     return vec3(opacity);
+  }
+  if (view == 8u) {
+    return vec3(stored_height);
   }
   return baseColor;
 }
@@ -173,7 +176,7 @@ void main() {
   if (textured && pc.materialDebug.x != 0u) {
     FragColor =
         vec4(labPbrDebugColor(pc.materialDebug.x, color.rgb, tangent_normal,
-                              normal_sample.b, ggx_alpha, f0, emissive,
+                              normal_sample.b, normal_sample.a, ggx_alpha, f0, emissive,
                               color.a),
              color.a);
     return;

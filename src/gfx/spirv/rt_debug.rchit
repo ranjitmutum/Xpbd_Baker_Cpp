@@ -1,5 +1,8 @@
 #version 460
 #extension GL_EXT_ray_tracing : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "src/gfx/spirv/labpbr_emission.glsl"
 
 layout(set = 0, binding = 2, std430) readonly buffer NormalBuffer {
   vec4 normals[];
@@ -69,6 +72,7 @@ struct PrimaryPayload {
   float opacity;
   vec4 attenuation;
   uvec4 status;
+  // xy barycentrics, z uintBitsToFloat(instance id), w LabPBR SSS [0,1].
   vec4 hitData;
   vec2 rayCone;
 };
@@ -128,12 +132,13 @@ vec4 sampleAlbedoRayCone(vec2 uv, float uvFootprint,
   return clamp(packed, vec4(0.0), vec4(1.0));
 }
 
-vec3 sampleNormalRayCone(vec2 uv, float uvFootprint) {
-  vec3 packed = textureLod(
+vec4 sampleNormalRayCone(vec2 uv, float uvFootprint) {
+  vec4 packed = textureLod(
       normalTexture, uv,
-      continuousTextureLod(normalTexture, uvFootprint)).rgb;
-  return finite3(packed) ? clamp(packed, vec3(0.0), vec3(1.0))
-                         : vec3(0.5, 0.5, 1.0);
+      continuousTextureLod(normalTexture, uvFootprint));
+  return any(isnan(packed)) || any(isinf(packed))
+             ? vec4(0.5, 0.5, 1.0, 1.0)
+             : clamp(packed, vec4(0.0), vec4(1.0));
 }
 
 vec4 sampleSpecularRayCone(vec2 uv, float uvFootprint) {
@@ -187,9 +192,9 @@ float decodeLabPbrMicrofacetAlpha(float smoothness) {
   return perceptualRoughness * perceptualRoughness;
 }
 
-float decodeLabPbrEmission(float packed) {
-  return packed > (254.5 / 255.0) ? 0.0
-                                  : packed * (255.0 / 254.0);
+float decodeLabPbrSubsurface(float packed) {
+  uint code = uint(round(clamp(packed, 0.0, 1.0) * 255.0));
+  return code >= 65u ? float(code - 65u) * (1.0 / 190.0) : 0.0;
 }
 
 vec3 decodeLabPbrF0(float packed, vec3 baseColor, out bool metal,
@@ -248,8 +253,8 @@ vec3 identityColor(uint value) {
 }
 
 vec3 labPbrDebugColor(uint view, vec3 baseColor, vec3 tangentNormal,
-                      float ao, float ggxAlpha, vec3 f0, vec3 emission,
-                      float opacity) {
+                       float ao, float storedHeight, float ggxAlpha, vec3 f0,
+                       vec3 emission, float opacity) {
   if (view == 1u) {
     return baseColor;
   }
@@ -270,6 +275,9 @@ vec3 labPbrDebugColor(uint view, vec3 baseColor, vec3 tangentNormal,
   }
   if (view == 7u) {
     return vec3(opacity);
+  }
+  if (view == 8u) {
+    return vec3(storedHeight);
   }
   return baseColor;
 }
@@ -398,11 +406,11 @@ void main() {
   vec3 bitangent =
       cross(interpolatedNormal, tangent) *
       (tangentData.w < 0.0 ? -1.0 : 1.0);
-  vec3 normalSample =
+  vec4 normalSample =
       normalMapActive ? sampleNormalRayCone(uv, uvFootprint)
-                      : vec3(0.5, 0.5, 1.0);
+                      : vec4(0.5, 0.5, 1.0, 1.0);
   vec3 tangentNormal =
-      normalMapActive ? decodeLabPbrNormal(normalSample)
+      normalMapActive ? decodeLabPbrNormal(normalSample.rgb)
                       : vec3(0.0, 0.0, 1.0);
   vec3 materialNormal =
       safeNormalizeNormal(mat3(tangent, bitangent, interpolatedNormal) *
@@ -412,18 +420,20 @@ void main() {
     materialNormal = -materialNormal;
   }
   float ambientOcclusion = clamp(normalSample.b, 0.0, 1.0);
+  float storedHeight = clamp(normalSample.a, 0.0, 1.0);
   float ggxAlpha = 1.0;
   vec3 f0 = vec3(0.04);
   bool metal = false;
   bool predefinedMetal = false;
   vec3 emission = vec3(0.0);
+  float subsurface = 0.0;
   if (specularMapActive) {
     vec4 specularSample = sampleSpecularRayCone(uv, uvFootprint);
     ggxAlpha = decodeLabPbrMicrofacetAlpha(specularSample.r);
     f0 = decodeLabPbrF0(specularSample.g, baseColor.rgb, metal,
                         predefinedMetal);
-    emission =
-        baseColor.rgb * decodeLabPbrEmission(specularSample.a);
+    emission = evaluateLabPbrEmission(baseColor.rgb, specularSample.a);
+    subsurface = metal ? 0.0 : decodeLabPbrSubsurface(specularSample.b);
   }
   float scalarF0 = clamp(f0.r, 0.0, 0.9604);
   float rootF0 = sqrt(scalarF0);
@@ -453,6 +463,7 @@ void main() {
   // lobe must be tinted by linear albedo (custom metals already use it as F0).
   payload.status.y = (metal ? 1u : 0u) | (predefinedMetal ? 2u : 0u) |
                      ((floatBitsToUint(surfaceOptics.w) != 0u) ? 4u : 0u);
+  payload.hitData.w = clamp(subsurface, 0.0, 1.0);
 
   if (mode == 7u) {
     payload.baseColor = baseColor.rgb;
@@ -469,6 +480,6 @@ void main() {
   if (materialDebug != 0u) {
     payload.baseColor = labPbrDebugColor(
         materialDebug, baseColor.rgb, tangentNormal, ambientOcclusion,
-        ggxAlpha, f0, emission, baseColor.a);
+        storedHeight, ggxAlpha, f0, emission, baseColor.a);
   }
 }

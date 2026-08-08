@@ -143,8 +143,11 @@
           choosePathTraceTargetExtent(
               requested_ptw, requested_pth, path_tracer.targetWidth(),
               path_tracer.targetHeight(), interactive_preview_resize);
+      const bool fg_live_input_for_frame =
+          frameGenerationRequiresLivePathTraceInput(
+              desired_frame_generation, interactive_preview_resize);
       std::uint32_t requested_output_mask = 0u;
-      if (desired_frame_generation && !interactive_preview_resize) {
+      if (fg_live_input_for_frame) {
         requested_output_mask |= kPathTraceRrMotionOutputMask;
       }
       requested_output_mask |=
@@ -196,7 +199,8 @@
                 : nullptr;
         pt_params.motion_history_valid =
             rt_motion_camera_history_valid_;
-        pt_params.temporal_reconstruction_input = dlss_settings.valid;
+        pt_params.temporal_reconstruction_input =
+            dlss_settings.valid || fg_live_input_for_frame;
         pt_params.ray_reconstruction_guides =
             dlss_settings.valid && pt_rr_requested;
         pt_params.reconstruction_mip_bias = reconstructionMipBias(
@@ -637,7 +641,7 @@
         write_timestamp(GpuTimestampQuery::PathTraceBegin,
                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
         if (target_result.exact()) {
-          path_tracer.recordDispatch(fs.cmd, rt_scene, pt_params, albedo_view,
+          path_tracer.recordDispatch(fs.cmd, *rt_scene, pt_params, albedo_view,
                                      normal_view, specular_view,
                                      static_albedo_sampler_,
                                      static_normal_sampler_,
@@ -719,7 +723,7 @@
             // application-frame token. The path-trace frame index remains a
             // separate temporal sampling sequence.
             dlss_frame.frame_index = static_cast<std::uint32_t>(
-                frame.diagnostics.render_frame);
+                temporal_render_serial);
             dlss_frame.frame_slot = pt_params.frame_slot;
             dlss_frame.jitter_x = pt_params.camera_jitter[0];
             dlss_frame.jitter_y = pt_params.camera_jitter[1];
@@ -764,20 +768,22 @@
                 streamline_vulkan_runtime_.recordDlss(dlss_frame);
           }
           if (pt_dlss_active) {
-            streamline_temporal_history_key_ =
+            streamline_temporal_commit_candidate_key_ =
                 pt_streamline_history_key;
-            streamline_temporal_history_valid_ = true;
-            streamline_temporal_render_width_ = ptw;
-            streamline_temporal_render_height_ = pth;
-            streamline_temporal_output_width_ = preview_output_width;
-            streamline_temporal_output_height_ = preview_output_height;
-            streamline_temporal_reset_generation_ =
+            streamline_temporal_commit_candidate_valid_ = true;
+            streamline_temporal_commit_candidate_render_width_ = ptw;
+            streamline_temporal_commit_candidate_render_height_ = pth;
+            streamline_temporal_commit_candidate_output_width_ =
+                preview_output_width;
+            streamline_temporal_commit_candidate_output_height_ =
+                preview_output_height;
+            streamline_temporal_commit_candidate_reset_generation_ =
                 pt_params.settings.reset_generation;
-            streamline_temporal_mode_ =
+            streamline_temporal_commit_candidate_mode_ =
                 pt_rr_requested ? pt_post.reconstruction_mode
                                 : pt_post.active_upscale;
-            streamline_temporal_ray_reconstruction_ = pt_rr_requested;
-            streamline_temporal_recovery_pending_ = false;
+            streamline_temporal_commit_candidate_ray_reconstruction_ =
+                pt_rr_requested;
             if (pt_rr_requested &&
                 !streamline_rr_active_logged_) {
               xpbd::log::infof(
@@ -836,16 +842,6 @@
           if (dlss_settings.valid) {
             streamline_temporal_recovery_pending_ = true;
           }
-        }
-        if (pt_dispatch_recorded_for_frame && frame.view_matrix != nullptr &&
-            frame.proj_matrix != nullptr) {
-          std::copy_n(frame.view_matrix, 16u,
-                      rt_motion_previous_view_.begin());
-          std::copy_n(frame.proj_matrix, 16u,
-                      rt_motion_previous_proj_.begin());
-          rt_motion_camera_history_valid_ = true;
-        } else if (pt_dispatch_recorded_for_frame) {
-          rt_motion_camera_history_valid_ = false;
         }
       } else {
         path_trace_active = false;

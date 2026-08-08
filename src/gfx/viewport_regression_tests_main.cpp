@@ -2,6 +2,7 @@
 // Linked as xpbd_viewport_regression_tests (see CMakeLists.txt).
 
 #include "xpbd/gfx/ray_tracing.hpp"
+#include "xpbd/gfx/dedicated_render_thread.hpp"
 #include "xpbd/gfx/frame_generation_state.hpp"
 #include "xpbd/gfx/gpu_backend.hpp"
 #include "xpbd/gfx/labpbr_authoring.hpp"
@@ -12,8 +13,11 @@
 #include "xpbd/gfx/labpbr_memory.hpp"
 #include "xpbd/gfx/path_trace_aov.hpp"
 #include "xpbd/gfx/preview_scene.hpp"
+#include "xpbd/gfx/render_thread_contract.hpp"
+#include "xpbd/gfx/render_thread_runtime.hpp"
 #include "xpbd/gfx/rt_scene_records.hpp"
 #include "xpbd/gfx/rt_scene_generations.hpp"
+#include "xpbd/gfx/vulkan_rt_scene.hpp"
 #include "xpbd/gfx/static_model_draw_plan.hpp"
 #include "xpbd/gfx/texture_image.hpp"
 #include "xpbd/gfx/uv_domain.hpp"
@@ -31,6 +35,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -39,9 +44,12 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -103,6 +111,29 @@ void expectNearDouble(double actual, double expected, double tolerance,
   expect(std::abs(actual - expected) <= tolerance, label);
 }
 
+struct RawUv {
+  float x = 0.0f;
+  float y = 0.0f;
+};
+
+RawUv mapOutputUvToCurrentRawUv(RawUv output_uv, RawUv jitter_pixels,
+                                std::uint32_t raw_width,
+                                std::uint32_t raw_height,
+                                bool reconstructed) {
+  if (!reconstructed) {
+    return output_uv;
+  }
+  const float width = static_cast<float>(raw_width);
+  const float height = static_cast<float>(raw_height);
+  const RawUv half_texel{0.5f / width, 0.5f / height};
+  return {
+      std::clamp(output_uv.x + jitter_pixels.x / width, half_texel.x,
+                 1.0f - half_texel.x),
+      std::clamp(output_uv.y + jitter_pixels.y / height, half_texel.y,
+                 1.0f - half_texel.y),
+  };
+}
+
 std::string readTestSource(const std::filesystem::path &relative_path) {
   const auto path =
       std::filesystem::path(XPBD_TEST_SOURCE_DIR) / relative_path;
@@ -143,6 +174,8 @@ void testPathTracePbrSourceContracts() {
       readTestSource("src/gfx/spirv/rt_debug.rahit");
   const std::string raygen =
       readTestSource("src/gfx/spirv/rt_debug.rgen");
+  const std::string emission_contract =
+      readTestSource("src/gfx/spirv/labpbr_emission.glsl");
   const std::string compute =
       readTestSource("src/gfx/spirv/path_trace.comp");
   const std::string composite =
@@ -172,7 +205,8 @@ void testPathTracePbrSourceContracts() {
       readTestSource("src/gfx/vulkan_rt_scene.cpp");
 
   expect(!forward.empty() && !forward_rt.empty() && !closest_hit.empty() &&
-              !any_hit.empty() && !raygen.empty() && !compute.empty() &&
+              !any_hit.empty() && !raygen.empty() &&
+              !emission_contract.empty() && !compute.empty() &&
               !composite.empty() && !backend.empty() &&
               !backend_static.empty() && !backend_environment.empty() &&
               !mip_header.empty() && !mip_source.empty() &&
@@ -184,6 +218,8 @@ void testPathTracePbrSourceContracts() {
   const std::string compact_composite = compactTestSource(composite);
   const std::string compact_closest_hit = compactTestSource(closest_hit);
   const std::string compact_any_hit = compactTestSource(any_hit);
+  const std::string compact_emission_contract =
+      compactTestSource(emission_contract);
   const std::string compact_path_tracer = compactTestSource(path_tracer);
   const std::string compact_stage50 = compactTestSource(stage50);
   expect(
@@ -228,6 +264,59 @@ void testPathTracePbrSourceContracts() {
              compute.find(", uv, 0.0)") != std::string::npos,
          "Full RT material reads use explicit ray-cone LOD and compatibility "
          "material reads retain their frozen base level");
+  expect(closest_hit.find(
+                 "#include \"src/gfx/spirv/labpbr_emission.glsl\"") !=
+                 std::string::npos &&
+             raygen.find(
+                 "#include \"src/gfx/spirv/labpbr_emission.glsl\"") !=
+                 std::string::npos &&
+             compact_emission_contract.find(
+                 "vec3evaluateLabPbrEmission(vec3linearBaseColor,") !=
+                 std::string::npos &&
+             compact_closest_hit.find(
+                 "emission=evaluateLabPbrEmission(baseColor.rgb,") !=
+                 std::string::npos,
+         "Emissive hits and explicit mesh-light samples share one LabPBR "
+         "emission decode and linear Base tint contract");
+  expect(raygen.find("vec3 evaluateMeshLightRadiance(") !=
+                 std::string::npos &&
+             raygen.find("uvs[i0] * b0 + uvs[i1] * b1 + uvs[i2] * b2") !=
+                 std::string::npos &&
+             raygen.find(
+                 "colors[i0] * b0 + colors[i1] * b1 + colors[i2] * b2") !=
+                 std::string::npos &&
+             raygen.find("textureLod(albedoTexture, uv, 0.0)") !=
+                 std::string::npos &&
+             raygen.find("textureLod(specularTexture, uv, 0.0)") !=
+                 std::string::npos &&
+             raygen.find("entry.metadata.z, b0, b1, b2") !=
+                 std::string::npos &&
+             raygen.find(
+                 "result.radiance = max(entry.emissionLuminance.rgb") ==
+                 std::string::npos &&
+             backend_static.find("labPbrEmissionAliasSupportFloor(") !=
+                 std::string::npos,
+         "Mesh-light NEE evaluates the actual barycentric UV, vertex tint, "
+         "Base texture, Specular emission, and coverage instead of a "
+         "per-triangle constant");
+  const std::string compact_mesh_light = compactTestSource(raygen);
+  expect(raygen.find("float meshLightPdf(") != std::string::npos &&
+             compact_mesh_light.find(
+                 "selectionPdf*distanceSquared/(area*lightCosine)") !=
+                 std::string::npos &&
+             compact_mesh_light.find(
+                 "entry.p0Probability.w*distanceSquared/"
+                 "(entry.p2Area.w*lightCosine)") != std::string::npos &&
+             raygen.find(
+                 "lightRegistryProbabilities().z * meshLightPdf(") !=
+                 std::string::npos &&
+             raygen.find("powerHeuristic(previousBsdfPdf, lightPdf)") !=
+                 std::string::npos &&
+             raygen.find(
+                 "powerHeuristic(registrySample.pdf, registryBsdfPdf)") !=
+                 std::string::npos,
+         "Mesh-light direct sampling and emissive-hit MIS use the same "
+         "Alias selection, area, solid-angle, and family PDFs");
   expect(compact_closest_hit.find("vec4reconstructionInfo;") !=
                  std::string::npos &&
              compact_closest_hit.find("continuousTextureLod") !=
@@ -282,6 +371,35 @@ void testPathTracePbrSourceContracts() {
              raygen.find("kRngDomainRussianRoulette") !=
                  std::string::npos,
          "Full RT paths use explicit state+dimension RNG domains");
+  expect(closest_hit.find("float decodeLabPbrSubsurface(float packed)") !=
+                 std::string::npos &&
+             closest_hit.find("code >= 65u ? float(code - 65u)") !=
+                 std::string::npos &&
+             closest_hit.find(
+                 "subsurface = metal ? 0.0 : decodeLabPbrSubsurface(") !=
+                 std::string::npos &&
+             closest_hit.find("payload.hitData.w = clamp(subsurface") !=
+                 std::string::npos,
+         "Full RT closest hit decodes only LabPBR SSS blue codes 65..255 "
+         "into reserved payload state and suppresses metals");
+  expect(raygen.find("kRngDomainSubsurface") != std::string::npos &&
+             raygen.find("bool insideSubsurfaceMedium = false") !=
+                 std::string::npos &&
+             raygen.find("subsurfaceFreeFlightFraction(") !=
+                 std::string::npos &&
+             raygen.find("floatBitsToUint(payload.hitData.z) != "
+                         "subsurfaceInstanceId") != std::string::npos &&
+             raygen.find("evaluateBsdfComponentsSubsurface(") !=
+                 std::string::npos &&
+             raygen.find("if (!(split > 0.0))") != std::string::npos &&
+             raygen.find("bool startSubsurface = false") !=
+                 std::string::npos &&
+             raygen.find("if (startSubsurface)") != std::string::npos &&
+             raygen.find("!cutoutMaterial") != std::string::npos &&
+             raygen.find("cosineHemisphere(\n              -geometricNormal") !=
+                 std::string::npos,
+         "Full RT SSS is an isolated bounded same-instance random walk with "
+         "closed-geometry entry and a zero-strength legacy fast path");
   expect(raygen.find("struct RayCone") != std::string::npos &&
              raygen.find("initialRayCone(") != std::string::npos &&
              raygen.find("propagateRayCone(") != std::string::npos &&
@@ -289,10 +407,10 @@ void testPathTracePbrSourceContracts() {
                  std::string::npos &&
              raygen.find("uv + vec2(0.0, inverseSize.y)") !=
                  std::string::npos &&
-             raygen.find("clamp(uv + vec2") == std::string::npos &&
-             closest_hit.find("payload.rayCone") != std::string::npos &&
-             any_hit.find("primaryPayload.rayCone") != std::string::npos &&
-             any_hit.find("shadowPayload.rayCone") != std::string::npos,
+              raygen.find("clamp(uv + vec2") == std::string::npos &&
+              closest_hit.find("payload.rayCone") != std::string::npos &&
+              any_hit.find("primaryPayload.rayCone") != std::string::npos &&
+              any_hit.find("shadowPayload") == std::string::npos,
          "Full RT initializes and propagates ray-cone footprint state into "
          "material LOD selection");
   expect(mip_header.find("enum class LabPbrMipSemantic") !=
@@ -439,7 +557,6 @@ void testPathTracePbrSourceContracts() {
 
   const std::string compact_forward = compactTestSource(forward);
   const std::string compact_forward_rt = compactTestSource(forward_rt);
-  const std::string compact_closest_hit = compactTestSource(closest_hit);
   const std::string compact_raygen = compactTestSource(raygen);
   const std::string compact_compute = compactTestSource(compute);
   const std::string compact_ray_tracing_header =
@@ -610,11 +727,16 @@ void testPathTracePbrSourceContracts() {
                  std::string::npos,
          "per-primitive optics has a material-generation GPU upload seam");
 
-  const std::array<std::string_view, 19> raygen_descriptor_contract{{
+  const std::array<std::string_view, 24> raygen_descriptor_contract{{
       "layout(set=0,binding=0)uniformaccelerationStructureEXTtopLevelAS;",
       "layout(set=0,binding=1,rgba16f)uniformimage2DoutputImage;",
       "layout(set=0,binding=3,std430)readonlybufferIndexBuffer{",
+      "layout(set=0,binding=4,std430)readonlybufferUvBuffer{",
+      "layout(set=0,binding=5)uniformsampler2DalbedoTexture;",
+      "layout(set=0,binding=6,std430)readonlybufferColorBuffer{",
+      "layout(set=0,binding=7,std430)readonlybufferPrimitiveFlagBuffer{",
       "layout(set=0,binding=10,r32f)uniformimage2DoutputDepth;",
+      "layout(set=0,binding=13)uniformsampler2DspecularTexture;",
       "layout(set=0,binding=14)uniformsampler2DenvironmentTexture;",
       "layout(set=0,binding=15,std430)readonlybufferEnvironmentBuffer{",
       "layout(set=0,binding=16,std430)readonlybufferEmissiveTriangleBuffer{",
@@ -2644,6 +2766,14 @@ void testLabPbrDecode() {
   expectNear(normal_debug[0], resolved.tangent_normal[0] * 0.5f + 0.5f,
              1.0e-6f,
              "CPU normal debug color matches Raster/PT convention");
+  expect(labPbrDebugViewFromName("height") == LabPbrDebugView::Height &&
+             std::string(labPbrDebugViewName(LabPbrDebugView::Height)) ==
+                 "height",
+         "Height data-only debug view has a stable name and parser");
+  const auto height_debug =
+      labPbrDebugColor(resolved, LabPbrDebugView::Height);
+  expectNear(height_debug[0], resolved.stored_height, 1.0e-6f,
+             "CPU Height debug exposes stored Normal alpha without displacement");
 
   auto rgb_specular = decodeLabPbrTexel(base, nullptr, &specular, 3);
   expectNear(rgb_specular.emission_strength, 0.0f, 1.0e-6f,
@@ -2788,10 +2918,16 @@ void testStrictLabPbrSuiteImport() {
         std::istreambuf_iterator<char>());
   };
   const auto encode = [](int width, int height,
-                         const std::vector<std::uint8_t> &rgba) {
+                         const std::vector<std::uint8_t> &rgba,
+                         int source_channels = 4) {
     std::vector<std::uint8_t> png;
     std::string error;
-    expect(xpbd::gfx::encodePngRgba8(width, height, rgba, png, &error),
+    xpbd::gfx::TextureImage image;
+    image.width = width;
+    image.height = height;
+    image.source_channels = source_channels;
+    image.rgba = rgba;
+    expect(xpbd::gfx::encodePngTextureImage(image, png, &error),
            "encode strict LabPBR fixture PNG");
     return png;
   };
@@ -2906,6 +3042,79 @@ void testStrictLabPbrSuiteImport() {
   expect(!unchanged.reloadRecommended() && !unchanged.metadata_changed &&
              unchanged.error.empty(),
          "unchanged strict source snapshot stays current");
+
+  const fs::path rgb_directory = directory / "rgb_suite";
+  fs::create_directories(rgb_directory, filesystem_error);
+  expect(!filesystem_error, "create RGB/RGBA provenance fixture directory");
+  filesystem_error.clear();
+  const fs::path rgb_base_path = rgb_directory / "texture.png";
+  const fs::path rgb_specular_path = rgb_directory / "texture_s.png";
+  const fs::path rgb_normal_path = rgb_directory / "texture_n.png";
+  const fs::path rgb_properties_path = rgb_directory / "texture.properties";
+  const std::vector<std::uint8_t> base_rgb_storage{
+      255u, 128u, 64u, 255u, 32u, 64u, 128u, 255u};
+  const std::vector<std::uint8_t> specular_rgb_storage{
+      0u, 0u, 0u, 255u, 255u, 230u, 64u, 255u};
+  const std::vector<std::uint8_t> normal_rgb_storage{
+      128u, 128u, 255u, 255u, 140u, 120u, 200u, 255u};
+  const auto base_rgb_png = encode(2, 1, base_rgb_storage, 3);
+  const auto specular_rgb_png = encode(2, 1, specular_rgb_storage, 3);
+  const auto normal_rgb_png = encode(2, 1, normal_rgb_storage, 3);
+  expect(writeBytes(rgb_base_path, base_rgb_png) &&
+             writeBytes(rgb_specular_path, specular_rgb_png) &&
+             writeBytes(rgb_normal_path, normal_rgb_png) &&
+             writeBytes(rgb_properties_path, properties_bytes),
+         "write all-RGB strict Suite fixture");
+  xpbd::gfx::LabPbrSuiteImportCache rgb_cache;
+  const auto rgb_imported =
+      xpbd::gfx::importLabPbrSuite(rgb_base_path, false, &rgb_cache);
+  const auto rgb_provenance = xpbd::gfx::labPbrAlphaProvenance(
+      rgb_imported.imported() ? &rgb_imported.suite.material : nullptr);
+  const auto rgb_features = xpbd::gfx::labPbrFeatureFlags(
+      rgb_imported.imported() ? &rgb_imported.suite.material : nullptr);
+  expect(rgb_imported.imported() &&
+             rgb_imported.suite.base_image->source_channels == 3 &&
+             rgb_imported.suite.material.normal_image.source_channels == 3 &&
+             rgb_imported.suite.material.specular_image.source_channels == 3 &&
+             rgb_provenance.base_source_channels == 3 &&
+             rgb_provenance.normal_source_channels == 3 &&
+             rgb_provenance.specular_source_channels == 3 &&
+             !rgb_provenance.base_alpha_authored &&
+             !rgb_provenance.height_alpha_authored &&
+             !rgb_provenance.emission_alpha_authored &&
+             (rgb_features & (xpbd::gfx::kLabPbrBaseAlphaAuthored |
+                              xpbd::gfx::kLabPbrHeightAlphaAuthored |
+                              xpbd::gfx::kLabPbrEmissionAlphaAuthored)) == 0u &&
+             rgb_imported.suite.material.sample(0.25f, 0.5f)
+                     .stored_height == 1.0f &&
+             rgb_imported.suite.material.sample(0.25f, 0.5f)
+                     .emission_strength == 0.0f,
+         "all-RGB Suite keeps default coverage/Height/emission and unauthored provenance");
+  expect(*rgb_imported.suite.source.base.original_bytes == base_rgb_png &&
+             *rgb_imported.suite.source.specular.original_bytes ==
+                 specular_rgb_png &&
+             *rgb_imported.suite.source.normal.original_bytes ==
+                 normal_rgb_png,
+         "all-RGB Suite retains exact source bytes");
+  const auto rgb_cached =
+      xpbd::gfx::importLabPbrSuite(rgb_base_path, false, &rgb_cache);
+  expect(rgb_cached.imported() && rgb_cached.suite.cache_hit &&
+             xpbd::gfx::labPbrAlphaProvenance(&rgb_cached.suite.material) ==
+                 rgb_provenance,
+         "RGB authored-alpha provenance survives immutable cache round-trip");
+
+  expect(writeBytes(rgb_base_path, base_png) &&
+             writeBytes(rgb_specular_path, specular_png),
+         "promote Base and Specular to RGBA for mixed Suite fixture");
+  const auto mixed_imported =
+      xpbd::gfx::importLabPbrSuite(rgb_base_path, false, nullptr);
+  const auto mixed_provenance = xpbd::gfx::labPbrAlphaProvenance(
+      mixed_imported.imported() ? &mixed_imported.suite.material : nullptr);
+  expect(mixed_imported.imported() &&
+             mixed_provenance.base_alpha_authored &&
+             !mixed_provenance.height_alpha_authored &&
+             mixed_provenance.emission_alpha_authored,
+         "mixed RGBA Base/RGB Normal/RGBA Specular keeps per-asset alpha provenance");
 
   const xpbd::gfx::TextureImage *excluded_images[] = {
       imported.suite.base_image.get(),
@@ -3412,6 +3621,21 @@ void testLabPbrAuthoringEncodingAndCoverage() {
                  preserved_materialized.source_channels &&
              materialized_default.rgba == preserved_materialized.rgba,
          "Composition materialization failure preserves caller output");
+  xpbd::gfx::TextureImage two_channel_source;
+  two_channel_source.width = 2;
+  two_channel_source.height = 2;
+  two_channel_source.source_channels = 2;
+  two_channel_source.rgba.assign(2u * 2u * 4u, 0u);
+  expect(!xpbd::gfx::materializeLabPbrSpecular(
+             2, 2, &two_channel_source, materialized_default,
+             &validation_error) &&
+             materialized_default.width == preserved_materialized.width &&
+             materialized_default.height == preserved_materialized.height &&
+             materialized_default.source_channels ==
+                 preserved_materialized.source_channels &&
+             materialized_default.rgba == preserved_materialized.rgba,
+         "Specular materialization rejects two-channel provenance "
+         "transactionally");
   GroupLabPbrOverride missing_group;
   missing_group.group_name = "missing";
   missing_group.emission_enabled = true;
@@ -3437,8 +3661,10 @@ void testLabPbrAuthoringEncodingAndCoverage() {
              &validation_error),
          "rebuild resolved material without authored sidecars");
   expect(!authored.specular_map_active &&
-             xpbd::gfx::labPbrFeatureFlags(&authored) == 0u,
-         "no override preserves exact missing-specular feature state");
+             xpbd::gfx::labPbrFeatureFlags(&authored) ==
+                 xpbd::gfx::kLabPbrBaseAlphaAuthored,
+         "no override preserves the authored Base alpha while retaining the "
+         "exact missing-sidecar feature state");
   expectNear(authored.sample(0.5f, 0.5f).dielectric_f0, 0.04f, 1.0e-6f,
               "no override preserves exact dielectric fallback");
   xpbd::gfx::TextureImage authored_specular;
@@ -3467,6 +3693,12 @@ void testLabPbrAuthoringEncodingAndCoverage() {
          "RGB LabPBR normal sidecar remains importable");
   expect(authored.normal_map_active && authored.normal_image.source_channels == 3,
          "RGB LabPBR normal sidecar reaches the resolved material");
+  const auto rgb_normal_provenance =
+      xpbd::gfx::labPbrAlphaProvenance(&authored);
+  expect(!rgb_normal_provenance.height_alpha_authored &&
+             (xpbd::gfx::labPbrFeatureFlags(&authored) &
+              xpbd::gfx::kLabPbrHeightAlphaAuthored) == 0u,
+         "RGB Normal keeps default Height distinct from authored alpha=255");
 }
 
 void testLabPbrCompositionAndConflicts() {
@@ -3608,7 +3840,6 @@ void testLabPbrPngChecksumAndNormalImport() {
          "Iris normal import preserves exact bytes and checksum");
 
   const auto preserved_bytes = normal.original_file_bytes;
-  const auto preserved_hash = normal.sha256;
   const auto preserved_decoded = normal.decoded;
   xpbd::gfx::TextureDecodeLimits iris_shared_budget;
   iris_shared_budget.maximum_peak_bytes =
@@ -3621,19 +3852,37 @@ void testLabPbrPngChecksumAndNormalImport() {
              *normal.original_file_bytes == png &&
              normal.decoded != nullptr && normal.decoded->rgba == rgba,
          "Iris sharing fits the peak that previously required an encoded-byte copy");
-  const auto committed_bytes = normal.original_file_bytes;
-  const auto committed_decoded = normal.decoded;
+  xpbd::gfx::TextureImage rgb_normal;
+  rgb_normal.width = 2;
+  rgb_normal.height = 1;
+  rgb_normal.source_channels = 3;
+  rgb_normal.rgba = rgba;
+  rgb_normal.rgba[3] = 255u;
+  rgb_normal.rgba[7] = 255u;
+  std::vector<std::uint8_t> rgb_png;
+  expect(xpbd::gfx::encodePngTextureImage(rgb_normal, rgb_png, &error) &&
+             write_bytes(normal_path, rgb_png),
+         "replace temporary source with matching RGB PNG");
+  expect(xpbd::gfx::importReadOnlyIrisNormal(
+             normal_path, 2, 1, normal, &error) && normal.valid() &&
+             normal.decoded->source_channels == 3 &&
+             normal.original_file_bytes != nullptr &&
+             *normal.original_file_bytes == rgb_png,
+         "RGB Iris normal imports with exact bytes and unauthored Height");
+  const auto rgb_committed_bytes = normal.original_file_bytes;
+  const auto rgb_committed_decoded = normal.decoded;
+  const auto rgb_committed_hash = normal.sha256;
 
-  const std::vector<std::uint8_t> rgb_png(
+  const std::vector<std::uint8_t> wrong_size_rgb_png(
       std::begin(kWhitePng), std::end(kWhitePng));
-  expect(write_bytes(normal_path, rgb_png),
-         "replace temporary source with RGB PNG");
+  expect(write_bytes(normal_path, wrong_size_rgb_png),
+         "replace temporary source with wrong-size RGB PNG");
   expect(!xpbd::gfx::importReadOnlyIrisNormal(
              normal_path, 2, 1, normal, &error),
-         "RGB Iris normal import is rejected");
-  expect(normal.original_file_bytes == committed_bytes &&
-             normal.decoded == committed_decoded &&
-             normal.sha256 == preserved_hash &&
+         "wrong-size RGB Iris normal import is rejected");
+  expect(normal.original_file_bytes == rgb_committed_bytes &&
+             normal.decoded == rgb_committed_decoded &&
+             normal.sha256 == rgb_committed_hash &&
              preserved_bytes != nullptr && preserved_decoded != nullptr,
          "failed normal replacement preserves active shared Iris assets");
 
@@ -3804,6 +4053,24 @@ void testLabPbrBundleExport() {
                                            0u, 10u, 0u, 0u},
          "missing Source Specular materializes the default map only for export");
 
+  xpbd::gfx::TextureImage rgb_specular_image = *composition.specular;
+  rgb_specular_image.source_channels = 3;
+  for (std::size_t texel = 0; texel < 2u; ++texel) {
+    rgb_specular_image.rgba[texel * 4u + 3u] = 255u;
+  }
+  xpbd::gfx::LabPbrCompositionResult rgb_composition;
+  rgb_composition.specular =
+      std::make_shared<const xpbd::gfx::TextureImage>(rgb_specular_image);
+  const auto rgb_export = xpbd::gfx::exportLabPbrBundle(
+      directory / "rgb_preserved.png", rgb_composition, nullptr, true);
+  xpbd::gfx::TextureImage rgb_exported_specular;
+  expect(rgb_export.success &&
+             xpbd::gfx::loadTextureImage(rgb_export.specular_path,
+                                         rgb_exported_specular, &error) &&
+             rgb_exported_specular.source_channels == 3 &&
+             rgb_exported_specular.rgba == rgb_specular_image.rgba,
+         "unedited RGB Specular exports and reimports without inventing authored alpha");
+
   xpbd::gfx::LabPbrCompositionResult conflicting = composition;
   conflicting.conflicts.push_back({});
   const auto blocked = xpbd::gfx::exportLabPbrBundle(
@@ -3940,6 +4207,40 @@ void testRtSceneGenerationContract() {
                rtSceneGenerationKey(changed) != rtSceneGenerationKey(stable),
            "each RT invalidation domain changes the scene key");
   }
+
+  xpbd::gfx::RtRestGeometry rest;
+  rest.positions = {0.0f, 0.0f, 0.0f, 1.0f, 0.0f,
+                    0.0f, 0.0f, 1.0f, 0.0f};
+  rest.normals = {0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
+                  1.0f, 0.0f, 0.0f, 1.0f};
+  rest.uvs = {0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f};
+  rest.indices = {0u, 1u, 2u};
+  rest.bone_indices = {0u, 0u, 0u};
+  rest.primitive_flags = {xpbd::gfx::kRtPrimitiveTextured};
+  rest.primitive_metadata = {{{0u, 0u, 0u, 0u}}};
+  rest.primitive_optics = {xpbd::gfx::RtSurfaceOptics{}};
+  rest.primitive_emission = {{{0.0f, 0.0f, 0.0f}}};
+  rest.geometry_ranges = {{xpbd::gfx::RtGeometryKind::RigidModel,
+                           xpbd::gfx::RtBlasPolicy::RigidLocalSpace,
+                           0u, 0u, 0u, 3u}};
+  expect(xpbd::gfx::classifyRtRestGeometryChange(rest, rest) ==
+             xpbd::gfx::RtRestGeometryChange::Unchanged,
+         "identical RT rest Candidates preserve the complete AS set");
+  auto material_only = rest;
+  material_only.primitive_optics[0].transmission = 0.25f;
+  expect(xpbd::gfx::classifyRtRestGeometryChange(rest, material_only) ==
+             xpbd::gfx::RtRestGeometryChange::MaterialOnly,
+         "ordinary RT material edits do not classify as BLAS topology");
+  auto alpha_class = rest;
+  alpha_class.primitive_flags[0] |= xpbd::gfx::kRtPrimitiveCutout;
+  expect(xpbd::gfx::classifyRtRestGeometryChange(rest, alpha_class) ==
+             xpbd::gfx::RtRestGeometryChange::AlphaClassification,
+         "Opaque-to-Cutout changes have an explicit geometry classification");
+  auto topology = rest;
+  topology.indices = {0u, 2u, 1u};
+  expect(xpbd::gfx::classifyRtRestGeometryChange(rest, topology) ==
+             xpbd::gfx::RtRestGeometryChange::Topology,
+         "index topology changes retain their full-build classification");
 }
 
 void testPathTraceOptionalOutputMaskContract() {
@@ -4649,6 +4950,9 @@ void testPathTraceBsdfAndDepth() {
   using xpbd::gfx::rtBeerLambertTransmittance;
   using xpbd::gfx::rtShadingNormalCorrection;
   using xpbd::gfx::rtSmithGgxG1;
+  using xpbd::gfx::rtSubsurfaceFreeFlightFraction;
+  using xpbd::gfx::rtSubsurfaceLobeSplit;
+  using xpbd::gfx::rtSubsurfaceOpticalDepth;
   using xpbd::gfx::kDeltaMirrorAlpha;
   using xpbd::gfx::kMinFiniteGgxAlpha;
   using xpbd::gfx::kPathTraceShadingNormalCorrectionLimit;
@@ -4728,6 +5032,46 @@ void testPathTraceBsdfAndDepth() {
              dielectric_probabilities.glossy > 0.0f &&
              dielectric_probabilities.transmission == 0.0f,
          "opaque dielectric selects diffuse and glossy only");
+  const auto zero_subsurface = rtSubsurfaceLobeSplit(
+      dielectric_probabilities.diffuse, 0.0f, true);
+  const auto disabled_subsurface = rtSubsurfaceLobeSplit(
+      dielectric_probabilities.diffuse, 1.0f, false);
+  const auto half_subsurface = rtSubsurfaceLobeSplit(
+      dielectric_probabilities.diffuse, 0.5f, true);
+  const auto full_subsurface = rtSubsurfaceLobeSplit(
+      dielectric_probabilities.diffuse, 1.0f, true);
+  expect(zero_subsurface.local_diffuse ==
+                 dielectric_probabilities.diffuse &&
+             zero_subsurface.subsurface == 0.0f &&
+             disabled_subsurface.local_diffuse ==
+                 dielectric_probabilities.diffuse &&
+             disabled_subsurface.subsurface == 0.0f,
+         "SSS zero and ineligible materials preserve the legacy diffuse "
+         "probability exactly");
+  expect(std::abs(half_subsurface.local_diffuse +
+                      half_subsurface.subsurface -
+                  dielectric_probabilities.diffuse) < 1.0e-7f &&
+             half_subsurface.local_diffuse ==
+                 half_subsurface.subsurface &&
+             full_subsurface.local_diffuse == 0.0f &&
+             full_subsurface.subsurface ==
+                 dielectric_probabilities.diffuse,
+         "SSS divides but never expands the legacy diffuse energy "
+         "allocation");
+  const float shallow_free_flight =
+      rtSubsurfaceFreeFlightFraction(0.0f, 0.25f);
+  const float deeper_free_flight =
+      rtSubsurfaceFreeFlightFraction(0.0f, 0.75f);
+  expect(rtSubsurfaceOpticalDepth(0.0f) == 0.35f &&
+             rtSubsurfaceOpticalDepth(1.0f) == 2.0f &&
+             rtSubsurfaceFreeFlightFraction(1.0f, 0.0f) == 0.0f &&
+             std::isfinite(shallow_free_flight) &&
+             std::isfinite(deeper_free_flight) &&
+             deeper_free_flight > shallow_free_flight &&
+             std::isfinite(rtSubsurfaceFreeFlightFraction(
+                 1.0f, std::numeric_limits<float>::infinity())),
+         "SSS chord-normalized free-flight sampling is finite, monotonic, "
+         "and matches the shader optical-depth endpoints");
 
   RtBsdfMaterial metal = dielectric;
   metal.base_color = {0.1f, 0.9f, 0.25f};
@@ -5731,9 +6075,11 @@ void testFrameGenerationStateLegality() {
   using xpbd::gfx::frameGenerationDisableAttemptAllowed;
   using xpbd::gfx::frameGenerationDisableMayDestroy;
   using xpbd::gfx::frameGenerationInputClearMayArmProxy;
+  using xpbd::gfx::frameGenerationHistoryReset;
   using xpbd::gfx::frameGenerationRecordDisableAttempt;
   using xpbd::gfx::frameGenerationRecordDisableCleanupFailure;
   using xpbd::gfx::frameGenerationRecordDisableDrain;
+  using xpbd::gfx::frameGenerationRequiresLivePathTraceInput;
   using xpbd::gfx::frameGenerationRuntimeCombinationIsLegal;
   using xpbd::gfx::frameGenerationStateAfterValidInputTagging;
   using xpbd::gfx::frameGenerationTemporalInputIsReady;
@@ -5775,6 +6121,15 @@ void testFrameGenerationStateLegality() {
          "DLSS-G accepts a successful temporal reconstruction output");
   expect(!frameGenerationTemporalInputIsReady(true, false),
          "DLSS-G rejects raw fallback after temporal reconstruction failure");
+  expect(frameGenerationRequiresLivePathTraceInput(true, false) &&
+             !frameGenerationRequiresLivePathTraceInput(false, false) &&
+             !frameGenerationRequiresLivePathTraceInput(true, true),
+         "DLSS-G keeps path-trace inputs live except while resize pauses them");
+  expect(frameGenerationHistoryReset(true, true, false) &&
+             !frameGenerationHistoryReset(true, false, true) &&
+             frameGenerationHistoryReset(false, false, true) &&
+             !frameGenerationHistoryReset(false, true, false),
+         "DLSS-G selects SR/RR history only when reconstruction feeds it");
 
   expect(frameGenerationRuntimeCombinationIsLegal(
              FrameGenerationRuntimeState::Unsupported, false, native, false,
@@ -6120,6 +6475,23 @@ void testTransparentGuidePolicySourceContracts() {
              compact_raygen.find("neutralizeRrGuides") !=
                  std::string::npos,
          "the deterministic primary probe keeps validity internal and marks raster-sky misses reactive");
+  const std::size_t guide_probe_begin =
+      compact_raygen.find("PrimaryAovProbeprobePrimaryAov(");
+  const std::size_t guide_probe_end = compact_raygen.find(
+      "voidclearTemporalTransparencyMasks(", guide_probe_begin);
+  const std::string guide_probe =
+      guide_probe_begin != std::string::npos &&
+              guide_probe_end != std::string::npos &&
+              guide_probe_end > guide_probe_begin
+          ? compact_raygen.substr(guide_probe_begin,
+                                  guide_probe_end - guide_probe_begin)
+          : std::string{};
+  expect(!guide_probe.empty() &&
+             guide_probe.find("payload.hitData.w") == std::string::npos &&
+             guide_probe.find("physicalTransmission") !=
+                 std::string::npos &&
+             guide_probe.find("if(blend)") != std::string::npos,
+         "positive SSS remains a closed diffuse guide surface while only physical transmission and Blend drive transparency/reactive semantics");
 
   const std::string compact_stage50 = compactTestSource(stage50);
   expect(compact_stage50.find("kPathTraceSrRequiredOutputMask") !=
@@ -6209,15 +6581,105 @@ void testTransparentGuidePolicySourceContracts() {
                  std::string::npos &&
              compact_any_hit.find("coverageVisibility") !=
                  std::string::npos &&
-             compact_any_hit.find("physicalTransmission") !=
-                 std::string::npos &&
-             compact_any_hit.find("shadowPayload.visibility*=") !=
-                 std::string::npos &&
-             compact_shadow_miss.find("shadowPayload.visibility=1.0;") ==
-                 std::string::npos &&
-             compact_raygen.find("kRngDomainAlphaCoverage") !=
-                 std::string::npos,
+              compact_any_hit.find("physicalTransmission") !=
+                  std::string::npos &&
+              compact_any_hit.find("primaryPayload.transmission*=") !=
+                  std::string::npos &&
+              compact_shadow_miss.find(
+                  "payload.transmission=clamp(payload.transmission,0.0,1.0);") !=
+                  std::string::npos &&
+              compact_raygen.find("PrimaryPayloadsavedPayload=payload;") !=
+                  std::string::npos &&
+              compact_raygen.find("shadowVisibility=payload.transmission;") !=
+                  std::string::npos &&
+              compact_raygen.find("payload=savedPayload;") !=
+                  std::string::npos &&
+              compact_raygen.find("kRngDomainAlphaCoverage") !=
+                  std::string::npos,
          "Cutout stays binary while deterministic coverage shadow visibility remains separate from physical transmission and beauty RNG");
+}
+
+void testStreamlineOptionalFeatureSourceContracts() {
+  const std::string manifest =
+      readTestSource("cmake/StreamlineManifest.cmake");
+  const std::string cmake = readTestSource("cmake/Streamline.cmake");
+  const std::string root_cmake = readTestSource("CMakeLists.txt");
+  const std::string runtime = readTestSource(
+      "src/gfx/streamline_vulkan_runtime.cpp");
+  expect(!manifest.empty() && !cmake.empty() && !root_cmake.empty() &&
+             !runtime.empty(),
+         "D3 optional Streamline feature source fixtures are readable");
+
+  const std::string compact_manifest = compactTestSource(manifest);
+  const std::string compact_cmake = compactTestSource(cmake);
+  const std::string compact_root = compactTestSource(root_cmake);
+  const std::string compact_runtime = compactTestSource(runtime);
+  expect(compact_manifest.find("_XPBD_STREAMLINE_CORE_REQUIRED") !=
+                 std::string::npos &&
+             compact_manifest.find("_XPBD_STREAMLINE_SR_REQUIRED") !=
+                 std::string::npos &&
+             compact_manifest.find("_XPBD_STREAMLINE_RR_REQUIRED") !=
+                 std::string::npos &&
+             compact_manifest.find("_XPBD_STREAMLINE_FG_REQUIRED") !=
+                 std::string::npos &&
+             compact_manifest.find("_XPBD_STREAMLINE_REFLEX_REQUIRED") !=
+                 std::string::npos &&
+             compact_manifest.find("_XPBD_STREAMLINE_PCL_REQUIRED") !=
+                 std::string::npos &&
+             compact_manifest.find(
+                 "if(_xpbd_srAND_xpbd_RR_FILES_FOUND)") !=
+                 std::string::npos &&
+             compact_manifest.find(
+                 "if(_xpbd_coreAND_xpbd_FG_FILES_FOUNDAND_xpbd_reflex)") !=
+                 std::string::npos,
+         "D3 manifest resolves core, SR, RR, FG, Reflex, and PCL independently while retaining real dependencies");
+  expect(compact_cmake.find("XPBD_STREAMLINE_RUNTIME_FILES") !=
+                 std::string::npos &&
+             compact_root.find(
+                 "if(NOTXPBD_STREAMLINE_COMPLETE_FOUND)") !=
+                 std::string::npos &&
+             compact_root.find(
+                 "XPBD_STREAMLINE_HAS_DLSS_SR=$<BOOL:${XPBD_STREAMLINE_SR_FOUND}>") !=
+                 std::string::npos &&
+             compact_root.find(
+                 "XPBD_STREAMLINE_HAS_DLSS_G=$<BOOL:${XPBD_STREAMLINE_FG_FOUND}>") !=
+                 std::string::npos,
+         "ordinary builds copy per-feature runtimes while the strict gate still requires the complete target set");
+  expect(compact_runtime.find("booldlss_plugin_available=false;") !=
+                 std::string::npos &&
+             compact_runtime.find("booldlss_rr_plugin_available=false;") !=
+                 std::string::npos &&
+             compact_runtime.find(
+                 "boolframe_generation_plugin_available=false;") !=
+                 std::string::npos &&
+             compact_runtime.find("booldlss_feature_loaded=false;") !=
+                 std::string::npos &&
+             compact_runtime.find("booldlss_runtime_faulted=false;") !=
+                 std::string::npos &&
+             compact_runtime.find("booldlss_rr_runtime_faulted=false;") !=
+                 std::string::npos &&
+             compact_runtime.find(
+                 "std::array<sl::Feature,5>requested_features{};") !=
+                 std::string::npos &&
+             compact_runtime.find(
+                 "request_feature(impl_->dlss_plugin_available,sl::kFeatureDLSS);") !=
+                 std::string::npos &&
+             compact_runtime.find(
+                 "request_feature(impl_->dlss_rr_plugin_available,sl::kFeatureDLSS_RR);") !=
+                 std::string::npos &&
+             compact_runtime.find(
+                 "request_feature(impl_->frame_generation_plugin_available,sl::kFeatureDLSS_G);") !=
+                 std::string::npos &&
+             compact_runtime.find(
+                 "request_feature(impl_->reflex_plugin_available,sl::kFeatureReflex);") !=
+                 std::string::npos &&
+             compact_runtime.find(
+                 "request_feature(impl_->pcl_plugin_available,sl::kFeaturePCL);") !=
+                 std::string::npos &&
+             compact_runtime.find(
+                 "constsl::Featurerequested_features[]={") ==
+                 std::string::npos,
+         "runtime requests only signed available plugins and records packaged, loaded, and supported state per feature");
 }
 
 void testFrameGenerationDisableSourceContracts() {
@@ -6238,11 +6700,14 @@ void testFrameGenerationDisableSourceContracts() {
       "src/gfx/vulkan_render/render/10_swapchain_and_frame_wait.inc");
   const std::string present = readTestSource(
       "src/gfx/vulkan_render/render/90_submit_present_and_finalize.inc");
+  const std::string path_trace = readTestSource(
+      "src/gfx/vulkan_render/render/50_path_trace_and_dlss.inc");
   const std::string app_main = readTestSource("src/app/main_sdl3.cpp");
   expect(!header.empty() && !state.empty() && !runtime.empty() &&
              !backend.empty() && !backend_internal.empty() &&
              !frame_generation.empty() && !frame_entry.empty() &&
              !swapchain_wait.empty() && !present.empty() &&
+             !path_trace.empty() &&
              !app_main.empty(),
          "DLSS-G disable-transaction source fixtures are readable");
 
@@ -6258,6 +6723,7 @@ void testFrameGenerationDisableSourceContracts() {
   const std::string compact_swapchain_wait =
       compactTestSource(swapchain_wait);
   const std::string compact_present = compactTestSource(present);
+  const std::string compact_path_trace = compactTestSource(path_trace);
   const std::string compact_app_main = compactTestSource(app_main);
 
   expect(
@@ -6316,6 +6782,13 @@ void testFrameGenerationDisableSourceContracts() {
               std::string::npos,
       "FG input-clear failures propagate into Native recovery");
   expect(
+      compact_frame_generation.find(
+          "frameGenerationHistoryReset(") != std::string::npos &&
+          compact_frame_generation.find(
+              "pt_temporal_reconstruction_requested_for_frame,pt_streamline_history_reset,pt_history_reset") !=
+              std::string::npos,
+      "FG reset follows the history source that actually feeds interpolation");
+  expect(
       compact_runtime.find("if(result==VK_ERROR_DEVICE_LOST){") !=
               std::string::npos &&
           compact_runtime.find(
@@ -6325,6 +6798,38 @@ void testFrameGenerationDisableSourceContracts() {
               "returnFrameGenerationTransitionResult::RecoverNative;") !=
               std::string::npos,
       "DLSS-G classifies only device loss as fatal and keeps SDK errors recoverable");
+  const std::size_t fg_state_poll_position = compact_present.find(
+      "pollFrameGenerationStateBeforePresent();");
+  const std::size_t fg_present_start_position =
+      compact_present.find("markPresentStart();");
+  const std::size_t fg_present_position =
+      compact_present.find("queuePresent(present_queue_,&pi);");
+  const std::size_t fg_present_end_position =
+      compact_present.find("markPresentEnd();");
+  const std::size_t fg_present_result_position = compact_present.find(
+      "updateFrameGenerationStateAfterPresent(pr);");
+  expect(
+      fg_state_poll_position != std::string::npos &&
+          fg_present_start_position != std::string::npos &&
+          fg_present_position != std::string::npos &&
+          fg_present_end_position != std::string::npos &&
+          fg_present_result_position != std::string::npos &&
+          fg_state_poll_position < fg_present_start_position &&
+          fg_present_start_position < fg_present_position &&
+          fg_present_position < fg_present_end_position &&
+          fg_present_end_position < fg_present_result_position,
+      "DLSS-G polls the prior async interval before Present and classifies the current result after Present");
+  expect(
+      compact_path_trace.find(
+          "frameGenerationRequiresLivePathTraceInput(") !=
+              std::string::npos &&
+          compact_path_trace.find(
+              "dlss_settings.valid||fg_live_input_for_frame") !=
+              std::string::npos &&
+          compact_runtime.find(
+              "sl::ResourceLifecycle::eOnlyValidNow") !=
+              std::string::npos,
+      "DLSS-G keeps RT inputs live and snapshots volatile guide resources");
   expect(
       compact_frame_entry.find("!fg_diagnostic.recovery_required") !=
               std::string::npos &&
@@ -6348,6 +6853,294 @@ void testFrameGenerationDisableSourceContracts() {
       "developer-only F11 fixture invokes the production fullscreen transition");
 }
 
+void testRenderThreadVulkanSafetySourceContract() {
+  const std::string backend =
+      readTestSource("src/gfx/vulkan_backend.cpp");
+  const std::string backend_internal = readTestSource(
+      "src/gfx/vulkan/vulkan_backend_internal.hpp");
+  const std::string adapter = readTestSource(
+      "src/gfx/vulkan_render_thread_backend.cpp");
+  const std::string threaded_client = readTestSource(
+      "src/gfx/threaded_vulkan_backend.cpp");
+  const std::string backend_factory = readTestSource(
+      "src/gfx/gpu_backend_factory.cpp");
+  const std::string assembly = readTestSource(
+      "src/gfx/vulkan/vulkan_backend_rt_assembly.cpp");
+  const std::string static_upload = readTestSource(
+      "src/gfx/vulkan/vulkan_backend_static_resources.cpp");
+  const std::string environment = readTestSource(
+      "src/gfx/vulkan/vulkan_backend_environment.cpp");
+  const std::string rt_scene =
+      readTestSource("src/gfx/vulkan_rt_scene.cpp");
+  const std::string frame_wait = readTestSource(
+      "src/gfx/vulkan_render/render/10_swapchain_and_frame_wait.inc");
+  const std::string acquire = readTestSource(
+      "src/gfx/vulkan_render/render/40_acquire_and_command_begin.inc");
+  const std::string temporal = readTestSource(
+      "src/gfx/vulkan_render/render/50_path_trace_and_dlss.inc");
+  const std::string finalize = readTestSource(
+      "src/gfx/vulkan_render/render/90_submit_present_and_finalize.inc");
+  const std::string app_main = readTestSource("src/app/main_sdl3.cpp");
+  expect(!backend.empty() && !backend_internal.empty() && !adapter.empty() &&
+             !threaded_client.empty() && !backend_factory.empty() &&
+             !assembly.empty() && !static_upload.empty() &&
+             !environment.empty() && !rt_scene.empty() &&
+             !frame_wait.empty() && !acquire.empty() && !temporal.empty() &&
+             !finalize.empty() && !app_main.empty(),
+         "R5-R7 Vulkan wait, ownership, activation, and Still fixtures are readable");
+
+  const std::string compact_backend = compactTestSource(backend);
+  const std::string compact_internal = compactTestSource(backend_internal);
+  const std::string compact_adapter = compactTestSource(adapter);
+  const std::string compact_threaded_client =
+      compactTestSource(threaded_client);
+  const std::string compact_backend_factory =
+      compactTestSource(backend_factory);
+  const std::string compact_assembly = compactTestSource(assembly);
+  const std::string compact_static = compactTestSource(static_upload);
+  const std::string compact_environment = compactTestSource(environment);
+  const std::string compact_rt_scene = compactTestSource(rt_scene);
+  const std::string compact_frame_wait = compactTestSource(frame_wait);
+  const std::string compact_acquire = compactTestSource(acquire);
+  const std::string compact_temporal = compactTestSource(temporal);
+  const std::string compact_finalize = compactTestSource(finalize);
+  const std::string compact_app_main = compactTestSource(app_main);
+
+  expect(compact_internal.find("ControlledWaitState") != std::string::npos &&
+             compact_backend.find("waitForFenceControlled(") !=
+                 std::string::npos &&
+             compact_backend.find("render_thread_control_?") !=
+                 std::string::npos &&
+             compact_backend.find("markGpuCompletionUnproven(stage);") !=
+                 std::string::npos &&
+             compact_frame_wait.find("SDL_Delay") == std::string::npos &&
+             compact_frame_wait.find("waitForFenceControlled(") !=
+                 std::string::npos &&
+             compact_frame_wait.find("fs.cmd,false,true") !=
+                 std::string::npos &&
+             compact_acquire.find("renderThreadStopRequested()") !=
+                 std::string::npos,
+         "active frame/acquire waits use finite RenderThread-aware slices, drain submitted work on normal shutdown, and use no SDL sleep");
+
+  expect(compact_backend.find(
+             "waitForDeviceIdleControlled(\"vkDeviceWaitIdle.shutdown\"") !=
+                 std::string::npos &&
+             compact_backend.find(
+                 "waitForDeviceIdleControlled(\"vkDeviceWaitIdle.suspend\"") !=
+                 std::string::npos &&
+             compact_backend.find(
+                 "waitForDeviceIdleControlled(\"vkDeviceWaitIdle.swapchain_recreate\"") !=
+                 std::string::npos &&
+             compact_backend.find("waiter.detach();") != std::string::npos &&
+             compact_backend.find("quarantine_required_=true;") !=
+                 std::string::npos,
+         "shutdown, Suspend ACK, and FG recreation share a bounded device-idle quarantine escape");
+
+  expect(compact_static.find("waitForFenceControlled(") !=
+                 std::string::npos &&
+             compact_static.find("command,true,true") !=
+                 std::string::npos &&
+             compact_static.find("if(gpu_completion_unproven_){") !=
+                 std::string::npos &&
+             compact_environment.find("waitForFenceControlled(") !=
+                 std::string::npos &&
+             compact_environment.find("command,true,true") !=
+                 std::string::npos &&
+             compact_environment.find(
+                 "markGpuCompletionUnproven(\"vkWaitForFences(dynamic_sky)\"") !=
+                 std::string::npos &&
+             compact_rt_scene.find(
+                 "wait_control_->reason()==RenderThreadStopReason::FatalQuarantine") !=
+                 std::string::npos &&
+             compact_rt_scene.find("completion_unproven_=true;") !=
+                 std::string::npos,
+         "transactional GPU submissions drain on ordinary shutdown and retain unproven resources after fatal cancellation");
+
+  expect(compact_adapter.find("UploadFontAtlasRenderCommand") !=
+                 std::string::npos &&
+             compact_adapter.find("uploadStaticAssetPacket(") !=
+                 std::string::npos &&
+             compact_adapter.find("uploadEnvironmentPacket(") !=
+                 std::string::npos &&
+             compact_assembly.find("frame.static_model_frame->bones") !=
+                 std::string::npos &&
+             compact_assembly.find("frame.raster_scene->environment") !=
+                 std::string::npos &&
+             compact_assembly.find("frame.rt_scene_generations") !=
+                 std::string::npos &&
+             compact_assembly.find("&assembly.update") !=
+                 std::string::npos,
+         "reliable font/static/environment commands route complete packet-backed A3 transactions");
+
+  expect(compact_adapter.find("createVulkanRenderThreadBackend()") !=
+                 std::string::npos &&
+             compact_threaded_client.find(
+                 "classThreadedVulkanBackendfinal:publicIGpuBackend") !=
+                 std::string::npos &&
+             compact_threaded_client.find(
+                 "returnstd::make_unique<ThreadedVulkanBackend>();") !=
+                 std::string::npos &&
+             compact_backend_factory.find(
+                 "OpenGLrendererisdeprecated;VulkanRenderThreadisrequired") !=
+                 std::string::npos &&
+             compact_threaded_client.find("packet_builder_.build(") !=
+                 std::string::npos &&
+             compact_threaded_client.find("worker_->publishFrame(packet)") !=
+                 std::string::npos &&
+             compact_threaded_client.find("UploadStaticAssetRenderCommand") !=
+                 std::string::npos &&
+             compact_threaded_client.find("UploadEnvironmentRenderCommand") !=
+                 std::string::npos &&
+             compact_app_main.find("XPBD_R5_RENDER_THREAD_PROBE") !=
+                 std::string::npos &&
+             compact_app_main.find("XPBD_R6_RENDER_THREAD_PROBE") !=
+                 std::string::npos &&
+             compact_app_main.find("runR5RenderThreadProbe(window,backend)") !=
+                 std::string::npos,
+         "the public Vulkan factory activates the packet/command-only RenderThread client while retaining the explicit probe");
+
+  expect(compact_adapter.find(
+             "setRenderThreadFrameContext(render_serial,previous_history)") !=
+                 std::string::npos &&
+             compact_temporal.find(
+                 "dlss_frame.frame_index=static_cast<std::uint32_t>(temporal_render_serial)") !=
+                 std::string::npos &&
+             compact_temporal.find(
+                 "streamline_temporal_commit_candidate_valid_=true") !=
+                 std::string::npos &&
+             compact_finalize.find(
+                 "if(stats_.present_succeeded){") != std::string::npos &&
+             compact_finalize.find(
+                 "streamline_temporal_history_render_serial_") !=
+                 std::string::npos &&
+             compact_finalize.find("discard_temporal_candidate()") !=
+                 std::string::npos,
+         "consumed render serials and present-committed temporal candidates replace UI and pre-submit authority");
+
+  expect(compact_threaded_client.find(
+             "RenderThreadDiagnosticsrenderThreadDiagnostics()constoverride") !=
+                 std::string::npos &&
+             compact_threaded_client.find("self->readyForWork(),") !=
+                 std::string::npos &&
+             compact_threaded_client.find("self->worker_!=nullptr,") ==
+                 std::string::npos &&
+             compact_threaded_client.find(
+                 "latest_previous_history_render_serial_=stats->previous_history_render_serial") !=
+                 std::string::npos &&
+             compact_threaded_client.find(
+                 "++mailbox_replacement_count_") != std::string::npos &&
+             compact_threaded_client.find(
+                 "self->last_presented_snapshot_") !=
+                 std::string::npos &&
+             compact_adapter.find(
+                 "outcome.previous_history_render_serial=") !=
+                 std::string::npos &&
+             compact_adapter.find(
+                 "previous_history!=nullptr?previous_history->render_serial:0u") !=
+                 std::string::npos,
+         "H1 observability distinguishes produced, replaced, consumed, previous-history, and presented serials");
+
+  expect(compact_app_main.find("XPBD_H1_WINDOW_GATE") !=
+                 std::string::npos &&
+             compact_app_main.find("H1_WINDOW_GATE_PASS") !=
+                 std::string::npos &&
+             compact_app_main.find("XPBD_H1_TEMPORAL_GATE") !=
+                 std::string::npos &&
+             compact_app_main.find("H1_TEMPORAL_GATE_PASS") !=
+                 std::string::npos &&
+             compact_app_main.find("XPBD_H1_HDRI_SWITCH") !=
+                 std::string::npos &&
+             compact_app_main.find("H1_HDRI_SWITCH_PASS") !=
+                 std::string::npos &&
+             compact_app_main.find("XPBD_H1_STILL_CANCEL_AT_SAMPLES") !=
+                 std::string::npos &&
+             compact_app_main.find("H1_FATAL_GATE_PASS") !=
+                 std::string::npos &&
+             compact_app_main.find("XPBD_H1_EXPECT_UPLOAD_SHUTDOWN") !=
+                 std::string::npos &&
+             compact_app_main.find("H1_UPLOAD_SHUTDOWN_GATE_PASS") !=
+                 std::string::npos &&
+             compact_adapter.find("XPBD_H1_INJECT_FATAL_AFTER_PRESENTS") !=
+                 std::string::npos &&
+             compact_adapter.find("XPBD_H1_SHUTDOWN_DURING_UPLOAD") !=
+                 std::string::npos &&
+             compact_adapter.find("recordFatalError(") !=
+                 std::string::npos &&
+             compact_adapter.find("control->requestShutdown()") !=
+                 std::string::npos,
+         "H1 hardware fixtures exercise window, temporal, HDRI, Still cancel, fatal, and clean upload-shutdown paths");
+
+  expect(compact_app_main.find(
+             "conststd::uint64_ts00_new_present_count=") !=
+                 std::string::npos &&
+             compact_app_main.find(
+                 "s00_pre_import_rt_present_frames+=s00_new_present_count") !=
+                 std::string::npos &&
+             compact_app_main.find(
+                 "backend_stats.present_success_count>s00_import_present_baseline") !=
+                 std::string::npos &&
+             compact_app_main.find(
+                 "packet_serial>s00_import_packet_baseline") !=
+                 std::string::npos &&
+             compact_app_main.find(
+                 "static_model->cube_count==s00_import_expected_cube_count") !=
+                 std::string::npos &&
+             compact_app_main.find(
+                 "rt_scene_generations.topology==frame.rt_scene_generations.topology") !=
+                 std::string::npos &&
+             compact_app_main.find(
+                 "s00_post_import_present_frames+=s00_new_present_count") !=
+                 std::string::npos &&
+             compact_app_main.find(
+                 "S00_EXIT_SUSPEND_ACKresult=worker_gpu_quiesced") !=
+                 std::string::npos &&
+             compact_app_main.find(
+                 "diagnostic_last_present_success_count") !=
+                 std::string::npos &&
+             compact_app_main.find(
+                 "completion_diagnostic_frames-=static_cast<std::uint32_t>") !=
+                 std::string::npos,
+         "S00 and performance evidence count unique worker presentations rather than repeated UI observations");
+
+  expect(compact_threaded_client.find(
+              "makeStartStillRenderCommand(packet,request)") !=
+                 std::string::npos &&
+             compact_threaded_client.find(
+                 "CancelStillRenderCommand{still_request->job_id}") !=
+                 std::string::npos &&
+             compact_threaded_client.find("if(!stillClientActive()){") !=
+                 std::string::npos &&
+             compact_adapter.find(
+                 "worker_frame.static_model=still.scene.static_model.get();") !=
+                 std::string::npos &&
+             compact_adapter.find(
+                 "worker_frame.world_environment=still.scene.world_environment.get();") !=
+                 std::string::npos &&
+             compact_adapter.find(
+                 "worker_frame.still_render=&still_request;") !=
+                 std::string::npos &&
+             compact_adapter.find(
+              "outcome.still_render_status=active_still_->status;") !=
+                  std::string::npos,
+          "R7 Still execution uses the immutable Start snapshot, freezes replacement uploads, and returns event observations");
+
+  expect(compact_app_main.find("owned_command.logical_texture_id=") !=
+                 std::string::npos &&
+             compact_threaded_client.find(
+                 "uiLogicalTextureId(UiLogicalTexture::FontAtlas)") !=
+                 std::string::npos &&
+             compact_backend.find("resolveUiLogicalTexture(") !=
+                 std::string::npos &&
+             compact_backend.find(
+                 "resolveUiLogicalTexture(logical_texture_id)") !=
+                 std::string::npos &&
+             compact_backend.find("&descriptor,0,nullptr") !=
+                 std::string::npos &&
+             compact_backend.find("reinterpret_cast<VkDescriptorSet") ==
+                 std::string::npos,
+         "R7 UI packets carry logical texture IDs and only the worker resolves Vulkan descriptors");
+}
+
 void testRtAlphaSemantics() {
   using xpbd::gfx::RtAlphaMode;
   using xpbd::gfx::RtFrontToBackAccumulator;
@@ -6358,6 +7151,20 @@ void testRtAlphaSemantics() {
   using xpbd::gfx::rtAcceptedOpacity;
   using xpbd::gfx::rtDeterministicShadowVisibilityAfter;
   using xpbd::gfx::rtShadowVisibilityAfter;
+
+  RtTransparentGuideProbeInputV1 subsurface_guide{};
+  subsurface_guide.classification = RtTransparencyClass::Opaque;
+  subsurface_guide.subsurface = 1.0f;
+  const auto subsurface_result =
+      resolveRtTransparentGuideProbeV1(subsurface_guide);
+  expectNear(subsurface_result.transparency_and_composition, 0.0f, 1.0e-6f,
+             "SSS does not become a transparency/composition guide");
+  expectNear(subsurface_result.reactive, 0.0f, 1.0e-6f,
+             "SSS does not become a reactive guide");
+  expectNear(subsurface_result.guide_validity, 1.0f, 1.0e-6f,
+             "SSS retains an opaque current-primary-surface guide");
+  expect(!subsurface_result.neutralize_rr_guides,
+         "SSS retains dielectric diffuse-albedo RR guides");
 
   expectNear(rtAcceptedOpacity(RtAlphaMode::Cutout, 0.0f), 0.0f, 1.0e-6f,
              "RT cutout rejects transparent texel");
@@ -6844,6 +7651,104 @@ void testWorldEnvironmentFoundation() {
              preserved_asset.generation == preserved_generation &&
              preserved_asset.source_identity == "fixture.hdr",
          "failed HDR asset replacement preserves committed state");
+  HdrDecodeLimits tiny_asset_peak;
+  tiny_asset_peak.maximum_asset_peak_bytes = 128u;
+  expect(!buildHdrEnvironmentAsset(hdr, "oversized.hdr", "oversized-sha",
+                                   9u, preserved_asset, &error,
+                                   tiny_asset_peak) &&
+             preserved_asset.valid() &&
+             preserved_asset.generation == preserved_generation,
+         "HDR distribution peak-budget failure preserves committed state");
+
+  HdriRuntimeBudget full_budget;
+  expect(resolveHdriRuntimeBudget(preserved_asset.radiance, 8192u,
+                                  full_budget, &error) &&
+             full_budget.requested_width == 8192u &&
+             full_budget.resolved_width == 4u &&
+             full_budget.resolved_height == 2u &&
+             full_budget.distribution_width == 4u &&
+             full_budget.distribution_height == 2u,
+         "HDR runtime resolver never pointlessly upscales the source extent");
+
+  FloatEnvironmentImage linear_source;
+  linear_source.width = 8u;
+  linear_source.height = 4u;
+  linear_source.rgba.resize(8u * 4u * 4u, 1.0f);
+  for (std::uint32_t y = 0u; y < linear_source.height; ++y) {
+    for (std::uint32_t x = 0u; x < linear_source.width; ++x) {
+      const std::size_t base =
+          (static_cast<std::size_t>(y) * linear_source.width + x) * 4u;
+      linear_source.rgba[base + 0u] = 2.0f + static_cast<float>(x);
+      linear_source.rgba[base + 1u] = 4.0f + static_cast<float>(y);
+      linear_source.rgba[base + 2u] = 8.0f;
+      linear_source.rgba[base + 3u] = 1.0f;
+    }
+  }
+  FloatEnvironmentImage linear_resampled;
+  expect(resampleHdriLatLong(linear_source, 4u, linear_resampled, &error) &&
+             linear_resampled.valid() && linear_resampled.width == 4u &&
+             linear_resampled.height == 2u &&
+             linear_resampled.rgba[0] > 1.0f &&
+             linear_resampled.rgba[2] >= 8.0f,
+         "HDR runtime resampling preserves unbounded linear radiance");
+  FloatEnvironmentImage invalid_linear_source = linear_source;
+  invalid_linear_source.rgba[0] = -1.0f;
+  const FloatEnvironmentImage preserved_resample = linear_resampled;
+  expect(!resampleHdriLatLong(invalid_linear_source, 4u,
+                              linear_resampled, &error) &&
+             linear_resampled.rgba == preserved_resample.rgba,
+         "invalid HDR resampling is transactional");
+
+  HdriRuntimeBudget width_four_budget;
+  HdriRuntimeBudgetLimits pressure_limits;
+  pressure_limits.minimum_runtime_width = 2u;
+  pressure_limits.safety_margin_bytes = 0u;
+  expect(resolveHdriRuntimeBudget(linear_source, 4u, width_four_budget,
+                                  &error, pressure_limits),
+         "HDR runtime budget exposes a deterministic smaller candidate");
+  pressure_limits.maximum_total_bytes = width_four_budget.total_bytes;
+  HdriRuntimeBudget pressure_resolved;
+  expect(resolveHdriRuntimeBudget(linear_source, 8u, pressure_resolved,
+                                  &error, pressure_limits) &&
+             pressure_resolved.resolved_width == 4u,
+         "HDR runtime budget deterministically lowers an oversized request");
+  HdriRuntimeBudget width_eight_budget;
+  expect(resolveHdriRuntimeBudget(linear_source, 8u, width_eight_budget,
+                                  &error),
+         "HDR runtime budget exposes the requested GPU footprint");
+  HdriRuntimeBudgetLimits gpu_pressure_limits;
+  gpu_pressure_limits.minimum_runtime_width = 2u;
+  gpu_pressure_limits.maximum_gpu_bytes =
+      width_four_budget.gpu_image_bytes +
+      width_four_budget.gpu_distribution_bytes;
+  HdriRuntimeBudget gpu_pressure_resolved;
+  expect(resolveHdriRuntimeBudget(linear_source, 8u,
+                                  gpu_pressure_resolved, &error,
+                                  gpu_pressure_limits) &&
+             gpu_pressure_resolved.resolved_width == 4u &&
+             width_eight_budget.gpu_image_bytes +
+                     width_eight_budget.gpu_distribution_bytes >
+                 gpu_pressure_limits.maximum_gpu_bytes,
+         "HDR runtime resolver applies the combined GPU image/table budget");
+
+  HdrEnvironmentRuntimeCandidate runtime_candidate;
+  expect(buildHdrEnvironmentRuntimeCandidate(
+             preserved_asset, 2u, 31u, runtime_candidate, &error) &&
+             runtime_candidate.valid() &&
+             runtime_candidate.content_generation == preserved_generation &&
+             runtime_candidate.runtime_settings_generation == 31u,
+         "HDR runtime Candidate commits matching radiance, Alias data, and generations");
+  const std::uint64_t runtime_candidate_generation =
+      runtime_candidate.runtime_settings_generation;
+  HdriRuntimeBudgetLimits impossible_runtime_limits;
+  impossible_runtime_limits.maximum_total_bytes = 1u;
+  expect(!buildHdrEnvironmentRuntimeCandidate(
+             preserved_asset, 2u, 32u, runtime_candidate, &error,
+             impossible_runtime_limits) &&
+             runtime_candidate.valid() &&
+             runtime_candidate.runtime_settings_generation ==
+                 runtime_candidate_generation,
+         "failed HDR runtime Candidate construction preserves the old complete set");
 
   WorldEnvironmentState world;
   ResolvedWorldEnvironment resolved = resolveWorldEnvironment(world);
@@ -6899,7 +7804,12 @@ void testWorldEnvironmentFoundation() {
   world.rotation_radians = static_cast<float>(-0.5 * pi);
   resolved = resolveWorldEnvironment(world);
   expect(resolved.sky_rendering == SkyRendering::UserHdri &&
-             resolved.hdr != nullptr && resolved.environment_lighting,
+             resolved.hdr != nullptr && resolved.environment_lighting &&
+             resolved.requested_hdri_runtime_width ==
+                 world.hdri_runtime_resolution &&
+             resolved.resolved_hdri_runtime_width == 4u &&
+             resolved.resolved_hdri_runtime_height == 2u &&
+             resolved.hdri_runtime_budget.valid(),
          "available selected HDR resolves as User HDRI");
   expectNear(resolved.environment_strength, 2.5f, 1e-6f,
              "HDR physical strength is independent");
@@ -7090,6 +8000,142 @@ void testWorldEnvironmentFoundation() {
                    "second emissive patch probability is exact");
   expect(emitters.probability(2) == 0.0,
          "zero-radiance patch has zero probability");
+  const std::uint32_t repeated_emitter = emitters.sample(0.75, 0.25);
+  expect(repeated_emitter == emitters.sample(0.75, 0.25),
+         "fixed Alias RNG inputs select the same emissive triangle");
+
+  const double triangle_u = xpbd::gfx::pathTraceRandom01(
+      17u, 23u, 29u, 0u, 0x4d455348u);
+  const double triangle_v = xpbd::gfx::pathTraceRandom01(
+      17u, 23u, 29u, 1u, 0x4d455348u);
+  const auto barycentrics =
+      sampleUniformTriangleBarycentrics(triangle_u, triangle_v);
+  const auto repeated_barycentrics =
+      sampleUniformTriangleBarycentrics(triangle_u, triangle_v);
+  expect(barycentrics == repeated_barycentrics &&
+             std::abs(barycentrics[0] + barycentrics[1] +
+                          barycentrics[2] -
+                      1.0) < 1.0e-12 &&
+             barycentrics[0] >= 0.0 && barycentrics[1] >= 0.0 &&
+             barycentrics[2] >= 0.0,
+         "fixed mesh-light RNG produces reproducible uniform-triangle "
+         "barycentrics");
+  xpbd::gfx::TextureImage gradient_base;
+  gradient_base.width = 2;
+  gradient_base.height = 2;
+  gradient_base.source_channels = 4;
+  gradient_base.rgba = {
+      255u, 0u, 0u, 255u, 0u, 255u, 0u, 255u,
+      0u, 0u, 255u, 255u, 255u, 255u, 255u, 255u};
+  xpbd::gfx::TextureImage gradient_specular;
+  gradient_specular.width = 2;
+  gradient_specular.height = 2;
+  gradient_specular.source_channels = 4;
+  gradient_specular.rgba = {
+      0u, 10u, 0u, 254u, 0u, 10u, 0u, 254u,
+      0u, 10u, 0u, 254u, 0u, 10u, 0u, 254u};
+  xpbd::gfx::ResolvedMaterialTable gradient_material;
+  gradient_material.width = 2;
+  gradient_material.height = 2;
+  gradient_material.specular_map_active = true;
+  gradient_material.setImageAssets(
+      std::make_shared<const xpbd::gfx::TextureImage>(gradient_base), {},
+      std::make_shared<const xpbd::gfx::TextureImage>(gradient_specular));
+  const auto red_barycentrics =
+      sampleUniformTriangleBarycentrics(0.0, 0.0);
+  const auto green_barycentrics =
+      sampleUniformTriangleBarycentrics(1.0, 0.0);
+  const auto &red_emission = gradient_material.sample(
+      static_cast<float>(red_barycentrics[1]),
+      static_cast<float>(red_barycentrics[2]));
+  const auto red_radiance = red_emission.emission_linear;
+  const auto &green_emission = gradient_material.sample(
+      static_cast<float>(green_barycentrics[1]),
+      static_cast<float>(green_barycentrics[2]));
+  const auto green_radiance = green_emission.emission_linear;
+  expect(gradient_material.valid() && red_radiance[0] > 0.99f &&
+             red_radiance[1] == 0.0f && green_radiance[0] == 0.0f &&
+             green_radiance[1] > 0.99f,
+         "barycentric UV selects true point radiance on a LabPBR emission "
+         "gradient instead of the triangle average");
+  const double sampled_mesh_pdf = emissiveTriangleSolidAnglePdf(
+      0.2, 2.0, 4.0, 0.5);
+  const double evaluated_mesh_pdf = areaPdfToSolidAngle(
+      0.2 / 2.0, 4.0, 0.5);
+  expectNearDouble(sampled_mesh_pdf, evaluated_mesh_pdf, 1.0e-12,
+                   "mesh-light sample and emissive-hit PDF use the same "
+                   "selection/area/solid-angle distribution");
+
+  xpbd::gfx::TextureImage support_base;
+  support_base.width = 4;
+  support_base.height = 4;
+  support_base.source_channels = 4;
+  support_base.rgba.assign(4u * 4u * 4u, 0u);
+  support_base.rgba[0u] = 255u;
+  support_base.rgba[1u] = 255u;
+  support_base.rgba[2u] = 255u;
+  support_base.rgba[3u] = 255u;
+  xpbd::gfx::TextureImage support_specular;
+  support_specular.width = 4;
+  support_specular.height = 4;
+  support_specular.source_channels = 4;
+  support_specular.rgba.resize(4u * 4u * 4u);
+  for (std::size_t pixel = 0u; pixel < 16u; ++pixel) {
+    const std::size_t offset = pixel * 4u;
+    support_specular.rgba[offset + 0u] = 0u;
+    support_specular.rgba[offset + 1u] = 10u;
+    support_specular.rgba[offset + 2u] = 0u;
+    support_specular.rgba[offset + 3u] = 255u;
+  }
+  support_specular.rgba[1u * 4u + 3u] = 254u;
+  xpbd::gfx::ResolvedMaterialTable support_material;
+  support_material.width = 4;
+  support_material.height = 4;
+  support_material.specular_map_active = true;
+  support_material.setImageAssets(
+      std::make_shared<const xpbd::gfx::TextureImage>(support_base), {},
+      std::make_shared<const xpbd::gfx::TextureImage>(support_specular));
+  expect(support_material.valid() &&
+             xpbd::gfx::labPbrEmissionAliasSupportFloor(
+                 &support_material) > 0.0f,
+         "a single emissive texel keeps positive Alias support even when "
+         "bounded probes miss neighboring filtered Base support");
+  const std::uint64_t emission_content_key =
+      xpbd::gfx::labPbrEmissionContentKey(&support_material);
+  auto roughness_only_specular = support_specular;
+  roughness_only_specular.rgba[1u * 4u + 0u] = 217u;
+  support_material.setImageAssets(
+      std::make_shared<const xpbd::gfx::TextureImage>(support_base), {},
+      std::make_shared<const xpbd::gfx::TextureImage>(
+          roughness_only_specular));
+  expect(emission_content_key != 0u &&
+             xpbd::gfx::labPbrEmissionContentKey(&support_material) ==
+                 emission_content_key,
+         "roughness-only edits preserve the mesh-emission generation key");
+  auto changed_emission_specular = support_specular;
+  changed_emission_specular.rgba[1u * 4u + 3u] = 128u;
+  support_material.setImageAssets(
+      std::make_shared<const xpbd::gfx::TextureImage>(support_base), {},
+      std::make_shared<const xpbd::gfx::TextureImage>(
+          changed_emission_specular));
+  expect(xpbd::gfx::labPbrEmissionContentKey(&support_material) !=
+             emission_content_key,
+         "Specular Alpha emission edits invalidate only the emission key");
+  support_specular.source_channels = 3;
+  support_material.setImageAssets(
+      std::make_shared<const xpbd::gfx::TextureImage>(support_base), {},
+      std::make_shared<const xpbd::gfx::TextureImage>(support_specular));
+  expect(xpbd::gfx::labPbrEmissionAliasSupportFloor(
+             &support_material) == 0.0f,
+         "RGB Specular provenance cannot invent emissive Alias support");
+  expect(xpbd::gfx::labPbrEmissionCoverageWeight(
+             0.01f, true, false) == 0.0f &&
+             xpbd::gfx::labPbrEmissionCoverageWeight(
+                 0.5f, true, false) == 1.0f &&
+             xpbd::gfx::labPbrEmissionCoverageWeight(
+                 0.5f, false, true) == 0.5f,
+         "textured emissive Cutout is binary while Blend uses expected "
+         "stochastic coverage");
 
   expectNearDouble(powerHeuristic(1.0, 1.0), 0.5, 1e-12,
                    "power heuristic splits equal PDFs");
@@ -7158,6 +8204,1697 @@ void testVulkanPathTraceImplementationSelection() {
   xpbd::gfx::setVulkanPathTraceAvailability(false, false);
 }
 
+void testA3AtomicRtCandidateSourceContract() {
+  const std::string internal = readTestSource(
+      "src/gfx/vulkan/vulkan_backend_internal.hpp");
+  const std::string static_resources = readTestSource(
+      "src/gfx/vulkan/vulkan_backend_static_resources.cpp");
+  const std::string stage20 = readTestSource(
+      "src/gfx/vulkan_render/render/20_environment_and_rt_scene.inc");
+  const std::string rt_header =
+      readTestSource("include/xpbd/gfx/vulkan_rt_scene.hpp");
+  const std::string rt_source =
+      readTestSource("src/gfx/vulkan_rt_scene.cpp");
+  const std::string environment_source = readTestSource(
+      "src/gfx/vulkan/vulkan_backend_environment.cpp");
+  expect(!internal.empty() && !static_resources.empty() &&
+             !stage20.empty() && !rt_header.empty() && !rt_source.empty() &&
+             !environment_source.empty(),
+         "A3 atomic RT Candidate source fixtures are readable");
+
+  const std::string compact_internal = compactTestSource(internal);
+  const std::string compact_static = compactTestSource(static_resources);
+  const std::string compact_stage20 = compactTestSource(stage20);
+  const std::string compact_rt_header = compactTestSource(rt_header);
+  const std::string compact_rt_source = compactTestSource(rt_source);
+  const std::string compact_environment =
+      compactTestSource(environment_source);
+  expect(compact_internal.find(
+             "std::array<std::unique_ptr<VulkanRtScene>,2>rt_scenes_") !=
+                 std::string::npos &&
+             compact_internal.find(
+             "std::array<std::unique_ptr<VulkanRtScene>,2>rt_scene_candidates_") !=
+                 std::string::npos,
+         "published and scratch RT scene owners are distinct complete objects");
+  expect(compact_rt_header.find(
+             "[[nodiscard]]boolsubmitPendingBuild();") !=
+                 std::string::npos &&
+             compact_rt_header.find(
+             "[[nodiscard]]RtScenePendingBuildStatepollPendingBuild(boolwait_for_completion=false);") !=
+                 std::string::npos &&
+             compact_rt_source.find(
+             "recordBuilds(cmd);returnsubmitOneShotPending(cmd);") !=
+                 std::string::npos &&
+             compact_rt_source.find(
+             "returnpollPendingBuild(true)==RtScenePendingBuildState::ReadyToCommit&&ready();") !=
+                 std::string::npos,
+         "RT Candidate submission stays unpublished until fence polling proves ReadyToCommit");
+  expect(compact_static.find(
+             "std::swap(rt_scenes_[slot],rt_scene_candidates_[slot]);") !=
+                 std::string::npos &&
+             compact_stage20.find(
+             "prepareRtSceneCandidate(frame_index_,rt_update)") !=
+                 std::string::npos &&
+             compact_stage20.find(
+             "publishRtSceneCandidate(frame_index_,scene_hash)") !=
+                 std::string::npos &&
+             compact_stage20.find("rt_scene->updateGeometry(") ==
+                 std::string::npos,
+         "render updates mutate only the scratch Candidate and pointer-swap after success");
+
+  const std::size_t injected_failure_arm =
+      compact_static.find("pending.fail_before_commit=true;");
+  const std::size_t injected_failure_check =
+      compact_static.find("if(pending.fail_before_commit){");
+  const std::size_t injected_failure_discard = compact_static.find(
+      "discardStaticAssetPending(\"injected-static-publish-failure\")",
+      injected_failure_check);
+  const std::size_t pending_commit = compact_static.find(
+      "complete=commitStaticAssetPending(uploaded_bytes)",
+      injected_failure_discard);
+  expect(injected_failure_arm != std::string::npos &&
+             injected_failure_check != std::string::npos &&
+             injected_failure_discard != std::string::npos &&
+             pending_commit != std::string::npos &&
+             injected_failure_check < injected_failure_discard &&
+             injected_failure_discard < pending_commit,
+         "static GPU/RT failure seam discards Pending before atomic commit can replace published owners");
+  expect(compact_static.find(
+             "pending.rt_candidates[i]->pollPendingBuild(true)") !=
+                 std::string::npos &&
+             compact_static.find(
+             "std::swap(rt_scene_candidates_[i],pending.rt_candidates[i])") !=
+                 std::string::npos &&
+             compact_static.find(
+             "discardStaticAssetPending(\"static-rt-candidate-submit-failure\")") !=
+                 std::string::npos &&
+             compact_static.find(
+                 "resetRtSceneCandidate(slot,\"prepare-or-budget-failure\")") !=
+                 std::string::npos,
+         "failed static and dynamic RT Candidates drain and discard without touching current owners");
+
+  const std::size_t budget_preflight = compact_static.find(
+      "log_transaction_budget(\"preflight\",budget_accepted)");
+  const std::size_t staging_allocation =
+      compact_static.find("createBuffer(staging_bytes");
+  const std::size_t budget_post_build = compact_static.find(
+      "log_transaction_budget(\"post-build\",actual_budget_accepted)");
+  const std::size_t budget_reject = compact_static.find(
+      "if(!actual_budget_accepted){", budget_post_build);
+  const std::size_t budget_discard = compact_static.find(
+      "discardStaticAssetPending(\"static-rt-candidate-budget-failure\")",
+      budget_reject);
+  const std::size_t deferred_return = compact_static.find(
+      "if(defer_commit){", budget_discard);
+  expect(compact_static.find("structStaticRtTransactionBudget{") !=
+                 std::string::npos &&
+             compact_static.find("cpu_persistent_bytes") !=
+                 std::string::npos &&
+             compact_static.find("rt_cpu_growth_bytes") !=
+                 std::string::npos &&
+             compact_static.find("XPBD_A3_STATIC_RT_MAX_PEAK_BYTES") !=
+                 std::string::npos &&
+             compact_static.find("finalizeStaticRtBudget(") !=
+                 std::string::npos &&
+             compact_rt_header.find("std::uint64_tcpu_rest_bytes=0;") !=
+                 std::string::npos &&
+             compact_rt_header.find("std::uint64_tcpu_workspace_bytes=0;") !=
+                 std::string::npos,
+         "U5 peak budget accounts for persistent/Candidate CPU and RT workspace");
+  expect(budget_preflight != std::string::npos &&
+             staging_allocation != std::string::npos &&
+             budget_post_build != std::string::npos &&
+             budget_reject != std::string::npos &&
+             budget_discard != std::string::npos &&
+             deferred_return != std::string::npos &&
+             budget_preflight < staging_allocation &&
+             budget_post_build < budget_reject &&
+             budget_reject < budget_discard &&
+             budget_discard < deferred_return,
+         "U5 rejects estimated and driver-sized peaks before allocating or publishing owners");
+
+  const std::size_t environment_key_begin = compact_environment.find(
+      "std::uint64_tVulkanBackend::worldEnvironmentResourceKey(");
+  const std::size_t environment_key_end = compact_environment.find(
+      "boolVulkanBackend::ensureWorldEnvironmentSampler()",
+      environment_key_begin);
+  expect(environment_key_begin != std::string::npos &&
+             environment_key_end != std::string::npos &&
+             compact_environment
+                     .substr(environment_key_begin,
+                             environment_key_end - environment_key_begin)
+                     .find("resolved.generation") == std::string::npos &&
+             compact_environment
+                     .substr(environment_key_begin,
+                             environment_key_end - environment_key_begin)
+                     .find("resolved.background_multiplier") !=
+                 std::string::npos &&
+             compact_environment.find("bind_published_runtime(false)") !=
+                 std::string::npos &&
+             compact_environment.find(
+                 "resolved=world_environment_published_") ==
+                 std::string::npos,
+         "HDR GPU key ignores unrelated global generations and stable hits preserve current logical state");
+}
+
+void testA5StaticSupersedeRetirementSourceContract() {
+  const std::string internal = readTestSource(
+      "src/gfx/vulkan/vulkan_backend_internal.hpp");
+  const std::string static_resources = readTestSource(
+      "src/gfx/vulkan/vulkan_backend_static_resources.cpp");
+  const std::string stage30 = readTestSource(
+      "src/gfx/vulkan_render/render/30_frame_resources_and_uploads.inc");
+  const std::string worker = readTestSource(
+      "src/gfx/dedicated_render_thread.cpp");
+  const std::string client = readTestSource(
+      "src/gfx/threaded_vulkan_backend.cpp");
+  const std::string adapter = readTestSource(
+      "src/gfx/vulkan_render_thread_backend.cpp");
+  const std::string environment = readTestSource(
+      "src/gfx/vulkan/vulkan_backend_environment.cpp");
+  const std::string assembly = readTestSource(
+      "src/gfx/vulkan/vulkan_backend_rt_assembly.cpp");
+  const std::string stage00 = readTestSource(
+      "src/gfx/vulkan_render/render/00_frame_entry.inc");
+  expect(!internal.empty() && !static_resources.empty() &&
+             !stage30.empty() && !worker.empty() && !client.empty() &&
+             !adapter.empty() && !environment.empty() &&
+             !assembly.empty() && !stage00.empty(),
+         "A5 P2 Supersede/retirement source fixtures are readable");
+
+  const std::string compact_internal = compactTestSource(internal);
+  const std::string compact_static = compactTestSource(static_resources);
+  const std::string compact_stage30 = compactTestSource(stage30);
+  const std::string compact_worker = compactTestSource(worker);
+  const std::string compact_client = compactTestSource(client);
+  const std::string compact_adapter = compactTestSource(adapter);
+  const std::string compact_environment = compactTestSource(environment);
+  const std::string compact_assembly = compactTestSource(assembly);
+  const std::string compact_stage00 = compactTestSource(stage00);
+
+  expect(compact_internal.find("structStaticAssetRetired{") !=
+                 std::string::npos &&
+             compact_internal.find(
+                 "std::array<std::unique_ptr<VulkanRtScene>,2>rt_candidates") !=
+                 std::string::npos &&
+             compact_static.find(
+                 "vkQueueSubmit(graphics_queue_,1,&submit,fence)") !=
+                 std::string::npos &&
+             compact_static.find(
+                 "retired.rt_scenes[i]=std::move(rt_scenes_[i])") !=
+                 std::string::npos &&
+             compact_static.find(
+                 "vkDestroyFence(device_,static_asset_retired_.completion_fence,nullptr)") !=
+                 std::string::npos,
+         "P2 retains old static/RT owners behind one graphics-queue retirement fence");
+
+  const std::size_t superseded_check =
+      compact_static.find("if(pending.superseded){");
+  const std::size_t superseded_discard = compact_static.find(
+      "discardStaticAssetPending(\"static-candidate-superseded\")",
+      superseded_check);
+  const std::size_t prepare_scratch = compact_static.find(
+      "prepareStaticPendingRtCandidates()", superseded_discard);
+  const std::size_t begin_retirement = compact_static.find(
+      "beginStaticAssetRetirement()", prepare_scratch);
+  const std::size_t atomic_commit = compact_static.find(
+      "commitStaticAssetPending(uploaded_bytes)", begin_retirement);
+  expect(superseded_check != std::string::npos &&
+             superseded_discard != std::string::npos &&
+             prepare_scratch != std::string::npos &&
+             begin_retirement != std::string::npos &&
+             atomic_commit != std::string::npos &&
+             superseded_check < superseded_discard &&
+             superseded_discard < prepare_scratch &&
+             prepare_scratch < begin_retirement &&
+             begin_retirement < atomic_commit,
+         "Superseded Candidates drain without publication and independent RT Candidates precede retirement/commit");
+
+  expect(compact_static.find(
+             "voidVulkanBackend::updateStaticTextureDescriptors(FrameSync&frame)") !=
+                 std::string::npos &&
+             compact_static.find(
+                 "frame.static_descriptor_revision=static_descriptor_revision_") !=
+                 std::string::npos &&
+             compact_stage30.find("updateStaticTextureDescriptors(fs)") !=
+                 std::string::npos,
+         "static descriptors refresh only after the selected frame slot fence is proven idle");
+
+  expect(compact_worker.find("state->commands.frontKind()") !=
+                 std::string::npos &&
+             compact_worker.find("state->backend->supersedeCommand(") !=
+                 std::string::npos &&
+             compact_worker.find("UploadSupersededEvent{") !=
+                 std::string::npos &&
+             compact_worker.find("state->mailbox.tryTake(stale_packet)") !=
+                 std::string::npos &&
+             compact_client.find(
+                 "!staticAssetMatchesAccepted(*last_committed_packet_)") !=
+                 std::string::npos &&
+             compact_client.find(
+                 "!environmentMatchesAccepted(*last_committed_packet_)") !=
+                 std::string::npos &&
+             compact_client.find(
+                 "std::optional<PendingStaticUpload>queued_static_upload_") !=
+                 std::string::npos &&
+             compact_adapter.find(
+                 "backend_->static_asset_pending_.superseded=true") !=
+                 std::string::npos,
+         "one reliable FIFO and a bounded last-committed client policy implement static Supersede");
+
+  const std::size_t environment_poll = compact_assembly.find(
+      "pollWorldEnvironmentPending(wait_for_completion,");
+  const std::size_t environment_retirement = compact_assembly.find(
+      "beginWorldEnvironmentRetirement()", environment_poll);
+  const std::size_t skybox_boundary = compact_assembly.find(
+      "uploadSkyboxCubemap(*packet.scene.preview_skybox)",
+      environment_retirement);
+  const std::size_t environment_commit = compact_assembly.find(
+      "commitWorldEnvironmentPending(uploaded_bytes)", skybox_boundary);
+  expect(compact_internal.find("structWorldEnvironmentPending{") !=
+                 std::string::npos &&
+             compact_internal.find("structWorldEnvironmentRetired{") !=
+                 std::string::npos &&
+             compact_environment.find(
+                 "discardWorldEnvironmentPending(\"environment-candidate-superseded\")") !=
+                 std::string::npos &&
+             environment_poll != std::string::npos &&
+             environment_retirement != std::string::npos &&
+             skybox_boundary != std::string::npos &&
+             environment_commit != std::string::npos &&
+             environment_poll < environment_retirement &&
+             environment_retirement < skybox_boundary &&
+             skybox_boundary < environment_commit &&
+             compact_stage00.find(
+                 "pollWorldEnvironmentRetirement(false,environment_retirement_complete)") !=
+                 std::string::npos,
+         "P3 keeps HDRI Candidate publication atomic and retires the old owner after queue proof");
+
+  expect(compact_worker.find("*front_kind!=pending_kind") !=
+                 std::string::npos &&
+             compact_client.find(
+                 "std::optional<PendingEnvironmentUpload>queued_environment_upload_") !=
+                 std::string::npos &&
+             compact_adapter.find(
+                 "backend_->world_environment_pending_.superseded=true") !=
+                 std::string::npos,
+         "P3 reuses the one reliable FIFO and bounded client Supersede lifecycle");
+}
+
+void testOwnedRenderThreadContracts() {
+  using namespace xpbd::gfx;
+
+  expect(isKnownUiLogicalTextureId(
+             uiLogicalTextureId(UiLogicalTexture::FontAtlas)) &&
+             !isKnownUiLogicalTextureId(0u) &&
+             !isKnownUiLogicalTextureId(2u),
+         "UI logical texture namespace accepts only worker-resolvable IDs");
+
+  std::array<std::byte, 12> ui_vertices{};
+  std::array<std::byte, 6> ui_indices{};
+  ui_vertices[0] = std::byte{0x2a};
+  ui_indices[0] = std::byte{0x11};
+  const UiDrawCommand ui_command{3u, 0u, 1u, 2.0f, 3.0f, 40.0f, 20.0f};
+  UiDrawData ui{};
+  ui.vertex_data = ui_vertices.data();
+  ui.vertex_bytes = ui_vertices.size();
+  ui.index_data = ui_indices.data();
+  ui.index_bytes = ui_indices.size();
+  ui.draw_commands = &ui_command;
+  ui.draw_command_count = 1u;
+  ui.logical_w = 1280;
+  ui.logical_h = 720;
+  ui.fb_w = 2560;
+  ui.fb_h = 1440;
+
+  std::array<float, 16> view{};
+  std::array<float, 16> proj{};
+  view[0] = 4.0f;
+  view[5] = 5.0f;
+  proj[0] = 6.0f;
+  proj[5] = 7.0f;
+
+  StaticIndexedModelMesh model;
+  model.cube_count = 3u;
+  model.bone_names.push_back("root");
+  StaticModelFrameData pose;
+  pose.cube_count = 3u;
+  pose.bones.resize(1u);
+  pose.bones[0].transform[12] = 2.0f;
+  TextureImage texture;
+  texture.width = 1;
+  texture.height = 1;
+  texture.source_channels = 4;
+  texture.rgba = {10u, 20u, 30u, 255u};
+  WorldEnvironmentState world;
+  world.generation = 7u;
+  world.background_exposure = 1.25f;
+  ViewportRasterScene raster;
+  raster.geometry_generation = 9u;
+  raster.topology_generation = 10u;
+  raster.skybox.face_size = 1;
+  raster.skybox.rgba.assign(24u, 64u);
+  raster.skybox.generation = 11u;
+
+  FrameInput source{};
+  source.fb_width = 2560;
+  source.fb_height = 1440;
+  source.viewport = {100, 50, 1920, 1080};
+  source.view_matrix = view.data();
+  source.proj_matrix = proj.data();
+  source.scene = &pose.overlays;
+  source.static_model = &model;
+  source.static_model_frame = &pose;
+  source.static_model_texture = &texture;
+  source.static_model_generation = 21u;
+  source.static_texture_generation = 22u;
+  source.world_environment = &world;
+  source.raster_scene = &raster;
+  source.ui = &ui;
+  source.clear_r = 0.25f;
+  source.clear_g = 0.5f;
+  source.clear_b = 0.75f;
+  source.prefer_ray_tracing = true;
+  source.rt_scene_generations = {21u, 31u, 41u, 51u, 61u, 71u};
+  source.rt_scene_generations_valid = true;
+
+  RenderFramePacketBuilder builder;
+  const auto first = builder.build(100u, source);
+  expect(first != nullptr && first->packet_serial == 1u &&
+             first->ui_frame_serial == 100u,
+         "owned render packet assigns distinct UI and packet serials");
+  expect(first->scene.static_model &&
+             first->scene.static_model->cube_count == 3u &&
+             first->scene.static_model_frame &&
+             first->scene.static_model_frame->bones[0].transform[12] == 2.0f &&
+             first->scene.scene.get() ==
+                 &first->scene.static_model_frame->overlays,
+         "owned render packet snapshots assets/pose and aliases owned overlays");
+  expect(first->ui.valid() && first->ui.vertices[0] == std::byte{0x2a} &&
+             first->ui.commands[0].logical_texture_id == 1u,
+         "owned render packet copies UI bytes and logical draw commands");
+
+  view[0] = 99.0f;
+  pose.bones[0].transform[12] = 88.0f;
+  model.cube_count = 77u;
+  texture.rgba[0] = 200u;
+  world.background_exposure = 9.0f;
+  ui_vertices[0] = std::byte{0x7f};
+  expect(first->view_matrix[0] == 4.0f &&
+             first->scene.static_model->cube_count == 3u &&
+             first->scene.static_model_frame->bones[0].transform[12] == 2.0f &&
+             first->scene.static_model_texture->rgba[0] == 10u &&
+             first->scene.world_environment->background_exposure == 1.25f &&
+             first->ui.vertices[0] == std::byte{0x2a},
+         "owned render packet survives producer mutation without naked pointers");
+
+  RenderFramePacketView first_view(*first);
+  expect(first_view.frame().view_matrix == first->view_matrix.data() &&
+             first_view.frame().static_model == first->scene.static_model.get() &&
+             first_view.frame().ui != nullptr &&
+             first_view.frame().ui->ctx == nullptr &&
+             first_view.frame().ui->vertex_data == first->ui.vertices.data(),
+         "consumer view binds only packet-owned UI and scene storage");
+
+  const auto second = builder.build(101u, source);
+  expect(second->packet_serial == 2u &&
+             second->scene.static_model == first->scene.static_model &&
+             second->scene.static_model_texture ==
+                 first->scene.static_model_texture &&
+             second->scene.world_environment == first->scene.world_environment &&
+             second->scene.static_model_frame !=
+                 first->scene.static_model_frame &&
+             second->scene.static_model_frame->bones[0].transform[12] == 88.0f,
+         "stable generations reuse immutable large assets but copy dynamic pose");
+
+  source.static_model_generation = 23u;
+  source.static_texture_generation = 24u;
+  ++world.generation;
+  const auto third = builder.build(102u, source);
+  expect(third->scene.static_model != first->scene.static_model &&
+             third->scene.static_model->cube_count == 77u &&
+             third->scene.static_model_texture !=
+                 first->scene.static_model_texture &&
+             third->scene.static_model_texture->rgba[0] == 200u &&
+             third->scene.world_environment != first->scene.world_environment &&
+             third->scene.world_environment->background_exposure == 9.0f,
+         "generation changes publish fresh immutable asset snapshots");
+
+  std::array<float, 16> still_view{};
+  std::array<float, 16> still_proj{};
+  still_view[0] = 12.0f;
+  still_proj[5] = 13.0f;
+  StillRenderStatus mutable_status;
+  StillRenderFrameRequest still_request{};
+  still_request.job_id = 501u;
+  still_request.width = 800u;
+  still_request.height = 600u;
+  still_request.target_samples = 128u;
+  still_request.samples_per_submit = 4u;
+  still_request.output_path = "immutable-still.png";
+  still_request.view_matrix = still_view.data();
+  still_request.proj_matrix = still_proj.data();
+  still_request.preview_skybox = &raster.skybox;
+  still_request.status = &mutable_status;
+  const auto still = makeStartStillRenderCommand(*third, still_request);
+  still_view[0] = 90.0f;
+  raster.skybox.rgba[0] = 255u;
+  mutable_status.state = StillRenderJobState::Failed;
+  expect(still.has_value() && still->valid() &&
+             still->view_matrix[0] == 12.0f &&
+             still->scene.static_model == third->scene.static_model &&
+             still->scene.static_model_frame ==
+                 third->scene.static_model_frame &&
+             still->scene.world_environment ==
+                 third->scene.world_environment &&
+              still->scene.preview_skybox == third->scene.preview_skybox &&
+              still->clear_r == 0.25f && still->clear_g == 0.5f &&
+              still->clear_b == 0.75f &&
+              still->source_packet_serial == third->packet_serial,
+         "Still start owns a complete immutable packet snapshot and no status dependency");
+
+  TemporalHistoryLedger history;
+  const auto first_candidate = makeHistoryCommitCandidate(*first, 1u);
+  expect(history.historySerial() == 0u && !history.current().has_value(),
+         "producing a packet does not advance temporal history");
+  expect(history.commit(first_candidate) && history.historySerial() == 1u &&
+             history.current()->packet_serial == first->packet_serial &&
+             history.current()->view_matrix[0] == 4.0f,
+         "accepted render commits the exact packet camera/pose as history");
+  expect(!history.commit(first_candidate) && history.historySerial() == 1u,
+         "duplicate or stale render serial cannot advance history");
+  history.invalidate();
+  expect(!history.current().has_value() && history.historySerial() == 1u,
+         "history invalidation preserves monotonic serial without stale authority");
+  expect(history.commit(makeHistoryCommitCandidate(*third, 2u)) &&
+              history.historySerial() == 2u &&
+              history.current()->packet_serial == third->packet_serial &&
+              history.current()->static_model == third->scene.static_model &&
+              history.current()->pose == third->scene.static_model_frame &&
+              history.current()->visibility_and_instances ==
+                  third->scene.raster_scene,
+          "only a later explicitly accepted render advances history again");
+
+  StaticIndexedModelMesh pick_model;
+  pick_model.bone_names = {"presented_root"};
+  pick_model.vertices.resize(4u);
+  pick_model.vertices[0].px = -0.5f;
+  pick_model.vertices[0].py = -0.5f;
+  pick_model.vertices[0].pz = -1.0f;
+  pick_model.vertices[1].px = 0.5f;
+  pick_model.vertices[1].py = -0.5f;
+  pick_model.vertices[1].pz = -1.0f;
+  pick_model.vertices[2].px = 0.5f;
+  pick_model.vertices[2].py = 0.5f;
+  pick_model.vertices[2].pz = -1.0f;
+  pick_model.vertices[3].px = -0.5f;
+  pick_model.vertices[3].py = 0.5f;
+  pick_model.vertices[3].pz = -1.0f;
+  StaticModelFace pick_face;
+  pick_face.vertex_count = 4u;
+  pick_face.bone_index = 0u;
+  pick_model.faces.push_back(pick_face);
+  StaticModelFrameData pick_pose;
+  pick_pose.bones.resize(1u);
+  LastPresentedSnapshot presented;
+  presented.present_serial = 9u;
+  presented.history.packet_serial = 17u;
+  presented.history.render_serial = 19u;
+  presented.history.history_serial = 23u;
+  presented.history.viewport = {200, 100, 100, 100};
+  presented.history.view_matrix = {1, 0, 0, 0, 0, 1, 0, 0,
+                                   0, 0, 1, 0, 0, 0, 0, 1};
+  presented.history.proj_matrix = presented.history.view_matrix;
+  presented.history.static_model =
+      std::make_shared<const StaticIndexedModelMesh>(pick_model);
+  presented.history.pose =
+      std::make_shared<const StaticModelFrameData>(pick_pose);
+  auto presented_pick = buildLastPresentedBonePickIndex(presented);
+  xpbd::render::BonePickDiagnostics presented_diagnostics;
+  expect(xpbd::render::pickBone(presented_pick, 50.0f, 50.0f, 6.0f,
+                                &presented_diagnostics) == "presented_root" &&
+             presented_diagnostics.total_face_count == 1u,
+         "LastPresented picking reprojects the committed mesh/pose/camera snapshot");
+
+  pick_pose.bones[0].tint[3] = 0.0f;
+  presented.present_serial = 10u;
+  presented.history.pose =
+      std::make_shared<const StaticModelFrameData>(pick_pose);
+  presented_pick = buildLastPresentedBonePickIndex(presented);
+  expect(xpbd::render::pickBone(presented_pick, 50.0f, 50.0f).empty(),
+         "LastPresented picking honors the exact RT instance visibility snapshot");
+}
+
+void testA4WindowBootstrapSourceContract() {
+  const std::string backend =
+      readTestSource("src/gfx/vulkan_backend.cpp");
+  const std::string internal = readTestSource(
+      "src/gfx/vulkan/vulkan_backend_internal.hpp");
+  const std::string bootstrap = readTestSource(
+      "src/gfx/vulkan_window_bootstrap.cpp");
+  const std::string factory =
+      readTestSource("src/gfx/gpu_backend_factory.cpp");
+  const std::string main = readTestSource("src/app/main_sdl3.cpp");
+  expect(!backend.empty() && !internal.empty() && !bootstrap.empty() &&
+             !factory.empty() && !main.empty(),
+         "A4 R3 SDL/Vulkan bootstrap source fixtures are readable");
+
+  const std::string compact_backend = compactTestSource(backend);
+  const std::string compact_internal = compactTestSource(internal);
+  const std::string compact_bootstrap = compactTestSource(bootstrap);
+  const std::string compact_factory = compactTestSource(factory);
+  const std::string compact_main = compactTestSource(main);
+  expect(compact_backend.find("SDL_GetWindowProperties") ==
+                 std::string::npos &&
+             compact_backend.find("SDL_GetWindowFlags") ==
+                 std::string::npos &&
+             compact_backend.find("SDL_GetWindowSizeInPixels") ==
+                 std::string::npos &&
+             compact_backend.find("SDL_Vulkan_GetInstanceExtensions") ==
+                 std::string::npos,
+         "Vulkan core init/swapchain code contains no Main-only SDL window query");
+  expect(compact_bootstrap.find("SDL_Vulkan_GetInstanceExtensions") !=
+                 std::string::npos &&
+             compact_bootstrap.find("SDL_GetWindowProperties(window)") !=
+                 std::string::npos &&
+             compact_bootstrap.find("SDL_GetWindowFlags(window)") !=
+                 std::string::npos &&
+             compact_bootstrap.find("SDL_GetWindowSizeInPixels(window") !=
+                 std::string::npos,
+         "Main-thread bootstrap owns extension/native-handle/window-state capture");
+  expect(compact_internal.find(
+             "boolinit(constVulkanWindowBootstrap&bootstrap)override;") !=
+                 std::string::npos &&
+             compact_factory.find(
+             "captureVulkanWindowBootstrap(window,bootstrap,&bootstrap_error)") !=
+                 std::string::npos &&
+             compact_factory.find("initialized=candidate->init(bootstrap);") !=
+                 std::string::npos,
+         "factory passes an owned bootstrap through the Vulkan-only init contract");
+  expect(compact_main.find("SDL_EVENT_WINDOW_MINIMIZED") !=
+                 std::string::npos &&
+             compact_main.find("SDL_EVENT_WINDOW_HIDDEN") !=
+                 std::string::npos &&
+             compact_main.find("SDL_EVENT_WINDOW_RESTORED") !=
+                 std::string::npos &&
+             compact_main.find("SDL_EVENT_WINDOW_SHOWN") !=
+                 std::string::npos &&
+              compact_main.find("refresh_backend_window_state") !=
+                  std::string::npos,
+          "Main forwards drawable and non-presentable window transitions");
+  expect(compact_main.find("run_suspended_window_operation") !=
+                 std::string::npos &&
+             compact_main.find("handle_backend_window_event(ev.type)") !=
+                 std::string::npos &&
+             compact_main.find("leave_suspended&&changed") !=
+                 std::string::npos &&
+             compact_main.find("SDL_MinimizeWindow(window)") !=
+                 std::string::npos &&
+             compact_main.find("SDL_RestoreWindow(window)") !=
+                 std::string::npos &&
+             compact_main.find("backend->prepareForSystemDialog()") !=
+                 std::string::npos &&
+             compact_main.find("backend->resumeAfterSystemDialog()") !=
+                 std::string::npos,
+         "R7 window resize/minimize/restore paths use the existing Suspend/ACK transaction");
+}
+
+void testDisabledRenderThreadScaffolding() {
+  using namespace xpbd::gfx;
+  using namespace std::chrono_literals;
+
+  LatestFrameMailbox mailbox;
+  auto first_packet = std::make_shared<RenderFramePacket>();
+  first_packet->packet_serial = 1u;
+  first_packet->ui_frame_serial = 10u;
+  std::weak_ptr<const RenderFramePacket> first_lifetime = first_packet;
+  const MailboxPublishOutcome first_publish = mailbox.publish(first_packet);
+  first_packet.reset();
+  auto second_packet = std::make_shared<RenderFramePacket>();
+  second_packet->packet_serial = 2u;
+  second_packet->ui_frame_serial = 11u;
+  const MailboxPublishOutcome second_publish = mailbox.publish(second_packet);
+  second_packet.reset();
+  expect(first_publish.result == MailboxPublishResult::Published &&
+             second_publish.result == MailboxPublishResult::Replaced &&
+             second_publish.displaced_packet_serial == 1u &&
+             first_lifetime.expired(),
+         "latest-frame mailbox destroys an overwritten unconsumed packet safely");
+
+  TemporalHistoryLedger mailbox_history;
+  std::shared_ptr<const RenderFramePacket> consumed_packet;
+  expect(mailbox_history.historySerial() == 0u &&
+             mailbox.tryTake(consumed_packet) && consumed_packet &&
+             consumed_packet->packet_serial == 2u &&
+             !mailbox.hasPendingFrame(),
+         "mailbox publication/overwrite assigns no render or history serial");
+  expect(mailbox_history.commit(
+             makeHistoryCommitCandidate(*consumed_packet, 1u)) &&
+             mailbox_history.current()->packet_serial == 2u,
+         "only the packet actually consumed can become temporal history");
+  mailbox.close();
+  auto rejected_packet = std::make_shared<RenderFramePacket>();
+  rejected_packet->packet_serial = 3u;
+  expect(mailbox.publish(rejected_packet).result ==
+                 MailboxPublishResult::Closed &&
+             mailbox.closed(),
+         "closed latest-frame mailbox rejects new preview work");
+
+  LatestFrameMailbox waiting_mailbox;
+  QueueWaitResult mailbox_wait = QueueWaitResult::Timeout;
+  std::shared_ptr<const RenderFramePacket> waited_packet;
+  std::thread waiting_consumer([&]() {
+    mailbox_wait = waiting_mailbox.waitTake(waited_packet, 2s);
+  });
+  auto wake_packet = std::make_shared<RenderFramePacket>();
+  wake_packet->packet_serial = 44u;
+  const auto wake_publish = waiting_mailbox.publish(wake_packet);
+  waiting_consumer.join();
+  expect(wake_publish.result == MailboxPublishResult::Published &&
+             mailbox_wait == QueueWaitResult::Item && waited_packet &&
+             waited_packet->packet_serial == 44u,
+         "latest-frame mailbox wakes a waiting consumer without polling");
+
+  ReliableRenderCommandQueue commands;
+  UploadFontAtlasRenderCommand font_upload;
+  font_upload.width = 2u;
+  font_upload.height = 2u;
+  font_upload.pixels = {std::byte{1}, std::byte{2}, std::byte{3},
+                        std::byte{4}};
+  const auto font_serial = commands.push(RenderCommand{font_upload});
+  font_upload.pixels[0] = std::byte{99};
+  const auto resize_serial =
+      commands.push(RenderCommand{ResizeRenderCommand{1920, 1080}});
+  const auto suspend_serial =
+      commands.push(RenderCommand{SuspendPresentationRenderCommand{}});
+  expect(font_serial == 1u && resize_serial == 2u &&
+             suspend_serial == 3u && commands.size() == 3u &&
+             !commands.push(RenderCommand{ResizeRenderCommand{0, 100}}),
+         "reliable command queue validates owned commands and assigns FIFO serials");
+
+  ReliableRenderCommand popped_command;
+  expect(commands.frontKind() == RenderCommandKind::UploadFontAtlas &&
+             commands.tryPop(popped_command) &&
+             popped_command.command_serial == 1u &&
+             renderCommandKind(popped_command.payload) ==
+                 RenderCommandKind::UploadFontAtlas &&
+             std::get<UploadFontAtlasRenderCommand>(popped_command.payload)
+                     .pixels[0] == std::byte{1},
+         "reliable upload command owns producer bytes and cannot be coalesced");
+  expect(commands.tryPop(popped_command) &&
+             popped_command.command_serial == 2u &&
+             renderCommandKind(popped_command.payload) ==
+                 RenderCommandKind::Resize &&
+             commands.tryPop(popped_command) &&
+             popped_command.command_serial == 3u &&
+             renderCommandKind(popped_command.payload) ==
+                 RenderCommandKind::SuspendPresentation,
+         "reliable command queue preserves cross-type insertion order");
+  commands.close();
+  expect(!commands.push(RenderCommand{ShutdownRenderCommand{}}) &&
+             commands.waitPop(popped_command, 0ms) ==
+                 QueueWaitResult::Closed,
+         "closed reliable command queue rejects new work after draining");
+
+  ReliableRenderCommandQueue concurrent_commands;
+  std::vector<std::uint64_t> consumed_serials;
+  bool concurrent_push_ok = true;
+  bool concurrent_wait_ok = true;
+  std::thread command_consumer([&]() {
+    ReliableRenderCommand command;
+    for (;;) {
+      const QueueWaitResult result =
+          concurrent_commands.waitPop(command, 2s);
+      if (result == QueueWaitResult::Closed) {
+        break;
+      }
+      if (result != QueueWaitResult::Item) {
+        concurrent_wait_ok = false;
+        break;
+      }
+      consumed_serials.push_back(command.command_serial);
+    }
+  });
+  std::thread command_producer([&]() {
+    for (int index = 0; index < 64; ++index) {
+      if (!concurrent_commands.push(
+              RenderCommand{ResizeRenderCommand{640 + index, 480}})) {
+        concurrent_push_ok = false;
+        break;
+      }
+    }
+    concurrent_commands.close();
+  });
+  command_producer.join();
+  command_consumer.join();
+  bool serials_monotonic = consumed_serials.size() == 64u;
+  for (std::size_t index = 0u;
+       serials_monotonic && index < consumed_serials.size(); ++index) {
+    serials_monotonic = consumed_serials[index] == index + 1u;
+  }
+  expect(concurrent_push_ok && concurrent_wait_ok && serials_monotonic,
+         "reliable command FIFO remains complete and ordered across producer/consumer threads");
+
+  BoundedRenderEventQueue events(3u);
+  RenderStatsEvent stats_one;
+  stats_one.render_serial = 1u;
+  stats_one.stats.fps = 10.0f;
+  RenderStatsEvent stats_two = stats_one;
+  stats_two.render_serial = 2u;
+  stats_two.stats.fps = 20.0f;
+  expect(events.publish(RenderEvent{stats_one}) ==
+                 EventPublishResult::Enqueued &&
+             events.publish(RenderEvent{stats_two}) ==
+                 EventPublishResult::Coalesced &&
+             events.publish(RenderEvent{StillRenderProgressEvent{
+                 7u, StillRenderJobState::Rendering, 1u, 16u}}) ==
+                  EventPublishResult::Enqueued &&
+             events.publish(RenderEvent{StillRenderProgressEvent{
+                 7u, StillRenderJobState::Saving, 8u, 16u}}) ==
+                  EventPublishResult::Coalesced &&
+             events.publish(RenderEvent{RenderCommandAckEvent{
+                 9u, RenderCommandKind::SuspendPresentation}}) ==
+                 EventPublishResult::Enqueued,
+         "bounded event queue coalesces Stats/progress while retaining reliable Ack");
+  expect(events.publish(RenderEvent{RendererFatalErrorEvent{
+             -4, "vkQueueSubmit", "device lost"}}) ==
+                 EventPublishResult::EnqueuedAfterCoalescibleEviction &&
+             events.size() == 3u,
+         "Fatal event evicts only coalescible telemetry at bounded capacity");
+  bool ack_seen = false;
+  bool fatal_seen = false;
+  RenderEvent popped_event;
+  while (events.tryPop(popped_event)) {
+    ack_seen = ack_seen ||
+               std::holds_alternative<RenderCommandAckEvent>(popped_event);
+    fatal_seen = fatal_seen ||
+                 std::holds_alternative<RendererFatalErrorEvent>(popped_event);
+  }
+  expect(ack_seen && fatal_seen,
+         "bounded event eviction never drops Ack or Fatal events");
+
+  BoundedRenderEventQueue reliable_only(2u);
+  expect(reliable_only.publish(RenderEvent{RenderCommandAckEvent{
+             1u, RenderCommandKind::Resize}}) ==
+                 EventPublishResult::Enqueued &&
+              reliable_only.publish(RenderEvent{StillRenderCompletedEvent{
+                  12u, 16u, 16u, "still.png"}}) ==
+                 EventPublishResult::Enqueued &&
+             reliable_only.publish(RenderEvent{RendererFatalErrorEvent{
+                 -4, "vkQueueSubmit", "device lost"}}) ==
+                 EventPublishResult::RetryRequired &&
+             reliable_only.size() == 2u,
+         "full reliable-only event queue applies explicit backpressure instead of dropping");
+  expect(reliable_only.tryPop(popped_event) &&
+             reliable_only.publish(RenderEvent{RendererFatalErrorEvent{
+                 -4, "vkQueueSubmit", "device lost"}}) ==
+                 EventPublishResult::Enqueued,
+         "reliable event can be retried after Main drains capacity");
+
+  BoundedRenderEventQueue waiting_events(1u);
+  expect(waiting_events.publish(RenderEvent{RenderCommandAckEvent{
+             1u, RenderCommandKind::Resize}}) ==
+             EventPublishResult::Enqueued,
+         "reliable event wait fixture fills bounded capacity");
+  EventPublishResult waited_publish = EventPublishResult::RetryRequired;
+  std::thread event_producer([&]() {
+    waited_publish = waiting_events.waitPublishReliable(
+        RenderEvent{RendererFatalErrorEvent{
+            -4, "vkQueuePresentKHR", "device lost"}},
+        2s);
+  });
+  expect(waiting_events.tryPop(popped_event),
+         "Main drains one reliable event to release backpressure");
+  event_producer.join();
+  expect(waited_publish == EventPublishResult::Enqueued &&
+             waiting_events.tryPop(popped_event) &&
+             std::holds_alternative<RendererFatalErrorEvent>(popped_event),
+         "bounded reliable publication waits and delivers after capacity becomes available");
+
+  BoundedRenderEventQueue telemetry_drop(1u);
+  expect(telemetry_drop.publish(RenderEvent{RenderCommandAckEvent{
+             2u, RenderCommandKind::Resize}}) ==
+                 EventPublishResult::Enqueued &&
+             telemetry_drop.publish(RenderEvent{RenderStatsEvent{}}) ==
+                 EventPublishResult::DroppedCoalescible,
+         "coalescible telemetry may drop rather than displace reliable events");
+
+  RenderThreadLifecycle lifecycle;
+  expect(lifecycle.state() == RenderThreadState::Disabled &&
+             !lifecycle.transition(RenderThreadState::Disabled,
+                                   RenderThreadState::Running) &&
+             lifecycle.transitionTo(RenderThreadState::Starting) &&
+             !lifecycle.transitionTo(RenderThreadState::Suspended) &&
+             lifecycle.transitionTo(RenderThreadState::Running) &&
+             lifecycle.transitionTo(RenderThreadState::SuspendRequested) &&
+             lifecycle.transitionTo(RenderThreadState::Suspended) &&
+             lifecycle.transitionTo(RenderThreadState::Running) &&
+             lifecycle.transitionTo(RenderThreadState::FatalQuarantined) &&
+             lifecycle.transitionTo(RenderThreadState::Stopping) &&
+             lifecycle.transitionTo(RenderThreadState::Stopped) &&
+             !lifecycle.transitionTo(RenderThreadState::Starting),
+         "RenderThread lifecycle enforces suspend/fatal/shutdown transition legality");
+  expect(std::string(renderThreadStateName(lifecycle.state())) == "Stopped" &&
+             legalRenderThreadTransition(RenderThreadState::Starting,
+                                         RenderThreadState::Stopping) &&
+             !legalRenderThreadTransition(RenderThreadState::Stopped,
+                                          RenderThreadState::Running),
+         "RenderThread lifecycle names and pure legality table are stable");
+}
+
+struct FakeRenderThreadBackendState {
+  std::mutex mutex;
+  std::condition_variable changed;
+  std::thread::id worker_thread;
+  std::vector<xpbd::gfx::RenderCommandKind> executed_commands;
+  std::size_t render_count = 0u;
+  std::size_t font_upload_count = 0u;
+  bool initialized = false;
+  bool shutdown_called = false;
+  bool fatal_on_vsync = false;
+  bool quarantine_on_shutdown = false;
+  bool block_render = false;
+  bool render_entered = false;
+  bool release_render = false;
+  bool defer_next_font_upload = false;
+  bool defer_next_static_upload = false;
+  bool pending_upload_active = false;
+  bool release_pending_upload = false;
+  bool pending_upload_superseded = false;
+  std::size_t pending_upload_poll_count = 0u;
+  std::uint64_t pending_upload_bytes = 0u;
+  xpbd::gfx::RenderCommandKind pending_upload_kind =
+      xpbd::gfx::RenderCommandKind::UploadFontAtlas;
+  std::optional<xpbd::gfx::StartStillRenderCommand> active_still;
+  std::uint32_t still_step = 0u;
+  bool still_cancel_requested = false;
+};
+
+class FakeRenderThreadBackend final
+    : public xpbd::gfx::IRenderThreadBackend {
+public:
+  explicit FakeRenderThreadBackend(
+      std::shared_ptr<FakeRenderThreadBackendState> state)
+      : state_(std::move(state)) {}
+
+  xpbd::gfx::RenderThreadBackendOutcome initialize(
+      const xpbd::gfx::VulkanWindowBootstrap &bootstrap,
+      std::shared_ptr<xpbd::gfx::RenderThreadControl> control) override {
+    xpbd::gfx::RenderThreadBackendOutcome outcome;
+    if (!bootstrap.renderThreadCompatible() || !control) {
+      outcome.status =
+          xpbd::gfx::RenderThreadBackendStatus::FatalQuarantine;
+      outcome.api = "FakeRenderThreadBackend::initialize";
+      outcome.message = "invalid bootstrap/control";
+      return outcome;
+    }
+    {
+      std::lock_guard lock(state_->mutex);
+      state_->initialized = true;
+      state_->worker_thread = std::this_thread::get_id();
+    }
+    state_->changed.notify_all();
+    outcome.device_name = "Fake Vulkan RT";
+    outcome.ray_tracing_ready = true;
+    outcome.streamline_ready = true;
+    return outcome;
+  }
+
+  xpbd::gfx::RenderThreadBackendOutcome executeCommand(
+      const xpbd::gfx::ReliableRenderCommand &command) override {
+    using namespace xpbd::gfx;
+    const RenderCommandKind kind = renderCommandKind(command.payload);
+    bool fatal_on_vsync = false;
+    bool command_pending = false;
+    std::uint64_t pending_bytes = 0u;
+    {
+      std::lock_guard lock(state_->mutex);
+      state_->executed_commands.push_back(kind);
+      if (kind == RenderCommandKind::UploadFontAtlas) {
+        ++state_->font_upload_count;
+        if (state_->defer_next_font_upload) {
+          state_->defer_next_font_upload = false;
+          state_->pending_upload_active = true;
+          state_->release_pending_upload = false;
+          state_->pending_upload_superseded = false;
+          state_->pending_upload_poll_count = 0u;
+          state_->pending_upload_bytes =
+              std::get<UploadFontAtlasRenderCommand>(command.payload)
+                  .pixels.size();
+          state_->pending_upload_kind = kind;
+          command_pending = true;
+          pending_bytes = state_->pending_upload_bytes;
+        }
+      } else if (kind == RenderCommandKind::UploadStaticAsset &&
+                 state_->defer_next_static_upload) {
+        state_->defer_next_static_upload = false;
+        state_->pending_upload_active = true;
+        state_->release_pending_upload = false;
+        state_->pending_upload_superseded = false;
+        state_->pending_upload_poll_count = 0u;
+        state_->pending_upload_bytes = 64u;
+        state_->pending_upload_kind = kind;
+        command_pending = true;
+        pending_bytes = state_->pending_upload_bytes;
+      } else if (kind == RenderCommandKind::StartStillRender) {
+        state_->active_still =
+            std::get<StartStillRenderCommand>(command.payload);
+        state_->still_step = 0u;
+        state_->still_cancel_requested = false;
+      } else if (kind == RenderCommandKind::CancelStillRender) {
+        const auto &cancel =
+            std::get<CancelStillRenderCommand>(command.payload);
+        if (state_->active_still &&
+            state_->active_still->job_id == cancel.job_id) {
+          state_->still_cancel_requested = true;
+        }
+      }
+      fatal_on_vsync = state_->fatal_on_vsync;
+    }
+    state_->changed.notify_all();
+
+    RenderThreadBackendOutcome outcome;
+    if (kind == RenderCommandKind::SetVSync && fatal_on_vsync) {
+      outcome.status = RenderThreadBackendStatus::FatalQuarantine;
+      outcome.api = "vkQueueSubmit(fake)";
+      outcome.result_code = -4;
+      outcome.message = "injected device lost";
+      return outcome;
+    }
+    if (command_pending) {
+      outcome.status = RenderThreadBackendStatus::Pending;
+      outcome.uploaded_bytes = pending_bytes;
+      return outcome;
+    }
+    if (kind == RenderCommandKind::UploadFontAtlas) {
+      outcome.uploaded_bytes =
+          std::get<UploadFontAtlasRenderCommand>(command.payload)
+              .pixels.size();
+    }
+    return outcome;
+  }
+
+  xpbd::gfx::RenderThreadBackendOutcome pollCommand(
+      const xpbd::gfx::ReliableRenderCommand &command) override {
+    using namespace xpbd::gfx;
+    RenderThreadBackendOutcome outcome;
+    bool released = false;
+    bool superseded = false;
+    {
+      std::lock_guard lock(state_->mutex);
+      if (!state_->pending_upload_active ||
+          renderCommandKind(command.payload) !=
+              state_->pending_upload_kind) {
+        outcome.status = RenderThreadBackendStatus::Failed;
+        outcome.message = "fake backend has no matching pending command";
+        return outcome;
+      }
+      ++state_->pending_upload_poll_count;
+      outcome.uploaded_bytes = state_->pending_upload_bytes;
+      released = state_->release_pending_upload;
+      superseded = state_->pending_upload_superseded;
+      if (released) {
+        state_->pending_upload_active = false;
+      }
+    }
+    state_->changed.notify_all();
+    if (!released) {
+      outcome.status = RenderThreadBackendStatus::Pending;
+      return outcome;
+    }
+    if (superseded) {
+      outcome.status = RenderThreadBackendStatus::Superseded;
+    }
+    return outcome;
+  }
+
+  xpbd::gfx::RenderThreadBackendOutcome supersedeCommand(
+      const xpbd::gfx::ReliableRenderCommand &current,
+      const xpbd::gfx::ReliableRenderCommand &replacement) override {
+    using namespace xpbd::gfx;
+    RenderThreadBackendOutcome outcome;
+    {
+      std::lock_guard lock(state_->mutex);
+      if (!state_->pending_upload_active ||
+          state_->pending_upload_kind !=
+              RenderCommandKind::UploadStaticAsset ||
+          renderCommandKind(current.payload) !=
+              RenderCommandKind::UploadStaticAsset ||
+          renderCommandKind(replacement.payload) !=
+              RenderCommandKind::UploadStaticAsset) {
+        outcome.status = RenderThreadBackendStatus::Failed;
+        outcome.message = "fake backend rejected static Supersede";
+        return outcome;
+      }
+      state_->pending_upload_superseded = true;
+    }
+    state_->changed.notify_all();
+    return outcome;
+  }
+
+  xpbd::gfx::RenderThreadBackendOutcome renderFrame(
+      const xpbd::gfx::RenderFramePacket &, std::uint64_t,
+      const xpbd::gfx::HistoryCommitSnapshot *previous_history) override {
+    using namespace xpbd::gfx;
+    std::unique_lock lock(state_->mutex);
+    ++state_->render_count;
+    state_->render_entered = true;
+    state_->changed.notify_all();
+    state_->changed.wait(lock, [&]() {
+      return !state_->block_render || state_->release_render;
+    });
+    std::optional<StillRenderStatus> still_status;
+    if (state_->active_still) {
+      const StartStillRenderCommand &still = *state_->active_still;
+      StillRenderStatus observation;
+      observation.job_id = still.job_id;
+      observation.target_samples = still.target_samples;
+      observation.output_path = still.output_path;
+      if (state_->still_cancel_requested) {
+        observation.state = StillRenderJobState::Cancelled;
+        observation.accumulated_samples =
+            (std::min)(4u, still.target_samples);
+        state_->active_still.reset();
+      } else if (state_->still_step++ == 0u) {
+        observation.state = StillRenderJobState::Rendering;
+        observation.accumulated_samples =
+            (std::min)(4u, still.target_samples);
+      } else {
+        observation.state = StillRenderJobState::Completed;
+        observation.accumulated_samples = still.target_samples;
+        state_->active_still.reset();
+      }
+      still_status = std::move(observation);
+    }
+    lock.unlock();
+
+    RenderThreadBackendOutcome outcome;
+    outcome.temporal_history_accepted = true;
+    outcome.presented = true;
+    outcome.previous_history_render_serial =
+        previous_history != nullptr ? previous_history->render_serial : 0u;
+    outcome.stats.present_succeeded = true;
+    outcome.stats.fps = 60.0f;
+    outcome.still_render_status = std::move(still_status);
+    return outcome;
+  }
+
+  xpbd::gfx::RenderThreadBackendShutdown shutdown() noexcept override {
+    bool quarantine = false;
+    {
+      std::lock_guard lock(state_->mutex);
+      state_->shutdown_called = true;
+      quarantine = state_->quarantine_on_shutdown;
+    }
+    state_->changed.notify_all();
+    return quarantine
+               ? xpbd::gfx::RenderThreadBackendShutdown::Quarantined
+               : xpbd::gfx::RenderThreadBackendShutdown::Clean;
+  }
+
+private:
+  std::shared_ptr<FakeRenderThreadBackendState> state_;
+};
+
+xpbd::gfx::VulkanWindowBootstrap fakeThreadBootstrap() {
+  xpbd::gfx::VulkanWindowBootstrap bootstrap;
+  bootstrap.required_instance_extensions = {"VK_KHR_surface",
+                                             "VK_KHR_win32_surface"};
+  bootstrap.surface_kind = xpbd::gfx::VulkanNativeSurfaceKind::Win32;
+  bootstrap.native_window_handle = reinterpret_cast<void *>(0x1);
+  bootstrap.pixel_width = 1280;
+  bootstrap.pixel_height = 720;
+  bootstrap.presentation_available = true;
+  return bootstrap;
+}
+
+template <typename Predicate>
+bool waitForRenderThreadEvent(xpbd::gfx::DedicatedRenderThread &worker,
+                              Predicate &&predicate,
+                              xpbd::gfx::RenderEvent &matched,
+                              std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  for (;;) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      return false;
+    }
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - now);
+    xpbd::gfx::RenderEvent event;
+    const xpbd::gfx::QueueWaitResult result =
+        worker.waitEvent(event, remaining);
+    if (result != xpbd::gfx::QueueWaitResult::Item) {
+      return false;
+    }
+    if (predicate(event)) {
+      matched = std::move(event);
+      return true;
+    }
+  }
+}
+
+void testDedicatedRenderThreadSafetyProtocol() {
+  using namespace xpbd::gfx;
+  using namespace std::chrono_literals;
+
+  const std::thread::id main_thread = std::this_thread::get_id();
+  auto normal_state = std::make_shared<FakeRenderThreadBackendState>();
+  DedicatedRenderThread worker(
+      fakeThreadBootstrap(),
+      [normal_state]() {
+        return std::make_unique<FakeRenderThreadBackend>(normal_state);
+      },
+      32u);
+  expect(worker.start() && worker.waitUntilRunning(2s),
+         "disabled DedicatedRenderThread initializes backend on its worker");
+  RenderEvent event;
+  expect(waitForRenderThreadEvent(
+             worker,
+             [](const RenderEvent &candidate) {
+               return std::holds_alternative<RendererInitializedEvent>(
+                   candidate);
+             },
+             event, 2s) &&
+             std::get<RendererInitializedEvent>(event).ray_tracing_ready &&
+             std::get<RendererInitializedEvent>(event).streamline_ready,
+         "worker publishes reliable Vulkan/RT/Streamline initialization state");
+  {
+    std::lock_guard lock(normal_state->mutex);
+    expect(normal_state->initialized &&
+               normal_state->worker_thread != main_thread,
+           "backend initialization occurs off Main on the dedicated worker");
+  }
+
+  const auto suspend_serial =
+      worker.enqueue(RenderCommand{SuspendPresentationRenderCommand{}});
+  expect(suspend_serial.has_value() &&
+             waitForRenderThreadEvent(
+                 worker,
+                 [&](const RenderEvent &candidate) {
+                   const auto *ack =
+                       std::get_if<RenderCommandAckEvent>(&candidate);
+                   return ack != nullptr &&
+                          ack->command_serial == *suspend_serial &&
+                          ack->command_kind ==
+                              RenderCommandKind::SuspendPresentation;
+                 },
+                 event, 2s) &&
+             worker.state() == RenderThreadState::Suspended,
+         "Suspend ACK is emitted only after backend safe-boundary success");
+
+  auto suspended_packet = std::make_shared<RenderFramePacket>();
+  suspended_packet->packet_serial = 71u;
+  suspended_packet->ui_frame_serial = 170u;
+  expect(worker.publishFrame(suspended_packet).result ==
+             MailboxPublishResult::Published,
+         "suspended worker retains the latest immutable preview packet");
+
+  UploadFontAtlasRenderCommand font;
+  font.width = 2u;
+  font.height = 2u;
+  font.pixels = {std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+  const auto upload_serial = worker.enqueue(RenderCommand{font});
+  const auto resize_serial =
+      worker.enqueue(RenderCommand{ResizeRenderCommand{1600, 900}});
+  expect(upload_serial.has_value() && resize_serial.has_value() &&
+             waitForRenderThreadEvent(
+                 worker,
+                 [&](const RenderEvent &candidate) {
+                   const auto *ack =
+                       std::get_if<RenderCommandAckEvent>(&candidate);
+                   return ack != nullptr &&
+                          ack->command_serial == *resize_serial;
+                 },
+                 event, 2s),
+         "Resize remains reliable while presentation is suspended");
+  {
+    std::lock_guard lock(normal_state->mutex);
+    expect(normal_state->render_count == 0u &&
+               normal_state->font_upload_count == 0u,
+           "suspended worker performs neither preview render nor unrelated GPU upload");
+  }
+
+  const auto resume_serial =
+      worker.enqueue(RenderCommand{ResumePresentationRenderCommand{}});
+  expect(resume_serial.has_value() &&
+             waitForRenderThreadEvent(
+                 worker,
+                 [&](const RenderEvent &candidate) {
+                   const auto *ack =
+                       std::get_if<RenderCommandAckEvent>(&candidate);
+                   return ack != nullptr &&
+                          ack->command_serial == *resume_serial &&
+                          ack->command_kind ==
+                              RenderCommandKind::ResumePresentation;
+                 },
+                 event, 2s) &&
+             worker.state() == RenderThreadState::Running,
+         "Resume crosses the backend boundary before Running/ACK publication");
+  expect(waitForRenderThreadEvent(
+             worker,
+             [&](const RenderEvent &candidate) {
+               const auto *uploaded =
+                   std::get_if<UploadCompletedEvent>(&candidate);
+               return uploaded != nullptr &&
+                      uploaded->command_serial == *upload_serial &&
+                      uploaded->uploaded_bytes == 4u;
+             },
+             event, 2s),
+         "GPU upload deferred during suspension completes reliably after Resume");
+  expect(waitForRenderThreadEvent(
+             worker,
+             [](const RenderEvent &candidate) {
+               const auto *stats = std::get_if<RenderStatsEvent>(&candidate);
+                return stats != nullptr && stats->render_serial == 1u &&
+                       stats->previous_history_render_serial == 0u &&
+                       stats->history_serial == 1u &&
+                       stats->present_serial == 1u &&
+                       stats->last_presented != nullptr &&
+                       stats->last_presented->present_serial == 1u &&
+                       stats->last_presented
+                               ->previous_history_render_serial == 0u &&
+                       stats->last_presented->history.packet_serial == 71u;
+              },
+              event, 2s),
+          "consumed preview publishes immutable render/history/present authority after Resume");
+
+  auto temporal_packet = std::make_shared<RenderFramePacket>();
+  temporal_packet->packet_serial = 72u;
+  temporal_packet->ui_frame_serial = 171u;
+  expect(worker.publishFrame(temporal_packet).result ==
+             MailboxPublishResult::Published &&
+             waitForRenderThreadEvent(
+                 worker,
+                 [](const RenderEvent &candidate) {
+                   const auto *stats =
+                       std::get_if<RenderStatsEvent>(&candidate);
+                   return stats != nullptr && stats->render_serial == 2u &&
+                          stats->previous_history_render_serial == 1u &&
+                          stats->history_serial == 2u &&
+                          stats->present_serial == 2u &&
+                          stats->last_presented != nullptr &&
+                          stats->last_presented
+                                  ->previous_history_render_serial == 1u &&
+                          stats->last_presented->history.packet_serial == 72u;
+                 },
+                 event, 2s),
+         "next consumed frame reports the preceding committed render as previous temporal history");
+
+  std::size_t commands_before_pending = 0u;
+  std::size_t renders_before_pending = 0u;
+  {
+    std::lock_guard lock(normal_state->mutex);
+    commands_before_pending =
+        normal_state->executed_commands.size();
+    renders_before_pending = normal_state->render_count;
+    normal_state->defer_next_font_upload = true;
+  }
+  UploadFontAtlasRenderCommand pending_font;
+  pending_font.width = 2u;
+  pending_font.height = 2u;
+  pending_font.rgba = true;
+  pending_font.pixels.assign(16u, std::byte{7});
+  const auto pending_upload_serial =
+      worker.enqueue(RenderCommand{pending_font});
+  const auto pending_resize_serial =
+      worker.enqueue(RenderCommand{ResizeRenderCommand{1700, 950}});
+  auto pending_preview_packet = std::make_shared<RenderFramePacket>();
+  pending_preview_packet->packet_serial = 720u;
+  pending_preview_packet->ui_frame_serial = 1720u;
+  expect(pending_upload_serial.has_value() &&
+             pending_resize_serial.has_value() &&
+             worker.publishFrame(pending_preview_packet).result ==
+                 MailboxPublishResult::Published,
+         "Pending upload retains the latest preview packet for safe post-commit rendering");
+  {
+    std::unique_lock lock(normal_state->mutex);
+    const bool pending_polled = normal_state->changed.wait_for(
+        lock, 2s, [&]() {
+          return normal_state->pending_upload_active &&
+                 normal_state->pending_upload_poll_count > 0u &&
+                 normal_state->render_count > renders_before_pending;
+        });
+    expect(pending_polled &&
+               normal_state->pending_upload_poll_count > 0u &&
+               normal_state->render_count > renders_before_pending &&
+               normal_state->executed_commands.size() ==
+                   commands_before_pending + 1u &&
+               normal_state->executed_commands.back() ==
+                   RenderCommandKind::UploadFontAtlas,
+           "Pending upload emits no early completion, blocks FIFO, and overlaps an immutable preview");
+    normal_state->release_pending_upload = true;
+  }
+  normal_state->changed.notify_all();
+  expect(waitForRenderThreadEvent(
+             worker,
+             [&](const RenderEvent &candidate) {
+               const auto *uploaded =
+                   std::get_if<UploadCompletedEvent>(&candidate);
+               return uploaded != nullptr &&
+                      uploaded->command_serial ==
+                          *pending_upload_serial &&
+                      uploaded->uploaded_bytes == 16u;
+             },
+             event, 2s) &&
+             waitForRenderThreadEvent(
+                 worker,
+                 [&](const RenderEvent &candidate) {
+                   const auto *ack =
+                       std::get_if<RenderCommandAckEvent>(&candidate);
+                 return ack != nullptr &&
+                          ack->command_serial ==
+                              *pending_resize_serial;
+                 },
+                 event, 2s),
+         "Pending upload commits before its later reliable FIFO command");
+  {
+    std::lock_guard lock(normal_state->mutex);
+    expect(!normal_state->pending_upload_active &&
+               normal_state->executed_commands.size() ==
+                   commands_before_pending + 2u &&
+               normal_state->executed_commands.back() ==
+                   RenderCommandKind::Resize &&
+               normal_state->render_count > renders_before_pending,
+           "Pending upload release preserves FIFO after overlapped preview progress");
+  }
+
+  std::size_t commands_before_supersede = 0u;
+  std::size_t renders_before_supersede = 0u;
+  {
+    std::lock_guard lock(normal_state->mutex);
+    commands_before_supersede =
+        normal_state->executed_commands.size();
+    renders_before_supersede = normal_state->render_count;
+    normal_state->defer_next_static_upload = true;
+  }
+  auto static_candidate_a = std::make_shared<RenderFramePacket>();
+  static_candidate_a->packet_serial = 801u;
+  static_candidate_a->scene.static_model =
+      std::make_shared<StaticIndexedModelMesh>();
+  static_candidate_a->scene.static_model_frame =
+      std::make_shared<StaticModelFrameData>();
+  auto static_candidate_b = std::make_shared<RenderFramePacket>();
+  static_candidate_b->packet_serial = 802u;
+  static_candidate_b->scene.static_model =
+      std::make_shared<StaticIndexedModelMesh>();
+  static_candidate_b->scene.static_model_frame =
+      std::make_shared<StaticModelFrameData>();
+  const auto static_candidate_a_serial = worker.enqueue(RenderCommand{
+      UploadStaticAssetRenderCommand{static_candidate_a}});
+  const auto static_candidate_b_serial = worker.enqueue(RenderCommand{
+      UploadStaticAssetRenderCommand{static_candidate_b}});
+  const auto supersede_resize_serial =
+      worker.enqueue(RenderCommand{ResizeRenderCommand{1710, 960}});
+  auto supersede_preview = std::make_shared<RenderFramePacket>();
+  supersede_preview->packet_serial = 800u;
+  supersede_preview->ui_frame_serial = 1800u;
+  expect(static_candidate_a_serial.has_value() &&
+             static_candidate_b_serial.has_value() &&
+             supersede_resize_serial.has_value() &&
+             worker.publishFrame(supersede_preview).result ==
+                 MailboxPublishResult::Published,
+         "static Candidate, front replacement, and unrelated FIFO command enqueue reliably");
+  {
+    std::unique_lock lock(normal_state->mutex);
+    const bool supersede_pending = normal_state->changed.wait_for(
+        lock, 2s, [&]() {
+          return normal_state->pending_upload_active &&
+                 normal_state->pending_upload_superseded &&
+                 normal_state->pending_upload_poll_count > 0u &&
+                 normal_state->render_count > renders_before_supersede;
+        });
+    expect(supersede_pending &&
+               normal_state->executed_commands.size() ==
+                   commands_before_supersede + 1u &&
+               normal_state->executed_commands.back() ==
+                   RenderCommandKind::UploadStaticAsset,
+           "front static replacement marks the submitted Candidate non-publishable while preview overlap continues");
+    normal_state->release_pending_upload = true;
+  }
+  normal_state->changed.notify_all();
+  expect(waitForRenderThreadEvent(
+             worker,
+             [&](const RenderEvent &candidate) {
+               const auto *superseded =
+                   std::get_if<UploadSupersededEvent>(&candidate);
+               return superseded != nullptr &&
+                      superseded->command_serial ==
+                          *static_candidate_a_serial &&
+                      superseded->replacement_command_serial ==
+                          *static_candidate_b_serial;
+             },
+             event, 2s) &&
+             waitForRenderThreadEvent(
+                 worker,
+                 [&](const RenderEvent &candidate) {
+                   const auto *completed =
+                       std::get_if<UploadCompletedEvent>(&candidate);
+                   return completed != nullptr &&
+                          completed->command_serial ==
+                              *static_candidate_b_serial;
+                 },
+                 event, 2s) &&
+             waitForRenderThreadEvent(
+                 worker,
+                 [&](const RenderEvent &candidate) {
+                   const auto *ack =
+                       std::get_if<RenderCommandAckEvent>(&candidate);
+                   return ack != nullptr &&
+                          ack->command_serial ==
+                              *supersede_resize_serial;
+                 },
+                 event, 2s),
+         "Superseded is terminal before the replacement executes and unrelated FIFO work resumes");
+  {
+    std::lock_guard lock(normal_state->mutex);
+    expect(!normal_state->pending_upload_active &&
+               normal_state->executed_commands.size() ==
+                   commands_before_supersede + 3u &&
+               normal_state->executed_commands[
+                   commands_before_supersede + 1u] ==
+                   RenderCommandKind::UploadStaticAsset &&
+               normal_state->executed_commands.back() ==
+                   RenderCommandKind::Resize,
+           "static Supersede executes one replacement without crossing unrelated FIFO order");
+  }
+
+  StartStillRenderCommand still_start;
+  still_start.job_id = 501u;
+  still_start.width = 64u;
+  still_start.height = 64u;
+  still_start.target_samples = 8u;
+  still_start.samples_per_submit = 4u;
+  still_start.output_path = "immutable-worker-still.png";
+  still_start.source_packet_serial = 71u;
+  const auto still_start_serial =
+      worker.enqueue(RenderCommand{still_start});
+  expect(still_start_serial.has_value() &&
+             waitForRenderThreadEvent(
+                 worker,
+                 [&](const RenderEvent &candidate) {
+                   const auto *ack =
+                       std::get_if<RenderCommandAckEvent>(&candidate);
+                   return ack != nullptr &&
+                          ack->command_serial == *still_start_serial &&
+                          ack->command_kind ==
+                              RenderCommandKind::StartStillRender;
+                 },
+                 event, 2s),
+         "immutable Still start is accepted through the reliable worker FIFO");
+  auto still_packet_one = std::make_shared<RenderFramePacket>();
+  still_packet_one->packet_serial = 73u;
+  still_packet_one->ui_frame_serial = 172u;
+  expect(worker.publishFrame(still_packet_one).result ==
+             MailboxPublishResult::Published &&
+             waitForRenderThreadEvent(
+                 worker,
+                 [](const RenderEvent &candidate) {
+                   const auto *progress =
+                       std::get_if<StillRenderProgressEvent>(&candidate);
+                   return progress != nullptr && progress->job_id == 501u &&
+                          progress->state ==
+                              StillRenderJobState::Rendering &&
+                          progress->completed_samples == 4u;
+                 },
+                 event, 2s),
+         "worker publishes coalescible Still progress from backend observation");
+  auto still_packet_two = std::make_shared<RenderFramePacket>();
+  still_packet_two->packet_serial = 74u;
+  still_packet_two->ui_frame_serial = 173u;
+  expect(worker.publishFrame(still_packet_two).result ==
+             MailboxPublishResult::Published &&
+             waitForRenderThreadEvent(
+                 worker,
+                 [](const RenderEvent &candidate) {
+                   const auto *completed =
+                       std::get_if<StillRenderCompletedEvent>(&candidate);
+                   return completed != nullptr &&
+                          completed->job_id == 501u &&
+                          completed->completed_samples == 8u &&
+                          completed->target_samples == 8u &&
+                          completed->output_path ==
+                              "immutable-worker-still.png";
+                 },
+                 event, 2s),
+         "worker publishes reliable immutable Still completion details");
+
+  still_start.job_id = 502u;
+  still_start.output_path = "cancelled-worker-still.png";
+  still_start.source_packet_serial = 74u;
+  const auto cancel_start_serial =
+      worker.enqueue(RenderCommand{still_start});
+  expect(cancel_start_serial.has_value() &&
+             waitForRenderThreadEvent(
+                 worker,
+                 [&](const RenderEvent &candidate) {
+                   const auto *ack =
+                       std::get_if<RenderCommandAckEvent>(&candidate);
+                   return ack != nullptr &&
+                          ack->command_serial == *cancel_start_serial;
+                 },
+                 event, 2s),
+         "second immutable Still job starts after terminal completion");
+  auto cancel_progress_packet = std::make_shared<RenderFramePacket>();
+  cancel_progress_packet->packet_serial = 75u;
+  cancel_progress_packet->ui_frame_serial = 174u;
+  expect(worker.publishFrame(cancel_progress_packet).result ==
+             MailboxPublishResult::Published &&
+             waitForRenderThreadEvent(
+                 worker,
+                 [](const RenderEvent &candidate) {
+                   const auto *progress =
+                       std::get_if<StillRenderProgressEvent>(&candidate);
+                   return progress != nullptr && progress->job_id == 502u;
+                 },
+                 event, 2s),
+         "cancellable Still job reaches worker rendering state");
+  const auto cancel_serial =
+      worker.enqueue(RenderCommand{CancelStillRenderCommand{502u}});
+  expect(cancel_serial.has_value() &&
+             waitForRenderThreadEvent(
+                 worker,
+                 [&](const RenderEvent &candidate) {
+                   const auto *ack =
+                       std::get_if<RenderCommandAckEvent>(&candidate);
+                   return ack != nullptr &&
+                          ack->command_serial == *cancel_serial &&
+                          ack->command_kind ==
+                              RenderCommandKind::CancelStillRender;
+                 },
+                 event, 2s),
+         "Still cancellation remains an ordered reliable command");
+  auto cancel_terminal_packet = std::make_shared<RenderFramePacket>();
+  cancel_terminal_packet->packet_serial = 76u;
+  cancel_terminal_packet->ui_frame_serial = 175u;
+  expect(worker.publishFrame(cancel_terminal_packet).result ==
+             MailboxPublishResult::Published &&
+             waitForRenderThreadEvent(
+                 worker,
+                 [](const RenderEvent &candidate) {
+                   const auto *cancelled =
+                       std::get_if<StillRenderCancelledEvent>(&candidate);
+                   return cancelled != nullptr &&
+                          cancelled->job_id == 502u &&
+                          cancelled->target_samples == 8u;
+                 },
+                 event, 2s),
+         "worker publishes a reliable terminal Still cancellation event");
+  expect(worker.shutdown(2s) == DedicatedRenderThreadShutdown::Clean,
+         "cooperative DedicatedRenderThread shutdown joins within its bound");
+  {
+    std::lock_guard lock(normal_state->mutex);
+    expect(normal_state->shutdown_called &&
+               normal_state->worker_thread != main_thread,
+           "backend shutdown remains worker-owned");
+  }
+
+  auto fatal_state = std::make_shared<FakeRenderThreadBackendState>();
+  fatal_state->fatal_on_vsync = true;
+  DedicatedRenderThread fatal_worker(
+      fakeThreadBootstrap(),
+      [fatal_state]() {
+        return std::make_unique<FakeRenderThreadBackend>(fatal_state);
+      },
+      16u);
+  expect(fatal_worker.start() && fatal_worker.waitUntilRunning(2s),
+         "fatal-injection worker reaches Running before command failure");
+  const auto fatal_command =
+      fatal_worker.enqueue(RenderCommand{SetVSyncRenderCommand{false}});
+  int fatal_events = 0;
+  expect(fatal_command.has_value() &&
+             waitForRenderThreadEvent(
+                 fatal_worker,
+                 [&](const RenderEvent &candidate) {
+                   if (std::holds_alternative<RendererFatalErrorEvent>(
+                           candidate)) {
+                     ++fatal_events;
+                     return true;
+                   }
+                   return false;
+                 },
+                 event, 2s),
+         "backend device-lost outcome publishes a fatal event");
+  while (fatal_worker.tryPopEvent(event)) {
+    if (std::holds_alternative<RendererFatalErrorEvent>(event)) {
+      ++fatal_events;
+    }
+  }
+  const DedicatedRenderThreadShutdown fatal_shutdown =
+      fatal_worker.shutdown(2s);
+  expect(fatal_events == 1 &&
+             fatal_shutdown ==
+                 DedicatedRenderThreadShutdown::BackendQuarantined &&
+             fatal_worker.state() == RenderThreadState::Stopped,
+         "fatal event is one-shot and backend ownership exits through quarantine");
+
+  auto blocked_state = std::make_shared<FakeRenderThreadBackendState>();
+  blocked_state->block_render = true;
+  DedicatedRenderThread blocked_worker(
+      fakeThreadBootstrap(),
+      [blocked_state]() {
+        return std::make_unique<FakeRenderThreadBackend>(blocked_state);
+      },
+      16u);
+  expect(blocked_worker.start() && blocked_worker.waitUntilRunning(2s),
+         "bounded-shutdown fixture starts its worker");
+  auto blocked_packet = std::make_shared<RenderFramePacket>();
+  blocked_packet->packet_serial = 99u;
+  blocked_packet->ui_frame_serial = 199u;
+  expect(blocked_worker.publishFrame(blocked_packet).result ==
+             MailboxPublishResult::Published,
+         "bounded-shutdown fixture dispatches a blocking backend frame");
+  {
+    std::unique_lock lock(blocked_state->mutex);
+    expect(blocked_state->changed.wait_for(lock, 2s, [&]() {
+             return blocked_state->render_entered;
+           }),
+           "blocking backend entered render before shutdown request");
+  }
+  const auto shutdown_begin = std::chrono::steady_clock::now();
+  const DedicatedRenderThreadShutdown timed_shutdown =
+      blocked_worker.shutdown(20ms);
+  const auto shutdown_elapsed = std::chrono::steady_clock::now() -
+                                shutdown_begin;
+  expect(timed_shutdown ==
+             DedicatedRenderThreadShutdown::JoinTimedOutQuarantined &&
+             shutdown_elapsed < 500ms &&
+             blocked_worker.control()->fatalQuarantineRequested(),
+         "bounded join timeout returns promptly and marks self-owned state quarantined");
+  {
+    std::lock_guard lock(blocked_state->mutex);
+    blocked_state->release_render = true;
+  }
+  blocked_state->changed.notify_all();
+  expect(blocked_worker.waitForState(RenderThreadState::Stopped, 2s),
+         "detached quarantined worker can terminate after the blocked call returns");
+  {
+    std::lock_guard lock(blocked_state->mutex);
+    expect(blocked_state->shutdown_called,
+           "quarantined worker still runs backend shutdown classification");
+  }
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -7189,6 +9926,7 @@ int main(int argc, char **argv) {
   testPathTracePbrSourceContracts();
   testEnvironmentLightAdoptionSourceContracts();
   testTransparentGuidePolicySourceContracts();
+  testStreamlineOptionalFeatureSourceContracts();
   testSelectionOutlineTemporalContract();
   testPathTraceSamplingAndAccumulation();
   testPathTraceAdjustableSettingsContract();
@@ -7199,11 +9937,18 @@ int main(int argc, char **argv) {
   testRayTracingCapability();
   testFrameGenerationStateLegality();
   testFrameGenerationDisableSourceContracts();
+  testRenderThreadVulkanSafetySourceContract();
   testRtAlphaSemantics();
   testRtMotionProjection();
   testStaticMaterialClassification();
   testWorldEnvironmentFoundation();
   testVulkanPathTraceImplementationSelection();
+  testA3AtomicRtCandidateSourceContract();
+  testA5StaticSupersedeRetirementSourceContract();
+  testOwnedRenderThreadContracts();
+  testA4WindowBootstrapSourceContract();
+  testDisabledRenderThreadScaffolding();
+  testDedicatedRenderThreadSafetyProtocol();
   if (g_failures != 0) {
     std::fprintf(stderr, "%d failure(s)\n", g_failures);
     return 1;

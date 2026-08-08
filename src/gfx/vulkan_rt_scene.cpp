@@ -99,10 +99,51 @@ packRtSurfaceOptics(const RtSurfaceOptics &input) noexcept {
   return packed;
 }
 
+void addCpuCapacityBytes(std::uint64_t bytes,
+                         std::uint64_t &total) noexcept {
+  const std::uint64_t maximum =
+      (std::numeric_limits<std::uint64_t>::max)();
+  total = bytes > maximum - total ? maximum : total + bytes;
+}
+
+template <typename T>
+void addCpuVectorCapacityBytes(const std::vector<T> &values,
+                               std::uint64_t &total) noexcept {
+  const std::uint64_t capacity =
+      static_cast<std::uint64_t>(values.capacity());
+  const std::uint64_t element_size = sizeof(T);
+  const std::uint64_t maximum =
+      (std::numeric_limits<std::uint64_t>::max)();
+  addCpuCapacityBytes(
+      capacity > maximum / element_size ? maximum
+                                        : capacity * element_size,
+      total);
+}
+
+[[nodiscard]] std::uint64_t
+rtRestCpuCapacityBytes(const RtRestGeometry &rest) noexcept {
+  std::uint64_t total = 0u;
+  addCpuVectorCapacityBytes(rest.positions, total);
+  addCpuVectorCapacityBytes(rest.normals, total);
+  addCpuVectorCapacityBytes(rest.uvs, total);
+  addCpuVectorCapacityBytes(rest.tangents, total);
+  addCpuVectorCapacityBytes(rest.indices, total);
+  addCpuVectorCapacityBytes(rest.bone_indices, total);
+  addCpuVectorCapacityBytes(rest.primitive_flags, total);
+  addCpuVectorCapacityBytes(rest.primitive_metadata, total);
+  addCpuVectorCapacityBytes(rest.primitive_optics, total);
+  addCpuVectorCapacityBytes(rest.primitive_emission, total);
+  addCpuVectorCapacityBytes(rest.geometry_ranges, total);
+  return total;
+}
+
 } // namespace
 
 bool VulkanRtScene::init(VkPhysicalDevice phys, VkDevice device,
                          std::uint32_t queue_family, VkQueue queue) {
+  if (completion_unproven_) {
+    return false;
+  }
   shutdown();
   phys_ = phys;
   device_ = device;
@@ -126,6 +167,22 @@ bool VulkanRtScene::init(VkPhysicalDevice phys, VkDevice device,
 }
 
 void VulkanRtScene::shutdown() {
+  if (completion_unproven_) {
+    return;
+  }
+  if (submitted_build_fence_ != VK_NULL_HANDLE) {
+    const RtScenePendingBuildState submitted =
+        pollPendingBuild(true);
+    if (submitted == RtScenePendingBuildState::PendingFence ||
+        submitted ==
+            RtScenePendingBuildState::CompletionUnproven) {
+      return;
+    }
+  }
+  if (completion_unproven_) {
+    return;
+  }
+  submitted_build_ready_ = false;
   if (device_ != VK_NULL_HANDLE) {
     destroyAs(tlas_);
     destroyGeometryStates();
@@ -212,6 +269,10 @@ void VulkanRtScene::shutdown() {
   phys_ = VK_NULL_HANDLE;
   device_ = VK_NULL_HANDLE;
   queue_ = VK_NULL_HANDLE;
+  submitted_build_command_ = VK_NULL_HANDLE;
+  submitted_build_fence_ = VK_NULL_HANDLE;
+  submitted_build_ready_ = false;
+  completion_unproven_ = false;
 }
 
 void VulkanRtScene::destroyGeometryStates() {
@@ -355,8 +416,31 @@ void VulkanRtScene::destroyAs(AccelerationStructure &as) {
   as = {};
 }
 
-void VulkanRtScene::setRestGeometry(RtRestGeometry geometry) {
+void VulkanRtScene::setRestGeometry(RtRestGeometry geometry) noexcept {
+  const RtRestGeometryChange change =
+      classifyRtRestGeometryChange(rest_, geometry);
+  const bool emission_changed =
+      rest_.primitive_emission != geometry.primitive_emission;
   rest_ = std::move(geometry);
+  if (change == RtRestGeometryChange::Unchanged) {
+    return;
+  }
+  if (change != RtRestGeometryChange::Topology) {
+    // Preserve the current AS set. The next generation-aware update refreshes
+    // material/emission buffers and compares each range's opaque contract;
+    // only ranges whose Vulkan geometry flag changed receive a full BLAS
+    // build.
+    geometry_prepared_ = false;
+    pending_ = PendingBuild::None;
+    pending_build_reason_ = RtAccelerationBuildReason::None;
+    uploaded_material_valid_ = false;
+    if (emission_changed) {
+      uploaded_emission_valid_ = false;
+      emissive_distribution_valid_ = false;
+      emitter_distribution_ms_ = 0.0f;
+    }
+    return;
+  }
   // Topology changed — force full rebuild next updateGeometry().
   last_vertex_count_ = 0;
   last_index_count_ = 0;
@@ -396,8 +480,8 @@ RtSceneStats VulkanRtScene::stats() const noexcept {
   for (const GeometryState &state : geometry_states_) {
     if (state.blas.handle != VK_NULL_HANDLE) {
       ++result.blas_count;
-      result.as_storage_bytes +=
-          static_cast<std::uint64_t>(state.blas.buffer_size);
+      addCpuCapacityBytes(static_cast<std::uint64_t>(state.blas.buffer_size),
+                          result.as_storage_bytes);
     }
   }
   result.tlas_count = tlas_.handle != VK_NULL_HANDLE ? 1u : 0u;
@@ -420,19 +504,58 @@ RtSceneStats VulkanRtScene::stats() const noexcept {
           ? cached_hidden_positive_weight_triangle_count_
           : 0u;
   result.primitive_count = last_index_count_ / 3u;
-  result.as_storage_bytes +=
-      static_cast<std::uint64_t>(tlas_.buffer_size);
+  addCpuCapacityBytes(static_cast<std::uint64_t>(tlas_.buffer_size),
+                      result.as_storage_bytes);
   result.scratch_bytes = static_cast<std::uint64_t>(scratch_.capacity);
-  result.attribute_bytes = static_cast<std::uint64_t>(
-      host_vertices_.capacity + host_previous_vertices_.capacity +
-      host_indices_.capacity +
-      host_normals_.capacity + host_uvs_.capacity + host_colors_.capacity +
-      host_tangents_.capacity + host_primitive_flags_.capacity +
-      host_primitive_metadata_.capacity + host_primitive_optics_.capacity +
-      host_instance_metadata_.capacity + host_instance_motion_.capacity +
-      host_emissive_triangles_.capacity + instance_buffer_.capacity);
-  result.allocated_bytes =
-      result.as_storage_bytes + result.scratch_bytes + result.attribute_bytes;
+  const std::array<VkDeviceSize, 14> attribute_capacities{
+      host_vertices_.capacity,
+      host_previous_vertices_.capacity,
+      host_indices_.capacity,
+      host_normals_.capacity,
+      host_uvs_.capacity,
+      host_colors_.capacity,
+      host_tangents_.capacity,
+      host_primitive_flags_.capacity,
+      host_primitive_metadata_.capacity,
+      host_primitive_optics_.capacity,
+      host_instance_metadata_.capacity,
+      host_instance_motion_.capacity,
+      host_emissive_triangles_.capacity,
+      instance_buffer_.capacity};
+  for (VkDeviceSize capacity : attribute_capacities) {
+    addCpuCapacityBytes(static_cast<std::uint64_t>(capacity),
+                        result.attribute_bytes);
+  }
+  result.allocated_bytes = result.as_storage_bytes;
+  addCpuCapacityBytes(result.scratch_bytes, result.allocated_bytes);
+  addCpuCapacityBytes(result.attribute_bytes, result.allocated_bytes);
+  result.cpu_rest_bytes = rtRestCpuCapacityBytes(rest_);
+  addCpuVectorCapacityBytes(geometry_states_, result.cpu_workspace_bytes);
+  addCpuVectorCapacityBytes(bone_transform_cache_,
+                            result.cpu_workspace_bytes);
+  addCpuVectorCapacityBytes(scratch_positions_, result.cpu_workspace_bytes);
+  addCpuVectorCapacityBytes(previous_positions_, result.cpu_workspace_bytes);
+  addCpuVectorCapacityBytes(scratch_normals_, result.cpu_workspace_bytes);
+  addCpuVectorCapacityBytes(scratch_uvs_, result.cpu_workspace_bytes);
+  addCpuVectorCapacityBytes(scratch_colors_, result.cpu_workspace_bytes);
+  addCpuVectorCapacityBytes(scratch_tangents_, result.cpu_workspace_bytes);
+  addCpuVectorCapacityBytes(scratch_indices_, result.cpu_workspace_bytes);
+  addCpuVectorCapacityBytes(scratch_primitive_flags_,
+                            result.cpu_workspace_bytes);
+  addCpuVectorCapacityBytes(scratch_primitive_metadata_,
+                            result.cpu_workspace_bytes);
+  addCpuVectorCapacityBytes(scratch_primitive_optics_,
+                            result.cpu_workspace_bytes);
+  addCpuVectorCapacityBytes(emissive_records_cache_,
+                            result.cpu_workspace_bytes);
+  addCpuVectorCapacityBytes(emissive_weights_cache_,
+                            result.cpu_workspace_bytes);
+  addCpuCapacityBytes(
+      static_cast<std::uint64_t>(last_update_failure_reason_.capacity()),
+      result.cpu_workspace_bytes);
+  result.cpu_allocated_bytes = result.cpu_rest_bytes;
+  addCpuCapacityBytes(result.cpu_workspace_bytes,
+                      result.cpu_allocated_bytes);
   result.full_builds = full_build_count_;
   result.refits = refit_count_;
   result.tlas_full_builds = tlas_full_build_count_;
@@ -482,7 +605,7 @@ VkCommandBuffer VulkanRtScene::beginOneShot() {
   return cmd;
 }
 
-bool VulkanRtScene::submitOneShot(VkCommandBuffer cmd) {
+bool VulkanRtScene::submitOneShotPending(VkCommandBuffer cmd) {
   if (cmd == VK_NULL_HANDLE) {
     last_update_failure_reason_ =
         "one-shot submission received a null command buffer";
@@ -490,7 +613,21 @@ bool VulkanRtScene::submitOneShot(VkCommandBuffer cmd) {
                       last_update_failure_reason_.c_str());
     return false;
   }
-  auto release_command_buffer = [&] {
+  if (submitted_build_fence_ != VK_NULL_HANDLE ||
+      submitted_build_command_ != VK_NULL_HANDLE) {
+    last_update_failure_reason_ =
+        "one-shot submission attempted while another build is pending";
+    xpbd::log::errorf("Vulkan RT scene one-shot %s",
+                      last_update_failure_reason_.c_str());
+    vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
+    return false;
+  }
+  VkFence fence = VK_NULL_HANDLE;
+  auto release_transaction = [&] {
+    if (fence != VK_NULL_HANDLE) {
+      vkDestroyFence(device_, fence, nullptr);
+      fence = VK_NULL_HANDLE;
+    }
     vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
     cmd = VK_NULL_HANDLE;
   };
@@ -500,7 +637,7 @@ bool VulkanRtScene::submitOneShot(VkCommandBuffer cmd) {
         std::to_string(static_cast<int>(result)) + ")";
     xpbd::log::errorf("Vulkan RT scene one-shot %s",
                       last_update_failure_reason_.c_str());
-    release_command_buffer();
+    release_transaction();
     return false;
   };
 
@@ -511,17 +648,107 @@ bool VulkanRtScene::submitOneShot(VkCommandBuffer cmd) {
   VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
   si.commandBufferCount = 1;
   si.pCommandBuffers = &cmd;
+  VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  const VkResult fence_result =
+      vkCreateFence(device_, &fence_info, nullptr, &fence);
+  if (fence_result != VK_SUCCESS) {
+    return fail("vkCreateFence", fence_result);
+  }
   const VkResult submit_result =
-      vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
+      vkQueueSubmit(queue_, 1, &si, fence);
   if (submit_result != VK_SUCCESS) {
     return fail("vkQueueSubmit", submit_result);
   }
-  const VkResult wait_result = vkQueueWaitIdle(queue_);
-  if (wait_result != VK_SUCCESS) {
-    return fail("vkQueueWaitIdle", wait_result);
-  }
-  release_command_buffer();
+  submitted_build_command_ = cmd;
+  submitted_build_fence_ = fence;
+  submitted_build_ready_ = false;
+  cmd = VK_NULL_HANDLE;
+  fence = VK_NULL_HANDLE;
   return true;
+}
+
+void VulkanRtScene::releaseSubmittedBuild() noexcept {
+  if (device_ == VK_NULL_HANDLE) {
+    submitted_build_command_ = VK_NULL_HANDLE;
+    submitted_build_fence_ = VK_NULL_HANDLE;
+    return;
+  }
+  if (submitted_build_fence_ != VK_NULL_HANDLE) {
+    vkDestroyFence(device_, submitted_build_fence_, nullptr);
+    submitted_build_fence_ = VK_NULL_HANDLE;
+  }
+  if (submitted_build_command_ != VK_NULL_HANDLE &&
+      cmd_pool_ != VK_NULL_HANDLE) {
+    vkFreeCommandBuffers(device_, cmd_pool_, 1,
+                         &submitted_build_command_);
+    submitted_build_command_ = VK_NULL_HANDLE;
+  }
+}
+
+RtScenePendingBuildState VulkanRtScene::pollPendingBuild(
+    bool wait_for_completion) {
+  if (completion_unproven_) {
+    return RtScenePendingBuildState::CompletionUnproven;
+  }
+  if (submitted_build_ready_) {
+    return RtScenePendingBuildState::ReadyToCommit;
+  }
+  if (submitted_build_fence_ == VK_NULL_HANDLE) {
+    return RtScenePendingBuildState::Idle;
+  }
+
+  VkResult wait_result = VK_NOT_READY;
+  for (;;) {
+    if (wait_control_ &&
+        wait_control_->reason() ==
+            RenderThreadStopReason::FatalQuarantine) {
+      const VkResult status =
+          vkGetFenceStatus(device_, submitted_build_fence_);
+      if (status == VK_SUCCESS) {
+        wait_result = status;
+        break;
+      }
+      completion_unproven_ = true;
+      last_update_failure_reason_ =
+          "vkWaitForFences cancelled by fatal quarantine before RT build "
+          "completion was proven";
+      xpbd::log::errorf("Vulkan RT scene one-shot %s",
+                        last_update_failure_reason_.c_str());
+      return RtScenePendingBuildState::CompletionUnproven;
+    }
+    if (!wait_for_completion) {
+      wait_result = vkGetFenceStatus(device_, submitted_build_fence_);
+      if (wait_result == VK_NOT_READY) {
+        return RtScenePendingBuildState::PendingFence;
+      }
+      break;
+    }
+    wait_result = vkWaitForFences(
+        device_, 1, &submitted_build_fence_, VK_TRUE,
+        wait_control_ ? 25'000'000ull : UINT64_MAX);
+    if (wait_result == VK_TIMEOUT) {
+      continue;
+    }
+    break;
+  }
+  if (wait_result != VK_SUCCESS) {
+    completion_unproven_ = true;
+    last_update_failure_reason_ =
+        std::string("vkWaitForFences failed without proving RT build ") +
+        "completion: " + vulkanRtResultName(wait_result) + " (" +
+        std::to_string(static_cast<int>(wait_result)) + ")";
+    xpbd::log::errorf("Vulkan RT scene one-shot %s",
+                      last_update_failure_reason_.c_str());
+    return RtScenePendingBuildState::CompletionUnproven;
+  }
+  releaseSubmittedBuild();
+  submitted_build_ready_ = ready();
+  if (!submitted_build_ready_) {
+    last_update_failure_reason_ =
+        "RT build fence completed but Candidate is not ready";
+    return RtScenePendingBuildState::Failed;
+  }
+  return RtScenePendingBuildState::ReadyToCommit;
 }
 
 bool VulkanRtScene::ensureScratch(VkDeviceSize size) {
@@ -920,6 +1147,10 @@ bool VulkanRtScene::updateGeometry(
   if (!initialized_ || !procs_ok_) {
     return fail("scene not initialized or RT procedures unavailable");
   }
+  if (submitted_build_fence_ != VK_NULL_HANDLE) {
+    return fail("scene mutation rejected while AS Candidate fence is pending");
+  }
+  submitted_build_ready_ = false;
   if (generations_valid && generations_valid_ &&
       generations == last_generations_ && geometry_prepared_) {
     // No source domain changed since the last submission.  In particular,
@@ -1492,8 +1723,7 @@ bool VulkanRtScene::updateGeometry(
   // distribution.
   const bool rebuild_emissive_distribution =
       !emissive_distribution_valid_ || topology_changed ||
-      materials_generation_changed || emission_generation_changed ||
-      visibility_generation_changed ||
+      emission_generation_changed || visibility_generation_changed ||
       (cached_positive_emission_source_ &&
        (positions_generation_changed || transforms_generation_changed));
   auto &emissive_records = emissive_records_cache_;
@@ -1678,6 +1908,9 @@ bool VulkanRtScene::updateGeometry(
             .count();
   }
 
+  std::vector<std::uint8_t> alpha_classification_rebuilds(
+      desired_states.size(), 0u);
+  bool alpha_classification_changed = false;
   if (geometry_states_.size() != desired_states.size()) {
     topology_changed = true;
   } else {
@@ -1689,10 +1922,13 @@ bool VulkanRtScene::updateGeometry(
           current.instance_custom_index != desired.instance_custom_index ||
           current.source_bone_index != desired.source_bone_index ||
           current.first_index != desired.first_index ||
-          current.index_count != desired.index_count ||
-          current.opaque_geometry != desired.opaque_geometry) {
+          current.index_count != desired.index_count) {
         topology_changed = true;
         break;
+      }
+      if (current.opaque_geometry != desired.opaque_geometry) {
+        alpha_classification_rebuilds[i] = 1u;
+        alpha_classification_changed = true;
       }
     }
   }
@@ -1709,19 +1945,24 @@ bool VulkanRtScene::updateGeometry(
       const GeometryState &desired = desired_states[i];
       state.pending_full_build = false;
       state.pending_refit = false;
-      switch (classifyRtGeometryUpdate(
-          state.content_hash, desired.content_hash, state.blas_policy,
-          state.built_once)) {
-      case RtGeometryUpdateKind::Refit:
+      if (alpha_classification_rebuilds[i] != 0u) {
+        state.pending_full_build = true;
+      } else {
+        switch (classifyRtGeometryUpdate(
+            state.content_hash, desired.content_hash, state.blas_policy,
+            state.built_once)) {
+        case RtGeometryUpdateKind::Refit:
           state.pending_refit = true;
           break;
-      case RtGeometryUpdateKind::FullBuild:
+        case RtGeometryUpdateKind::FullBuild:
           state.pending_full_build = true;
           break;
-      case RtGeometryUpdateKind::None:
+        case RtGeometryUpdateKind::None:
           break;
+        }
       }
       state.content_hash = desired.content_hash;
+      state.opaque_geometry = desired.opaque_geometry;
     }
   }
   // The explicit snapshot is owned across frame slots by the backend. It may
@@ -1939,7 +2180,7 @@ bool VulkanRtScene::updateGeometry(
       bufferDeviceAddress(host_primitive_metadata_.buffer);
   host_primitive_optics_.address =
       bufferDeviceAddress(host_primitive_optics_.buffer);
-  if (upload_topology || materials_generation_changed) {
+  if (upload_topology || upload_materials) {
     copy_upload(host_primitive_flags_.mapped, primitive_flags.data(),
                 primitive_flag_bytes);
     copy_upload(host_primitive_metadata_.mapped, primitive_metadata.data(),
@@ -2048,6 +2289,9 @@ bool VulkanRtScene::updateGeometry(
       pending_build_reason_ = RtAccelerationBuildReason::StorageReallocated;
     } else if (!had_tlas) {
       pending_build_reason_ = RtAccelerationBuildReason::MissingTopLevel;
+    } else if (alpha_classification_changed) {
+      pending_build_reason_ =
+          RtAccelerationBuildReason::AlphaClassificationChanged;
     } else {
       pending_build_reason_ = RtAccelerationBuildReason::OtherFullBuild;
     }
@@ -2127,24 +2371,48 @@ void VulkanRtScene::recordBuilds(VkCommandBuffer cmd) {
   pending_build_reason_ = RtAccelerationBuildReason::None;
 }
 
+bool VulkanRtScene::submitPendingBuild() {
+  if (!initialized_ || !procs_ok_ || !geometry_prepared_) {
+    last_update_failure_reason_ =
+        "scene is not prepared for an AS Candidate transaction";
+    return false;
+  }
+  if (submitted_build_fence_ != VK_NULL_HANDLE) {
+    last_update_failure_reason_ =
+        "scene already owns a submitted AS Candidate transaction";
+    return false;
+  }
+  if (submitted_build_ready_) {
+    return true;
+  }
+  if (pending_ == PendingBuild::None) {
+    submitted_build_ready_ = ready();
+    return submitted_build_ready_;
+  }
+  VkCommandBuffer cmd = beginOneShot();
+  if (cmd == VK_NULL_HANDLE) {
+    return false;
+  }
+  recordBuilds(cmd);
+  return submitOneShotPending(cmd);
+}
+
+bool VulkanRtScene::buildPendingAndWait() {
+  if (!submitPendingBuild()) {
+    return false;
+  }
+  return pollPendingBuild(true) ==
+             RtScenePendingBuildState::ReadyToCommit &&
+         ready();
+}
+
 bool VulkanRtScene::updateAndBuild(const float *bone_transforms_column_major,
                                    std::size_t bone_count) {
   // Blocking fallback for callers that do not own a frame command buffer.
   if (!updateGeometry(bone_transforms_column_major, bone_count)) {
     return false;
   }
-  if (pending_ == PendingBuild::None) {
-    return ready();
-  }
-  VkCommandBuffer cmd = beginOneShot();
-  if (!cmd) {
-    return false;
-  }
-  recordBuilds(cmd);
-  if (!submitOneShot(cmd)) {
-    return false;
-  }
-  return ready();
+  return buildPendingAndWait();
 }
 
 void VulkanRtScene::writeTlasDescriptor(VkDescriptorSet set,

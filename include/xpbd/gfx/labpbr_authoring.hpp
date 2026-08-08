@@ -101,7 +101,8 @@ struct ReadOnlyIrisNormalAsset {
 
   [[nodiscard]] bool valid() const noexcept {
     return decoded != nullptr && decoded->valid() &&
-           decoded->source_channels == 4 && original_file_bytes != nullptr &&
+           (decoded->source_channels == 3 || decoded->source_channels == 4) &&
+           original_file_bytes != nullptr &&
            !original_file_bytes->empty() && sha256.size() == 64u;
   }
   void clear() { *this = {}; }
@@ -166,5 +167,11 @@ bool encodePngRgba8(int width, int height,
                     std::span<const std::uint8_t> rgba,
                     std::vector<std::uint8_t> &png,
                     std::string *error = nullptr);
+
+// Encodes the internal RGBA8 storage using the retained RGB/RGBA source
+// semantics. This prevents decoder-filled alpha from becoming authored alpha.
+bool encodePngTextureImage(const TextureImage &image,
+                           std::vector<std::uint8_t> &png,
+                           std::string *error = nullptr);
 
 } // namespace xpbd::gfx

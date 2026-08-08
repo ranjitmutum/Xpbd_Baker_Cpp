@@ -32,11 +32,33 @@
       if (request.cancel_requested && !terminal) {
         if (frame_index_ == 0u) {
           still_path_tracer_.cancelStillCapture();
-          still_active_job_id_ = 0u;
-          status.state = StillRenderJobState::Cancelled;
-          status.error.clear();
-          xpbd::log::infof("STILL_JOB cancelled job_id=%llu",
-                           static_cast<unsigned long long>(request.job_id));
+          const PathTraceCaptureState capture_state =
+              still_path_tracer_.captureState();
+          if (capture_state == PathTraceCaptureState::Saving) {
+            status.state = StillRenderJobState::Saving;
+            status.error.clear();
+          } else if (capture_state == PathTraceCaptureState::Completed) {
+            still_active_job_id_ = 0u;
+            status.state = StillRenderJobState::Completed;
+            status.error.clear();
+            xpbd::log::infof(
+                "STILL_JOB complete job_id=%llu samples=%u path=%s",
+                static_cast<unsigned long long>(request.job_id),
+                status.accumulated_samples, status.output_path.c_str());
+          } else if (capture_state == PathTraceCaptureState::Failed) {
+            still_active_job_id_ = 0u;
+            status.state = StillRenderJobState::Failed;
+            status.error = still_path_tracer_.captureError();
+            xpbd::log::errorf("STILL_JOB error job_id=%llu error=%s",
+                              static_cast<unsigned long long>(request.job_id),
+                              status.error.c_str());
+          } else {
+            still_active_job_id_ = 0u;
+            status.state = StillRenderJobState::Cancelled;
+            status.error.clear();
+            xpbd::log::infof("STILL_JOB cancelled job_id=%llu",
+                             static_cast<unsigned long long>(request.job_id));
+          }
         }
       } else if (!terminal &&
                  (active_render_path_ != RenderPath::RayTracing ||
@@ -54,7 +76,7 @@
         xpbd::log::errorf("STILL_JOB error job_id=%llu error=%s",
                           static_cast<unsigned long long>(request.job_id),
                           status.error.c_str());
-      } else if (!terminal && frame_index_ == 0u && !rt_scene.ready()) {
+      } else if (!terminal && frame_index_ == 0u && !rt_scene->ready()) {
         if (still_waiting_job_id_ != request.job_id) {
           still_waiting_job_id_ = request.job_id;
           still_wait_started_ = Clock::now();
@@ -71,7 +93,7 @@
                             static_cast<unsigned long long>(request.job_id),
                             status.error.c_str());
         }
-      } else if (!terminal && rt_scene.ready() && frame_index_ == 0u) {
+      } else if (!terminal && rt_scene->ready() && frame_index_ == 0u) {
         still_waiting_job_id_ = 0u;
         const bool new_job = still_active_job_id_ != request.job_id;
         if (new_job) {
@@ -302,7 +324,7 @@
                     ? static_specular_texture_.view
                     : VK_NULL_HANDLE;
             still_path_tracer_.recordDispatch(
-                fs.cmd, rt_scene, still_params, albedo_view, normal_view,
+                fs.cmd, *rt_scene, still_params, albedo_view, normal_view,
                 specular_view, static_albedo_sampler_,
                 static_normal_sampler_, static_specular_sampler_);
             status.accumulated_samples =
@@ -345,6 +367,7 @@
                                static_cast<unsigned long long>(request.job_id));
               break;
             case PathTraceCaptureState::PendingGpuReadback:
+            case PathTraceCaptureState::Saving:
               if (status.state != StillRenderJobState::Saving) {
                 still_last_progress_time_ = Clock::now();
                 xpbd::log::infof(

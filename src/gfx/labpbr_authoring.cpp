@@ -576,14 +576,20 @@ bool materializeLabPbrSpecular(int width, int height,
        imported_specular->height != height)) {
     return fail("imported specular dimensions do not match atlas");
   }
+  if (imported_specular != nullptr && imported_specular->valid() &&
+      imported_specular->source_channels != 3 &&
+      imported_specular->source_channels != 4) {
+    return fail("imported specular must retain RGB or RGBA source semantics");
+  }
   try {
     TextureImage candidate;
     candidate.width = width;
     candidate.height = height;
-    candidate.source_channels = 4;
     if (imported_specular != nullptr && imported_specular->valid()) {
+      candidate.source_channels = imported_specular->source_channels;
       candidate.rgba = imported_specular->rgba;
     } else {
+      candidate.source_channels = 4;
       candidate.rgba.resize(texel_count * 4u);
       for (std::size_t texel = 0; texel < texel_count; ++texel) {
         candidate.rgba[texel * 4u + 0u] = 0u;
@@ -698,6 +704,9 @@ LabPbrCompositionResult composeLabPbrSpecular(
                        group_name, authored_specular, claims);
         }
         if (override_value.emission_enabled) {
+          // RGB inputs have decoder-filled alpha. Promote only when an edit
+          // actually authors the LabPBR emission channel.
+          authored_specular.source_channels = 4;
           claimChannel(texel, LabPbrOverrideChannel::Emission,
                        encodeLabPbrEmission(override_value.emission),
                        group_name, authored_specular, claims);
@@ -745,7 +754,8 @@ bool buildAuthoredResolvedMaterial(
        (!authored_specular->valid() ||
         authored_specular->width != base->width ||
         authored_specular->height != base->height ||
-        authored_specular->source_channels != 4))) {
+         (authored_specular->source_channels != 3 &&
+          authored_specular->source_channels != 4)))) {
     if (error != nullptr) {
       *error = "authored specular image does not match the base atlas";
     }
@@ -761,7 +771,8 @@ bool buildAuthoredResolvedMaterial(
   }
   if (normal != nullptr &&
       (!normal->valid() || normal->width != base->width ||
-       normal->height != base->height || normal->source_channels < 3)) {
+       normal->height != base->height ||
+       (normal->source_channels != 3 && normal->source_channels != 4))) {
     if (error != nullptr) {
       *error = "normal image does not match the base atlas or lacks RGB";
     }
@@ -951,9 +962,9 @@ bool importReadOnlyIrisNormal(const std::filesystem::path &path,
       }
       return false;
     }
-    if (decoded.source_channels != 4) {
+    if (decoded.source_channels != 3 && decoded.source_channels != 4) {
       if (error != nullptr) {
-        *error = "Iris Normal Decode stage failed: image must be RGBA";
+        *error = "Iris Normal Decode stage failed: image must be RGB or RGBA";
       }
       return false;
     }
@@ -992,34 +1003,49 @@ bool importReadOnlyIrisNormal(const std::filesystem::path &path,
   }
 }
 
-bool encodePngRgba8(int width, int height,
-                    std::span<const std::uint8_t> rgba,
-                    std::vector<std::uint8_t> &png, std::string *error) {
+static bool encodePngRgbaStorage(int width, int height,
+                                 std::span<const std::uint8_t> rgba,
+                                 int encoded_channels,
+                                 std::vector<std::uint8_t> &png,
+                                 std::string *error) {
   if (width <= 0 || height <= 0) {
     if (error != nullptr) {
       *error = "PNG dimensions must be positive";
     }
     return false;
   }
-  const std::size_t row_bytes = static_cast<std::size_t>(width) * 4u;
-  const std::size_t expected = row_bytes * static_cast<std::size_t>(height);
-  if (row_bytes / 4u != static_cast<std::size_t>(width) ||
-      expected / static_cast<std::size_t>(height) != row_bytes ||
-      rgba.size() != expected) {
+  if (encoded_channels != 3 && encoded_channels != 4) {
     if (error != nullptr) {
-      *error = "PNG RGBA byte count does not match dimensions";
+      *error = "PNG output must retain RGB or RGBA semantics";
     }
     return false;
   }
+  const std::size_t width_size = static_cast<std::size_t>(width);
   const std::size_t height_size = static_cast<std::size_t>(height);
-  if (expected >
+  const std::size_t rgba_row_bytes = width_size * 4u;
+  const std::size_t encoded_row_bytes =
+      width_size * static_cast<std::size_t>(encoded_channels);
+  const std::size_t expected_rgba = rgba_row_bytes * height_size;
+  const std::size_t encoded_bytes = encoded_row_bytes * height_size;
+  if (rgba_row_bytes / 4u != width_size ||
+      encoded_row_bytes / static_cast<std::size_t>(encoded_channels) !=
+          width_size ||
+      expected_rgba / height_size != rgba_row_bytes ||
+      encoded_bytes / height_size != encoded_row_bytes ||
+      rgba.size() != expected_rgba) {
+    if (error != nullptr) {
+      *error = "PNG RGBA storage byte count does not match dimensions";
+    }
+    return false;
+  }
+  if (encoded_bytes >
       (std::numeric_limits<std::size_t>::max)() - height_size) {
     if (error != nullptr) {
       *error = "PNG scanline dimensions overflow";
     }
     return false;
   }
-  const std::size_t scanline_size = expected + height_size;
+  const std::size_t scanline_size = encoded_bytes + height_size;
   const std::size_t block_count =
       scanline_size / 65535u + (scanline_size % 65535u != 0u ? 1u : 0u);
   const std::size_t maximum_size =
@@ -1039,9 +1065,18 @@ bool encodePngRgba8(int width, int height,
   scanlines.reserve(scanline_size);
   for (int y = 0; y < height; ++y) {
     scanlines.push_back(0u);
-    const auto row = rgba.subspan(static_cast<std::size_t>(y) * row_bytes,
-                                  row_bytes);
-    scanlines.insert(scanlines.end(), row.begin(), row.end());
+    const auto row = rgba.subspan(
+        static_cast<std::size_t>(y) * rgba_row_bytes, rgba_row_bytes);
+    if (encoded_channels == 4) {
+      scanlines.insert(scanlines.end(), row.begin(), row.end());
+    } else {
+      for (std::size_t x = 0; x < width_size; ++x) {
+        const std::size_t offset = x * 4u;
+        scanlines.insert(scanlines.end(), row.begin() +
+                                              static_cast<std::ptrdiff_t>(offset),
+                         row.begin() + static_cast<std::ptrdiff_t>(offset + 3u));
+      }
+    }
   }
 
   std::vector<std::uint8_t> zlib;
@@ -1088,7 +1123,7 @@ bool encodePngRgba8(int width, int height,
       static_cast<std::uint8_t>(static_cast<std::uint32_t>(height) >> 8u);
   ihdr[7] = static_cast<std::uint8_t>(height);
   ihdr[8] = 8u;
-  ihdr[9] = 6u;
+  ihdr[9] = encoded_channels == 4 ? 6u : 2u;
   appendPngChunk(png, "IHDR", ihdr);
   appendPngChunk(png, "IDAT", zlib);
   appendPngChunk(png, "IEND", {});
@@ -1096,6 +1131,26 @@ bool encodePngRgba8(int width, int height,
     error->clear();
   }
   return true;
+}
+
+bool encodePngRgba8(int width, int height,
+                    std::span<const std::uint8_t> rgba,
+                    std::vector<std::uint8_t> &png, std::string *error) {
+  return encodePngRgbaStorage(width, height, rgba, 4, png, error);
+}
+
+bool encodePngTextureImage(const TextureImage &image,
+                           std::vector<std::uint8_t> &png,
+                           std::string *error) {
+  if (!image.valid() ||
+      (image.source_channels != 3 && image.source_channels != 4)) {
+    if (error != nullptr) {
+      *error = "PNG texture image must be valid RGB or RGBA data";
+    }
+    return false;
+  }
+  return encodePngRgbaStorage(image.width, image.height, image.rgba,
+                              image.source_channels, png, error);
 }
 
 } // namespace xpbd::gfx

@@ -366,6 +366,8 @@ const char *labPbrDebugViewName(LabPbrDebugView view) noexcept {
     return "emission";
   case LabPbrDebugView::Opacity:
     return "opacity";
+  case LabPbrDebugView::Height:
+    return "height";
   }
   return "shaded";
 }
@@ -392,6 +394,9 @@ LabPbrDebugView labPbrDebugViewFromName(std::string_view name) noexcept {
   if (name == "opacity" || name == "alpha") {
     return LabPbrDebugView::Opacity;
   }
+  if (name == "height" || name == "stored-height") {
+    return LabPbrDebugView::Height;
+  }
   return LabPbrDebugView::Shaded;
 }
 
@@ -416,6 +421,8 @@ labPbrDebugColor(const ResolvedMaterialTexel &texel,
     return texel.emission_linear;
   case LabPbrDebugView::Opacity:
     return {texel.opacity, texel.opacity, texel.opacity};
+  case LabPbrDebugView::Height:
+    return {texel.stored_height, texel.stored_height, texel.stored_height};
   case LabPbrDebugView::Shaded:
   default:
     return texel.base_color_linear;
@@ -434,7 +441,137 @@ labPbrFeatureFlags(const ResolvedMaterialTable *material) noexcept {
   if (material->specular_map_active) {
     flags |= kLabPbrSpecularMapActive;
   }
+  const LabPbrAlphaProvenance provenance =
+      labPbrAlphaProvenance(material);
+  if (provenance.base_alpha_authored) {
+    flags |= kLabPbrBaseAlphaAuthored;
+  }
+  if (provenance.height_alpha_authored) {
+    flags |= kLabPbrHeightAlphaAuthored;
+  }
+  if (provenance.emission_alpha_authored) {
+    flags |= kLabPbrEmissionAlphaAuthored;
+  }
   return flags;
+}
+
+LabPbrAlphaProvenance
+labPbrAlphaProvenance(const ResolvedMaterialTable *material) noexcept {
+  LabPbrAlphaProvenance provenance;
+  if (material == nullptr) {
+    return provenance;
+  }
+  provenance.base_source_channels = material->base_image.source_channels;
+  provenance.normal_source_channels =
+      material->normal_map_active ? material->normal_image.source_channels : 0;
+  provenance.specular_source_channels =
+      material->specular_map_active ? material->specular_image.source_channels
+                                    : 0;
+  provenance.base_alpha_authored = provenance.base_source_channels >= 4;
+  provenance.height_alpha_authored =
+      provenance.normal_source_channels >= 4;
+  provenance.emission_alpha_authored =
+      provenance.specular_source_channels >= 4;
+  return provenance;
+}
+
+float labPbrEmissionAliasSupportFloor(
+    const ResolvedMaterialTable *material) noexcept {
+  if (material == nullptr || !material->valid() ||
+      !material->specular_map_active ||
+      material->specular_image.source_channels < 4) {
+    return 0.0f;
+  }
+  const std::size_t pixel_count =
+      static_cast<std::size_t>(material->width) *
+      static_cast<std::size_t>(material->height);
+  float maximum_emission = 0.0f;
+  float maximum_covered_base_luminance = 0.0f;
+  for (std::size_t pixel = 0u; pixel < pixel_count; ++pixel) {
+    const std::size_t offset = pixel * 4u;
+    const std::uint8_t emission_code =
+        material->specular_image.rgba[offset + 3u];
+    const std::uint8_t coverage_code =
+        material->base_image.rgba[offset + 3u];
+    if (emission_code != 255u) {
+      maximum_emission = std::max(
+          maximum_emission,
+          static_cast<float>(emission_code) / 254.0f);
+    }
+    if (coverage_code < 6u) {
+      continue;
+    }
+    const float coverage =
+        static_cast<float>(coverage_code) / 255.0f;
+    const float covered_base_luminance =
+        (0.2126f * srgb8ToLinear(material->base_image.rgba[offset + 0u]) +
+         0.7152f * srgb8ToLinear(material->base_image.rgba[offset + 1u]) +
+         0.0722f * srgb8ToLinear(material->base_image.rgba[offset + 2u])) *
+        coverage;
+    if (std::isfinite(covered_base_luminance)) {
+      maximum_covered_base_luminance = std::max(
+          maximum_covered_base_luminance, covered_base_luminance);
+    }
+  }
+  const float maximum_luminance =
+      maximum_emission * maximum_covered_base_luminance;
+  return maximum_luminance > 0.0f
+             ? std::max(maximum_luminance * 1.0e-6f, 1.0e-8f)
+             : 0.0f;
+}
+
+std::uint64_t labPbrEmissionContentKey(
+    const ResolvedMaterialTable *material) noexcept {
+  if (material == nullptr || !material->valid() ||
+      !material->specular_map_active ||
+      material->specular_image.source_channels < 4 ||
+      !material->base_image.valid() ||
+      !material->specular_image.valid() ||
+      material->base_image.width != material->specular_image.width ||
+      material->base_image.height != material->specular_image.height) {
+    return 0u;
+  }
+  std::uint64_t key = 14695981039346656037ull;
+  const auto mix_byte = [&](std::uint8_t value) {
+    key ^= value;
+    key *= 1099511628211ull;
+  };
+  const auto mix_u64 = [&](std::uint64_t value) {
+    for (std::uint32_t byte = 0u; byte < 8u; ++byte) {
+      mix_byte(static_cast<std::uint8_t>(value >> (byte * 8u)));
+    }
+  };
+  bool positive_emission = false;
+  mix_u64(material->base_image.width);
+  mix_u64(material->base_image.height);
+  const std::size_t pixel_count =
+      material->specular_image.rgba.size() / 4u;
+  for (std::size_t pixel = 0u; pixel < pixel_count; ++pixel) {
+    const std::uint8_t emission =
+        material->specular_image.rgba[pixel * 4u + 3u];
+    if (emission == 0u || emission == 255u) {
+      continue;
+    }
+    positive_emission = true;
+    mix_u64(static_cast<std::uint64_t>(pixel));
+    mix_byte(emission);
+    mix_byte(material->base_image.rgba[pixel * 4u + 0u]);
+    mix_byte(material->base_image.rgba[pixel * 4u + 1u]);
+    mix_byte(material->base_image.rgba[pixel * 4u + 2u]);
+    mix_byte(material->base_image.rgba[pixel * 4u + 3u]);
+  }
+  return positive_emission ? key : 0u;
+}
+
+float labPbrEmissionCoverageWeight(float opacity, bool cutout,
+                                   bool blend) noexcept {
+  const float coverage = std::isfinite(opacity)
+                             ? std::clamp(opacity, 0.0f, 1.0f)
+                             : 1.0f;
+  if ((cutout || blend) && !(coverage >= 0.02f)) {
+    return 0.0f;
+  }
+  return blend ? coverage : 1.0f;
 }
 
 ResolvedMaterialTexel decodeLabPbrTexel(

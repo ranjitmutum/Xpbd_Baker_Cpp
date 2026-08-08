@@ -16,14 +16,18 @@ bool nativeDialogOpen() noexcept { return g_dialog_depth > 0; }
 
 NativeDialogScope::NativeDialogScope() {
   if (g_dialog_depth == 0) {
-    if (g_hooks.prepare) {
-      g_hooks.prepare();
+    if (g_hooks.prepare && !g_hooks.prepare()) {
+      return;
     }
   }
   ++g_dialog_depth;
+  ready_ = true;
 }
 
 NativeDialogScope::~NativeDialogScope() {
+  if (!ready_) {
+    return;
+  }
   if (g_dialog_depth > 0) {
     --g_dialog_depth;
   }

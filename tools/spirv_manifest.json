@@ -117,9 +117,9 @@
       "target_env": "vulkan1.2",
       "spv": "src/gfx/spirv/path_trace.comp.spv",
       "inc": "src/gfx/spirv/path_trace.comp.spv.inc",
-      "source_sha256": "cff4c07384881b0802efdb8229167d9d52fd9ae6321785fe07e8db7cbf8ffc0a",
-      "spv_sha256": "f0927f61c5c11309beba090b8eafb6f1a69dc21e6800b87cbb61ce014196e3f9",
-      "inc_sha256": "f622dc7bfd8dff9bd73988acea2b617f2e87cc9253a44e0757743d400c492979"
+      "source_sha256": "4b29b3e9ad0ba95c0732e16fed59ddfa58c611d1bf76be4f18f5a738c74e627d",
+      "spv_sha256": "045c8557728ef610b7d74365343f25ee42f4a0fd7ccc940eb93ac7b823893b51",
+      "inc_sha256": "09c0473ed25c4c5e89a32408c3dd7057acb002f7247a43946987cec4add8aea6"
     },
     {
       "source": "src/gfx/spirv/pt_composite.frag",
@@ -144,34 +144,34 @@
       "target_env": "vulkan1.2",
       "spv": "src/gfx/spirv/rt_debug.rahit.spv",
       "inc": "src/gfx/spirv/rt_debug.rahit.spv.inc",
-      "source_sha256": "a49daa4ed29e1353ba1f578a004eac212fad71563bd340f87b5b7cf634b28140",
-      "spv_sha256": "ea5d19e3abc01013767c37aa664d38c7ab99845f003e9b89b8e7ae61de652a42",
-      "inc_sha256": "151529c7a99b454d8bffb07933d93f8eea9c0e494dd1a86e51ba414b35935411"
+      "source_sha256": "1fd2a45f18e577e21d8e0937f351994c799be133192fbf4ac7251aa690b02a46",
+      "spv_sha256": "d50fd237982c6cb5e1b71d226bbb68a5e40567ebc89fe7445017d66e8927e225",
+      "inc_sha256": "cc22db4025f59bc9f3ac5e6b60124415f61a21678373120edbeb1a1922e54165"
     },
     {
       "source": "src/gfx/spirv/rt_debug.rchit",
       "target_env": "vulkan1.2",
       "spv": "src/gfx/spirv/rt_debug.rchit.spv",
       "inc": "src/gfx/spirv/rt_debug.rchit.spv.inc",
-      "source_sha256": "b2ed01d61ceb0a2a1ff7b3babbb51cf0e0e8320cdc0de8fecf5b6da7a6b389fc",
-      "spv_sha256": "df33443bf9bfd4418fb36387148de9e94742b2a36b48472316e325e1eae67178",
-      "inc_sha256": "b77e73e4beba0634fbd58b980c6ff9f1aa53d472241a3aef6ee2695f7f56a1d9"
+      "source_sha256": "44df34d4940ea1a2fd78de44560ff8ac8e7e5e7ba49c7a761f96e485d5290cdd",
+      "spv_sha256": "2a7865afbb25669f04b6500206e5b199090d508df1a3be3b0b85b46cb2f12a6d",
+      "inc_sha256": "bc95a7b810ca3f1ac2a325f154105d7a8cb40e11d3b77e1baa200f2a25a46801"
     },
     {
       "source": "src/gfx/spirv/rt_debug.rgen",
       "target_env": "vulkan1.2",
       "spv": "src/gfx/spirv/rt_debug.rgen.spv",
       "inc": "src/gfx/spirv/rt_debug.rgen.spv.inc",
-      "source_sha256": "83a215a647dbbdddeca85a942eddb7390bb18eb822fb51791b98cb47f42fcde9",
-      "spv_sha256": "215b6b96595bb6c164aef3ec4ae548b77770025b5f039c2138a78b5177070a62",
-      "inc_sha256": "68e322c311ef8870f2d1efca00e6a17a82430c04ca73ac17951952c216f1c014"
+      "source_sha256": "adbda13371b5b9dd7307fc446d6a9480fcb4878298dda392bb25472fa59bd413",
+      "spv_sha256": "b49038b10c5b231b83fb33818bc54796a0259249b0fbb34e3ce35d9a224df4ef",
+      "inc_sha256": "b5209de63216c82e165f77dd24bcec17c8dce802739d090b90df0acf1e4b862c"
     },
     {
       "source": "src/gfx/spirv/rt_debug.rmiss",
       "target_env": "vulkan1.2",
       "spv": "src/gfx/spirv/rt_debug.rmiss.spv",
       "inc": "src/gfx/spirv/rt_debug.rmiss.spv.inc",
-      "source_sha256": "b16aeb3191119111a36be8a7e66cc6a7f295d0e7d7fa8e7547ff032f7e12a640",
+      "source_sha256": "ae0ba0cb151a7764cc352f51258549c81e4306e235d723de0fdf36a514a71ae7",
       "spv_sha256": "9a4be32c257d708ef9acd535d5f6cf1a0f59f5e622df46e2d021f5791fdf3ec0",
       "inc_sha256": "2095c1f7c8416c50fc2336f2f2f6df8907a94a49b3d89ae6ccf7be7ed7c60d40"
     },
@@ -180,9 +180,9 @@
       "target_env": "vulkan1.2",
       "spv": "src/gfx/spirv/rt_shadow.rmiss.spv",
       "inc": "src/gfx/spirv/rt_shadow.rmiss.spv.inc",
-      "source_sha256": "0e6c7c88d6dd10aaf2d7732d16ccdf0e23785fc6c17bd0be761b682e5d5ce189",
-      "spv_sha256": "87c08f9f2efb8a0d285278ed696d7bd2037f7de78ec91535a9e61a67d634e180",
-      "inc_sha256": "4c5d7b41669a31b5129b61c4843c08601755a301de23c9da723847d43c832db5"
+      "source_sha256": "162c8561d61ab6b10a0d9fde6b212beb13d142d1685170bfb3b1104f43852523",
+      "spv_sha256": "5ef14438e0911ee5f400478dcec59dcd3915d4ae8f8e9084bc4de0c13dacf06a",
+      "inc_sha256": "2f1b4e29060d27b695f4e54ac46c9323854709c88f91b259130952f199ba4d02"
     },
     {
       "source": "src/gfx/spirv/skybox.frag",
@@ -207,9 +207,9 @@
       "target_env": "vulkan1.0",
       "spv": "src/gfx/spirv/static_mesh.frag.spv",
       "inc": "src/gfx/spirv/static_mesh.frag.spv.inc",
-      "source_sha256": "a5d34714bb2fa865bc4f4797f94c46d7d6a2281f4b39182ac2c6ccb0ef861f55",
-      "spv_sha256": "772f77ccf2995e38613854b2aaf2b6c7a07ee6febbc06796353e58c9bbcd2e6f",
-      "inc_sha256": "2cd3d4833c2baf26ca08724d91277ee8a9ed2a2d2fe07f6ca57edd591f3d6e9f"
+      "source_sha256": "5f6bcf07720d230e034455ca1948fd222ad3dd90d144693642a34bdb4cdaacb0",
+      "spv_sha256": "54a17559426753821c0abb249ae2385ae3fad1ef398a1db587dc37fd49591cca",
+      "inc_sha256": "636631a42ac66c1c474f961fcbbf9b548c5b0e4a6b9a34a3553a4ca7ed418743"
     },
     {
       "source": "src/gfx/spirv/static_mesh.vert",
@@ -225,9 +225,9 @@
       "target_env": "vulkan1.2",
       "spv": "src/gfx/spirv/static_mesh_rt.frag.spv",
       "inc": "src/gfx/spirv/static_mesh_rt.frag.spv.inc",
-      "source_sha256": "5b3558438417b5f627557a9a2a084322a88a8401f493485ac82012ef065397bd",
-      "spv_sha256": "94d241a9cb0c078583f87fb337ed51a774e81939417a47b4c5e2c6d8b0e9997a",
-      "inc_sha256": "924e755c362ccd96c1a38613c4b34fae0d443e678cd458b9a7c017c0a6dce227"
+      "source_sha256": "77c0dccbc1571d3aba2598ce991d8d48ce8746b80d8af03796466c7c4cef05f8",
+      "spv_sha256": "98c28c213673fd0079f85c353094d093e788266befc6981b9814693d69c17db7",
+      "inc_sha256": "68d5d23bff4c67041c724de0b46056215ad830bf07df7082334e8951d73a9097"
     },
     {
       "source": "src/gfx/spirv/static_mesh_rt.vert",
@@ -261,6 +261,10 @@
     {
       "path": "src/gfx/spirv/atmosphere_common.glsl",
       "sha256": "dbe874ffcc89c87e766bb6d5717c42b68f94380acbafec71a459b9645c1f340d"
+    },
+    {
+      "path": "src/gfx/spirv/labpbr_emission.glsl",
+      "sha256": "36b6ada6da342c137b2af15a7619362966ef12696258fe9f52e2779246922ea1"
     },
     {
       "path": "third_party/bruneton/atmosphere/definitions.glsl",

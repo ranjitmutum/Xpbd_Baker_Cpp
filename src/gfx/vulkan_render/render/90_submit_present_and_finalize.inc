@@ -1,11 +1,23 @@
     write_timestamp(GpuTimestampQuery::FrameEnd,
                     VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    const auto discard_temporal_candidate = [&]() {
+      if (pt_dispatch_recorded_for_frame) {
+        path_tracer.invalidateTemporalHistory();
+      }
+      if (streamline_temporal_commit_candidate_valid_) {
+        streamline_vulkan_runtime_.invalidateDlssHistory();
+        streamline_temporal_history_valid_ = false;
+        streamline_temporal_recovery_pending_ = true;
+        streamline_temporal_commit_candidate_valid_ = false;
+      }
+    };
     const VkResult end_command = call_with_diagnostics(
         "vkEndCommandBuffer",
         [&] { return vkEndCommandBuffer(fs.cmd); });
     if (end_command != VK_SUCCESS) {
       SDL_Log("Vulkan command buffer end failed: %d",
               static_cast<int>(end_command));
+      discard_temporal_candidate();
       enterFatalVulkanError(frame, "vkEndCommandBuffer", end_command);
       return;
     }
@@ -36,6 +48,7 @@
     if (submit_result != VK_SUCCESS) {
       SDL_Log("Vulkan queue submit failed: %d",
               static_cast<int>(submit_result));
+      discard_temporal_candidate();
       enterFatalVulkanError(frame, "vkQueueSubmit(frame)", submit_result);
       return;
     }
@@ -80,6 +93,8 @@
     logDiagnosticApi("vkQueuePresentKHR", "before", std::nullopt, 0.0,
                      image_index, fs.fence, image_resource.last_in_flight,
                      fs.cmd, false, true);
+    const FrameGenerationTransitionResult fg_state_poll_transition =
+        streamline_vulkan_runtime_.pollFrameGenerationStateBeforePresent();
     streamline_vulkan_runtime_.markPresentStart();
     VkResult pr =
         streamline_vulkan_runtime_.queuePresent(present_queue_, &pi);
@@ -88,6 +103,63 @@
         pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR;
     if (stats_.present_succeeded) {
       ++stats_.present_success_count;
+      if (pt_dispatch_recorded_for_frame && frame.view_matrix != nullptr &&
+          frame.proj_matrix != nullptr) {
+        std::copy_n(frame.view_matrix, 16u,
+                    rt_motion_previous_view_.begin());
+        std::copy_n(frame.proj_matrix, 16u,
+                    rt_motion_previous_proj_.begin());
+        rt_motion_camera_history_valid_ = true;
+      } else if (pt_dispatch_recorded_for_frame) {
+        rt_motion_camera_history_valid_ = false;
+      }
+
+      if (rt_motion_clear_on_commit) {
+        rt_motion_previous_positions_.clear();
+        rt_motion_previous_bones_.clear();
+        rt_motion_topology_hash_ = 0u;
+        rt_motion_history_valid_ = false;
+        rt_motion_history_render_serial_ = 0u;
+      } else if (rt_motion_commit_candidate_valid) {
+        rt_motion_previous_positions_.swap(rt_motion_commit_positions);
+        rt_motion_previous_bones_.swap(rt_motion_commit_bones);
+        rt_motion_topology_hash_ = rt_motion_commit_topology_hash;
+        rt_motion_history_valid_ = true;
+      }
+      if (path_trace_active && rt_motion_history_valid_) {
+        rt_motion_history_render_serial_ =
+            render_thread_frame_context_active_
+                ? render_thread_render_serial_
+                : temporal_render_serial;
+      }
+
+      if (streamline_temporal_commit_candidate_valid_) {
+        streamline_temporal_history_key_ =
+            streamline_temporal_commit_candidate_key_;
+        streamline_temporal_history_valid_ = true;
+        streamline_temporal_render_width_ =
+            streamline_temporal_commit_candidate_render_width_;
+        streamline_temporal_render_height_ =
+            streamline_temporal_commit_candidate_render_height_;
+        streamline_temporal_output_width_ =
+            streamline_temporal_commit_candidate_output_width_;
+        streamline_temporal_output_height_ =
+            streamline_temporal_commit_candidate_output_height_;
+        streamline_temporal_reset_generation_ =
+            streamline_temporal_commit_candidate_reset_generation_;
+        streamline_temporal_mode_ =
+            streamline_temporal_commit_candidate_mode_;
+        streamline_temporal_ray_reconstruction_ =
+            streamline_temporal_commit_candidate_ray_reconstruction_;
+        streamline_temporal_recovery_pending_ = false;
+        streamline_temporal_history_render_serial_ =
+            render_thread_frame_context_active_
+                ? render_thread_render_serial_
+                : temporal_render_serial;
+        streamline_temporal_commit_candidate_valid_ = false;
+      }
+    } else {
+      discard_temporal_candidate();
     }
     const FrameGenerationTransitionResult fg_present_transition =
         streamline_vulkan_runtime_.updateFrameGenerationStateAfterPresent(pr);
@@ -95,7 +167,10 @@
         streamline_vulkan_runtime_.frameGenerationActive();
     stats_.dlss_frames_actually_presented =
         streamline_vulkan_runtime_.framesActuallyPresented();
-    if (fg_present_transition == FrameGenerationTransitionResult::RecoverNative) {
+    if (fg_state_poll_transition ==
+            FrameGenerationTransitionResult::RecoverNative ||
+        fg_present_transition ==
+            FrameGenerationTransitionResult::RecoverNative) {
       const FrameGenerationDiagnostic diagnostic =
           streamline_vulkan_runtime_.frameGenerationDiagnostic();
       fg_force_native_recovery_ = true;

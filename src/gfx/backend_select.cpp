@@ -56,7 +56,7 @@ BackendRequest parseBackendRequest(int argc, char **argv) {
           eq(env, "dx11") || eq(env, "d3d11")) {
         req.parse_error =
             std::string("Graphics backend '") + env +
-            "' was removed; only OpenGL and Vulkan are available";
+            "' was removed; Vulkan is the supported renderer";
         req.force = true;
       }
     }
@@ -85,7 +85,7 @@ BackendRequest parseBackendRequest(int argc, char **argv) {
          eq(a, "gles"))) {
       req.parse_error =
           std::string("Graphics backend flag '") + argv[i] +
-          "' was removed; use -gl or -vk";
+          "' was removed; use -vk";
       req.force = true;
     }
   }

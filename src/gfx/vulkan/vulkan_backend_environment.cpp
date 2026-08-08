@@ -11,6 +11,7 @@
 #include <exception>
 #include <future>
 #include <limits>
+#include <new>
 #include <string>
 #include <thread>
 #include <utility>
@@ -66,10 +67,23 @@ static const uint32_t kSpvAtmosphereEnvironmentCacheComp[] = {
 
 [[nodiscard]] VulkanBackend::DynamicSkyCpuResult VulkanBackend::buildDynamicSkyDistribution(
       const DynamicSkyCpuInput &input, VkDevice device, VkFence fence,
-      Clock::time_point submitted_at) {
+      Clock::time_point submitted_at,
+      std::shared_ptr<RenderThreadControl> control) {
     DynamicSkyCpuResult result;
-    result.fence_result =
-        vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+    for (;;) {
+      if (control && control->fatalQuarantineRequested()) {
+        const VkResult status = vkGetFenceStatus(device, fence);
+        result.fence_result =
+            status == VK_SUCCESS ? VK_SUCCESS : VK_TIMEOUT;
+        break;
+      }
+      result.fence_result = vkWaitForFences(
+          device, 1, &fence, VK_TRUE,
+          control ? 25'000'000ull : UINT64_MAX);
+      if (result.fence_result != VK_TIMEOUT) {
+        break;
+      }
+    }
     result.cache_compute_ms =
         std::chrono::duration<double, std::milli>(Clock::now() - submitted_at)
             .count();
@@ -342,8 +356,11 @@ bool VulkanBackend::pollDynamicSkyEnvironmentCache(bool wait_for_completion) {
         return false;
       }
       DynamicSkyCpuResult fallback;
-      fallback.fence_result =
-          vkWaitForFences(device_, 1, &pending.fence, VK_TRUE, UINT64_MAX);
+      const ControlledWaitResult wait = waitForFenceControlled(
+          pending.fence, "vkWaitForFences.dynamic_sky_fallback",
+          static_cast<std::uint32_t>(frame_index_), VK_NULL_HANDLE,
+          pending.command, true, true);
+      fallback.fence_result = wait.result;
       fallback.error = "dynamic-sky worker launch failed";
       std::promise<DynamicSkyCpuResult> promise;
       pending.completion = promise.get_future();
@@ -352,6 +369,15 @@ bool VulkanBackend::pollDynamicSkyEnvironmentCache(bool wait_for_completion) {
                pending.completion.wait_for(std::chrono::milliseconds(0)) !=
                    std::future_status::ready) {
       return false;
+    } else if (wait_for_completion) {
+      while (pending.completion.wait_for(std::chrono::milliseconds(25)) !=
+             std::future_status::ready) {
+        if (render_thread_control_ &&
+            render_thread_control_->fatalQuarantineRequested()) {
+          markGpuCompletionUnproven("dynamic_sky_cpu_completion");
+          return true;
+        }
+      }
     }
 
     DynamicSkyCpuResult cpu_result;
@@ -361,13 +387,19 @@ bool VulkanBackend::pollDynamicSkyEnvironmentCache(bool wait_for_completion) {
       // A broken future does not prove that the submitted command buffer has
       // completed. Establish completion independently before reclaiming any
       // Vulkan object owned by the pending transaction.
-      cpu_result.fence_result =
-          vkWaitForFences(device_, 1, &pending.fence, VK_TRUE, UINT64_MAX);
+      const ControlledWaitResult wait = waitForFenceControlled(
+          pending.fence, "vkWaitForFences.dynamic_sky_exception",
+          static_cast<std::uint32_t>(frame_index_), VK_NULL_HANDLE,
+          pending.command, true, true);
+      cpu_result.fence_result = wait.result;
       cpu_result.error = std::string("dynamic-sky worker completion failed: ") +
                          exception.what();
     } catch (...) {
-      cpu_result.fence_result =
-          vkWaitForFences(device_, 1, &pending.fence, VK_TRUE, UINT64_MAX);
+      const ControlledWaitResult wait = waitForFenceControlled(
+          pending.fence, "vkWaitForFences.dynamic_sky_exception",
+          static_cast<std::uint32_t>(frame_index_), VK_NULL_HANDLE,
+          pending.command, true, true);
+      cpu_result.fence_result = wait.result;
       cpu_result.error =
           "dynamic-sky worker completion failed with unknown exception";
     }
@@ -380,8 +412,7 @@ bool VulkanBackend::pollDynamicSkyEnvironmentCache(bool wait_for_completion) {
           vkResultName(cpu_result.fence_result),
           static_cast<int>(cpu_result.fence_result), frame_index_,
           static_cast<unsigned long long>(still_active_job_id_));
-      recordFatalVulkanError("vkWaitForFences(dynamic_sky)",
-                             cpu_result.fence_result);
+      markGpuCompletionUnproven("vkWaitForFences(dynamic_sky)");
       // Do not destroy the fence, free the command buffer, or release any
       // image/buffer here: a non-successful wait does not prove completion.
       return true;
@@ -517,6 +548,9 @@ void VulkanBackend::discardDynamicSkyPending() {
 
 void VulkanBackend::clearDynamicSkyEnvironmentCache() {
     discardDynamicSkyPending();
+    if (quarantine_required_) {
+      return;
+    }
     destroyImage(atmosphere_environment_cache_);
     destroyImage(atmosphere_cloud_history_);
     destroyImage(atmosphere_environment_spare_cache_);
@@ -537,6 +571,9 @@ void VulkanBackend::clearDynamicSkyEnvironmentCache() {
 
 void VulkanBackend::clearProceduralAtmosphereImage() {
     clearDynamicSkyEnvironmentCache();
+    if (quarantine_required_) {
+      return;
+    }
     destroyImage(atmosphere_transmittance_);
     destroyImage(atmosphere_scattering_);
     destroyImage(atmosphere_irradiance_);
@@ -546,6 +583,9 @@ void VulkanBackend::clearProceduralAtmosphereImage() {
 
 void VulkanBackend::destroyProceduralAtmosphereGpu() {
     clearProceduralAtmosphereImage();
+    if (quarantine_required_) {
+      return;
+    }
     if (atmosphere_environment_cache_pipeline_ != VK_NULL_HANDLE) {
       vkDestroyPipeline(device_, atmosphere_environment_cache_pipeline_,
                         nullptr);
@@ -916,13 +956,6 @@ bool VulkanBackend::buildProceduralAtmosphereLuts(
       xpbd::log::warn("Procedural atmosphere compute pipeline creation failed");
       return false;
     }
-    if ((atmosphere_transmittance_.image != VK_NULL_HANDLE ||
-         atmosphere_scattering_.image != VK_NULL_HANDLE ||
-         atmosphere_irradiance_.image != VK_NULL_HANDLE) &&
-        vkQueueWaitIdle(graphics_queue_) != VK_SUCCESS) {
-      return false;
-    }
-
     const std::uint32_t scattering_width = dimensions.scatteringWidth();
     const std::uint64_t transmittance_pixels =
         static_cast<std::uint64_t>(dimensions.transmittance_width) *
@@ -966,6 +999,9 @@ bool VulkanBackend::buildProceduralAtmosphereLuts(
     Buffer readback{};
     VkCommandBuffer command = VK_NULL_HANDLE;
     auto cleanup = [&] {
+      if (gpu_completion_unproven_) {
+        return;
+      }
       if (command != VK_NULL_HANDLE) {
         vkFreeCommandBuffers(device_, cmd_pool_, 1, &command);
         command = VK_NULL_HANDLE;
@@ -1221,39 +1257,7 @@ bool VulkanBackend::buildProceduralAtmosphereLuts(
       cleanup();
       return false;
     }
-    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &command;
-    const VkResult submit_result =
-        vkQueueSubmit(graphics_queue_, 1, &submit, VK_NULL_HANDLE);
-    if (submit_result != VK_SUCCESS) {
-      xpbd::log::errorf(
-          "Procedural atmosphere LUT submit failed: API=vkQueueSubmit "
-          "VkResult=%s(%d) resource=atmosphere-luts frame_slot=%u "
-          "still_job_id=%llu",
-          vkResultName(submit_result), static_cast<int>(submit_result),
-          frame_index_,
-          static_cast<unsigned long long>(still_active_job_id_));
-      if (submit_result == VK_ERROR_DEVICE_LOST) {
-        recordFatalVulkanError("vkQueueSubmit(atmosphere_luts)",
-                               submit_result);
-      }
-      cleanup();
-      return false;
-    }
-    const VkResult wait_result = vkQueueWaitIdle(graphics_queue_);
-    if (wait_result != VK_SUCCESS) {
-      xpbd::log::errorf(
-          "Procedural atmosphere LUT wait failed: API=vkQueueWaitIdle "
-          "VkResult=%s(%d) resource=atmosphere-luts frame_slot=%u "
-          "still_job_id=%llu",
-          vkResultName(wait_result), static_cast<int>(wait_result),
-          frame_index_,
-          static_cast<unsigned long long>(still_active_job_id_));
-      if (wait_result == VK_ERROR_DEVICE_LOST) {
-        recordFatalVulkanError("vkQueueWaitIdle(atmosphere_luts)",
-                               wait_result);
-      }
+    if (!submitGraphicsTransactionAndWait(command, "atmosphere-luts")) {
       cleanup();
       return false;
     }
@@ -1526,6 +1530,9 @@ bool VulkanBackend::buildDynamicSkyEnvironmentCache(
     VkCommandBuffer command = VK_NULL_HANDLE;
     VkFence update_fence = VK_NULL_HANDLE;
     auto cleanup = [&] {
+      if (gpu_completion_unproven_) {
+        return;
+      }
       if (update_fence != VK_NULL_HANDLE) {
         vkDestroyFence(device_, update_fence, nullptr);
         update_fence = VK_NULL_HANDLE;
@@ -2008,13 +2015,15 @@ bool VulkanBackend::buildDynamicSkyEnvironmentCache(
     try {
       const VkDevice worker_device = device_;
       const VkFence worker_fence = atmosphere_environment_pending_.fence;
+      const std::shared_ptr<RenderThreadControl> worker_control =
+          render_thread_control_;
       atmosphere_environment_pending_.completion = std::async(
           std::launch::async,
           [cpu_input, worker_device, worker_fence,
-           cache_compute_begin]() mutable {
+           cache_compute_begin, worker_control]() mutable {
             return buildDynamicSkyDistribution(
                 cpu_input, worker_device, worker_fence,
-                cache_compute_begin);
+                cache_compute_begin, worker_control);
           });
     } catch (const std::exception &exception) {
       xpbd::log::errorf(
@@ -2040,8 +2049,11 @@ bool VulkanBackend::ensureProceduralAtmosphereResources(
         resolved.atmosphere == nullptr) {
       if (atmosphere_transmittance_.image != VK_NULL_HANDLE ||
           atmosphere_transmittance_pipeline_ != VK_NULL_HANDLE) {
-        if (vkQueueWaitIdle(graphics_queue_) == VK_SUCCESS) {
+        if (submitGraphicsTransactionAndWait(
+                VK_NULL_HANDLE, "procedural-atmosphere-clear")) {
           destroyProceduralAtmosphereGpu();
+        } else {
+          return false;
         }
       }
       atmosphere_failed_key_.clear();
@@ -2129,29 +2141,401 @@ void VulkanBackend::clearWorldEnvironmentResources() {
     world_environment_power_estimate_ = 0.0f;
     world_environment_resource_key_ = 0;
     world_environment_ready_ = false;
+    world_environment_runtime_asset_ = {};
+    world_environment_published_ = {};
+  }
+
+void VulkanBackend::destroyWorldEnvironmentRetired() noexcept {
+    WorldEnvironmentRetired &retired = world_environment_retired_;
+    if (retired.completion_fence != VK_NULL_HANDLE) {
+      return;
+    }
+    destroyImage(retired.texture);
+    destroyBuffer(retired.distribution);
+    if (diagnostics_enabled_ && retired.resource_key != 0u) {
+      xpbd::log::infof(
+          "VKDIAG environment_retirement_reclaimed generation=%llu "
+          "elapsed_ms=%.4f",
+          static_cast<unsigned long long>(retired.generation),
+          std::chrono::duration<double, std::milli>(
+              Clock::now() - retired.submitted_at)
+              .count());
+    }
+    retired = {};
+  }
+
+bool VulkanBackend::pollWorldEnvironmentRetirement(
+    bool wait_for_completion, bool &complete) {
+    complete = !world_environment_retired_.active();
+    if (complete) {
+      return true;
+    }
+    if (gpu_completion_unproven_ || quarantine_required_) {
+      return false;
+    }
+    VkResult status = VK_NOT_READY;
+    if (wait_for_completion) {
+      const ControlledWaitResult wait = waitForFenceControlled(
+          world_environment_retired_.completion_fence,
+          "vkWaitForFences.environment_retirement", UINT32_MAX,
+          VK_NULL_HANDLE, VK_NULL_HANDLE, true, true);
+      if (!wait.completed()) {
+        return false;
+      }
+      status = VK_SUCCESS;
+    } else {
+      status = vkGetFenceStatus(
+          device_, world_environment_retired_.completion_fence);
+      if (status == VK_NOT_READY) {
+        return true;
+      }
+    }
+    if (status != VK_SUCCESS) {
+      markGpuCompletionUnproven(
+          "vkGetFenceStatus.environment_retirement");
+      return false;
+    }
+    vkDestroyFence(device_,
+                   world_environment_retired_.completion_fence, nullptr);
+    world_environment_retired_.completion_fence = VK_NULL_HANDLE;
+    destroyWorldEnvironmentRetired();
+    complete = true;
+    return true;
+  }
+
+void VulkanBackend::discardWorldEnvironmentPending(
+    const char *reason) noexcept {
+    WorldEnvironmentPending &pending = world_environment_pending_;
+    if (!pending.active || gpu_completion_unproven_) {
+      return;
+    }
+    if (pending.upload_fence != VK_NULL_HANDLE) {
+      const ControlledWaitResult wait = waitForFenceControlled(
+          pending.upload_fence,
+          "vkWaitForFences.environment_pending_discard", UINT32_MAX,
+          VK_NULL_HANDLE, pending.upload_command, true, true);
+      if (!wait.completed()) {
+        markGpuCompletionUnproven(
+            "vkWaitForFences.environment_pending_discard");
+        return;
+      }
+      vkDestroyFence(device_, pending.upload_fence, nullptr);
+      pending.upload_fence = VK_NULL_HANDLE;
+    }
+    if (pending.upload_command != VK_NULL_HANDLE) {
+      vkFreeCommandBuffers(device_, cmd_pool_, 1,
+                           &pending.upload_command);
+      pending.upload_command = VK_NULL_HANDLE;
+    }
+    destroyBuffer(pending.staging);
+    if (pending.retirement_fence != VK_NULL_HANDLE) {
+      const ControlledWaitResult wait = waitForFenceControlled(
+          pending.retirement_fence,
+          "vkWaitForFences.environment_pending_retirement_discard",
+          UINT32_MAX, VK_NULL_HANDLE, VK_NULL_HANDLE, true, true);
+      if (!wait.completed()) {
+        markGpuCompletionUnproven(
+            "vkWaitForFences.environment_pending_retirement_discard");
+        return;
+      }
+      vkDestroyFence(device_, pending.retirement_fence, nullptr);
+      pending.retirement_fence = VK_NULL_HANDLE;
+    }
+    destroyImage(pending.texture);
+    destroyBuffer(pending.distribution);
+    if (diagnostics_enabled_) {
+      xpbd::log::infof(
+          "VKDIAG environment_pending_discard generation=%llu reason=%s",
+          static_cast<unsigned long long>(pending.generation),
+          reason != nullptr ? reason : "unspecified");
+    }
+    pending = {};
+  }
+
+bool VulkanBackend::pollWorldEnvironmentPending(
+    bool wait_for_completion, bool &ready, bool &superseded) {
+    ready = false;
+    superseded = false;
+    WorldEnvironmentPending &pending = world_environment_pending_;
+    if (!pending.active) {
+      ready = true;
+      return true;
+    }
+    if (gpu_completion_unproven_ || quarantine_required_) {
+      return false;
+    }
+    if (pending.upload_fence != VK_NULL_HANDLE) {
+      if (wait_for_completion) {
+        const ControlledWaitResult wait = waitForFenceControlled(
+            pending.upload_fence, "vkWaitForFences.environment_pending",
+            UINT32_MAX, VK_NULL_HANDLE, pending.upload_command, true, true);
+        if (!wait.completed()) {
+          return false;
+        }
+      } else {
+        const VkResult status =
+            vkGetFenceStatus(device_, pending.upload_fence);
+        if (status == VK_NOT_READY) {
+          return true;
+        }
+        if (status != VK_SUCCESS) {
+          markGpuCompletionUnproven(
+              "vkGetFenceStatus.environment_pending");
+          return false;
+        }
+      }
+      vkDestroyFence(device_, pending.upload_fence, nullptr);
+      pending.upload_fence = VK_NULL_HANDLE;
+      if (pending.upload_command != VK_NULL_HANDLE) {
+        vkFreeCommandBuffers(device_, cmd_pool_, 1,
+                             &pending.upload_command);
+        pending.upload_command = VK_NULL_HANDLE;
+      }
+      destroyBuffer(pending.staging);
+    }
+    if (pending.superseded) {
+      discardWorldEnvironmentPending("environment-candidate-superseded");
+      if (gpu_completion_unproven_ || world_environment_pending_.active) {
+        return false;
+      }
+      ready = true;
+      superseded = true;
+      return true;
+    }
+    ready = true;
+    return true;
+  }
+
+bool VulkanBackend::beginWorldEnvironmentRetirement() {
+    WorldEnvironmentPending &pending = world_environment_pending_;
+    const bool have_published_owner =
+        world_environment_texture_.image != VK_NULL_HANDLE ||
+        world_environment_distribution_.buffer != VK_NULL_HANDLE;
+    if (!have_published_owner) {
+      return true;
+    }
+    if (world_environment_retired_.active()) {
+      writeLog("Vulkan environment retirement slot is still active");
+      return false;
+    }
+    if (pending.retirement_fence != VK_NULL_HANDLE) {
+      return true;
+    }
+    VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFence fence = VK_NULL_HANDLE;
+    const VkResult create_result =
+        vkCreateFence(device_, &fence_info, nullptr, &fence);
+    if (create_result != VK_SUCCESS) {
+      if (create_result == VK_ERROR_DEVICE_LOST) {
+        recordFatalVulkanError(
+            "vkCreateFence.environment_retirement", create_result);
+      } else {
+        writeLog("Vulkan environment retirement fence creation failed");
+      }
+      return false;
+    }
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    const VkResult submit_result =
+        vkQueueSubmit(graphics_queue_, 1u, &submit, fence);
+    if (submit_result != VK_SUCCESS) {
+      vkDestroyFence(device_, fence, nullptr);
+      if (submit_result == VK_ERROR_DEVICE_LOST) {
+        recordFatalVulkanError(
+            "vkQueueSubmit.environment_retirement", submit_result);
+      } else {
+        writeLog("Vulkan environment retirement marker submission failed");
+      }
+      return false;
+    }
+    pending.retirement_fence = fence;
+    if (diagnostics_enabled_) {
+      xpbd::log::infof(
+          "VKDIAG environment_retirement_submitted generation=%llu "
+          "fence=0x%llx",
+          static_cast<unsigned long long>(
+              world_environment_published_.generation),
+          static_cast<unsigned long long>(
+              reinterpret_cast<std::uintptr_t>(fence)));
+    }
+    return true;
+  }
+
+bool VulkanBackend::commitWorldEnvironmentPending(
+    std::uint64_t &uploaded_bytes) {
+    uploaded_bytes = 0u;
+    WorldEnvironmentPending &pending = world_environment_pending_;
+    if (!pending.active || pending.upload_fence != VK_NULL_HANDLE ||
+        pending.upload_command != VK_NULL_HANDLE) {
+      return false;
+    }
+    const bool have_published_owner =
+        world_environment_texture_.image != VK_NULL_HANDLE ||
+        world_environment_distribution_.buffer != VK_NULL_HANDLE;
+    if (have_published_owner &&
+        pending.retirement_fence == VK_NULL_HANDLE) {
+      return false;
+    }
+    if (have_published_owner) {
+      WorldEnvironmentRetired &retired = world_environment_retired_;
+      retired.texture = world_environment_texture_;
+      retired.distribution = world_environment_distribution_;
+      retired.completion_fence = pending.retirement_fence;
+      retired.runtime_asset = std::move(world_environment_runtime_asset_);
+      retired.published = std::move(world_environment_published_);
+      retired.published.hdr = retired.runtime_asset.valid()
+                                  ? &retired.runtime_asset
+                                  : nullptr;
+      retired.resource_key = world_environment_resource_key_;
+      retired.generation = retired.published.generation;
+      retired.submitted_at = Clock::now();
+      pending.retirement_fence = VK_NULL_HANDLE;
+      world_environment_texture_ = {};
+      world_environment_distribution_ = {};
+    } else {
+      clearWorldEnvironmentResources();
+    }
+
+    world_environment_texture_ = pending.texture;
+    world_environment_distribution_ = pending.distribution;
+    pending.texture = {};
+    pending.distribution = {};
+    world_environment_distribution_bytes_ = pending.distribution_bytes;
+    world_environment_power_estimate_ = pending.power_estimate;
+    world_environment_runtime_asset_ = std::move(pending.runtime_asset);
+    world_environment_published_ = std::move(pending.published);
+    world_environment_published_.hdr = &world_environment_runtime_asset_;
+    world_environment_resource_key_ = pending.resource_key;
+    world_environment_failed_key_ = 0u;
+    world_environment_ready_ = true;
+    uploaded_bytes = pending.uploaded_bytes;
+    xpbd::log::infof(
+        "World HDRI GPU ready: source=%ux%u requested=%u resolved=%ux%u "
+        "mips=%u image=%llu table=%llu peak_budget=%llu generation=%llu",
+        pending.source_width, pending.source_height,
+        world_environment_published_.requested_hdri_runtime_width,
+        pending.runtime_width, pending.runtime_height,
+        pending.mip_levels,
+        static_cast<unsigned long long>(pending.gpu_image_bytes),
+        static_cast<unsigned long long>(pending.distribution_bytes),
+        static_cast<unsigned long long>(pending.budget.total_bytes),
+        static_cast<unsigned long long>(pending.generation));
+    if (diagnostics_enabled_) {
+      xpbd::log::infof(
+          "VKDIAG environment_pending_commit generation=%llu bytes=%llu "
+          "elapsed_ms=%.4f",
+          static_cast<unsigned long long>(pending.generation),
+          static_cast<unsigned long long>(uploaded_bytes),
+          std::chrono::duration<double, std::milli>(
+              Clock::now() - pending.submitted_at)
+              .count());
+    }
+    pending = {};
+    return true;
   }
 
 void VulkanBackend::destroyWorldEnvironmentGpu() {
+    discardWorldEnvironmentPending("environment-resource-destroy");
+    if (gpu_completion_unproven_ || world_environment_pending_.active) {
+      return;
+    }
+    bool retirement_complete = false;
+    if (!pollWorldEnvironmentRetirement(true, retirement_complete) ||
+        !retirement_complete) {
+      return;
+    }
     clearWorldEnvironmentResources();
     if (world_environment_sampler_ != VK_NULL_HANDLE) {
       vkDestroySampler(device_, world_environment_sampler_, nullptr);
       world_environment_sampler_ = VK_NULL_HANDLE;
     }
     world_environment_failed_key_ = 0;
-  }std::uint64_t VulkanBackend::worldEnvironmentResourceKey(
+  }
+
+bool VulkanBackend::submitGraphicsTransactionAndWait(
+      VkCommandBuffer command, const char *resource) {
+    const char *label = resource != nullptr ? resource : "graphics-transaction";
+    VkFence fence = VK_NULL_HANDLE;
+    VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    const VkResult fence_result =
+        vkCreateFence(device_, &fence_info, nullptr, &fence);
+    if (fence_result != VK_SUCCESS) {
+      xpbd::log::errorf(
+          "Vulkan transaction fence creation failed: resource=%s "
+          "VkResult=%s(%d)",
+          label, vkResultName(fence_result), static_cast<int>(fence_result));
+      if (fence_result == VK_ERROR_DEVICE_LOST) {
+        recordFatalVulkanError("vkCreateFence(graphics_transaction)",
+                               fence_result);
+      }
+      return false;
+    }
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    if (command != VK_NULL_HANDLE) {
+      submit.commandBufferCount = 1u;
+      submit.pCommandBuffers = &command;
+    }
+    const VkResult submit_result =
+        vkQueueSubmit(graphics_queue_, 1u, &submit, fence);
+    if (submit_result != VK_SUCCESS) {
+      xpbd::log::errorf(
+          "Vulkan transaction submit failed: resource=%s "
+          "VkResult=%s(%d)",
+          label, vkResultName(submit_result),
+          static_cast<int>(submit_result));
+      if (submit_result == VK_ERROR_DEVICE_LOST) {
+        recordFatalVulkanError("vkQueueSubmit(graphics_transaction)",
+                               submit_result);
+      }
+      vkDestroyFence(device_, fence, nullptr);
+      return false;
+    }
+    const std::string wait_stage =
+        std::string("vkWaitForFences.") + label;
+    const ControlledWaitResult wait = waitForFenceControlled(
+        fence, wait_stage.c_str(), UINT32_MAX, VK_NULL_HANDLE, command, true,
+        true);
+    if (!wait.completed()) {
+      xpbd::log::errorf(
+          "Vulkan transaction fence wait failed: resource=%s "
+          "VkResult=%s(%d)",
+          label, vkResultName(wait.result), static_cast<int>(wait.result));
+      // A non-successful fence wait does not prove completion. The fence and
+      // every submitted transaction object remain owned by the quarantined
+      // backend and must not be destroyed here.
+      return false;
+    }
+    vkDestroyFence(device_, fence, nullptr);
+    return true;
+  }
+
+std::uint64_t VulkanBackend::worldEnvironmentResourceKey(
       const ResolvedWorldEnvironment &resolved) const {
     std::uint64_t key = 14695981039346656037ull;
     appendPathTraceHistoryValue(
         key, static_cast<std::uint32_t>(resolved.sky_rendering));
-    appendPathTraceHistoryValue(key, resolved.generation);
     appendPathTraceHistoryValue(key, resolved.background_visible);
     appendPathTraceHistoryValue(key, resolved.environment_lighting);
     appendPathTraceHistoryValue(key, resolved.environment_strength);
     appendPathTraceHistoryValue(key, resolved.background_exposure);
+    appendPathTraceHistoryValue(key, resolved.background_multiplier);
     appendPathTraceHistoryValue(key, resolved.rotation_radians);
+    appendPathTraceHistoryValue(key, resolved.hdri_runtime_generation);
+    appendPathTraceHistoryValue(key,
+                                resolved.requested_hdri_runtime_width);
+    appendPathTraceHistoryValue(key,
+                                resolved.resolved_hdri_runtime_width);
+    appendPathTraceHistoryValue(key,
+                                resolved.resolved_hdri_runtime_height);
+    appendPathTraceHistoryValue(
+        key, resolved.hdri_runtime_budget.distribution_width);
+    appendPathTraceHistoryValue(
+        key, resolved.hdri_runtime_budget.distribution_height);
     if (resolved.hdr != nullptr) {
       appendPathTraceHistoryBytes(key, resolved.hdr->checksum.data(),
                                   resolved.hdr->checksum.size());
+      appendPathTraceHistoryValue(key, resolved.hdr->generation);
+      appendPathTraceHistoryValue(key, resolved.hdr->radiance.width);
+      appendPathTraceHistoryValue(key, resolved.hdr->radiance.height);
     }
     return key;
   }
@@ -2174,16 +2558,71 @@ bool VulkanBackend::ensureWorldEnvironmentSampler() {
   }
 
 bool VulkanBackend::uploadWorldEnvironment(
-      const ResolvedWorldEnvironment &resolved) {
+      ResolvedWorldEnvironment &resolved, bool defer_commit) {
+    static_assert(
+        std::is_nothrow_move_assignable_v<HdrEnvironmentAsset> &&
+        std::is_nothrow_move_assignable_v<ResolvedWorldEnvironment>);
     constexpr VkDeviceSize kMaximumGpuBytes =
         VkDeviceSize{512} * 1024u * 1024u;
     if (resolved.sky_rendering != SkyRendering::UserHdri ||
         resolved.hdr == nullptr || !resolved.hdr->valid()) {
       return false;
     }
-    const FloatEnvironmentImage &radiance = resolved.hdr->radiance;
+    if (world_environment_pending_.active) {
+      writeLog("Vulkan world-environment Candidate is already pending");
+      return false;
+    }
+    const std::uint64_t requested_resource_key =
+        worldEnvironmentResourceKey(resolved);
+    const HdrEnvironmentAsset &source_asset = *resolved.hdr;
+    const std::uint32_t source_asset_width = source_asset.radiance.width;
+    const std::uint32_t source_asset_height = source_asset.radiance.height;
+    HdrEnvironmentRuntimeCandidate runtime_candidate;
+    std::string candidate_error;
+    if (!buildHdrEnvironmentRuntimeCandidate(
+            source_asset, resolved.requested_hdri_runtime_width,
+            resolved.hdri_runtime_generation, runtime_candidate,
+            &candidate_error)) {
+      xpbd::log::warnf(
+          "World HDRI runtime candidate rejected: %s",
+          candidate_error.empty() ? "unknown candidate failure"
+                                  : candidate_error.c_str());
+      return false;
+    }
+    if (runtime_candidate.budget.resolved_width !=
+            resolved.resolved_hdri_runtime_width ||
+        runtime_candidate.budget.resolved_height !=
+            resolved.resolved_hdri_runtime_height) {
+      xpbd::log::warn(
+          "World HDRI runtime candidate disagrees with the resolved key");
+      return false;
+    }
+    HdrEnvironmentAsset published_asset;
+    ResolvedWorldEnvironment published_resolved;
+    try {
+      published_asset.source_identity = source_asset.source_identity;
+      published_asset.checksum = source_asset.checksum;
+      published_resolved = resolved;
+    } catch (const std::bad_alloc &) {
+      xpbd::log::warn(
+          "World HDRI publication Candidate allocation failed");
+      return false;
+    } catch (...) {
+      xpbd::log::warn(
+          "World HDRI publication Candidate construction raised an exception");
+      return false;
+    }
+    published_asset.generation = runtime_candidate.content_generation;
+    published_resolved.hdri_runtime_budget = runtime_candidate.budget;
+    published_resolved.resolved_hdri_runtime_width =
+        runtime_candidate.budget.resolved_width;
+    published_resolved.resolved_hdri_runtime_height =
+        runtime_candidate.budget.resolved_height;
+    const FloatEnvironmentImage &radiance = runtime_candidate.radiance;
+    const std::uint32_t runtime_width = radiance.width;
+    const std::uint32_t runtime_height = radiance.height;
     const EnvironmentDistribution &distribution =
-        resolved.hdr->distribution;
+        runtime_candidate.distribution;
     if (!radiance.valid() || !distribution.valid() ||
         radiance.width != distribution.width() ||
         radiance.height != distribution.height()) {
@@ -2260,7 +2699,15 @@ bool VulkanBackend::uploadWorldEnvironment(
     Buffer new_distribution{};
     ImageResource new_texture{};
     VkCommandBuffer command = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
     auto cleanup = [&] {
+      if (gpu_completion_unproven_) {
+        return;
+      }
+      if (fence != VK_NULL_HANDLE) {
+        vkDestroyFence(device_, fence, nullptr);
+        fence = VK_NULL_HANDLE;
+      }
       if (command != VK_NULL_HANDLE) {
         vkFreeCommandBuffers(device_, cmd_pool_, 1, &command);
         command = VK_NULL_HANDLE;
@@ -2410,76 +2857,142 @@ bool VulkanBackend::uploadWorldEnvironment(
       cleanup();
       return false;
     }
+    published_asset.radiance = std::move(runtime_candidate.radiance);
+    published_asset.distribution = std::move(runtime_candidate.distribution);
+    if (!published_asset.valid()) {
+      cleanup();
+      return false;
+    }
+    const HdriRuntimeBudget published_budget = runtime_candidate.budget;
+    VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    const VkResult fence_result =
+        vkCreateFence(device_, &fence_info, nullptr, &fence);
+    if (fence_result != VK_SUCCESS) {
+      if (fence_result == VK_ERROR_DEVICE_LOST) {
+        recordFatalVulkanError(
+            "vkCreateFence.world_environment_pending", fence_result);
+      }
+      cleanup();
+      return false;
+    }
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submit.commandBufferCount = 1;
+    submit.commandBufferCount = 1u;
     submit.pCommandBuffers = &command;
     const VkResult submit_result =
-        vkQueueSubmit(graphics_queue_, 1, &submit, VK_NULL_HANDLE);
+        vkQueueSubmit(graphics_queue_, 1u, &submit, fence);
     if (submit_result != VK_SUCCESS) {
-      xpbd::log::errorf(
-          "HDR environment upload submit failed: API=vkQueueSubmit "
-          "VkResult=%s(%d) resource=world-environment extent=%ux%u "
-          "frame_slot=%u still_job_id=%llu",
-          vkResultName(submit_result), static_cast<int>(submit_result),
-          radiance.width, radiance.height, frame_index_,
-          static_cast<unsigned long long>(still_active_job_id_));
       if (submit_result == VK_ERROR_DEVICE_LOST) {
-        recordFatalVulkanError("vkQueueSubmit(world_environment)",
-                               submit_result);
+        recordFatalVulkanError(
+            "vkQueueSubmit.world_environment_pending", submit_result);
       }
       cleanup();
       return false;
     }
-    const VkResult wait_result = vkQueueWaitIdle(graphics_queue_);
-    if (wait_result != VK_SUCCESS) {
-      xpbd::log::errorf(
-          "HDR environment upload wait failed: API=vkQueueWaitIdle "
-          "VkResult=%s(%d) resource=world-environment extent=%ux%u "
-          "frame_slot=%u still_job_id=%llu",
-          vkResultName(wait_result), static_cast<int>(wait_result),
-          radiance.width, radiance.height, frame_index_,
-          static_cast<unsigned long long>(still_active_job_id_));
-      if (wait_result == VK_ERROR_DEVICE_LOST) {
-        recordFatalVulkanError("vkQueueWaitIdle(world_environment)",
-                               wait_result);
-      }
-      cleanup();
-      return false;
-    }
-    vkFreeCommandBuffers(device_, cmd_pool_, 1, &command);
-    command = VK_NULL_HANDLE;
-    destroyBuffer(staging);
 
-    clearWorldEnvironmentResources();
-    world_environment_texture_ = new_texture;
-    new_texture = {};
-    world_environment_distribution_ = new_distribution;
+    WorldEnvironmentPending &pending = world_environment_pending_;
+    pending.staging = staging;
+    pending.distribution = new_distribution;
+    pending.texture = new_texture;
+    pending.upload_command = command;
+    pending.upload_fence = fence;
+    pending.runtime_asset = std::move(published_asset);
+    pending.published = std::move(published_resolved);
+    pending.published.hdr = &pending.runtime_asset;
+    pending.budget = published_budget;
+    pending.distribution_bytes = table_bytes;
+    pending.power_estimate = header.light_power[0];
+    pending.resource_key = requested_resource_key;
+    pending.uploaded_bytes = static_cast<std::uint64_t>(image_bytes);
+    pending.gpu_image_bytes = static_cast<std::uint64_t>(gpu_image_bytes);
+    pending.generation = resolved.generation;
+    pending.source_width = source_asset_width;
+    pending.source_height = source_asset_height;
+    pending.runtime_width = runtime_width;
+    pending.runtime_height = runtime_height;
+    pending.mip_levels = environment_mip_levels;
+    pending.active = true;
+    pending.submitted_at = Clock::now();
+    staging = {};
     new_distribution = {};
-    world_environment_distribution_bytes_ = table_bytes;
-    world_environment_power_estimate_ = header.light_power[0];
-    world_environment_resource_key_ =
-        worldEnvironmentResourceKey(resolved);
-    world_environment_failed_key_ = 0;
-    world_environment_ready_ = true;
+    new_texture = {};
+    command = VK_NULL_HANDLE;
+    fence = VK_NULL_HANDLE;
+
     xpbd::log::infof(
-        "World HDRI GPU ready: %ux%u mips=%u image=%llu table=%llu "
-        "generation=%llu",
-        radiance.width, radiance.height,
-        environment_mip_levels,
+        "A5_ENVIRONMENT_PENDING_BEGIN generation=%llu image=%llu "
+        "table=%llu",
+        static_cast<unsigned long long>(pending.generation),
         static_cast<unsigned long long>(gpu_image_bytes),
-        static_cast<unsigned long long>(table_bytes),
-        static_cast<unsigned long long>(resolved.generation));
+        static_cast<unsigned long long>(table_bytes));
+    if (defer_commit) {
+      return true;
+    }
+    bool ready = false;
+    bool superseded = false;
+    if (!pollWorldEnvironmentPending(true, ready, superseded) ||
+        !ready || superseded) {
+      discardWorldEnvironmentPending(
+          "synchronous-environment-pending-failure");
+      return false;
+    }
+    bool retirement_complete = false;
+    if (!pollWorldEnvironmentRetirement(true, retirement_complete) ||
+        !retirement_complete || !beginWorldEnvironmentRetirement()) {
+      discardWorldEnvironmentPending(
+          "synchronous-environment-retirement-failure");
+      return false;
+    }
+    std::uint64_t committed_bytes = 0u;
+    if (!commitWorldEnvironmentPending(committed_bytes)) {
+      discardWorldEnvironmentPending(
+          "synchronous-environment-commit-failure");
+      return false;
+    }
+    resolved.hdr = &world_environment_runtime_asset_;
+    resolved.hdri_runtime_budget = published_budget;
+    resolved.resolved_hdri_runtime_width = published_budget.resolved_width;
+    resolved.resolved_hdri_runtime_height = published_budget.resolved_height;
     return true;
   }
 
 bool VulkanBackend::ensureWorldEnvironmentResources(
-      const ResolvedWorldEnvironment &resolved) {
+      ResolvedWorldEnvironment &resolved, bool defer_commit) {
+    const auto bind_published_runtime = [&](bool restore_gpu_parameters) {
+      if (restore_gpu_parameters) {
+        resolved.background_visible =
+            world_environment_published_.background_visible;
+        resolved.environment_lighting =
+            world_environment_published_.environment_lighting;
+        resolved.environment_strength =
+            world_environment_published_.environment_strength;
+        resolved.background_exposure =
+            world_environment_published_.background_exposure;
+        resolved.background_multiplier =
+            world_environment_published_.background_multiplier;
+        resolved.rotation_radians =
+            world_environment_published_.rotation_radians;
+        resolved.requested_hdri_runtime_width =
+            world_environment_published_.requested_hdri_runtime_width;
+        resolved.hdri_runtime_generation =
+            world_environment_published_.hdri_runtime_generation;
+      }
+      resolved.hdr = &world_environment_runtime_asset_;
+      resolved.hdri_runtime_budget =
+          world_environment_published_.hdri_runtime_budget;
+      resolved.resolved_hdri_runtime_width =
+          world_environment_published_.resolved_hdri_runtime_width;
+      resolved.resolved_hdri_runtime_height =
+          world_environment_published_.resolved_hdri_runtime_height;
+    };
     if (resolved.sky_rendering != SkyRendering::UserHdri ||
         resolved.hdr == nullptr) {
       if (world_environment_texture_.image != VK_NULL_HANDLE ||
           world_environment_distribution_.buffer != VK_NULL_HANDLE) {
-        if (vkQueueWaitIdle(graphics_queue_) == VK_SUCCESS) {
+        if (submitGraphicsTransactionAndWait(
+                VK_NULL_HANDLE, "world-environment-clear")) {
           clearWorldEnvironmentResources();
+        } else {
+          return false;
         }
       }
       world_environment_failed_key_ = 0;
@@ -2489,15 +3002,37 @@ bool VulkanBackend::ensureWorldEnvironmentResources(
         worldEnvironmentResourceKey(resolved);
     if (world_environment_ready_ &&
         world_environment_resource_key_ == resource_key) {
+      // The GPU resource key already covers every field stored in its image
+      // and header. Preserve unrelated current-frame state (celestial/cloud
+      // generations, debug view, transparency) while rebinding the immutable
+      // runtime asset owned by the published transaction.
+      bind_published_runtime(false);
       return true;
     }
     if (world_environment_failed_key_ == resource_key) {
+      if (world_environment_ready_) {
+        bind_published_runtime(true);
+        resolved.warning =
+            "HDR update failed; retaining the previous complete environment";
+        return true;
+      }
       return false;
     }
-    if (!uploadWorldEnvironment(resolved)) {
+    if (!uploadWorldEnvironment(resolved, defer_commit)) {
       world_environment_failed_key_ = resource_key;
+      if (world_environment_ready_) {
+        xpbd::log::warnf(
+            "World HDRI GPU upload failed for generation %llu; retaining "
+            "the previous complete environment",
+            static_cast<unsigned long long>(resolved.generation));
+        bind_published_runtime(true);
+        resolved.warning =
+            "HDR update failed; retaining the previous complete environment";
+        return true;
+      }
       xpbd::log::warnf(
-          "World HDRI GPU upload failed for generation %llu; resolving Off",
+          "World HDRI GPU upload failed for generation %llu; no previous "
+          "environment is available",
           static_cast<unsigned long long>(resolved.generation));
       return false;
     }

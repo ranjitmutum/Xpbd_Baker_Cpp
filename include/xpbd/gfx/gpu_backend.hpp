@@ -26,12 +26,52 @@ struct nk_draw_null_texture;
 
 namespace xpbd::gfx {
 
+struct VulkanWindowBootstrap;
+struct LastPresentedSnapshot;
+
 enum class BackendKind {
   OpenGL33,
   Vulkan,
 };
 
+enum class UiLogicalTexture : std::uint64_t {
+  FontAtlas = 1u,
+};
+
+[[nodiscard]] inline constexpr std::uint64_t
+uiLogicalTextureId(UiLogicalTexture texture) noexcept {
+  return static_cast<std::uint64_t>(texture);
+}
+
+[[nodiscard]] inline constexpr bool
+isKnownUiLogicalTextureId(std::uint64_t texture_id) noexcept {
+  return texture_id == uiLogicalTextureId(UiLogicalTexture::FontAtlas);
+}
+
+struct UiDrawCommand {
+  std::uint32_t element_count = 0;
+  std::uint32_t index_offset = 0;
+  std::uint64_t logical_texture_id = 0;
+  float clip_x = 0.0f;
+  float clip_y = 0.0f;
+  float clip_w = 0.0f;
+  float clip_h = 0.0f;
+};
+
 struct UiDrawData {
+  // Owned/thread-safe representation. The producer owns these ranges for the
+  // duration of a synchronous call; RenderFramePacket copies them before a
+  // packet can cross threads. Texture IDs are logical IDs, never Vulkan
+  // descriptors or image handles.
+  const void *vertex_data = nullptr;
+  std::size_t vertex_bytes = 0;
+  const void *index_data = nullptr;
+  std::size_t index_bytes = 0;
+  const UiDrawCommand *draw_commands = nullptr;
+  std::size_t draw_command_count = 0;
+
+  // Transitional synchronous Nuklear view. The dedicated RenderThread never
+  // stores or consumes these pointers.
   const nk_context *ctx = nullptr;
   const nk_buffer *cmds = nullptr;
   const nk_buffer *vertices = nullptr;
@@ -259,6 +299,25 @@ struct DynamicMeshUploadLayout {
   std::size_t total_bytes = 0;
 };
 
+// CPU-only observability for the asynchronous renderer. These counters are
+// deliberately not backend handles: they let unattended gates distinguish UI
+// packet production from worker consumption and committed presentation.
+struct RenderThreadDiagnostics {
+  bool active = false;
+  bool fatal = false;
+  std::uint64_t latest_ui_frame_serial = 0;
+  std::uint64_t latest_packet_serial = 0;
+  std::uint64_t latest_render_serial = 0;
+  std::uint64_t latest_previous_history_render_serial = 0;
+  std::uint64_t latest_history_serial = 0;
+  std::uint64_t latest_present_serial = 0;
+  std::shared_ptr<const LastPresentedSnapshot> last_presented;
+  std::uint64_t mailbox_replacement_count = 0;
+  std::uint64_t accepted_world_environment_generation = 0;
+  std::uint64_t accepted_hdri_runtime_generation = 0;
+  bool environment_upload_pending = false;
+};
+
 [[nodiscard]] constexpr bool
 useStaticModelViewport(bool backend_supports_static_model,
                        std::string_view legacy_override) noexcept {
@@ -316,10 +375,18 @@ class IGpuBackend {
 public:
   virtual ~IGpuBackend() = default;
   virtual bool init(SDL_Window *window) = 0;
+  // Vulkan-only initialization contract. The SDL/Main thread owns bootstrap
+  // capture; a dedicated RenderThread may consume the immutable result.
+  virtual bool init(const VulkanWindowBootstrap &bootstrap) {
+    (void)bootstrap;
+    return false;
+  }
   virtual void shutdown() = 0;
   virtual void resize(int fb_w, int fb_h) = 0;
   virtual bool uploadFontAtlas(const void *pixels, int width, int height,
                                bool is_rgba = false) = 0;
+  // This is a producer-side logical ID. Vulkan descriptor/image handles stay
+  // worker-owned and are resolved only while recording the draw command.
   [[nodiscard]] virtual unsigned int fontTextureId() const = 0;
 
   [[nodiscard]] virtual bool supportsStaticModel() const { return false; }
@@ -348,6 +415,17 @@ public:
   [[nodiscard]] virtual const char *name() const = 0;
   [[nodiscard]] virtual const char *deviceName() const = 0;
   [[nodiscard]] virtual FrameStats stats() const = 0;
+  // The dedicated Vulkan proxy exposes only an immutable CPU snapshot of the
+  // last frame the worker actually presented. Backends without asynchronous
+  // presentation authority return an empty snapshot.
+  [[nodiscard]] virtual std::shared_ptr<const LastPresentedSnapshot>
+  lastPresentedSnapshot() const {
+    return {};
+  }
+  [[nodiscard]] virtual RenderThreadDiagnostics
+  renderThreadDiagnostics() const {
+    return {};
+  }
   [[nodiscard]] virtual PathTracePostProcessCapabilities
   pathTracePostProcessCapabilities() const {
     return {};
@@ -359,8 +437,8 @@ public:
 
   // Pause GPU work before a native modal dialog (file picker, etc.).
   // Must idle the device so the system dialog is not fighting in-flight RT.
-  virtual void prepareForSystemDialog() {}
-  virtual void resumeAfterSystemDialog() {}
+  [[nodiscard]] virtual bool prepareForSystemDialog() { return true; }
+  [[nodiscard]] virtual bool resumeAfterSystemDialog() { return true; }
   [[nodiscard]] virtual bool presentationSuspended() const { return false; }
 
   // NVIDIA RT capability (Vulkan RT extensions). Default: unsupported.

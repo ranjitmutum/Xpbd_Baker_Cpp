@@ -41,18 +41,12 @@ struct PrimaryPayload {
   float opacity;
   vec4 attenuation;
   uvec4 status;
+  // xy barycentrics, z uintBitsToFloat(instance id), w LabPBR SSS [0,1].
   vec4 hitData;
   vec2 rayCone;
 };
 
-struct ShadowPayload {
-  float visibility;
-  float reserved;
-  vec2 rayCone;
-};
-
 layout(location = 0) rayPayloadInEXT PrimaryPayload primaryPayload;
-layout(location = 1) rayPayloadInEXT ShadowPayload shadowPayload;
 hitAttributeEXT vec2 hitBarycentrics;
 
 const uint kMaterialTextured = 1u << 0u;
@@ -114,8 +108,7 @@ void main() {
   uint flags = primitiveFlags[globalPrimitive];
   const bool shadowRay =
       (gl_IncomingRayFlagsEXT & gl_RayFlagsSkipClosestHitShaderEXT) != 0u;
-  vec2 rayCone = shadowRay ? shadowPayload.rayCone
-                           : primaryPayload.rayCone;
+  vec2 rayCone = primaryPayload.rayCone;
   if ((flags & kMaterialTextured) != 0u) {
     vec2 uv = uvs[i0] * w0 + uvs[i1] * hitBarycentrics.x +
               uvs[i2] * hitBarycentrics.y;
@@ -144,12 +137,12 @@ void main() {
                    ? coverageVisibility + alpha * physicalTransmission
                    : physicalTransmission)
             : coverageVisibility;
-    shadowPayload.visibility *= clamp(layerVisibility, 0.0, 1.0);
-    if (shadowPayload.visibility > 1.0e-4) {
+    primaryPayload.transmission *= clamp(layerVisibility, 0.0, 1.0);
+    if (primaryPayload.transmission > 1.0e-4) {
       // Deterministic transmittance continues through later layers. Physical
       // Beer-Lambert distance remains owned by the beauty medium path.
       ignoreIntersectionEXT;
     }
-    shadowPayload.visibility = 0.0;
+    primaryPayload.transmission = 0.0;
   }
 }

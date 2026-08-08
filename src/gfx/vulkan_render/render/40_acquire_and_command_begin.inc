@@ -4,26 +4,25 @@
                      UINT32_MAX, fs.fence, VK_NULL_HANDLE, fs.cmd, false, true);
     VkResult acq = VK_SUCCESS;
     bool acquire_timed_out = false;
-    if (!diagnostics_enabled_) {
+    do {
+      if (renderThreadStopRequested()) {
+        return;
+      }
       acq = streamline_vulkan_runtime_.acquireNextImage(
-          device_, swapchain_, UINT64_MAX, fs.image_available,
-          VK_NULL_HANDLE, &image_index);
-    } else {
-      do {
-        acq = streamline_vulkan_runtime_.acquireNextImage(
-            device_, swapchain_, kDiagnosticWaitSliceNs,
-            fs.image_available, VK_NULL_HANDLE, &image_index);
-        if (acq == VK_TIMEOUT || acq == VK_NOT_READY) {
-          acquire_timed_out = true;
-          logDiagnosticApi(
-              "vkAcquireNextImageKHR", "timeout", acq,
-              std::chrono::duration<double, std::milli>(Clock::now() -
-                                                        acquire_start)
-                  .count(),
-              UINT32_MAX, fs.fence, VK_NULL_HANDLE, fs.cmd, true, true);
-        }
-      } while (acq == VK_TIMEOUT || acq == VK_NOT_READY);
-    }
+          device_, swapchain_,
+          render_thread_control_ ? kControlledWaitSliceNs : UINT64_MAX,
+          fs.image_available, VK_NULL_HANDLE, &image_index);
+      if (acq == VK_TIMEOUT || acq == VK_NOT_READY) {
+        acquire_timed_out = true;
+        logDiagnosticApi(
+            "vkAcquireNextImageKHR", "timeout", acq,
+            std::chrono::duration<double, std::milli>(Clock::now() -
+                                                      acquire_start)
+                .count(),
+            UINT32_MAX, fs.fence, VK_NULL_HANDLE, fs.cmd,
+            diagnostics_enabled_, diagnostics_enabled_);
+      }
+    } while (acq == VK_TIMEOUT || acq == VK_NOT_READY);
     logDiagnosticApi(
         "vkAcquireNextImageKHR", "after", acq,
         std::chrono::duration<double, std::milli>(Clock::now() - acquire_start)
@@ -70,32 +69,33 @@
     }
     if (image_index >= framebuffers_.size() ||
         image_index >= swap_image_resources_.size()) {
-      writeLog("Vulkan acquire returned an invalid swapchain image index");
-      fatal_error_ = true;
+      recordFatalError(
+          "vkAcquireNextImageKHR",
+          "Vulkan acquire returned an invalid swapchain image index");
       return;
     }
     SwapchainImageResource &image_resource =
         swap_image_resources_[image_index];
     if (!image_resource.render_finished) {
-      writeLog("Vulkan swapchain image has no present semaphore");
-      fatal_error_ = true;
+      recordFatalError(
+          "swapchain.render_finished",
+          "Vulkan swapchain image has no present semaphore");
       return;
     }
     if (presentFenceLifecycleEnabled() &&
         !image_resource.present_fence) {
-      writeLog("Vulkan swapchain image has no present completion fence");
-      fatal_error_ = true;
+      recordFatalError(
+          "swapchain.present_fence",
+          "Vulkan swapchain image has no present completion fence");
       return;
     }
     if (image_resource.last_in_flight &&
         image_resource.last_in_flight != fs.fence) {
-      const VkResult image_wait = wait_for_fence(
+      const ControlledWaitResult image_wait = wait_for_fence(
           image_resource.last_in_flight, "vkWaitForFences.image", image_index,
           image_resource.last_in_flight);
-      if (image_wait != VK_SUCCESS) {
-        SDL_Log("Vulkan swapchain image fence wait failed: %d",
-                static_cast<int>(image_wait));
-        enterFatalVulkanError(frame, "vkWaitForFences(image)", image_wait);
+      if (!image_wait.completed()) {
+        failActiveStillRender(frame, fatal_error_detail_);
         return;
       }
     }
@@ -117,15 +117,12 @@
 
     if (presentFenceLifecycleEnabled() &&
         image_resource.present_pending) {
-      const VkResult present_wait =
+      const ControlledWaitResult present_wait =
           wait_for_fence(image_resource.present_fence,
                          "vkWaitForFences.present_reuse", image_index,
                          image_resource.last_in_flight);
-      if (present_wait != VK_SUCCESS) {
-        SDL_Log("Vulkan present fence wait before reuse failed: %d",
-                static_cast<int>(present_wait));
-        enterFatalVulkanError(frame, "vkWaitForFences(present)",
-                              present_wait);
+      if (!present_wait.completed()) {
+        failActiveStillRender(frame, fatal_error_detail_);
         return;
       }
       image_resource.present_pending = false;
@@ -199,9 +196,9 @@
     write_timestamp(GpuTimestampQuery::AsBegin,
                     VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
     if (rt_as_needs_record) {
-      const RtSceneStats before_build = rt_scene.stats();
-      rt_scene.recordBuilds(fs.cmd);
-      const RtSceneStats after_build = rt_scene.stats();
+      const RtSceneStats before_build = rt_scene->stats();
+      rt_scene->recordBuilds(fs.cmd);
+      const RtSceneStats after_build = rt_scene->stats();
       if (diagnostics_enabled_ &&
           (diagnostic_rt_as_events_logged_ < 64u ||
            after_build.full_builds != before_build.full_builds ||
@@ -228,7 +225,7 @@
     }
     write_timestamp(GpuTimestampQuery::AsEnd,
                     VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
-    const RtSceneStats active_rt_stats = rt_scene.stats();
+    const RtSceneStats active_rt_stats = rt_scene->stats();
     stats_.rt_blas_count = 0;
     stats_.rt_tlas_count = 0;
     stats_.rt_instance_count = 0;
@@ -252,7 +249,10 @@
     stats_.rt_descriptor_cache_hits = 0;
     stats_.rt_descriptor_entries_written = 0;
     for (const auto &scene : rt_scenes_) {
-      const RtSceneStats scene_stats = scene.stats();
+      if (!scene) {
+        continue;
+      }
+      const RtSceneStats scene_stats = scene->stats();
       stats_.rt_blas_count += scene_stats.blas_count;
       stats_.rt_tlas_count += scene_stats.tlas_count;
       stats_.rt_instance_count += scene_stats.instance_count;
@@ -286,4 +286,3 @@
     stats_.rt_descriptor_cache_hits = rt_descriptor_cache_hits_frame_;
     stats_.rt_descriptor_entries_written =
         rt_descriptor_entries_written_frame_;
-

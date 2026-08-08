@@ -241,6 +241,10 @@ struct HdrDecodeLimits {
   std::uint32_t maximum_width = 8192;
   std::uint32_t maximum_height = 4096;
   std::size_t maximum_decoded_bytes = std::size_t{512} * 1024u * 1024u;
+  std::uint64_t maximum_asset_peak_bytes =
+      std::uint64_t{2} * 1024u * 1024u * 1024u;
+  std::uint64_t asset_safety_margin_bytes =
+      std::uint64_t{64} * 1024u * 1024u;
 };
 
 // Strict, transactional Radiance RGBE decode. On failure, `out` is unchanged.
@@ -326,6 +330,89 @@ struct HdrEnvironmentAsset {
     std::string checksum, std::uint64_t generation, HdrEnvironmentAsset &out,
     std::string *error = nullptr, HdrDecodeLimits limits = {});
 
+// One admission decision covers the retained source asset, the temporary CPU
+// resample/Alias build, the persistent runtime candidate, the GPU image/table,
+// staging, and a fixed safety margin.  The resolver lowers the requested 2:1
+// runtime extent deterministically when the complete transaction would exceed
+// this budget; it never upscales beyond the source image.
+struct HdriRuntimeBudgetLimits {
+  std::uint32_t minimum_runtime_width = 256u;
+  std::uint32_t maximum_runtime_width = 8192u;
+  std::uint64_t maximum_total_bytes =
+      std::uint64_t{2} * 1024u * 1024u * 1024u;
+  std::uint64_t maximum_gpu_bytes =
+      std::uint64_t{512} * 1024u * 1024u;
+  std::uint64_t safety_margin_bytes =
+      std::uint64_t{64} * 1024u * 1024u;
+};
+
+struct HdriRuntimeBudget {
+  std::uint32_t source_width = 0u;
+  std::uint32_t source_height = 0u;
+  std::uint32_t requested_width = 0u;
+  std::uint32_t resolved_width = 0u;
+  std::uint32_t resolved_height = 0u;
+  std::uint32_t distribution_width = 0u;
+  std::uint32_t distribution_height = 0u;
+  std::uint64_t source_radiance_bytes = 0u;
+  std::uint64_t source_distribution_bytes = 0u;
+  std::uint64_t runtime_radiance_bytes = 0u;
+  std::uint64_t runtime_distribution_bytes = 0u;
+  std::uint64_t distribution_scratch_bytes = 0u;
+  std::uint64_t gpu_image_bytes = 0u;
+  std::uint64_t gpu_distribution_bytes = 0u;
+  std::uint64_t staging_bytes = 0u;
+  std::uint64_t safety_margin_bytes = 0u;
+  std::uint64_t total_bytes = 0u;
+
+  [[nodiscard]] bool valid() const noexcept {
+    return source_width > 0u && source_height > 0u &&
+           source_width == source_height * 2u && requested_width > 0u &&
+           resolved_width > 0u && resolved_height > 0u &&
+           resolved_width == resolved_height * 2u &&
+           distribution_width == resolved_width &&
+           distribution_height == resolved_height && total_bytes > 0u;
+  }
+};
+
+// Pure, allocation-free runtime extent/budget resolution.
+[[nodiscard]] bool resolveHdriRuntimeBudget(
+    const FloatEnvironmentImage &source, std::uint32_t requested_width,
+    HdriRuntimeBudget &out, std::string *error = nullptr,
+    HdriRuntimeBudgetLimits limits = {});
+
+// Transactional lat-long resampling in linear radiance.  Horizontal taps
+// wrap at the longitude seam; vertical taps clamp at the poles.  No tone map
+// or [0,1] clamp is applied.
+[[nodiscard]] bool resampleHdriLatLong(
+    const FloatEnvironmentImage &source, std::uint32_t resolved_width,
+    FloatEnvironmentImage &out, std::string *error = nullptr);
+
+struct HdrEnvironmentRuntimeCandidate {
+  FloatEnvironmentImage radiance;
+  EnvironmentDistribution distribution;
+  HdriRuntimeBudget budget;
+  std::uint64_t content_generation = 0u;
+  std::uint64_t runtime_settings_generation = 0u;
+
+  [[nodiscard]] bool valid() const noexcept {
+    return radiance.valid() && distribution.valid() && budget.valid() &&
+           radiance.width == budget.resolved_width &&
+           radiance.height == budget.resolved_height &&
+           distribution.width() == budget.distribution_width &&
+           distribution.height() == budget.distribution_height;
+  }
+};
+
+// Builds the immutable CPU half of the synchronous HDR upload transaction and
+// publishes it to `out` only after resampling, distribution construction, and
+// the unified budget checks all succeed.
+[[nodiscard]] bool buildHdrEnvironmentRuntimeCandidate(
+    const HdrEnvironmentAsset &source, std::uint32_t requested_width,
+    std::uint64_t runtime_settings_generation,
+    HdrEnvironmentRuntimeCandidate &out, std::string *error = nullptr,
+    HdriRuntimeBudgetLimits limits = {});
+
 struct SkyTimeControls {
   float utc_offset_hours = 0.0f;
   bool playing = false;
@@ -402,6 +489,7 @@ struct WorldEnvironmentState {
   std::uint64_t cloud_generation = 0;
   std::uint64_t display_generation = 0;
   std::uint64_t target_generation = 0;
+  std::uint64_t hdri_runtime_generation = 0;
   std::uint64_t generation = 0;
 };
 
@@ -424,6 +512,11 @@ struct ResolvedWorldEnvironment {
   const NightSkyControls *night = nullptr;
   const VolumetricCloudState *clouds = nullptr;
   const HdrEnvironmentAsset *hdr = nullptr;
+  HdriRuntimeBudget hdri_runtime_budget{};
+  std::uint32_t requested_hdri_runtime_width = 0u;
+  std::uint32_t resolved_hdri_runtime_width = 0u;
+  std::uint32_t resolved_hdri_runtime_height = 0u;
+  std::uint64_t hdri_runtime_generation = 0u;
   SkyDebugView debug_view = SkyDebugView::Off;
   std::uint64_t lighting_generation = 0;
   std::uint64_t celestial_generation = 0;
@@ -523,6 +616,12 @@ struct EmissivePatch {
   double world_area = 0.0;
   double average_luminance = 0.0;
 };
+
+[[nodiscard]] std::array<double, 3> sampleUniformTriangleBarycentrics(
+    double sample_u, double sample_v) noexcept;
+[[nodiscard]] double emissiveTriangleSolidAnglePdf(
+    double triangle_selection_probability, double world_area,
+    double distance_squared, double absolute_light_cosine) noexcept;
 
 class EmissivePatchDistribution {
 public:

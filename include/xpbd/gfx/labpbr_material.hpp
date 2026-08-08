@@ -32,10 +32,14 @@ enum class LabPbrDebugView : std::uint32_t {
   F0 = 5,
   Emission = 6,
   Opacity = 7,
+  Height = 8,
 };
 
 inline constexpr std::uint32_t kLabPbrNormalMapActive = 1u << 0u;
 inline constexpr std::uint32_t kLabPbrSpecularMapActive = 1u << 1u;
+inline constexpr std::uint32_t kLabPbrBaseAlphaAuthored = 1u << 2u;
+inline constexpr std::uint32_t kLabPbrHeightAlphaAuthored = 1u << 3u;
+inline constexpr std::uint32_t kLabPbrEmissionAlphaAuthored = 1u << 4u;
 
 struct LabPbrAssetPaths {
   std::filesystem::path base;
@@ -132,6 +136,17 @@ public:
   [[nodiscard]] const ResolvedMaterialTexel &sample(float u, float v) const;
 };
 
+struct LabPbrAlphaProvenance {
+  int base_source_channels = 0;
+  int normal_source_channels = 0;
+  int specular_source_channels = 0;
+  bool base_alpha_authored = false;
+  bool height_alpha_authored = false;
+  bool emission_alpha_authored = false;
+
+  bool operator==(const LabPbrAlphaProvenance &) const = default;
+};
+
 struct TangentFrame {
   std::array<float, 3> tangent{1.0f, 0.0f, 0.0f};
   float handedness = 1.0f;
@@ -152,6 +167,21 @@ labPbrDebugColor(const ResolvedMaterialTexel &texel,
                  LabPbrDebugView view) noexcept;
 [[nodiscard]] std::uint32_t
 labPbrFeatureFlags(const ResolvedMaterialTable *material) noexcept;
+[[nodiscard]] LabPbrAlphaProvenance
+labPbrAlphaProvenance(const ResolvedMaterialTable *material) noexcept;
+// Returns a small positive Alias-weight estimate when the aligned Base and
+// Specular assets contain any emissive support. It is not sampled radiance;
+// it prevents bounded per-triangle probes from assigning zero probability to
+// a thin emissive texel that the GPU can evaluate at its true barycentric UV.
+[[nodiscard]] float labPbrEmissionAliasSupportFloor(
+    const ResolvedMaterialTable *material) noexcept;
+// Deterministic render-generation key for the channels that can change mesh
+// emission: authored Specular Alpha plus Base RGB/coverage at emitting texels.
+// Roughness, F0, normal, height, porosity, and SSS-only edits do not affect it.
+[[nodiscard]] std::uint64_t labPbrEmissionContentKey(
+    const ResolvedMaterialTable *material) noexcept;
+[[nodiscard]] float labPbrEmissionCoverageWeight(
+    float opacity, bool cutout, bool blend) noexcept;
 
 [[nodiscard]] ResolvedMaterialTexel decodeLabPbrTexel(
     const std::array<std::uint8_t, 4> &base_rgba,

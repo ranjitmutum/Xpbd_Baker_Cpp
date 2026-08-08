@@ -3,6 +3,7 @@
 #include "xpbd/app/native_dialog.hpp"
 #include "xpbd/app/nuklear_ui.hpp"
 #include "xpbd/gfx/backend_select.hpp"
+#include "xpbd/gfx/dedicated_render_thread.hpp"
 #include "xpbd/gfx/gpu_backend.hpp"
 #include "xpbd/gfx/preview_scene.hpp"
 #include "xpbd/gfx/static_model_draw_plan.hpp"
@@ -10,12 +11,14 @@
 #include "xpbd/log.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <system_error>
 #include <thread>
+#include <unordered_map>
 
 
 #define SDL_MAIN_HANDLED
@@ -248,15 +251,210 @@ bool pointInsideViewport(const xpbd::app::UiLayout &layout, float x,
          y <= layout.vp_y + layout.vp_h;
 }
 
+bool runR5RenderThreadProbe(
+    SDL_Window *window,
+    std::unique_ptr<xpbd::gfx::IGpuBackend> &synchronous_backend) {
+#if !defined(XPBD_GFX_VULKAN)
+  (void)window;
+  (void)synchronous_backend;
+  return false;
+#else
+  using namespace xpbd::gfx;
+  using namespace std::chrono_literals;
+  if (window == nullptr || !synchronous_backend ||
+      synchronous_backend->kind() != BackendKind::Vulkan) {
+    return false;
+  }
+
+  VulkanWindowBootstrap bootstrap;
+  std::string bootstrap_error;
+  if (!captureVulkanWindowBootstrap(window, bootstrap, &bootstrap_error)) {
+    xpbd::log::errorf("R5_RENDER_THREAD_PROBE_FAIL stage=bootstrap error=%s",
+                      bootstrap_error.c_str());
+    return false;
+  }
+  synchronous_backend->shutdown();
+  synchronous_backend.reset();
+
+  DedicatedRenderThread worker(
+      bootstrap, []() { return createVulkanRenderThreadBackend(); }, 64u);
+  if (!worker.start() || !worker.waitUntilRunning(30s)) {
+    xpbd::log::error("R5_RENDER_THREAD_PROBE_FAIL stage=worker_init");
+    (void)worker.shutdown(5s);
+    return false;
+  }
+
+  RenderEvent event;
+  const auto wait_event = [&](auto &&predicate,
+                              std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) {
+        return false;
+      }
+      const auto remaining =
+          std::chrono::duration_cast<std::chrono::milliseconds>(deadline -
+                                                                now);
+      if (worker.waitEvent(event, remaining) != QueueWaitResult::Item) {
+        return false;
+      }
+      if (predicate(event)) {
+        return true;
+      }
+    }
+  };
+
+  bool passed = wait_event(
+      [](const RenderEvent &candidate) {
+        const auto *initialized =
+            std::get_if<RendererInitializedEvent>(&candidate);
+        return initialized != nullptr && initialized->ray_tracing_ready &&
+               initialized->streamline_ready;
+      },
+      5s);
+
+  UploadFontAtlasRenderCommand font;
+  font.width = 2u;
+  font.height = 2u;
+  font.pixels = {std::byte{255}, std::byte{192}, std::byte{128},
+                 std::byte{64}};
+  const auto font_serial =
+      passed ? worker.enqueue(RenderCommand{std::move(font)}) : std::nullopt;
+  passed = passed && font_serial.has_value() &&
+           wait_event(
+               [&](const RenderEvent &candidate) {
+                 const auto *uploaded =
+                     std::get_if<UploadCompletedEvent>(&candidate);
+                 return uploaded != nullptr &&
+                        uploaded->command_serial == *font_serial &&
+                        uploaded->command_kind ==
+                            RenderCommandKind::UploadFontAtlas;
+               },
+               10s);
+
+  auto packet = std::make_shared<RenderFramePacket>();
+  packet->ui_frame_serial = 1u;
+  packet->packet_serial = 1u;
+  packet->fb_width = bootstrap.pixel_width;
+  packet->fb_height = bootstrap.pixel_height;
+  packet->viewport = {0, 0, bootstrap.pixel_width,
+                      bootstrap.pixel_height};
+  packet->view_matrix = {1, 0, 0, 0, 0, 1, 0, 0,
+                         0, 0, 1, 0, 0, 0, 0, 1};
+  packet->proj_matrix = packet->view_matrix;
+  packet->prefer_ray_tracing = true;
+  passed = passed &&
+           worker.publishFrame(packet).result ==
+               MailboxPublishResult::Published &&
+           wait_event(
+               [](const RenderEvent &candidate) {
+                 const auto *stats = std::get_if<RenderStatsEvent>(&candidate);
+                 return stats != nullptr && stats->render_serial == 1u &&
+                        stats->present_serial == 1u &&
+                        stats->stats.present_succeeded;
+               },
+               15s);
+
+  const auto suspend_serial =
+      passed
+          ? worker.enqueue(
+                RenderCommand{SuspendPresentationRenderCommand{}})
+          : std::nullopt;
+  passed = passed && suspend_serial.has_value() &&
+           wait_event(
+               [&](const RenderEvent &candidate) {
+                 const auto *ack =
+                     std::get_if<RenderCommandAckEvent>(&candidate);
+                 return ack != nullptr &&
+                        ack->command_serial == *suspend_serial &&
+                        ack->command_kind ==
+                            RenderCommandKind::SuspendPresentation;
+               },
+               10s) &&
+           worker.state() == RenderThreadState::Suspended;
+
+  int resized_width = bootstrap.pixel_width;
+  int resized_height = bootstrap.pixel_height;
+  if (passed) {
+    SDL_SetWindowSize(window, (std::max)(640, bootstrap.pixel_width - 32),
+                      (std::max)(480, bootstrap.pixel_height - 32));
+    if (!SDL_GetWindowSizeInPixels(window, &resized_width,
+                                   &resized_height)) {
+      passed = false;
+    }
+  }
+  const auto resize_serial =
+      passed ? worker.enqueue(RenderCommand{ResizeRenderCommand{
+                   resized_width, resized_height}})
+             : std::nullopt;
+  const auto resume_serial =
+      passed
+          ? worker.enqueue(
+                RenderCommand{ResumePresentationRenderCommand{}})
+          : std::nullopt;
+  passed = passed && resize_serial.has_value() && resume_serial.has_value() &&
+           wait_event(
+               [&](const RenderEvent &candidate) {
+                 const auto *ack =
+                     std::get_if<RenderCommandAckEvent>(&candidate);
+                 return ack != nullptr &&
+                        ack->command_serial == *resize_serial;
+               },
+               10s) &&
+           wait_event(
+               [&](const RenderEvent &candidate) {
+                 const auto *ack =
+                     std::get_if<RenderCommandAckEvent>(&candidate);
+                 return ack != nullptr &&
+                        ack->command_serial == *resume_serial &&
+                        ack->command_kind ==
+                            RenderCommandKind::ResumePresentation;
+               },
+               10s) &&
+           worker.state() == RenderThreadState::Running;
+
+  const DedicatedRenderThreadShutdown shutdown = worker.shutdown(10s);
+  passed = passed && shutdown == DedicatedRenderThreadShutdown::Clean;
+  xpbd::log::infof(
+      "R5_RENDER_THREAD_PROBE_%s frame=1 suspend_ack=1 resize=%dx%d "
+      "shutdown=%u",
+      passed ? "PASS" : "FAIL", resized_width, resized_height,
+      static_cast<unsigned>(shutdown));
+  return passed;
+#endif
+}
+
 }
 
 int app_main(int argc, char **argv) {
   SDL_SetMainReady();
 
+  const char *strict_probe_value =
+      std::getenv("XPBD_STRICT_RT_GATE_PROBE");
+  const bool strict_rt_gate_probe =
+      strict_probe_value != nullptr && strict_probe_value[0] == '1' &&
+      strict_probe_value[1] == '\0';
+  const char *r5_probe_value =
+      std::getenv("XPBD_R5_RENDER_THREAD_PROBE");
+  const bool r5_render_thread_probe =
+      r5_probe_value != nullptr && r5_probe_value[0] == '1' &&
+      r5_probe_value[1] == '\0';
+  const char *r6_probe_value =
+      std::getenv("XPBD_R6_RENDER_THREAD_PROBE");
+  const bool r6_render_thread_probe =
+      r6_probe_value != nullptr && r6_probe_value[0] == '1' &&
+      r6_probe_value[1] == '\0';
+
   if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
-    SDL_ShowSimpleMessageBox(
-        SDL_MESSAGEBOX_ERROR, "XPBD Bone Baker",
-        SDL_GetError() ? SDL_GetError() : "SDL_Init failed", nullptr);
+    const char *error = SDL_GetError() ? SDL_GetError() : "SDL_Init failed";
+    if (strict_rt_gate_probe) {
+      std::fprintf(stderr, "STRICT_RT_GATE_PROBE_FAIL stage=sdl error=%s\n",
+                   error);
+    } else {
+      SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "XPBD Bone Baker", error,
+                               nullptr);
+    }
     return 1;
   }
 
@@ -264,8 +462,14 @@ int app_main(int argc, char **argv) {
 
   auto backend_req = xpbd::gfx::parseBackendRequest(argc, argv);
   if (!backend_req.parse_error.empty()) {
-    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "XPBD Bone Baker",
-                             backend_req.parse_error.c_str(), nullptr);
+    if (strict_rt_gate_probe) {
+      std::fprintf(stderr,
+                   "STRICT_RT_GATE_PROBE_FAIL stage=backend_request error=%s\n",
+                   backend_req.parse_error.c_str());
+    } else {
+      SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "XPBD Bone Baker",
+                               backend_req.parse_error.c_str(), nullptr);
+    }
     SDL_Quit();
     return 1;
   }
@@ -304,8 +508,14 @@ int app_main(int argc, char **argv) {
     const std::string msg = backend_err.empty()
                                 ? std::string("GPU backend init failed")
                                 : backend_err;
-    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "XPBD Bone Baker",
-                             msg.c_str(), window);
+    if (strict_rt_gate_probe) {
+      std::fprintf(stderr,
+                   "STRICT_RT_GATE_PROBE_FAIL stage=backend_init error=%s\n",
+                   msg.c_str());
+    } else {
+      SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "XPBD Bone Baker",
+                               msg.c_str(), window);
+    }
     if (window) {
       SDL_DestroyWindow(window);
     }
@@ -318,6 +528,54 @@ int app_main(int argc, char **argv) {
                    backend->name(), backend->deviceName(),
                    xpbd::gfx::preferenceName(backend_req.pref),
                    backend_req.force ? 1 : 0);
+
+  if (r5_render_thread_probe) {
+    const bool probe_pass = runR5RenderThreadProbe(window, backend);
+    std::fprintf(probe_pass ? stdout : stderr,
+                 "R5_RENDER_THREAD_PROBE_%s\n",
+                 probe_pass ? "PASS" : "FAIL");
+    if (backend) {
+      backend->shutdown();
+      backend.reset();
+    }
+    if (window != nullptr) {
+      SDL_DestroyWindow(window);
+      window = nullptr;
+    }
+    xpbd::log::shutdown();
+    SDL_Quit();
+    return probe_pass ? 0 : 1;
+  }
+
+  if (strict_rt_gate_probe) {
+#if defined(XPBD_STRICT_RT_GATE) && XPBD_STRICT_RT_GATE
+    const bool strict_probe_pass =
+        std::string(backend->name()) == "Vulkan";
+#else
+    const bool strict_probe_pass = false;
+#endif
+    if (strict_probe_pass) {
+      xpbd::log::info(
+          "STRICT_RT_GATE_PROBE_PASS backend=Vulkan runtime_contract=active");
+      std::fprintf(stdout,
+                   "STRICT_RT_GATE_PROBE_PASS backend=Vulkan "
+                   "runtime_contract=active\n");
+    } else {
+      xpbd::log::error(
+          "STRICT_RT_GATE_PROBE_FAIL strict build or Vulkan selection missing");
+      std::fprintf(stderr,
+                   "STRICT_RT_GATE_PROBE_FAIL stage=selection "
+                   "strict_build_or_vulkan_missing=1\n");
+    }
+    backend.reset();
+    if (window != nullptr) {
+      SDL_DestroyWindow(window);
+      window = nullptr;
+    }
+    xpbd::log::shutdown();
+    SDL_Quit();
+    return strict_probe_pass ? 0 : 1;
+  }
 
   // Wire native file dialogs to the app window and pause the GPU while open.
   {
@@ -332,13 +590,14 @@ int app_main(int argc, char **argv) {
     static xpbd::gfx::IGpuBackend *s_backend_for_dialog = nullptr;
     s_backend_for_dialog = backend.get();
     hooks.prepare = []() {
-      if (s_backend_for_dialog) {
-        s_backend_for_dialog->prepareForSystemDialog();
-      }
+      return s_backend_for_dialog != nullptr &&
+             s_backend_for_dialog->prepareForSystemDialog();
     };
     hooks.finish = []() {
-      if (s_backend_for_dialog) {
-        s_backend_for_dialog->resumeAfterSystemDialog();
+      if (s_backend_for_dialog &&
+          !s_backend_for_dialog->resumeAfterSystemDialog()) {
+        xpbd::log::error(
+            "Native dialog close failed: RenderThread Resume ACK failed");
       }
     };
     xpbd::app::setNativeDialogHooks(hooks);
@@ -449,6 +708,8 @@ int app_main(int argc, char **argv) {
   constexpr int kMaxIdx = 128 * 1024;
   std::vector<NkVertex> vert_slab(static_cast<size_t>(kMaxVerts));
   std::vector<nk_draw_index> idx_slab(static_cast<size_t>(kMaxIdx));
+  std::vector<xpbd::gfx::UiDrawCommand> ui_draw_commands;
+  ui_draw_commands.reserve(512u);
 
   static const nk_draw_vertex_layout_element vertex_layout[] = {
       {NK_VERTEX_POSITION, NK_FORMAT_FLOAT, NK_OFFSETOF(NkVertex, position)},
@@ -861,6 +1122,21 @@ int app_main(int argc, char **argv) {
       xpbd::log::warnf("Startup World HDRI failed: %s (%s)",
                        startup_hdri, session.last_error.c_str());
     }
+  }
+  const std::uint32_t previous_hdri_runtime_width =
+      session.world_environment.hdri_runtime_resolution;
+  apply_path_trace_uint("XPBD_HDRI_RUNTIME_RESOLUTION",
+                        session.world_environment.hdri_runtime_resolution);
+  session.world_environment.hdri_runtime_resolution =
+      std::clamp(session.world_environment.hdri_runtime_resolution,
+                 256u, 8192u) &
+      ~std::uint32_t{1};
+  if (session.world_environment.hdri_runtime_resolution !=
+      previous_hdri_runtime_width) {
+    session.touchWorldEnvironmentHdriRuntime();
+    xpbd::log::infof(
+        "Startup HDRI runtime resolution: requested=%u",
+        session.world_environment.hdri_runtime_resolution);
   }
   auto apply_world_float = [&](const char *name, float &target,
                                float minimum, float maximum) {
@@ -1302,6 +1578,11 @@ int app_main(int argc, char **argv) {
                            unattended_frame_limit));
     }
   }
+  if (r6_render_thread_probe && unattended_frame_limit == 0u) {
+    unattended_frame_limit = 1u;
+  }
+  const auto r6_render_thread_probe_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
   std::filesystem::path s00_hot_import_model;
   bool s00_hot_import_enabled = false;
   bool s00_hot_import_started = false;
@@ -1310,11 +1591,15 @@ int app_main(int argc, char **argv) {
   bool s00_hot_import_post_present = false;
   std::uint64_t s00_pre_import_rt_present_frames = 0;
   std::uint64_t s00_import_commit_frame = 0;
+  std::uint64_t s00_import_present_baseline = 0;
+  std::uint64_t s00_import_packet_baseline = 0;
+  std::uint64_t s00_import_expected_cube_count = 0;
   std::uint64_t s00_rt_ready_frame = 0;
+  std::uint64_t s00_last_observed_present_count = 0;
   std::uint64_t s00_post_import_present_frames = 0;
   std::uint64_t s00_pre_import_fg_active_frames = 0;
   std::uint64_t s00_post_import_fg_active_frames = 0;
-  std::uint64_t s00_fg_phase_start_frame = 0;
+  std::uint64_t s00_fg_phase_start_present_count = 0;
   auto s00_fg_phase_start_time = std::chrono::steady_clock::now();
   bool s00_hot_import_requires_fg = false;
   constexpr std::uint64_t kS00RequiredFgActiveFrames = 5u;
@@ -1335,7 +1620,6 @@ int app_main(int argc, char **argv) {
     s00_hot_import_requires_fg =
         session.path_trace_settings.requested_frame_generation ==
         xpbd::gfx::PathTraceFrameGeneration::On;
-    s00_fg_phase_start_frame = render_frame_number;
     s00_fg_phase_start_time = std::chrono::steady_clock::now();
     xpbd::log::infof(
         "S00_HOT_IMPORT_ARMED path=%s required_rt_presents=30 "
@@ -1464,6 +1748,81 @@ int app_main(int argc, char **argv) {
   if (r0f_g03_f11_gate) {
     xpbd::log::info("R0F_G03_F11_GATE_ARMED frame=120");
   }
+  bool h1_window_gate = false;
+  apply_path_trace_bool("XPBD_H1_WINDOW_GATE", h1_window_gate);
+  bool h1_temporal_gate = false;
+  apply_path_trace_bool("XPBD_H1_TEMPORAL_GATE", h1_temporal_gate);
+  bool h1_expect_fatal_gate = false;
+  apply_path_trace_bool("XPBD_H1_EXPECT_FATAL", h1_expect_fatal_gate);
+  bool h1_expect_upload_shutdown_gate = false;
+  apply_path_trace_bool("XPBD_H1_EXPECT_UPLOAD_SHUTDOWN",
+                        h1_expect_upload_shutdown_gate);
+  std::uint32_t h1_still_cancel_at_samples = 0u;
+  apply_path_trace_uint("XPBD_H1_STILL_CANCEL_AT_SAMPLES",
+                        h1_still_cancel_at_samples);
+  std::filesystem::path h1_hdri_switch_path;
+  if (const char *path = std::getenv("XPBD_H1_HDRI_SWITCH");
+      path != nullptr && path[0] != '\0') {
+    h1_hdri_switch_path = std::filesystem::path(path);
+  }
+  const bool h1_hdri_switch_gate = !h1_hdri_switch_path.empty();
+  if (h1_window_gate || h1_temporal_gate || h1_expect_fatal_gate ||
+      h1_expect_upload_shutdown_gate || h1_hdri_switch_gate ||
+      h1_still_cancel_at_samples > 0u) {
+    xpbd::log::infof(
+        "H1_GATE_ARMED window=%d temporal=%d fatal=%d upload_shutdown=%d "
+        "hdri=%d still_cancel_samples=%u",
+        h1_window_gate ? 1 : 0, h1_temporal_gate ? 1 : 0,
+        h1_expect_fatal_gate ? 1 : 0,
+        h1_expect_upload_shutdown_gate ? 1 : 0,
+        h1_hdri_switch_gate ? 1 : 0,
+        h1_still_cancel_at_samples);
+  }
+  enum class H1WindowStage : std::uint8_t {
+    AwaitReady,
+    ResizeSmallWait,
+    ResizeLargeWait,
+    ResizeOriginalWait,
+    FullscreenOn1Wait,
+    FullscreenOff1Wait,
+    FullscreenOn2Wait,
+    FullscreenOff2Wait,
+    RestoreAfterMinimize,
+    RestoreWait,
+    Dialog1Wait,
+    Dialog2Wait,
+    Dialog3Wait,
+    Complete,
+    Failed,
+  };
+  H1WindowStage h1_window_stage = H1WindowStage::AwaitReady;
+  std::uint64_t h1_window_present_baseline = 0u;
+  const auto h1_window_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(120);
+  const auto h1_temporal_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(90);
+  const auto h1_fatal_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(60);
+  const auto h1_upload_shutdown_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(60);
+  const auto h1_hdri_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(90);
+  std::unordered_map<std::uint64_t, std::array<float, 16>>
+      h1_temporal_produced_views;
+  std::uint64_t h1_temporal_last_recorded_ui_serial = 0u;
+  std::uint64_t h1_temporal_last_present_serial = 0u;
+  std::uint64_t h1_temporal_observed_presents = 0u;
+  std::uint64_t h1_temporal_previous_view_render_serial = 0u;
+  std::array<float, 16> h1_temporal_previous_view{};
+  bool h1_temporal_previous_view_valid = false;
+  bool h1_temporal_observed_latest_ahead = false;
+  bool h1_still_cancel_requested = false;
+  bool h1_hdri_switch_started = false;
+  bool h1_hdri_commit_observed = false;
+  std::uint64_t h1_hdri_present_baseline = 0u;
+  std::uint64_t h1_hdri_commit_present_baseline = 0u;
+  std::uint64_t h1_hdri_generation_after_switch = 0u;
+  std::uint64_t h1_hdri_runtime_generation_after_switch = 0u;
   bool perf_diagnostics = false;
   apply_path_trace_bool("XPBD_PERF_DIAGNOSTICS", perf_diagnostics);
   bool vulkan_diagnostics = false;
@@ -1480,6 +1839,7 @@ int app_main(int argc, char **argv) {
   }
   std::uint64_t result_commit_frame_number = 0;
   std::uint32_t completion_diagnostic_frames = 0;
+  std::uint64_t diagnostic_last_present_success_count = 0;
   if (perf_diagnostics) {
     const std::uint64_t requested_frames =
         unattended_frame_limit > 0u ? unattended_frame_limit : 300u;
@@ -1506,6 +1866,63 @@ int app_main(int argc, char **argv) {
     bool maximized = false;
     bool valid = false;
   } windowed_geometry;
+  bool window_visibility_suspended = false;
+
+  const auto refresh_backend_window_state = [&]() {
+    int pixel_width = 0;
+    int pixel_height = 0;
+    const SDL_WindowFlags flags = SDL_GetWindowFlags(window);
+    const bool extent_valid =
+        SDL_GetWindowSizeInPixels(window, &pixel_width, &pixel_height);
+    if (!extent_valid ||
+        (flags & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN)) != 0u) {
+      pixel_width = 0;
+      pixel_height = 0;
+    }
+    backend->resize(pixel_width, pixel_height);
+    return std::array<int, 2>{pixel_width, pixel_height};
+  };
+
+  const auto run_suspended_window_operation =
+      [&](const char *label, const auto &operation,
+          bool leave_suspended) {
+        if (!backend->prepareForSystemDialog()) {
+          xpbd::log::errorf(
+              "%s aborted: RenderThread Suspend ACK failed", label);
+          app_exit_code = 33;
+          running = false;
+          return false;
+        }
+        bool changed = operation();
+        if (changed) {
+          changed = SDL_SyncWindow(window);
+        }
+        const std::array<int, 2> pixel_extent =
+            refresh_backend_window_state();
+        if (leave_suspended && changed) {
+          window_visibility_suspended = true;
+        } else {
+          if (!backend->resumeAfterSystemDialog()) {
+            xpbd::log::errorf(
+                "%s failed: RenderThread Resume ACK failed", label);
+            app_exit_code = 34;
+            running = false;
+            return false;
+          }
+          window_visibility_suspended = false;
+        }
+        if (!changed) {
+          xpbd::log::warnf("%s SDL operation failed: %s", label,
+                           SDL_GetError() != nullptr ? SDL_GetError()
+                                                     : "unknown error");
+        } else {
+          xpbd::log::infof(
+              "%s backend extent=%dx%d leave_suspended=%d", label,
+              pixel_extent[0], pixel_extent[1],
+              leave_suspended ? 1 : 0);
+        }
+        return changed;
+      };
 
   const auto toggle_borderless_fullscreen = [&]() {
     const bool entering =
@@ -1522,7 +1939,11 @@ int app_main(int argc, char **argv) {
 
     // DLSS-G must be disabled and all tagged resources retired before a
     // window-mode/swapchain transition.
-    backend->prepareForSystemDialog();
+    if (!backend->prepareForSystemDialog()) {
+      xpbd::log::error(
+          "F11 borderless fullscreen aborted: RenderThread Suspend ACK failed");
+      return false;
+    }
     bool changed = true;
     if (entering) {
       changed = SDL_SetWindowFullscreenMode(window, nullptr) &&
@@ -1548,13 +1969,14 @@ int app_main(int argc, char **argv) {
       }
     }
 
-    int pixel_width = 0;
-    int pixel_height = 0;
-    SDL_GetWindowSizeInPixels(window, &pixel_width, &pixel_height);
-    backend->resumeAfterSystemDialog();
-    if (pixel_width > 0 && pixel_height > 0) {
-      backend->resize(pixel_width, pixel_height);
+    const std::array<int, 2> pixel_extent =
+        refresh_backend_window_state();
+    if (!backend->resumeAfterSystemDialog()) {
+      xpbd::log::error(
+          "F11 borderless fullscreen failed: RenderThread Resume ACK failed");
+      return false;
     }
+    window_visibility_suspended = false;
     if (!changed) {
       xpbd::log::warnf(
           "F11 borderless fullscreen transition failed: %s",
@@ -1562,8 +1984,38 @@ int app_main(int argc, char **argv) {
     } else {
       xpbd::log::infof(
           "F11 borderless fullscreen: %s (%dx%d)",
-          entering ? "on" : "off", pixel_width, pixel_height);
+          entering ? "on" : "off", pixel_extent[0], pixel_extent[1]);
     }
+    return changed;
+  };
+
+  const auto handle_backend_window_event = [&](std::uint32_t event_type) {
+    const bool unavailable = event_type == SDL_EVENT_WINDOW_MINIMIZED ||
+                             event_type == SDL_EVENT_WINDOW_HIDDEN;
+    if (unavailable && !window_visibility_suspended) {
+      if (!backend->prepareForSystemDialog()) {
+        xpbd::log::error(
+            "Window visibility transition aborted: RenderThread Suspend ACK "
+            "failed");
+        app_exit_code = 35;
+        return false;
+      }
+      window_visibility_suspended = true;
+    }
+
+    const std::array<int, 2> extent = refresh_backend_window_state();
+    if (!unavailable && window_visibility_suspended && extent[0] > 0 &&
+        extent[1] > 0) {
+      if (!backend->resumeAfterSystemDialog()) {
+        xpbd::log::error(
+            "Window visibility transition failed: RenderThread Resume ACK "
+            "failed");
+        app_exit_code = 36;
+        return false;
+      }
+      window_visibility_suspended = false;
+    }
+    return true;
   };
 
 #if defined(_WIN32)
@@ -1716,10 +2168,15 @@ int app_main(int argc, char **argv) {
         toggle_borderless_fullscreen();
       }
       if (ev.type == SDL_EVENT_WINDOW_RESIZED ||
-          ev.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) {
-        int pw = 0, ph = 0;
-        SDL_GetWindowSizeInPixels(window, &pw, &ph);
-        backend->resize(pw, ph);
+          ev.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED ||
+          ev.type == SDL_EVENT_WINDOW_MINIMIZED ||
+          ev.type == SDL_EVENT_WINDOW_HIDDEN ||
+          ev.type == SDL_EVENT_WINDOW_RESTORED ||
+          ev.type == SDL_EVENT_WINDOW_SHOWN ||
+          ev.type == SDL_EVENT_WINDOW_MAXIMIZED) {
+        if (!handle_backend_window_event(ev.type)) {
+          running = false;
+        }
       }
       if (ev.type == SDL_EVENT_MOUSE_WHEEL) {
         wheel_y += ev.wheel.y;
@@ -1817,11 +2274,13 @@ int app_main(int argc, char **argv) {
     frame_stats.pick_cache_rebuilds = 0;
     frame_stats.pick_candidate_faces = 0;
     frame_stats.pick_total_faces = 0;
+    const std::shared_ptr<const xpbd::gfx::LastPresentedSnapshot>
+        presented_pick_snapshot = backend->lastPresentedSnapshot();
     const auto timedPickBone = [&](float local_x, float local_y, float view_w,
                                    float view_h) {
       const auto pick_start = std::chrono::steady_clock::now();
-      std::string bone =
-          session.pickBoneAt(local_x, local_y, view_w, view_h);
+      std::string bone = session.pickBoneAt(presented_pick_snapshot.get(),
+                                            local_x, local_y, view_w, view_h);
       const auto pick_end = std::chrono::steady_clock::now();
       frame_stats.pick_ms +=
           std::chrono::duration<float, std::milli>(pick_end - pick_start)
@@ -1845,8 +2304,10 @@ int app_main(int argc, char **argv) {
                       SDL_BUTTON_MMASK)) != 0;
       if (prev_layout.viewport_hovered && !any_button_down &&
           pointInsideViewport(prev_layout, mx, my)) {
-        const std::uint64_t scene_token = session.viewportPickStateToken(
-            prev_layout.vp_w, prev_layout.vp_h);
+        const std::uint64_t scene_token =
+            presented_pick_snapshot
+                ? presented_pick_snapshot->present_serial
+                : 0u;
         const bool pointer_or_layout_changed =
             !hover_pick_snapshot_valid || mx != hover_pick_mouse_x ||
             my != hover_pick_mouse_y ||
@@ -1875,8 +2336,7 @@ int app_main(int argc, char **argv) {
           hover_pick_viewport_y = prev_layout.vp_y;
           hover_pick_viewport_w = prev_layout.vp_w;
           hover_pick_viewport_h = prev_layout.vp_h;
-          hover_pick_scene_token = session.viewportPickStateToken(
-              prev_layout.vp_w, prev_layout.vp_h);
+          hover_pick_scene_token = scene_token;
         }
       } else if (!prev_layout.viewport_hovered ||
                  !pointInsideViewport(prev_layout, mx, my)) {
@@ -1915,6 +2375,19 @@ int app_main(int argc, char **argv) {
         win_h > 0 ? static_cast<float>(fb_h) / static_cast<float>(win_h) : 1.0f;
 
     session.synchronizeStillRenderState();
+    if (h1_still_cancel_at_samples > 0u &&
+        !h1_still_cancel_requested && session.stillRenderActive() &&
+        session.still_render_job.status.accumulated_samples >=
+            h1_still_cancel_at_samples) {
+      h1_still_cancel_requested = true;
+      session.requestStillRenderCancel();
+      xpbd::log::infof(
+          "H1_STILL_CANCEL_REQUEST job_id=%llu samples=%u target=%u",
+          static_cast<unsigned long long>(
+              session.still_render_job.status.job_id),
+          session.still_render_job.status.accumulated_samples,
+          session.still_render_job.status.target_samples);
+    }
     bool s00_still_terminal_exit = false;
     if (s00_exit_after_still) {
       const auto &still_status = session.still_render_job.status;
@@ -2132,6 +2605,13 @@ int app_main(int argc, char **argv) {
             ui_result.layout.vp_x, ui_result.layout.vp_y,
             ui_result.layout.vp_w, ui_result.layout.vp_h, scale_x, scale_y,
             fb_w, fb_h);
+    if (h1_temporal_gate) {
+      session.camera.yaw_deg =
+          std::fmod(static_cast<float>(render_frame_number) * 0.75f,
+                    360.0f);
+      session.camera.pitch_deg =
+          std::sin(static_cast<float>(render_frame_number) * 0.01f) * 12.0f;
+    }
     float view[16], proj[16];
     const float viewport_aspect =
         framebuffer_viewport.h > 0
@@ -2198,7 +2678,35 @@ int app_main(int argc, char **argv) {
       }
     }
 
+    ui_draw_commands.clear();
+    const nk_draw_command *ui_command = nullptr;
+    std::uint32_t ui_index_offset = 0u;
+    nk_draw_foreach(ui_command, &ctx, &cmds) {
+      if (ui_command == nullptr || ui_command->elem_count == 0u) {
+        continue;
+      }
+      xpbd::gfx::UiDrawCommand owned_command{};
+      owned_command.element_count = ui_command->elem_count;
+      owned_command.index_offset = ui_index_offset;
+      owned_command.logical_texture_id = static_cast<std::uint64_t>(
+          static_cast<std::uint32_t>(ui_command->texture.id));
+      owned_command.clip_x = ui_command->clip_rect.x;
+      owned_command.clip_y = ui_command->clip_rect.y;
+      owned_command.clip_w = ui_command->clip_rect.w;
+      owned_command.clip_h = ui_command->clip_rect.h;
+      ui_draw_commands.push_back(owned_command);
+      ui_index_offset += ui_command->elem_count;
+    }
+
     xpbd::gfx::UiDrawData ui_draw{};
+    ui_draw.vertex_data = nk_buffer_memory_const(&vbuf);
+    ui_draw.vertex_bytes = static_cast<std::size_t>(
+        vbuf.allocated > 0 ? vbuf.allocated : nk_buffer_total(&vbuf));
+    ui_draw.index_data = nk_buffer_memory_const(&ebuf);
+    ui_draw.index_bytes = static_cast<std::size_t>(
+        ebuf.allocated > 0 ? ebuf.allocated : nk_buffer_total(&ebuf));
+    ui_draw.draw_commands = ui_draw_commands.data();
+    ui_draw.draw_command_count = ui_draw_commands.size();
     ui_draw.ctx = &ctx;
     ui_draw.cmds = &cmds;
     ui_draw.vertices = &vbuf;
@@ -2317,6 +2825,9 @@ int app_main(int argc, char **argv) {
     const std::uint64_t material_generation =
         still_snapshot != nullptr ? still_snapshot->material_generation
                                   : session.materialGeneration();
+    const std::uint64_t emission_generation =
+        still_snapshot != nullptr ? still_snapshot->emission_generation
+                                  : session.emissionGeneration();
     std::uint64_t pose_generation = xpbd::gfx::mixRtGeneration(
         animation_generation, physics_generation);
     pose_generation = xpbd::gfx::mixRtGeneration(
@@ -2350,7 +2861,10 @@ int app_main(int argc, char **argv) {
                                    session.textureGeneration()),
         xpbd::gfx::mixRtGeneration(physics_generation,
                                    appearance_generation));
-    rt_generations.emission = rt_generations.materials;
+    // Bone appearance tint multiplies authored mesh emission, so it belongs
+    // in the emission/Alias domain even though roughness/F0-only edits do not.
+    rt_generations.emission = xpbd::gfx::mixRtGeneration(
+        emission_generation, appearance_generation);
     rt_generations.visibility = xpbd::gfx::mixRtGeneration(
         xpbd::gfx::mixRtGeneration(
             static_cast<std::uint64_t>(session.preview_scene_id),
@@ -2359,8 +2873,25 @@ int app_main(int argc, char **argv) {
     frame.rt_scene_generations_valid = true;
 
     backend->render(frame);
-    if (completion_diagnostic_frames > 0) {
-      --completion_diagnostic_frames;
+    if (h1_temporal_gate) {
+      const xpbd::gfx::RenderThreadDiagnostics produced =
+          backend->renderThreadDiagnostics();
+      if (produced.latest_ui_frame_serial >
+          h1_temporal_last_recorded_ui_serial) {
+        std::array<float, 16> produced_view{};
+        std::copy_n(preview_view, produced_view.size(),
+                    produced_view.begin());
+        h1_temporal_produced_views.insert_or_assign(
+            produced.latest_ui_frame_serial, produced_view);
+        h1_temporal_last_recorded_ui_serial =
+            produced.latest_ui_frame_serial;
+      }
+      if (h1_temporal_produced_views.size() > 100'000u) {
+        xpbd::log::error(
+            "H1_TEMPORAL_GATE_FAIL reason=producer_history_limit");
+        app_exit_code = 41;
+        running = false;
+      }
     }
     ++render_frame_number;
     if (r0f_g03_f11_gate && !r0f_g03_f11_triggered &&
@@ -2371,7 +2902,10 @@ int app_main(int argc, char **argv) {
     }
     if (unattended_resize_gate) {
       auto resize_window = [&](int width, int height) {
-        if (!SDL_SetWindowSize(window, width, height)) {
+        const bool resized = run_suspended_window_operation(
+            "Unattended preview resize",
+            [&]() { return SDL_SetWindowSize(window, width, height); }, false);
+        if (!resized) {
           xpbd::log::warnf(
               "Unattended preview resize failed at frame %llu: %s",
               static_cast<unsigned long long>(render_frame_number),
@@ -2392,12 +2926,16 @@ int app_main(int argc, char **argv) {
             (std::max)(unattended_initial_width, 1),
             (std::max)(unattended_initial_height, 1));
       } else if (render_frame_number == 520u) {
-        if (SDL_MinimizeWindow(window)) {
+        if (run_suspended_window_operation(
+                "Unattended preview minimize",
+                [&]() { return SDL_MinimizeWindow(window); }, true)) {
           xpbd::log::info(
               "Unattended preview resize: window minimized");
         }
       } else if (render_frame_number == 560u) {
-        if (SDL_RestoreWindow(window)) {
+        if (run_suspended_window_operation(
+                "Unattended preview restore",
+                [&]() { return SDL_RestoreWindow(window); }, false)) {
           xpbd::log::info(
               "Unattended preview resize: window restored");
         }
@@ -2405,12 +2943,59 @@ int app_main(int argc, char **argv) {
     }
     if (unattended_frame_limit > 0 &&
         render_frame_number >= unattended_frame_limit) {
-      xpbd::log::infof(
-          "Unattended frame limit reached after %llu frames",
-          static_cast<unsigned long long>(render_frame_number));
-      running = false;
+      bool exit_unattended = true;
+      if (r6_render_thread_probe) {
+        const xpbd::gfx::FrameStats probe_stats = backend->stats();
+        const bool probe_pass = probe_stats.present_success_count > 0u &&
+                                probe_stats.active_render_path ==
+                                    static_cast<int>(
+                                        xpbd::gfx::RenderPath::RayTracing);
+        if (probe_pass) {
+          xpbd::log::infof(
+              "R6_RENDER_THREAD_PROBE_PASS ui_frames=%llu presents=%llu "
+              "render_path=%d",
+              static_cast<unsigned long long>(render_frame_number),
+              static_cast<unsigned long long>(
+                  probe_stats.present_success_count),
+              probe_stats.active_render_path);
+          std::fprintf(stdout, "R6_RENDER_THREAD_PROBE_PASS\n");
+        } else if (std::chrono::steady_clock::now() >=
+                   r6_render_thread_probe_deadline) {
+          app_exit_code = 32;
+          xpbd::log::errorf(
+              "R6_RENDER_THREAD_PROBE_FAIL ui_frames=%llu presents=%llu "
+              "render_path=%d",
+              static_cast<unsigned long long>(render_frame_number),
+              static_cast<unsigned long long>(
+                  probe_stats.present_success_count),
+              probe_stats.active_render_path);
+          std::fprintf(stderr, "R6_RENDER_THREAD_PROBE_FAIL\n");
+        } else {
+          exit_unattended = false;
+        }
+      }
+      if (exit_unattended) {
+        xpbd::log::infof(
+            "Unattended frame limit reached after %llu frames",
+            static_cast<unsigned long long>(render_frame_number));
+        running = false;
+      }
     }
     const auto backend_stats = backend->stats();
+    if (backend_stats.present_success_count >
+        diagnostic_last_present_success_count) {
+      const std::uint64_t completed_presents =
+          backend_stats.present_success_count -
+          diagnostic_last_present_success_count;
+      if (completion_diagnostic_frames > 0u) {
+        completion_diagnostic_frames -= static_cast<std::uint32_t>(
+            (std::min)(completed_presents,
+                       static_cast<std::uint64_t>(
+                           completion_diagnostic_frames)));
+      }
+      diagnostic_last_present_success_count =
+          backend_stats.present_success_count;
+    }
     frame_stats.gpu_ms = backend_stats.gpu_ms;
     frame_stats.upload_ms = backend_stats.upload_ms;
     frame_stats.upload_bytes = backend_stats.upload_bytes;
@@ -2503,6 +3088,469 @@ int app_main(int argc, char **argv) {
     frame_stats.rt_aov_write_mask = backend_stats.rt_aov_write_mask;
     frame_stats.rt_last_build_reason = backend_stats.rt_last_build_reason;
     frame_stats.rt_last_tlas_reason = backend_stats.rt_last_tlas_reason;
+
+    const xpbd::gfx::RenderThreadDiagnostics render_thread_diagnostics =
+        backend->renderThreadDiagnostics();
+    if (h1_expect_upload_shutdown_gate &&
+        !render_thread_diagnostics.active) {
+      if (render_thread_diagnostics.fatal) {
+        xpbd::log::errorf(
+            "H1_UPLOAD_SHUTDOWN_GATE_FAIL reason=fatal_quarantine "
+            "render_serial=%llu history_serial=%llu present_serial=%llu",
+            static_cast<unsigned long long>(
+                render_thread_diagnostics.latest_render_serial),
+            static_cast<unsigned long long>(
+                render_thread_diagnostics.latest_history_serial),
+            static_cast<unsigned long long>(
+                render_thread_diagnostics.latest_present_serial));
+        app_exit_code = 48;
+      } else {
+        xpbd::log::infof(
+            "H1_UPLOAD_SHUTDOWN_GATE_PASS render_serial=%llu "
+            "history_serial=%llu present_serial=%llu replacements=%llu",
+            static_cast<unsigned long long>(
+                render_thread_diagnostics.latest_render_serial),
+            static_cast<unsigned long long>(
+                render_thread_diagnostics.latest_history_serial),
+            static_cast<unsigned long long>(
+                render_thread_diagnostics.latest_present_serial),
+            static_cast<unsigned long long>(
+                render_thread_diagnostics.mailbox_replacement_count));
+      }
+      running = false;
+    }
+    if (render_thread_diagnostics.fatal && running) {
+      if (h1_expect_fatal_gate) {
+        xpbd::log::infof(
+            "H1_FATAL_GATE_PASS render_serial=%llu history_serial=%llu "
+            "present_serial=%llu replacements=%llu",
+            static_cast<unsigned long long>(
+                render_thread_diagnostics.latest_render_serial),
+            static_cast<unsigned long long>(
+                render_thread_diagnostics.latest_history_serial),
+            static_cast<unsigned long long>(
+                render_thread_diagnostics.latest_present_serial),
+            static_cast<unsigned long long>(
+                render_thread_diagnostics.mailbox_replacement_count));
+      } else {
+        xpbd::log::error(
+            "RenderThread fatal quarantine reached Main; exiting the UI "
+            "loop");
+        app_exit_code = 37;
+      }
+      running = false;
+    }
+
+    if (h1_temporal_gate && app_exit_code == 0 && running) {
+      const std::shared_ptr<const xpbd::gfx::LastPresentedSnapshot>
+          presented = render_thread_diagnostics.last_presented;
+      if (presented != nullptr && presented->present_serial >
+                                      h1_temporal_last_present_serial) {
+        const auto produced = h1_temporal_produced_views.find(
+            presented->history.ui_frame_serial);
+        const bool view_known =
+            produced != h1_temporal_produced_views.end();
+        const bool view_exact =
+            view_known && std::equal(produced->second.begin(),
+                                     produced->second.end(),
+                                     presented->history.view_matrix.begin());
+        const bool view_changed =
+            !h1_temporal_previous_view_valid ||
+            !std::equal(h1_temporal_previous_view.begin(),
+                        h1_temporal_previous_view.end(),
+                        presented->history.view_matrix.begin());
+        const bool serials_exact =
+            presented->history.ui_frame_serial > 0u &&
+            presented->history.packet_serial > 0u &&
+            presented->history.render_serial > 0u &&
+            presented->history.history_serial > 0u &&
+            render_thread_diagnostics.latest_present_serial >=
+                presented->present_serial &&
+            render_thread_diagnostics.latest_render_serial >=
+                presented->history.render_serial &&
+            render_thread_diagnostics.latest_history_serial >=
+                presented->history.history_serial;
+        const bool previous_history_exact =
+            h1_temporal_observed_presents == 0u
+                ? presented->previous_history_render_serial <
+                      presented->history.render_serial
+                : presented->previous_history_render_serial >=
+                          h1_temporal_previous_view_render_serial &&
+                      presented->previous_history_render_serial <
+                          presented->history.render_serial;
+        if (!view_exact || !view_changed || !serials_exact ||
+            !previous_history_exact) {
+          xpbd::log::errorf(
+              "H1_TEMPORAL_GATE_FAIL view_known=%d view_exact=%d "
+              "view_changed=%d serials_exact=%d previous_exact=%d "
+              "ui=%llu packet=%llu render=%llu previous=%llu history=%llu "
+              "present=%llu",
+              view_known ? 1 : 0, view_exact ? 1 : 0,
+              view_changed ? 1 : 0, serials_exact ? 1 : 0,
+              previous_history_exact ? 1 : 0,
+              static_cast<unsigned long long>(
+                  presented->history.ui_frame_serial),
+              static_cast<unsigned long long>(
+                  presented->history.packet_serial),
+              static_cast<unsigned long long>(
+                  presented->history.render_serial),
+              static_cast<unsigned long long>(
+                  presented->previous_history_render_serial),
+              static_cast<unsigned long long>(
+                  presented->history.history_serial),
+              static_cast<unsigned long long>(
+                  presented->present_serial));
+          app_exit_code = 42;
+          running = false;
+        } else {
+          ++h1_temporal_observed_presents;
+          h1_temporal_last_present_serial = presented->present_serial;
+          h1_temporal_previous_view_render_serial =
+              presented->history.render_serial;
+          h1_temporal_previous_view = presented->history.view_matrix;
+          h1_temporal_previous_view_valid = true;
+          h1_temporal_observed_latest_ahead =
+              h1_temporal_observed_latest_ahead ||
+              render_thread_diagnostics.latest_ui_frame_serial >
+                  presented->history.ui_frame_serial;
+          xpbd::log::infof(
+              "H1_TEMPORAL_PRESENT observed=%llu ui=%llu packet=%llu "
+              "render=%llu previous=%llu history=%llu present=%llu "
+              "latest_ui=%llu replacements=%llu",
+              static_cast<unsigned long long>(
+                  h1_temporal_observed_presents),
+              static_cast<unsigned long long>(
+                  presented->history.ui_frame_serial),
+              static_cast<unsigned long long>(
+                  presented->history.packet_serial),
+              static_cast<unsigned long long>(
+                  presented->history.render_serial),
+              static_cast<unsigned long long>(
+                  presented->previous_history_render_serial),
+              static_cast<unsigned long long>(
+                  presented->history.history_serial),
+              static_cast<unsigned long long>(
+                  presented->present_serial),
+              static_cast<unsigned long long>(
+                  render_thread_diagnostics.latest_ui_frame_serial),
+              static_cast<unsigned long long>(
+                  render_thread_diagnostics.mailbox_replacement_count));
+          if (h1_temporal_observed_presents >= 8u &&
+              h1_temporal_observed_latest_ahead &&
+              render_thread_diagnostics.mailbox_replacement_count >= 64u) {
+            xpbd::log::infof(
+                "H1_TEMPORAL_GATE_PASS presents=%llu replacements=%llu "
+                "latest_ui=%llu committed_ui=%llu render=%llu history=%llu "
+                "present_serial=%llu",
+                static_cast<unsigned long long>(
+                    h1_temporal_observed_presents),
+                static_cast<unsigned long long>(
+                    render_thread_diagnostics.mailbox_replacement_count),
+                static_cast<unsigned long long>(
+                    render_thread_diagnostics.latest_ui_frame_serial),
+                static_cast<unsigned long long>(
+                    presented->history.ui_frame_serial),
+                static_cast<unsigned long long>(
+                    presented->history.render_serial),
+                static_cast<unsigned long long>(
+                    presented->history.history_serial),
+                static_cast<unsigned long long>(presented->present_serial));
+            running = false;
+          }
+        }
+      }
+      if (running && std::chrono::steady_clock::now() >=
+                         h1_temporal_deadline) {
+        xpbd::log::errorf(
+            "H1_TEMPORAL_GATE_FAIL reason=timeout presents=%llu "
+            "replacements=%llu",
+            static_cast<unsigned long long>(
+                h1_temporal_observed_presents),
+            static_cast<unsigned long long>(
+                render_thread_diagnostics.mailbox_replacement_count));
+        app_exit_code = 43;
+        running = false;
+      }
+    }
+
+    if (h1_hdri_switch_gate && app_exit_code == 0 && running) {
+      if (!h1_hdri_switch_started &&
+          backend_stats.present_success_count >= 3u &&
+          backend_stats.active_render_path ==
+              static_cast<int>(xpbd::gfx::RenderPath::RayTracing)) {
+        const std::uint64_t generation_before =
+            session.world_environment.generation;
+        if (!session.loadWorldHdr(h1_hdri_switch_path)) {
+          xpbd::log::errorf(
+              "H1_HDRI_SWITCH_FAIL reason=load path=%s error=%s",
+              h1_hdri_switch_path.string().c_str(),
+              session.last_error.c_str());
+          app_exit_code = 44;
+          running = false;
+        } else {
+          h1_hdri_switch_started = true;
+          h1_hdri_present_baseline =
+              backend_stats.present_success_count;
+          h1_hdri_generation_after_switch =
+              session.world_environment.generation;
+          h1_hdri_runtime_generation_after_switch =
+              session.world_environment.hdri_runtime_generation;
+          xpbd::log::infof(
+              "H1_HDRI_SWITCH_BEGIN presents=%llu generation=%llu->%llu "
+              "runtime_generation=%llu source=%s",
+              static_cast<unsigned long long>(
+                  h1_hdri_present_baseline),
+              static_cast<unsigned long long>(generation_before),
+              static_cast<unsigned long long>(
+                  h1_hdri_generation_after_switch),
+              static_cast<unsigned long long>(
+                  session.world_environment.hdri_runtime_generation),
+              session.world_environment.hdr.source_identity.c_str());
+        }
+      } else if (h1_hdri_switch_started &&
+                 !h1_hdri_commit_observed &&
+                 !render_thread_diagnostics.environment_upload_pending &&
+                 render_thread_diagnostics
+                         .accepted_world_environment_generation ==
+                     h1_hdri_generation_after_switch &&
+                 render_thread_diagnostics
+                         .accepted_hdri_runtime_generation ==
+                     h1_hdri_runtime_generation_after_switch) {
+        h1_hdri_commit_observed = true;
+        h1_hdri_commit_present_baseline =
+            render_thread_diagnostics.latest_present_serial;
+        xpbd::log::infof(
+            "H1_HDRI_SWITCH_COMMIT present_serial=%llu generation=%llu "
+            "runtime_generation=%llu",
+            static_cast<unsigned long long>(
+                h1_hdri_commit_present_baseline),
+            static_cast<unsigned long long>(
+                h1_hdri_generation_after_switch),
+            static_cast<unsigned long long>(
+                h1_hdri_runtime_generation_after_switch));
+      } else if (h1_hdri_commit_observed &&
+                 render_thread_diagnostics.latest_present_serial >
+                     h1_hdri_commit_present_baseline &&
+                 backend_stats.active_render_path ==
+                     static_cast<int>(
+                         xpbd::gfx::RenderPath::RayTracing) &&
+                 session.world_environment.generation ==
+                     h1_hdri_generation_after_switch) {
+        xpbd::log::infof(
+            "H1_HDRI_SWITCH_PASS presents=%llu->%llu commit_present=%llu "
+            "generation=%llu source=%s",
+            static_cast<unsigned long long>(h1_hdri_present_baseline),
+            static_cast<unsigned long long>(
+                backend_stats.present_success_count),
+            static_cast<unsigned long long>(
+                h1_hdri_commit_present_baseline),
+            static_cast<unsigned long long>(
+                session.world_environment.generation),
+            session.world_environment.hdr.source_identity.c_str());
+        running = false;
+      }
+      if (running && std::chrono::steady_clock::now() >= h1_hdri_deadline) {
+        xpbd::log::errorf(
+            "H1_HDRI_SWITCH_FAIL reason=timeout started=%d presents=%llu",
+            h1_hdri_switch_started ? 1 : 0,
+            static_cast<unsigned long long>(
+                backend_stats.present_success_count));
+        app_exit_code = 45;
+        running = false;
+      }
+    }
+
+    if (h1_expect_fatal_gate && running &&
+        std::chrono::steady_clock::now() >= h1_fatal_deadline) {
+      xpbd::log::error(
+          "H1_FATAL_GATE_FAIL reason=timeout_without_fatal_event");
+      app_exit_code = 46;
+      running = false;
+    }
+
+    if (h1_expect_upload_shutdown_gate && running &&
+        std::chrono::steady_clock::now() >=
+            h1_upload_shutdown_deadline) {
+      xpbd::log::error(
+          "H1_UPLOAD_SHUTDOWN_GATE_FAIL "
+          "reason=timeout_worker_still_active");
+      app_exit_code = 48;
+      running = false;
+    }
+
+    if (h1_window_gate && app_exit_code == 0 && running) {
+      const auto arm_window_wait = [&](H1WindowStage next) {
+        h1_window_present_baseline =
+            backend_stats.present_success_count;
+        h1_window_stage = next;
+      };
+      const auto fail_window_gate = [&](const char *stage) {
+        xpbd::log::errorf("H1_WINDOW_GATE_FAIL stage=%s", stage);
+        h1_window_stage = H1WindowStage::Failed;
+        app_exit_code = 47;
+        running = false;
+      };
+      const auto dialog_cycle = [&](unsigned cycle) {
+        xpbd::log::infof("H1_DIALOG_CYCLE_BEGIN cycle=%u", cycle);
+        if (!backend->prepareForSystemDialog()) {
+          return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        if (!backend->resumeAfterSystemDialog()) {
+          return false;
+        }
+        xpbd::log::infof("H1_DIALOG_CYCLE_END cycle=%u", cycle);
+        return true;
+      };
+      const bool advanced =
+          backend_stats.present_success_count >
+          h1_window_present_baseline;
+      switch (h1_window_stage) {
+      case H1WindowStage::AwaitReady:
+        if (backend_stats.present_success_count >= 2u) {
+          if (!run_suspended_window_operation(
+                  "H1 resize small",
+                  [&]() { return SDL_SetWindowSize(window, 1000, 700); },
+                  false)) {
+            fail_window_gate("resize_small");
+          } else {
+            arm_window_wait(H1WindowStage::ResizeSmallWait);
+          }
+        }
+        break;
+      case H1WindowStage::ResizeSmallWait:
+        if (advanced) {
+          if (!run_suspended_window_operation(
+                  "H1 resize large",
+                  [&]() { return SDL_SetWindowSize(window, 1400, 900); },
+                  false)) {
+            fail_window_gate("resize_large");
+          } else {
+            arm_window_wait(H1WindowStage::ResizeLargeWait);
+          }
+        }
+        break;
+      case H1WindowStage::ResizeLargeWait:
+        if (advanced) {
+          if (!run_suspended_window_operation(
+                  "H1 resize original",
+                  [&]() { return SDL_SetWindowSize(window, kWinW, kWinH); },
+                  false)) {
+            fail_window_gate("resize_original");
+          } else {
+            arm_window_wait(H1WindowStage::ResizeOriginalWait);
+          }
+        }
+        break;
+      case H1WindowStage::ResizeOriginalWait:
+        if (advanced) {
+          if (!toggle_borderless_fullscreen()) {
+            fail_window_gate("fullscreen_on_1");
+          } else {
+            arm_window_wait(H1WindowStage::FullscreenOn1Wait);
+          }
+        }
+        break;
+      case H1WindowStage::FullscreenOn1Wait:
+        if (advanced) {
+          if (!toggle_borderless_fullscreen()) {
+            fail_window_gate("fullscreen_off_1");
+          } else {
+            arm_window_wait(H1WindowStage::FullscreenOff1Wait);
+          }
+        }
+        break;
+      case H1WindowStage::FullscreenOff1Wait:
+        if (advanced) {
+          if (!toggle_borderless_fullscreen()) {
+            fail_window_gate("fullscreen_on_2");
+          } else {
+            arm_window_wait(H1WindowStage::FullscreenOn2Wait);
+          }
+        }
+        break;
+      case H1WindowStage::FullscreenOn2Wait:
+        if (advanced) {
+          if (!toggle_borderless_fullscreen()) {
+            fail_window_gate("fullscreen_off_2");
+          } else {
+            arm_window_wait(H1WindowStage::FullscreenOff2Wait);
+          }
+        }
+        break;
+      case H1WindowStage::FullscreenOff2Wait:
+        if (advanced) {
+          const bool minimized = run_suspended_window_operation(
+              "H1 minimize to zero extent",
+              [&]() { return SDL_MinimizeWindow(window); }, true);
+          const bool zero_extent_suspended =
+              minimized && backend->presentationSuspended() &&
+              (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED) != 0u;
+          if (!zero_extent_suspended) {
+            fail_window_gate("minimize_zero_extent");
+          } else {
+            xpbd::log::info(
+                "H1_WINDOW_ZERO_EXTENT observed=1 suspended=1");
+            h1_window_stage = H1WindowStage::RestoreAfterMinimize;
+          }
+        }
+        break;
+      case H1WindowStage::RestoreAfterMinimize:
+        if (!run_suspended_window_operation(
+                "H1 restore from zero extent",
+                [&]() { return SDL_RestoreWindow(window); }, false)) {
+          fail_window_gate("restore_from_zero_extent");
+        } else {
+          arm_window_wait(H1WindowStage::RestoreWait);
+        }
+        break;
+      case H1WindowStage::RestoreWait:
+        if (advanced) {
+          if (!dialog_cycle(1u)) {
+            fail_window_gate("dialog_1");
+          } else {
+            arm_window_wait(H1WindowStage::Dialog1Wait);
+          }
+        }
+        break;
+      case H1WindowStage::Dialog1Wait:
+        if (advanced) {
+          if (!dialog_cycle(2u)) {
+            fail_window_gate("dialog_2");
+          } else {
+            arm_window_wait(H1WindowStage::Dialog2Wait);
+          }
+        }
+        break;
+      case H1WindowStage::Dialog2Wait:
+        if (advanced) {
+          if (!dialog_cycle(3u)) {
+            fail_window_gate("dialog_3");
+          } else {
+            arm_window_wait(H1WindowStage::Dialog3Wait);
+          }
+        }
+        break;
+      case H1WindowStage::Dialog3Wait:
+        if (advanced) {
+          h1_window_stage = H1WindowStage::Complete;
+          xpbd::log::infof(
+              "H1_WINDOW_GATE_PASS presents=%llu resize=3 fullscreen=4 "
+              "zero_extent=1 restore=1 dialog_cycles=3",
+              static_cast<unsigned long long>(
+                  backend_stats.present_success_count));
+          running = false;
+        }
+        break;
+      case H1WindowStage::Complete:
+      case H1WindowStage::Failed:
+        break;
+      }
+      if (running && std::chrono::steady_clock::now() >=
+                         h1_window_deadline) {
+        fail_window_gate("timeout");
+      }
+    }
 
     if (s00_deferred_still_queue.deferred() &&
         !s00_deferred_still_queue.queued &&
@@ -2669,9 +3717,21 @@ int app_main(int argc, char **argv) {
       const bool s00_fg_present_active =
           backend_stats.dlss_frame_generation_active &&
           backend_stats.dlss_frames_actually_presented > 1u;
+      const std::uint64_t s00_new_present_count =
+          backend_stats.present_success_count >
+                  s00_last_observed_present_count
+              ? backend_stats.present_success_count -
+                    s00_last_observed_present_count
+              : 0u;
+      if (s00_new_present_count > 0u) {
+        s00_last_observed_present_count =
+            backend_stats.present_success_count;
+      }
       const std::uint64_t s00_fg_phase_frames =
-          render_frame_number >= s00_fg_phase_start_frame
-              ? render_frame_number - s00_fg_phase_start_frame
+          backend_stats.present_success_count >=
+                  s00_fg_phase_start_present_count
+              ? backend_stats.present_success_count -
+                    s00_fg_phase_start_present_count
               : 0u;
       const auto s00_fg_phase_elapsed =
           std::chrono::steady_clock::now() - s00_fg_phase_start_time;
@@ -2682,37 +3742,44 @@ int app_main(int argc, char **argv) {
                               ? "pre_import"
                               : (!s00_hot_import_rt_ready ? "rt_rebuild"
                                                          : "post_import");
-      xpbd::log::infof(
-          "S00_PRESENT_HEARTBEAT frame=%llu stage=%s render_path=%d "
-          "blas=%u tlas=%u instances=%u primitives=%u fg_required=%d "
-          "fg_active=%d fg_presented=%u fg_streak=%llu",
-          static_cast<unsigned long long>(render_frame_number), stage,
-          backend_stats.active_render_path, backend_stats.rt_blas_count,
-          backend_stats.rt_tlas_count, backend_stats.rt_instance_count,
-          backend_stats.rt_primitive_count,
-          s00_hot_import_requires_fg ? 1 : 0,
-          backend_stats.dlss_frame_generation_active ? 1 : 0,
-          backend_stats.dlss_frames_actually_presented,
-          static_cast<unsigned long long>(
-              s00_hot_import_started
-                  ? s00_post_import_fg_active_frames
-                  : s00_pre_import_fg_active_frames));
+      if (s00_new_present_count > 0u) {
+        xpbd::log::infof(
+            "S00_PRESENT_HEARTBEAT frame=%llu stage=%s "
+            "present_success_count=%llu present_delta=%llu render_path=%d "
+            "blas=%u tlas=%u instances=%u primitives=%u fg_required=%d "
+            "fg_active=%d fg_presented=%u fg_streak=%llu",
+            static_cast<unsigned long long>(render_frame_number), stage,
+            static_cast<unsigned long long>(
+                backend_stats.present_success_count),
+            static_cast<unsigned long long>(s00_new_present_count),
+            backend_stats.active_render_path, backend_stats.rt_blas_count,
+            backend_stats.rt_tlas_count, backend_stats.rt_instance_count,
+            backend_stats.rt_primitive_count,
+            s00_hot_import_requires_fg ? 1 : 0,
+            backend_stats.dlss_frame_generation_active ? 1 : 0,
+            backend_stats.dlss_frames_actually_presented,
+            static_cast<unsigned long long>(
+                s00_hot_import_started
+                    ? s00_post_import_fg_active_frames
+                    : s00_pre_import_fg_active_frames));
+      }
 
       if (!s00_hot_import_started) {
         const bool rt_present_ready =
             session.enable_ray_tracing &&
             backend_stats.active_render_path == 1 &&
             backend_stats.rt_tlas_count > 0u;
-        if (rt_present_ready) {
-          ++s00_pre_import_rt_present_frames;
-        } else {
+        if (!rt_present_ready) {
           s00_pre_import_rt_present_frames = 0;
+        } else if (s00_new_present_count > 0u) {
+          s00_pre_import_rt_present_frames += s00_new_present_count;
         }
-        if (s00_hot_import_requires_fg && rt_present_ready &&
-            s00_fg_present_active) {
-          ++s00_pre_import_fg_active_frames;
-        } else if (s00_hot_import_requires_fg) {
-          s00_pre_import_fg_active_frames = 0;
+        if (s00_hot_import_requires_fg && s00_new_present_count > 0u) {
+          if (rt_present_ready && s00_fg_present_active) {
+            ++s00_pre_import_fg_active_frames;
+          } else {
+            s00_pre_import_fg_active_frames = 0;
+          }
         }
         const bool fg_pre_import_ready =
             !s00_hot_import_requires_fg ||
@@ -2724,13 +3791,25 @@ int app_main(int argc, char **argv) {
           xpbd::log::infof("S00_DIALOG_CYCLE_BEGIN frame=%llu",
                            static_cast<unsigned long long>(
                                render_frame_number));
-          backend->prepareForSystemDialog();
+          if (!backend->prepareForSystemDialog()) {
+            app_exit_code = 30;
+            running = false;
+            xpbd::log::error(
+                "S00_DIALOG_CYCLE_FAILED reason=suspend_ack_failed");
+            break;
+          }
           const auto dialog_hold_begin = std::chrono::steady_clock::now();
           if (s00_dialog_hold_ms > 0u) {
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(s00_dialog_hold_ms));
           }
-          backend->resumeAfterSystemDialog();
+          if (!backend->resumeAfterSystemDialog()) {
+            app_exit_code = 31;
+            running = false;
+            xpbd::log::error(
+                "S00_DIALOG_CYCLE_FAILED reason=resume_ack_failed");
+            break;
+          }
           const auto actual_dialog_hold_ms =
               std::chrono::duration_cast<std::chrono::milliseconds>(
                   std::chrono::steady_clock::now() - dialog_hold_begin)
@@ -2771,7 +3850,14 @@ int app_main(int argc, char **argv) {
             }
             s00_hot_import_committed = true;
             s00_import_commit_frame = render_frame_number;
-            s00_fg_phase_start_frame = render_frame_number;
+            s00_import_present_baseline =
+                backend_stats.present_success_count;
+            s00_import_packet_baseline =
+                render_thread_diagnostics.latest_packet_serial;
+            s00_import_expected_cube_count =
+                static_cast<std::uint64_t>(cube_count);
+            s00_fg_phase_start_present_count =
+                backend_stats.present_success_count;
             s00_fg_phase_start_time = std::chrono::steady_clock::now();
             s00_post_import_fg_active_frames = 0u;
             xpbd::log::infof(
@@ -2799,30 +3885,58 @@ int app_main(int argc, char **argv) {
       } else if (s00_hot_import_committed &&
                  !s00_hot_import_rt_ready &&
                  render_frame_number > s00_import_commit_frame &&
+                 render_thread_diagnostics.last_presented != nullptr &&
+                 render_thread_diagnostics.last_presented->history
+                         .packet_serial > s00_import_packet_baseline &&
+                 render_thread_diagnostics.last_presented->history
+                         .static_model != nullptr &&
+                 render_thread_diagnostics.last_presented->history
+                         .static_model->cube_count ==
+                     s00_import_expected_cube_count &&
+                 render_thread_diagnostics.last_presented->history
+                         .rt_scene_generations_valid &&
+                 render_thread_diagnostics.last_presented->history
+                         .rt_scene_generations.topology ==
+                     frame.rt_scene_generations.topology &&
+                 backend_stats.present_success_count >
+                     s00_import_present_baseline &&
                  backend_stats.active_render_path == 1 &&
                  backend_stats.rt_tlas_count > 0u &&
                  backend_stats.rt_primitive_count > 0u) {
         s00_hot_import_rt_ready = true;
         s00_rt_ready_frame = render_frame_number;
-        s00_fg_phase_start_frame = render_frame_number;
+        s00_fg_phase_start_present_count =
+            backend_stats.present_success_count;
         s00_fg_phase_start_time = std::chrono::steady_clock::now();
         s00_post_import_fg_active_frames = 0u;
         xpbd::log::infof(
-            "S00_IMPORT_RT_READY frame=%llu generation=%llu blas=%u tlas=%u "
-            "instances=%u primitives=%u as_bytes=%llu",
+            "S00_IMPORT_RT_READY frame=%llu generation=%llu packet=%llu "
+            "model_cubes=%llu topology=%llu blas=%u tlas=%u instances=%u "
+            "primitives=%u as_bytes=%llu",
             static_cast<unsigned long long>(render_frame_number),
             static_cast<unsigned long long>(session.modelGeneration()),
+            static_cast<unsigned long long>(
+                render_thread_diagnostics.last_presented->history
+                    .packet_serial),
+            static_cast<unsigned long long>(
+                render_thread_diagnostics.last_presented->history
+                    .static_model->cube_count),
+            static_cast<unsigned long long>(
+                render_thread_diagnostics.last_presented->history
+                    .rt_scene_generations.topology),
             backend_stats.rt_blas_count, backend_stats.rt_tlas_count,
             backend_stats.rt_instance_count, backend_stats.rt_primitive_count,
             static_cast<unsigned long long>(
                 backend_stats.rt_allocated_bytes));
       } else if (s00_hot_import_rt_ready &&
                  render_frame_number > s00_rt_ready_frame) {
-        ++s00_post_import_present_frames;
-        if (s00_hot_import_requires_fg && s00_fg_present_active) {
-          ++s00_post_import_fg_active_frames;
-        } else if (s00_hot_import_requires_fg) {
-          s00_post_import_fg_active_frames = 0u;
+        if (s00_new_present_count > 0u) {
+          s00_post_import_present_frames += s00_new_present_count;
+          if (s00_hot_import_requires_fg && s00_fg_present_active) {
+            ++s00_post_import_fg_active_frames;
+          } else if (s00_hot_import_requires_fg) {
+            s00_post_import_fg_active_frames = 0u;
+          }
         }
         const bool fg_post_import_ready =
             !s00_hot_import_requires_fg ||
@@ -2830,7 +3944,6 @@ int app_main(int argc, char **argv) {
                 kS00RequiredFgActiveFrames;
         if (s00_post_import_present_frames >= 30u &&
             fg_post_import_ready) {
-          s00_hot_import_post_present = true;
           xpbd::log::infof(
               "S00_POST_IMPORT_PRESENT frame=%llu count=%llu "
               "fg_streak=%llu",
@@ -2839,6 +3952,15 @@ int app_main(int argc, char **argv) {
                   s00_post_import_present_frames),
               static_cast<unsigned long long>(
                   s00_post_import_fg_active_frames));
+          if (!backend->prepareForSystemDialog()) {
+            xpbd::log::error(
+                "S00_EXIT_SUSPEND_FAILED reason=suspend_ack_failed");
+            app_exit_code = 48;
+          } else {
+            s00_hot_import_post_present = true;
+            xpbd::log::info(
+                "S00_EXIT_SUSPEND_ACK result=worker_gpu_quiesced");
+          }
           running = false;
         } else if (s00_hot_import_requires_fg &&
                    s00_fg_phase_timed_out) {

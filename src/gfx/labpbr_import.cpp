@@ -834,14 +834,16 @@ LabPbrSuiteImportResult importLabPbrSuite(
     result.error = std::move(inspect_error);
     return result;
   }
-  if (base_header.source_channels < 3) {
+  if (base_header.source_channels != 3 &&
+      base_header.source_channels != 4) {
     result.error =
         "Base Decode stage failed: image must contain RGB or RGBA channels";
     return result;
   }
-  if (specular_header.source_channels != 4) {
+  if (specular_header.source_channels != 3 &&
+      specular_header.source_channels != 4) {
     result.error =
-        "Specular Sidecar Decode stage failed: _s.png must be an RGBA image";
+        "Specular Sidecar Decode stage failed: _s.png must be an RGB or RGBA image";
     return result;
   }
   if (base_header.width != specular_header.width ||
@@ -856,9 +858,10 @@ LabPbrSuiteImportResult importLabPbrSuite(
       result.error = std::move(inspect_error);
       return result;
     }
-    if (normal_header.source_channels != 4) {
+    if (normal_header.source_channels != 3 &&
+        normal_header.source_channels != 4) {
       result.error =
-          "Normal Sidecar Decode stage failed: _n.png must be an RGBA image";
+          "Normal Sidecar Decode stage failed: _n.png must be an RGB or RGBA image";
       return result;
     }
     if (base_header.width != normal_header.width ||
@@ -986,14 +989,15 @@ LabPbrSuiteImportResult importLabPbrSuite(
     result.error = std::move(decode_error);
     return result;
   }
-  if (base.source_channels < 3) {
+  if (base.source_channels != 3 && base.source_channels != 4) {
     result.error =
         "Base Decode stage failed: image must contain RGB or RGBA channels";
     return result;
   }
-  if (specular_image.source_channels != 4) {
+  if (specular_image.source_channels != 3 &&
+      specular_image.source_channels != 4) {
     result.error =
-        "Specular Sidecar Decode stage failed: _s.png must be an RGBA image";
+        "Specular Sidecar Decode stage failed: _s.png must be an RGB or RGBA image";
     return result;
   }
   if (base.width != specular_image.width ||
@@ -1008,9 +1012,10 @@ LabPbrSuiteImportResult importLabPbrSuite(
       result.error = std::move(decode_error);
       return result;
     }
-    if (normal_image.source_channels != 4) {
+    if (normal_image.source_channels != 3 &&
+        normal_image.source_channels != 4) {
       result.error =
-          "Normal Sidecar Decode stage failed: _n.png must be an RGBA image";
+          "Normal Sidecar Decode stage failed: _n.png must be an RGB or RGBA image";
       return result;
     }
     if (base.width != normal_image.width ||
